@@ -1351,7 +1351,7 @@ async def test_multiple_tool_calls_in_one_step_fail_stably() -> None:
 
 
 @pytest.mark.asyncio
-async def test_second_model_tool_call_fails_before_second_handler() -> None:
+async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
     requests: list[dict[str, object]] = []
     handler_calls = 0
     store = InMemoryStore()
@@ -1416,13 +1416,87 @@ async def test_second_model_tool_call_fails_before_second_handler() -> None:
             AgentSpec(name="test", model="fake/model"),
             "two sequential calls",
         )
+        result = await asyncio.wait_for(run.result(), timeout=1)
+
+        assert handler_calls == 2
+        assert len(requests) == 3
+        assert [item.value for item in result.tool_results] == [3, 7]
+        assert result.output_text == "ten"
+        assert result.usage == TokenUsage(
+            prompt_tokens=6,
+            completion_tokens=3,
+            total_tokens=9,
+        )
+        messages = requests[2]["messages"]
+        assert isinstance(messages, list)
+        assert [message["role"] for message in messages] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert messages[1]["tool_calls"][0]["id"] == "call_one"
+        assert messages[2]["tool_call_id"] == "call_one"
+        assert messages[3]["tool_calls"][0]["id"] == "call_two"
+        assert messages[4]["tool_call_id"] == "call_two"
+        snapshot = await sdk.runs.get(run.run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+        ]
+        assert event_types.count("tool.call.started") == 2
+        assert event_types[-1] == "run.completed"
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_ninth_sequential_tool_call_fails_before_handler() -> None:
+    store = InMemoryStore()
+    model_calls = 0
+    handler_calls = 0
+
+    async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal model_calls
+        model_calls += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield _tool_call_chunks(
+                '{"a":1,"b":2}',
+                call_id=f"call_{model_calls}",
+            )[0]
+
+        return chunks()
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return a + b
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=acompletion,
+        permission_default="allow",
+    )
+    try:
+        _register_add(sdk, handler)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "exceed the tool step limit",
+        )
+
         with pytest.raises(AgentSDKError) as raised:
             await asyncio.wait_for(run.result(), timeout=1)
 
         assert raised.value.code is ErrorCode.INVALID_STATE
-        assert raised.value.message == "additional tool calls are not supported"
-        assert handler_calls == 1
-        assert len(requests) == 2
+        assert raised.value.message == "tool step limit exceeded"
+        assert handler_calls == 8
+        assert model_calls == 9
         snapshot = await sdk.runs.get(run.run_id)
         assert snapshot.status is RunStatus.FAILED
         event_types = [
@@ -1430,7 +1504,7 @@ async def test_second_model_tool_call_fails_before_second_handler() -> None:
             for stored in await store.read_events(after_cursor=0)
             if stored.event.run_id == run.run_id
         ]
-        assert event_types.count("tool.call.started") == 1
+        assert event_types.count("tool.call.started") == 8
         assert event_types[-2:] == ["step.failed", "run.failed"]
     finally:
         await sdk.close()

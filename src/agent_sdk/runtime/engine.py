@@ -38,6 +38,7 @@ from agent_sdk.tools.registry import ToolRegistry
 
 _DELTA_FLUSH_SECONDS = 0.05
 _DELTA_FLUSH_BYTES = 4 * 1024
+_MAX_TOOL_STEPS = 8
 
 
 class _RunEmitter:
@@ -302,10 +303,10 @@ class RunEngine:
                     await emitter.close()
                     raise failure
 
-                if calls and tool_results:
+                if calls and len(tool_results) >= _MAX_TOOL_STEPS:
                     failure = AgentSDKError(
                         ErrorCode.INVALID_STATE,
-                        "additional tool calls are not supported",
+                        "tool step limit exceeded",
                         retryable=False,
                     )
                     await self._fail_run(
