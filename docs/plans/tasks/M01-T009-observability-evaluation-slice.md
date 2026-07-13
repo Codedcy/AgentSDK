@@ -69,7 +69,7 @@ assert timeline.events[-1].event.type == "run.completed"
 
 Add `latest_cursor()` to the StateStore contract, InMemoryStore, SQLiteStore and the SDK's lazy SQLite adapter. InMemory returns its monotonic allocation counter under the Store lock. SQLite reads `sqlite_sequence` under its existing lock, preserving the allocated cursor even if rows were deleted. Do not derive this value only from `MAX(events.cursor)`.
 
-Extend `StateStore.read_events` with optional keyword-only `up_to_cursor` and `limit` parameters, defaulting to the existing unbounded behavior for source compatibility. InMemory applies the cursor/session predicates and then slices under its lock; SQLite applies `cursor <= ?`, ordered `LIMIT ?` in SQL. Internal callers in this slice use a fixed bounded page size. Validate nonpositive limits/inverted cursor windows before touching storage.
+Extend `StateStore.read_events` with optional keyword-only `up_to_cursor` and `limit` parameters, defaulting to the existing unbounded behavior for source compatibility. InMemory iterates in cursor order and stops as soon as `limit` qualifying rows have been copied under its lock (it must not first allocate the full backlog); SQLite applies `cursor <= ?`, ordered `LIMIT ?` in SQL. Internal callers in this slice use a fixed bounded page size. Validate nonpositive limits/inverted cursor windows before touching storage.
 
 - [ ] **Step 3: Implement bounded, stable Run observations**
 
@@ -83,7 +83,7 @@ For this slice `execution_tree(root_run_id)` means the requested Run plus the tr
 
 Return a flat, deterministic tuple of `ExecutionTreeNode(snapshot, parent_run_id, created_cursor)` in creation-cursor order. Validate exact Session ownership and every relationship against the current Run snapshots. Detect relevant Run transitions/new Child creation during assembly with a bounded re-read and fail closed on inconsistent/cross-Session records. Do not enumerate mutable in-process task state.
 
-Do not require the global high-water to remain equal during tree assembly: unrelated Sessions/Runs may continue committing forever. Re-read bounded pages only after captured `H`; retry when those events transition an already-selected Run or create a Child whose parent is in the selected tree. After the tail check, re-read root and every selected Run snapshot and require exact equality/session ownership with the assembled observation; this catches Session deletion or same-id replacement that emits no retained event. Ignore malformed records that provably belong to an unrelated Session/tree, while a cross-Session record that claims a selected parent is an integrity failure.
+Do not require the global high-water to remain equal during tree assembly: unrelated Sessions/Runs may continue committing forever. Capture one finite `tail_H`, then re-read bounded pages only in `(H, tail_H]`; retry when those events transition an already-selected Run or create a Child whose parent is in the selected tree. Never chase a moving high-water while scanning the tail. After the tail check, re-read root and every selected Run snapshot and require exact equality/session ownership with the assembled observation; this catches Session deletion or same-id replacement that emits no retained event. Ignore malformed records that provably belong to an unrelated Session/tree, while a cross-Session record that claims a selected parent is an integrity failure.
 
 - [ ] **Step 5: Verify Task 1**
 
@@ -220,6 +220,7 @@ Create terminal Runs with pass/fail/unknown evaluation records and successful/fa
 - evaluator/tool exact filters affect both numerator and denominator;
 - no known denominator returns `value=None`, never a fabricated zero-rate conclusion;
 - each result includes metric name, sample/missing counts, method, filters, evidence ids and `as_of_cursor`.
+- a copied evaluation payload under a different event aggregate/Session cannot survive deletion of its real owner and continue contributing.
 
 Define aggregation units exactly:
 
@@ -232,13 +233,13 @@ Define aggregation units exactly:
 
 - [ ] **Step 2: Implement cursor-bounded fact aggregation**
 
-Capture `latest_cursor()` as `H`, page through the durable log with `up_to_cursor=H` and a fixed `limit`, and aggregate in constant memory. Parse only `evaluation.completed` and `tool.call.completed` typed payloads using the exact counting/filter rules above. Count attributable malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down (the returned evidence tuple is result-sized by definition; event scanning itself is bounded).
+Capture `latest_cursor()` as `H`, page through the durable log with `up_to_cursor=H` and a fixed `limit`, and aggregate in constant memory. Parse only `evaluation.completed` and `tool.call.completed` typed payloads using the exact counting/filter rules above. For every parsed evaluation require `event.run_id == result.evaluation_id` and `event.session_id == result.session_id`; an identity mismatch is an attributable malformed/missing candidate, never a known verdict. This envelope/payload cross-check preserves Session-owned deletion semantics. Tool terminal payloads contain no duplicated Session/Run identity and have no equivalent cross-check. Count other attributable malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down (the returned evidence tuple is result-sized by definition; event scanning itself is bounded).
 
 These methods report deterministic counting methods such as `explicit_evaluation_verdict` and `terminal_tool_status`. Do not emit failure stage, root cause, usefulness, attribution or recommendations in this slice.
 
 - [ ] **Step 3: Prove restart and deletion behavior**
 
-Run the same aggregates on InMemory and SQLite, close/reopen SQLite and compare results. Delete one contributing Session and assert its evaluation snapshot/event and Tool events are absent and all aggregate numerators/denominators/missing counts are recomputed without that Session.
+Run the same aggregates on InMemory and SQLite, close/reopen SQLite and compare results. Delete one contributing Session and assert its evaluation snapshot/event and Tool events are absent and all aggregate numerators/denominators/missing counts are recomputed without that Session. Inject an evaluation event whose envelope Session/aggregate disagrees with an otherwise valid payload; prove it is missing rather than known and cannot retain the payload Session's contribution after deletion.
 
 - [ ] **Step 4: Verify Task 4**
 
