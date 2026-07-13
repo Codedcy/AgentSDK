@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+import json
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,10 @@ async def test_public_sdk_queries_subscribes_evaluates_and_aggregates() -> None:
         )
         terminal = await asyncio.wait_for(anext(stream), timeout=1)
         await stream.aclose()
+        serialized_terminal = terminal.model_dump(mode="json")
+        assert json.loads(json.dumps(serialized_terminal))["event"]["type"] == (
+            "run.completed"
+        )
         evaluation = await sdk.evaluations.evaluate(
             handle.run_id,
             ExactOutputEvaluator(expected="ok"),
