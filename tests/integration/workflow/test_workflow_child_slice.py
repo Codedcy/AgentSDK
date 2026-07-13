@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import traceback
 from collections.abc import AsyncIterator
 from typing import Any
@@ -10,11 +12,13 @@ import pytest
 from agent_sdk import (
     AgentSDK,
     AgentSDKError,
+    AgentNode,
     AgentSpec,
     ChildResult,
     ErrorCode,
     TaskEnvelope,
     WorkflowDefinition,
+    WorkflowEdge,
     WorkflowHandle,
     WorkflowIR,
     WorkflowResult,
@@ -292,4 +296,122 @@ async def test_workflow_result_waiter_cancellation_does_not_cancel_execution() -
     release_child.set()
 
     assert (await asyncio.wait_for(handle.result(), timeout=1)).output_text == "done"
+    await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_live_events_final_drain_yields_success_tail_after_task_finishes() -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        if params["model"] == "fake/planner":
+            provider_started.set()
+            await release_provider.wait()
+        return _chunks("done")
+
+    sdk = AgentSDK.for_test(store=InMemoryStore(), acompletion=provider)
+    sdk.agents.define(AgentSpec(name="planner", revision="1", model="fake/planner"))
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.workflows.start(
+        session.session_id, WorkflowDefinition.model_validate(DEFINITION)
+    )
+    events = handle.events()
+    assert (await anext(events)).event.type == "workflow.started"
+    assert (await anext(events)).event.type == "workflow.node.started"
+    await asyncio.wait_for(provider_started.wait(), timeout=1)
+
+    release_provider.set()
+    await handle.result()
+    tail = [stored.event.type async for stored in events]
+
+    assert tail[-1] == "workflow.completed"
+    assert tail.count("workflow.node.completed") == 2
+    await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_live_events_final_drain_yields_failure_tail_before_task_error() -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        provider_started.set()
+        await release_provider.wait()
+        raise RuntimeError("RAW_LIVE_FAILURE")
+
+    sdk = AgentSDK.for_test(store=InMemoryStore(), acompletion=provider)
+    sdk.agents.define(AgentSpec(name="planner", revision="1", model="fake/planner"))
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.workflows.start(
+        session.session_id, WorkflowDefinition.model_validate(DEFINITION)
+    )
+    events = handle.events()
+    assert (await anext(events)).event.type == "workflow.started"
+    assert (await anext(events)).event.type == "workflow.node.started"
+    await asyncio.wait_for(provider_started.wait(), timeout=1)
+
+    release_provider.set()
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    tail = [stored.event.type async for stored in events]
+
+    assert tail[-2:] == ["workflow.node.failed", "workflow.failed"]
+    await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_facade_revalidates_constructed_ir_before_any_write() -> None:
+    calls = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return _chunks("unused")
+
+    nodes = tuple(
+        AgentNode(
+            id=node_id,
+            agent_revision=f"{node_id}:1",
+            input=node_id,
+        )
+        for node_id in ("root", "left", "right")
+    )
+    edges = (
+        WorkflowEdge(source="root", target="left"),
+        WorkflowEdge(source="root", target="right"),
+    )
+    content = {
+        "schema_version": 1,
+        "name": "unsafe",
+        "nodes": [node.model_dump(mode="json") for node in nodes],
+        "edges": [edge.model_dump(mode="json") for edge in edges],
+    }
+    unsafe = WorkflowIR.model_construct(
+        schema_version=1,
+        name="unsafe",
+        nodes=nodes,
+        edges=edges,
+        definition_hash=hashlib.sha256(
+            json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(store=store, acompletion=provider)
+    session = await sdk.sessions.create(workspaces=[])
+
+    with pytest.raises(AgentSDKError) as raised:
+        await sdk.workflows.start(session.session_id, unsafe)
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "workflow IR is invalid"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert calls == 0
+    assert not any(
+        event.event.type == "workflow.started"
+        for event in await store.read_events(after_cursor=0)
+    )
     await sdk.close()

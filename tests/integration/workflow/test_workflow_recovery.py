@@ -14,7 +14,13 @@ from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.models import RunSnapshot, RunStatus
-from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    SnapshotWrite,
+    StateStore,
+    StoredEvent,
+)
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.workflow import WorkflowCompiler, WorkflowExecutor, WorkflowIR
@@ -448,3 +454,216 @@ def _traceback_frames(error: BaseException) -> list[Any]:
         frames.append(current.tb_frame)
         current = current.tb_next
     return frames
+
+
+@pytest.mark.parametrize("foreign_status", ["created", "completed"])
+@pytest.mark.asyncio
+async def test_resume_rejects_cross_session_selected_run_without_model_or_projection(
+    foreign_status: str,
+) -> None:
+    calls = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return _chunks("FOREIGN_SESSION_SECRET")
+
+    delegate = InMemoryStore()
+    interrupted = _CommitThenCancelStore(delegate, "workflow.node.started")
+    commands = RuntimeCommands(interrupted)
+    executor = WorkflowExecutor(
+        interrupted,
+        commands,
+        RunEngine(interrupted, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+    owner = await commands.create_session(workspaces=[])
+    handle = await executor.start(owner.session_id, _ir())
+    with pytest.raises(asyncio.CancelledError):
+        await handle.result()
+    workflow = await executor.get(handle.workflow_run_id)
+
+    foreign_session = await commands.create_session(workspaces=[])
+    foreign = await commands.start_run(
+        foreign_session.session_id,
+        agent_revision="planner:1",
+        user_input="make a plan",
+    )
+    if foreign_status == "completed":
+        await RunEngine(
+            interrupted, LiteLLMGateway._for_test(provider)
+        ).execute(
+            foreign.run_id,
+            ModelRequest(
+                model="fake/planner",
+                messages=({"role": "user", "content": "make a plan"},),
+            ),
+        )
+    calls = 0
+
+    injected_node = workflow.nodes[0].model_copy(update={"run_id": foreign.run_id})
+    injected = workflow.model_copy(
+        update={
+            "nodes": (injected_node, *workflow.nodes[1:]),
+        }
+    )
+    await delegate.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "workflow",
+                    workflow.workflow_run_id,
+                    workflow.session_id,
+                    workflow.version + 1,
+                    injected.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    "workflow_node",
+                    injected_node.entity_id,
+                    workflow.session_id,
+                    injected_node.version + 1,
+                    injected_node.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    resumed = WorkflowExecutor(
+        delegate,
+        RuntimeCommands(delegate),
+        RunEngine(delegate, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+    events_before = await delegate.read_events(after_cursor=0)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await (await resumed.resume(workflow.workflow_run_id)).result()
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "related run does not match workflow node"
+    assert "FOREIGN_SESSION_SECRET" not in str(raised.value)
+    assert calls == 0
+    assert await resumed.get(workflow.workflow_run_id) == injected
+    assert await delegate.read_events(after_cursor=0) == events_before
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_corrupt_embedded_node_owner_before_write_or_model() -> None:
+    calls = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return _chunks("unused")
+
+    delegate = InMemoryStore()
+    interrupted = _CommitThenCancelStore(delegate, "workflow.node.started")
+    commands = RuntimeCommands(interrupted)
+    executor = WorkflowExecutor(
+        interrupted,
+        commands,
+        RunEngine(interrupted, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+    session = await commands.create_session(workspaces=[])
+    handle = await executor.start(session.session_id, _ir())
+    with pytest.raises(asyncio.CancelledError):
+        await handle.result()
+    workflow = await executor.get(handle.workflow_run_id)
+    corrupt_node = workflow.nodes[0].model_copy(update={"session_id": "ses_foreign"})
+    corrupt = workflow.model_copy(
+        update={
+            "nodes": (corrupt_node, *workflow.nodes[1:]),
+        }
+    )
+    await delegate.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "workflow",
+                    workflow.workflow_run_id,
+                    workflow.session_id,
+                    workflow.version + 1,
+                    corrupt.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    events_before = await delegate.read_events(after_cursor=0)
+    resumed = WorkflowExecutor(
+        delegate,
+        RuntimeCommands(delegate),
+        RunEngine(delegate, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+
+    with pytest.raises(AgentSDKError) as raised:
+        await resumed.resume(workflow.workflow_run_id)
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "failed to load workflow run"
+    assert calls == 0
+    assert await delegate.read_events(after_cursor=0) == events_before
+
+
+class _BlockingNodeReadStore:
+    def __init__(self) -> None:
+        self.delegate = InMemoryStore()
+        self.block_next_node_read = False
+        self.node_read_blocked = asyncio.Event()
+        self.release_node_read = asyncio.Event()
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        return await self.delegate.commit(batch)
+
+    async def read_events(
+        self, *, after_cursor: int, session_id: str | None = None
+    ) -> list[StoredEvent]:
+        return await self.delegate.read_events(
+            after_cursor=after_cursor, session_id=session_id
+        )
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        if kind == "workflow_node" and self.block_next_node_read:
+            self.block_next_node_read = False
+            self.node_read_blocked.set()
+            await self.release_node_read.wait()
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.delegate.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_get_retries_when_workflow_transitions_between_aggregate_reads() -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        if params["model"] == "fake/planner":
+            provider_started.set()
+            await release_provider.wait()
+        return _chunks("done")
+
+    store = _BlockingNodeReadStore()
+    commands = RuntimeCommands(store)
+    executor = WorkflowExecutor(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+    session = await commands.create_session(workspaces=[])
+    handle = await executor.start(session.session_id, _ir())
+    await asyncio.wait_for(provider_started.wait(), timeout=1)
+    store.block_next_node_read = True
+    get_task = asyncio.create_task(executor.get(handle.workflow_run_id))
+    await asyncio.wait_for(store.node_read_blocked.wait(), timeout=1)
+
+    release_provider.set()
+    await handle.result()
+    store.release_node_read.set()
+    observed = await asyncio.wait_for(get_task, timeout=1)
+
+    assert observed.status is WorkflowRunStatus.COMPLETED

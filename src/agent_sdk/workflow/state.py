@@ -27,6 +27,7 @@ class _LoadFailure(Enum):
     MISSING = "missing"
     INVALID = "invalid"
     STORE = "store"
+    UNSTABLE = "unstable"
 
 
 class _CommitFailure(Enum):
@@ -89,6 +90,12 @@ class WorkflowState:
                 ErrorCode.NOT_FOUND,
                 "workflow run not found",
                 retryable=False,
+            )
+        if result is _LoadFailure.UNSTABLE:
+            raise AgentSDKError(
+                ErrorCode.CONFLICT,
+                "workflow state changed during load",
+                retryable=True,
             )
         if isinstance(result, _LoadFailure):
             raise AgentSDKError(
@@ -322,16 +329,46 @@ async def _load_workflow(
     store: StateStore,
     workflow_run_id: str,
 ) -> WorkflowRunSnapshot | _LoadFailure:
-    try:
-        data = await store.get_snapshot("workflow", workflow_run_id)
-    except Exception:
-        return _LoadFailure.STORE
-    if data is None:
-        return _LoadFailure.MISSING
-    try:
-        return WorkflowRunSnapshot.model_validate(data)
-    except Exception:
-        return _LoadFailure.INVALID
+    for _ in range(4):
+        try:
+            before = await store.get_snapshot("workflow", workflow_run_id)
+        except Exception:
+            return _LoadFailure.STORE
+        if before is None:
+            return _LoadFailure.MISSING
+        try:
+            workflow = WorkflowRunSnapshot.model_validate(before)
+        except Exception:
+            return _LoadFailure.INVALID
+        nodes_match = True
+        for expected_node in workflow.nodes:
+            try:
+                node_data = await store.get_snapshot(
+                    "workflow_node", expected_node.entity_id
+                )
+            except Exception:
+                return _LoadFailure.STORE
+            if node_data is None:
+                nodes_match = False
+                break
+            try:
+                stored_node = WorkflowNodeSnapshot.model_validate(node_data)
+            except Exception:
+                nodes_match = False
+                break
+            if stored_node != expected_node:
+                nodes_match = False
+                break
+        try:
+            after = await store.get_snapshot("workflow", workflow_run_id)
+        except Exception:
+            return _LoadFailure.STORE
+        if before != after:
+            continue
+        if not nodes_match:
+            return _LoadFailure.INVALID
+        return workflow
+    return _LoadFailure.UNSTABLE
 
 
 async def _commit_batch(

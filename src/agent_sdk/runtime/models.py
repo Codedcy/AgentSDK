@@ -4,7 +4,14 @@ from typing import Any, Literal, Self
 
 from collections.abc import Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agent_sdk.tools.models import ToolResult
 from agent_sdk.subagents.models import TaskEnvelope
@@ -90,6 +97,14 @@ class RunResult(BaseModel):
     tool_results: tuple[ToolResult, ...] = ()
 
 
+class RunFailure(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: str
+    message: str
+    retryable: bool
+
+
 class SessionSnapshot(BaseModel):
     session_id: str
     status: Literal["active"] = "active"
@@ -112,3 +127,23 @@ class RunSnapshot(BaseModel):
     workflow_run_id: str | None = None
     workflow_node_id: str | None = None
     task_envelope: TaskEnvelope | None = None
+    error: RunFailure | None = None
+
+    @model_validator(mode="after")
+    def _validate_status_fields(self) -> Self:
+        if self.status is RunStatus.CREATED:
+            if self.version != 1 or any(
+                value is not None for value in (self.output_text, self.usage, self.error)
+            ):
+                raise ValueError("created run contains execution state")
+        elif self.status in {RunStatus.RUNNING, RunStatus.WAITING_PERMISSION}:
+            if any(
+                value is not None for value in (self.output_text, self.usage, self.error)
+            ):
+                raise ValueError("nonterminal run contains terminal state")
+        elif self.status is RunStatus.COMPLETED:
+            if self.output_text is None or self.usage is None or self.error is not None:
+                raise ValueError("completed run state is invalid")
+        elif self.output_text is None or self.usage is None or self.error is None:
+            raise ValueError("failed run state is invalid")
+        return self

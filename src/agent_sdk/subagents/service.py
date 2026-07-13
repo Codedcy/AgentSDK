@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
+from enum import Enum
 from functools import partial
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
@@ -13,6 +14,10 @@ from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.models import RunResult, RunSnapshot, RunStatus, mutable_model_params
 from agent_sdk.storage.base import StateStore
 from agent_sdk.subagents.models import ChildResult, ChildUsage, TaskEnvelope
+
+
+class _ChildTaskFailure(Enum):
+    FAILED = "failed"
 
 
 class SubagentService:
@@ -80,11 +85,16 @@ class SubagentService:
     async def await_result(self, run_id: str) -> ChildResult:
         task = self._tasks.get(run_id)
         if task is not None:
-            result = await task
+            outcome = await _settle_child_task(task)
+            task = None
             snapshot = await self._load_run(run_id, missing_message="child run not found")
-            return self._child_result(snapshot, result)
+            if outcome is _ChildTaskFailure.FAILED:
+                raise _child_failure(snapshot)
+            return self._child_result(snapshot, outcome)
 
         snapshot = await self._load_run(run_id, missing_message="child run not found")
+        if snapshot.status is RunStatus.FAILED:
+            raise _child_failure(snapshot)
         if snapshot.status is not RunStatus.COMPLETED:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
@@ -150,3 +160,27 @@ def render_task_envelope(task: TaskEnvelope) -> str:
         separators=(",", ":"),
         ensure_ascii=False,
     )
+
+
+async def _settle_child_task(
+    task: asyncio.Task[RunResult],
+) -> RunResult | _ChildTaskFailure:
+    try:
+        return await task
+    except Exception:
+        return _ChildTaskFailure.FAILED
+
+
+def _child_failure(snapshot: RunSnapshot) -> AgentSDKError:
+    failure = snapshot.error
+    if failure is None:
+        return AgentSDKError(
+            ErrorCode.INTERNAL,
+            "child run failed",
+            retryable=False,
+        )
+    try:
+        code = ErrorCode(failure.code)
+    except ValueError:
+        code = ErrorCode.INTERNAL
+    return AgentSDKError(code, failure.message, retryable=failure.retryable)

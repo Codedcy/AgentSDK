@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -311,3 +312,141 @@ async def test_all_run_emits_require_the_session_to_still_exist() -> None:
         await task
     assert raised.value.code is ErrorCode.NOT_FOUND
     assert await store.read_events(after_cursor=0) == []
+
+
+@pytest.mark.parametrize("failure_mode", ["provider", "malformed"])
+@pytest.mark.parametrize("await_after_callback", [False, True])
+@pytest.mark.asyncio
+async def test_direct_child_failure_is_durable_stable_and_sanitized(
+    failure_mode: str,
+    await_after_callback: bool,
+) -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        provider_started.set()
+        await release_provider.wait()
+        if failure_mode == "provider":
+            raise RuntimeError("RAW_DIRECT_CHILD_PROVIDER_SECRET")
+
+        async def malformed() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [{"delta": {"content": "partial"}}],
+                "usage": {
+                    "prompt_tokens": "RAW_DIRECT_CHILD_MALFORMED_SECRET"
+                },
+            }
+
+        return malformed()
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    registry = AgentRegistry()
+    registry.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    service = SubagentService(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        registry,
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = await commands.start_run(
+        session.session_id, agent_revision="planner:1", user_input="parent"
+    )
+    child = await service.spawn(
+        session_id=session.session_id,
+        parent_run_id=parent.run_id,
+        workflow_run_id="wfr_failure",
+        workflow_node_id="child",
+        agent_revision="worker:1",
+        task=TaskEnvelope(objective="fail safely"),
+    )
+    await asyncio.wait_for(provider_started.wait(), timeout=1)
+    waiter: asyncio.Task[object] | None = None
+    if not await_after_callback:
+        waiter = asyncio.create_task(service.await_result(child.run_id))
+        await asyncio.sleep(0)
+    release_provider.set()
+    if await_after_callback:
+        while child.run_id in service._tasks:  # type: ignore[attr-defined]
+            await asyncio.sleep(0)
+
+    with pytest.raises(AgentSDKError) as raised:
+        if waiter is None:
+            await service.await_result(child.run_id)
+        else:
+            await waiter
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "model call failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    formatted = "".join(traceback.format_exception(raised.value))
+    assert "RAW_DIRECT_CHILD_PROVIDER_SECRET" not in formatted
+    assert "RAW_DIRECT_CHILD_MALFORMED_SECRET" not in formatted
+    for frame in _sdk_traceback_frames(raised.value):
+        assert not any(
+            "RAW_DIRECT_CHILD_PROVIDER_SECRET" in repr(value)
+            or "RAW_DIRECT_CHILD_MALFORMED_SECRET" in repr(value)
+            for value in frame.f_locals.values()
+        )
+    persisted = RunSnapshot.model_validate(await store.get_snapshot("run", child.run_id))
+    assert persisted.status is RunStatus.FAILED
+    assert persisted.error is not None
+    assert persisted.error.message == "model call failed"
+
+
+def _sdk_traceback_frames(error: BaseException) -> list[Any]:
+    frames: list[Any] = []
+    cursor = error.__traceback__
+    while cursor is not None:
+        normalized = cursor.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/agent_sdk/" in normalized:
+            frames.append(cursor.tb_frame)
+        cursor = cursor.tb_next
+    return frames
+
+
+@pytest.mark.asyncio
+async def test_direct_child_preserves_parameterized_cancelled_error_instance() -> None:
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    expected = asyncio.CancelledError("child-stop", 7)
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        provider_started.set()
+        await release_provider.wait()
+        raise expected
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    registry = AgentRegistry()
+    registry.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    service = SubagentService(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        registry,
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = await commands.start_run(
+        session.session_id, agent_revision="planner:1", user_input="parent"
+    )
+    child = await service.spawn(
+        session_id=session.session_id,
+        parent_run_id=parent.run_id,
+        workflow_run_id="wfr_cancel",
+        workflow_node_id="child",
+        agent_revision="worker:1",
+        task=TaskEnvelope(objective="cancel"),
+    )
+    waiter = asyncio.create_task(service.await_result(child.run_id))
+    await asyncio.wait_for(provider_started.wait(), timeout=1)
+    release_provider.set()
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await waiter
+
+    assert raised.value is expected
+    assert raised.value.args == ("child-stop", 7)

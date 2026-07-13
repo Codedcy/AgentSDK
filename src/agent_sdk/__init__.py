@@ -23,6 +23,7 @@ from agent_sdk.prompts import BuiltPrompt, PromptComposer, PromptManifest
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.models import (
     AgentSpec,
+    RunFailure,
     RunResult,
     RunSnapshot,
     RunStatus,
@@ -77,6 +78,7 @@ __all__ = [
     "PromptManifest",
     "BuiltPrompt",
     "RunAPI",
+    "RunFailure",
     "RunHandle",
     "RunResult",
     "RunSnapshot",

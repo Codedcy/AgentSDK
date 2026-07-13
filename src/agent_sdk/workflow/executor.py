@@ -50,6 +50,10 @@ class _RunLoadFailure(Enum):
     INVALID = "invalid"
 
 
+class _IRValidationFailure(Enum):
+    INVALID = "invalid"
+
+
 class WorkflowExecutor:
     def __init__(
         self,
@@ -179,6 +183,14 @@ class WorkflowExecutor:
                 failure = _generic_failure("related run state is invalid")
                 await self._persist_failure(snapshot, index, failure)
                 raise _failure_error(failure)
+            if isinstance(run, RunSnapshot) and not _related_run_matches(
+                snapshot, index, node, run
+            ):
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "related run does not match workflow node",
+                    retryable=False,
+                )
             if run is _RunLoadFailure.MISSING:
                 result = await self._create_and_execute(snapshot, index, node, run_id)
             elif run.status is RunStatus.CREATED:
@@ -280,14 +292,21 @@ class WorkflowExecutor:
 
 
 def _validated_ir(workflow: WorkflowIR) -> WorkflowIR:
-    try:
-        return WorkflowIR.model_validate(workflow.model_dump(mode="json"))
-    except ValidationError:
+    result = _validate_ir(workflow)
+    if result is _IRValidationFailure.INVALID:
         raise AgentSDKError(
             ErrorCode.INVALID_STATE,
             "workflow IR is invalid",
             retryable=False,
-        ) from None
+        )
+    return result
+
+
+def _validate_ir(workflow: WorkflowIR) -> WorkflowIR | _IRValidationFailure:
+    try:
+        return WorkflowIR.model_validate(workflow.model_dump(mode="json"))
+    except ValidationError:
+        return _IRValidationFailure.INVALID
 
 
 async def _load_run(
@@ -372,6 +391,38 @@ def _task_envelope(node: AgentNode) -> TaskEnvelope:
         evidence_refs=node.evidence_refs,
         allowed_tools=node.allowed_tools,
         workspace_scopes=node.workspace_scopes,
+    )
+
+
+def _related_run_matches(
+    workflow: WorkflowRunSnapshot,
+    index: int,
+    node: AgentNode,
+    run: RunSnapshot,
+) -> bool:
+    if (
+        run.run_id != workflow.nodes[index].run_id
+        or run.session_id != workflow.session_id
+        or run.workflow_run_id != workflow.workflow_run_id
+        or run.workflow_node_id != node.id
+        or run.agent_revision != node.agent_revision
+    ):
+        return False
+    if node.run_as == "parent":
+        return (
+            run.parent_run_id is None
+            and run.task_envelope is None
+            and run.user_input == node.input
+        )
+    if index == 0:
+        return False
+    expected_parent = workflow.nodes[index - 1].run_id
+    expected_envelope = _task_envelope(node)
+    return (
+        expected_parent is not None
+        and run.parent_run_id == expected_parent
+        and run.task_envelope == expected_envelope
+        and run.user_input == render_task_envelope(expected_envelope)
     )
 
 

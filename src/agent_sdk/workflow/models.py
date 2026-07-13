@@ -92,6 +92,7 @@ class WorkflowIR(BaseModel):
 
     @model_validator(mode="after")
     def _validate_hash(self) -> Self:
+        _validate_canonical_graph(self.nodes, self.edges)
         expected = hashlib.sha256(
             _canonical_json(self._content()).encode("utf-8")
         ).hexdigest()
@@ -109,6 +110,25 @@ class WorkflowIR(BaseModel):
 
     def canonical_bytes(self) -> bytes:
         return self.canonical_json().encode("utf-8")
+
+
+def _validate_canonical_graph(
+    nodes: tuple[AgentNode, ...],
+    edges: tuple[WorkflowEdge, ...],
+) -> None:
+    if not nodes:
+        raise ValueError("workflow IR must contain at least one node")
+    node_ids = tuple(node.id for node in nodes)
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("workflow IR node ids must be unique")
+    if nodes[0].run_as == "child":
+        raise ValueError("workflow IR root cannot be a child")
+    expected_edges = tuple(
+        (left.id, right.id) for left, right in zip(nodes, nodes[1:])
+    )
+    actual_edges = tuple((edge.source, edge.target) for edge in edges)
+    if actual_edges != expected_edges:
+        raise ValueError("workflow IR must be a canonical sequential chain")
 
 
 class WorkflowRunStatus(StrEnum):
@@ -146,6 +166,43 @@ class WorkflowNodeSnapshot(BaseModel):
     usage: TokenUsage | None = None
     error: WorkflowFailure | None = None
 
+    @model_validator(mode="after")
+    def _validate_status_fields(self) -> Self:
+        if self.status is WorkflowNodeStatus.PENDING:
+            if self.version != 1 or any(
+                value is not None
+                for value in (self.run_id, self.output_text, self.usage, self.error)
+            ):
+                raise ValueError("pending workflow node contains execution state")
+        elif self.status is WorkflowNodeStatus.RUNNING:
+            if (
+                self.version != 2
+                or self.run_id is None
+                or any(
+                    value is not None
+                    for value in (self.output_text, self.usage, self.error)
+                )
+            ):
+                raise ValueError("running workflow node state is invalid")
+        elif self.status is WorkflowNodeStatus.COMPLETED:
+            if (
+                self.version != 3
+                or self.run_id is None
+                or self.output_text is None
+                or self.usage is None
+                or self.error is not None
+            ):
+                raise ValueError("completed workflow node state is invalid")
+        elif (
+            self.version != 3
+            or self.run_id is None
+            or self.error is None
+            or self.output_text is not None
+            or self.usage is not None
+        ):
+            raise ValueError("failed workflow node state is invalid")
+        return self
+
 
 class WorkflowRunSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -160,6 +217,72 @@ class WorkflowRunSnapshot(BaseModel):
     usage: TokenUsage | None = None
     error: WorkflowFailure | None = None
 
+    @model_validator(mode="after")
+    def _validate_aggregate(self) -> Self:
+        if len(self.nodes) != len(self.workflow.nodes):
+            raise ValueError("workflow snapshot node count does not match definition")
+        for node, definition_node in zip(self.nodes, self.workflow.nodes, strict=True):
+            if (
+                node.workflow_run_id != self.workflow_run_id
+                or node.session_id != self.session_id
+                or node.node_id != definition_node.id
+                or node.entity_id != f"{self.workflow_run_id}:{definition_node.id}"
+            ):
+                raise ValueError("workflow snapshot node ownership is invalid")
+
+        statuses = tuple(node.status for node in self.nodes)
+        first_incomplete = next(
+            (
+                index
+                for index, status in enumerate(statuses)
+                if status is not WorkflowNodeStatus.COMPLETED
+            ),
+            len(statuses),
+        )
+        if any(
+            status is not WorkflowNodeStatus.PENDING
+            for status in statuses[first_incomplete + 1 :]
+        ):
+            raise ValueError("workflow snapshot statuses are not a legal sequential prefix")
+
+        if self.status is WorkflowRunStatus.RUNNING:
+            if any(
+                value is not None for value in (self.output_text, self.usage, self.error)
+            ):
+                raise ValueError("running workflow contains terminal fields")
+        elif self.status is WorkflowRunStatus.COMPLETED:
+            if (
+                any(status is not WorkflowNodeStatus.COMPLETED for status in statuses)
+                or self.output_text is None
+                or self.usage is None
+                or self.error is not None
+                or self.output_text != self.nodes[-1].output_text
+                or self.usage != _sum_node_usage(self.nodes)
+            ):
+                raise ValueError("completed workflow state is invalid")
+        elif (
+            statuses.count(WorkflowNodeStatus.FAILED) != 1
+            or self.error is None
+            or self.output_text is not None
+            or self.usage is not None
+            or self.error
+            != next(
+                node.error
+                for node in self.nodes
+                if node.status is WorkflowNodeStatus.FAILED
+            )
+        ):
+            raise ValueError("failed workflow state is invalid")
+        base_version = 1 + sum(node.version - 1 for node in self.nodes)
+        expected_version = (
+            base_version
+            if self.status is WorkflowRunStatus.RUNNING
+            else base_version + 1
+        )
+        if self.version != expected_version:
+            raise ValueError("workflow snapshot version does not match node state")
+        return self
+
 
 class WorkflowResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -169,3 +292,19 @@ class WorkflowResult(BaseModel):
     nodes: tuple[WorkflowNodeSnapshot, ...]
     output_text: str
     usage: TokenUsage
+
+
+def _sum_node_usage(nodes: tuple[WorkflowNodeSnapshot, ...]) -> TokenUsage:
+    def total(field: str) -> int | None:
+        values = [
+            getattr(node.usage, field)
+            for node in nodes
+            if node.usage is not None and getattr(node.usage, field) is not None
+        ]
+        return sum(values) if values else None
+
+    return TokenUsage(
+        prompt_tokens=total("prompt_tokens"),
+        completion_tokens=total("completion_tokens"),
+        total_tokens=total("total_tokens"),
+    )

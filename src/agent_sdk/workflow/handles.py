@@ -35,6 +35,7 @@ class WorkflowHandle:
 
     async def events(self, cursor: int = 0) -> AsyncIterator[StoredEvent]:
         next_cursor = cursor
+        completion_observed = False
         while True:
             events = await _read_events(self._store, next_cursor)
             if events is None:
@@ -51,6 +52,17 @@ class WorkflowHandle:
                 if stored.event.type in _TERMINAL_EVENTS:
                     return
             if self._task.done():
+                if not completion_observed:
+                    completion_observed = True
+                    continue
+                if events:
+                    continue
+                snapshot = await WorkflowState(self._store).load(self.workflow_run_id)
+                if snapshot.status in {
+                    WorkflowRunStatus.COMPLETED,
+                    WorkflowRunStatus.FAILED,
+                }:
+                    return
                 if self._task.cancelled():
                     raise asyncio.CancelledError
                 error = self._task.exception()
@@ -62,12 +74,6 @@ class WorkflowHandle:
                         "workflow execution failed",
                         retryable=False,
                     ) from None
-                snapshot = await WorkflowState(self._store).load(self.workflow_run_id)
-                if snapshot.status in {
-                    WorkflowRunStatus.COMPLETED,
-                    WorkflowRunStatus.FAILED,
-                }:
-                    return
                 raise AgentSDKError(
                     ErrorCode.INTERNAL,
                     "workflow execution ended without terminal state",

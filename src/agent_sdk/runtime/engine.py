@@ -18,7 +18,13 @@ from agent_sdk.models.litellm_gateway import (
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
-from agent_sdk.runtime.models import RunResult, RunSnapshot, RunStatus, TokenUsage
+from agent_sdk.runtime.models import (
+    RunFailure,
+    RunResult,
+    RunSnapshot,
+    RunStatus,
+    TokenUsage,
+)
 from agent_sdk.storage.base import (
     CommitBatch,
     SnapshotPrecondition,
@@ -474,6 +480,11 @@ class RunEngine:
             update={
                 "output_text": "".join(chunks),
                 "usage": usage,
+                "error": RunFailure(
+                    code=failure.code.value,
+                    message=failure.message,
+                    retryable=failure.retryable,
+                ),
             },
         )
 

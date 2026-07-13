@@ -8,11 +8,16 @@ from pydantic import ValidationError
 
 from agent_sdk.subagents import ChildResult, TaskEnvelope
 from agent_sdk.workflow import (
+    AgentNode,
     WorkflowCompiler,
     WorkflowDefinition,
+    WorkflowEdge,
     WorkflowFailure,
+    WorkflowIR,
     WorkflowNodeSnapshot,
     WorkflowNodeStatus,
+    WorkflowRunSnapshot,
+    WorkflowRunStatus,
 )
 
 
@@ -220,6 +225,8 @@ def test_child_and_failure_models_are_recursively_detached_and_frozen() -> None:
         session_id="ses_1",
         node_id="node",
         status=WorkflowNodeStatus.FAILED,
+        version=3,
+        run_id="run_1",
         error=failure,
     )
     child = ChildResult(
@@ -234,3 +241,150 @@ def test_child_and_failure_models_are_recursively_detached_and_frozen() -> None:
     assert child.evidence_refs == ("artifact:1",)
     with pytest.raises(ValidationError):
         snapshot.error.message = "raw"  # type: ignore[union-attr,misc]
+
+
+def _agent_node(node_id: str, *, run_as: str = "parent") -> AgentNode:
+    return AgentNode.model_validate(
+        {
+            "id": node_id,
+            "kind": "agent",
+            "agent_revision": f"{node_id}:1",
+            "input": node_id,
+            "run_as": run_as,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "nodes,edges",
+    [
+        (
+            (_agent_node("root"), _agent_node("left"), _agent_node("right")),
+            (
+                WorkflowEdge(source="root", target="left"),
+                WorkflowEdge(source="root", target="right"),
+            ),
+        ),
+        (
+            (_agent_node("root"), _agent_node("child")),
+            (
+                WorkflowEdge(source="root", target="child"),
+                WorkflowEdge(source="child", target="root"),
+            ),
+        ),
+        (
+            (_agent_node("child", run_as="child"),),
+            (),
+        ),
+        (
+            (_agent_node("same"), _agent_node("same")),
+            (WorkflowEdge(source="same", target="same"),),
+        ),
+        (
+            (_agent_node("root"), _agent_node("middle"), _agent_node("leaf")),
+            (
+                WorkflowEdge(source="middle", target="leaf"),
+                WorkflowEdge(source="root", target="middle"),
+            ),
+        ),
+    ],
+)
+def test_workflow_ir_create_rejects_hashable_noncanonical_graphs(
+    nodes: tuple[AgentNode, ...],
+    edges: tuple[WorkflowEdge, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowIR.create(name="unsafe", nodes=nodes, edges=edges)
+
+
+def test_workflow_ir_model_validate_rejects_self_hashed_branching_graph() -> None:
+    nodes = (_agent_node("root"), _agent_node("left"), _agent_node("right"))
+    edges = (
+        WorkflowEdge(source="root", target="left"),
+        WorkflowEdge(source="root", target="right"),
+    )
+    content = {
+        "schema_version": 1,
+        "name": "unsafe",
+        "nodes": [node.model_dump(mode="json") for node in nodes],
+        "edges": [edge.model_dump(mode="json") for edge in edges],
+    }
+    payload = {
+        **content,
+        "definition_hash": hashlib.sha256(
+            json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+    with pytest.raises(ValidationError):
+        WorkflowIR.model_validate(payload)
+
+
+def _pending_workflow_snapshot() -> WorkflowRunSnapshot:
+    workflow = WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(WORKFLOW_DATA)
+    )
+    workflow_run_id = "wfr_owner"
+    session_id = "ses_owner"
+    nodes = tuple(
+        WorkflowNodeSnapshot(
+            entity_id=f"{workflow_run_id}:{node.id}",
+            workflow_run_id=workflow_run_id,
+            session_id=session_id,
+            node_id=node.id,
+            status=WorkflowNodeStatus.PENDING,
+        )
+        for node in workflow.nodes
+    )
+    return WorkflowRunSnapshot(
+        workflow_run_id=workflow_run_id,
+        session_id=session_id,
+        status=WorkflowRunStatus.RUNNING,
+        workflow=workflow,
+        nodes=nodes,
+    )
+
+
+def test_workflow_snapshot_rejects_misaligned_owned_nodes_and_illegal_status_shape() -> None:
+    valid = _pending_workflow_snapshot().model_dump(mode="json")
+    corruptions: list[dict[str, object]] = []
+
+    missing = json.loads(json.dumps(valid))
+    missing["nodes"] = missing["nodes"][:-1]
+    corruptions.append(missing)
+
+    for field, value in (
+        ("workflow_run_id", "wfr_foreign"),
+        ("session_id", "ses_foreign"),
+        ("node_id", "wrong"),
+        ("entity_id", "wfr_owner:wrong"),
+    ):
+        corrupted = json.loads(json.dumps(valid))
+        corrupted["nodes"][0][field] = value
+        corruptions.append(corrupted)
+
+    reordered = json.loads(json.dumps(valid))
+    reordered["nodes"] = list(reversed(reordered["nodes"]))
+    corruptions.append(reordered)
+
+    illegal_prefix = json.loads(json.dumps(valid))
+    illegal_prefix["nodes"][1].update(
+        {
+            "status": "completed",
+            "run_id": "run_child",
+            "output_text": "done",
+            "usage": {},
+            "version": 3,
+        }
+    )
+    corruptions.append(illegal_prefix)
+
+    invalid_terminal = json.loads(json.dumps(valid))
+    invalid_terminal["status"] = "completed"
+    invalid_terminal["output_text"] = "done"
+    invalid_terminal["usage"] = {}
+    corruptions.append(invalid_terminal)
+
+    for corrupted in corruptions:
+        with pytest.raises(ValidationError):
+            WorkflowRunSnapshot.model_validate(corrupted)
