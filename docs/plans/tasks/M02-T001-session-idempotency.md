@@ -14,11 +14,21 @@
 - LiteLLM remains the only model integration; this task performs no provider I/O inside a Store transaction.
 - Idempotency arbitration, events, snapshots, and the first result are committed atomically.
 - A matching replay allocates no event cursor and launches no second local Run/Workflow task.
+- T001 never advances a detached nonterminal Run/Workflow. Its handle or
+  `Workflow.resume` returns retryable `CONFLICT: recovery required`; T002 owns
+  capability-checked lease recovery.
+- Run and Workflow start fingerprints include immutable execution descriptors,
+  so revision/IR reuse cannot hide different models, model params, or Tool
+  schemas.
+- Idempotent close/Run/Workflow replay carries an exact Session replay
+  precondition. A retained `deleting` Session is rejected before replay, and a
+  replay-vs-delete race linearizes under the Store lock.
 - Reusing one `(scope, key)` with a different request fingerprint fails closed with `CONFLICT` and reveals no stored request/result data.
 - Closing rejects new Run, Workflow, and Child creation but permits already-owned work to reach a terminal state.
 - Deleted is not a persisted Session state; successful delete makes lookup return `NOT_FOUND` and removes Session-owned idempotency records.
 - Workspace files and future global persistent Policy rules are outside Session deletion.
 - Force close/delete is implemented only with the durable cancellation machinery in M02-T004; M02-T001 implements the complete non-force lifecycle and does not erase live work.
+- v1-to-v2 schema upgrade requires a quiescent database with no older SDK writer; M02-T001 does not claim a cross-version writer fence absent from M01.
 - New behavior uses RED-GREEN-REFACTOR. Every task has a separate implementation commit and independent spec/code-quality review.
 
 ---
@@ -37,7 +47,12 @@
 
 **Interfaces:**
 - Consumes: `CommitBatch`, Memory/SQLite commit locks, canonical JSON, lazy SQLite adapter.
-- Produces: `IdempotencyWrite`, immutable `IdempotencyRecord`, `IdempotencyConflictError`, `fingerprint_command`, `CommitResult.applied`, `CommitResult.idempotency`, and `StateStore.get_idempotency`.
+- Produces: `IdempotencyWrite`, read-only `IdempotencyReplay`, immutable
+  `IdempotencyRecord`, `IdempotencyValidationError`,
+  `IdempotencyConflictError`, `IdempotencyCorruptionError`, internal
+  `IdempotencyReplayMissError`, `fingerprint_command`, replay-only exact
+  snapshot preconditions, `CommitResult.applied`, `CommitResult.idempotency`,
+  and `StateStore.get_idempotency`.
 
 - [ ] **Step 1: Write failing Store contract tests**
 
@@ -81,11 +96,20 @@ async def test_mismatched_idempotency_reuse_is_atomic(store_factory: StoreFactor
 
 Also cover: empty/over-256 keys, invalid fingerprints, non-JSON/non-finite
 results, returned-result defensive copying, concurrent matching commits, key
-scope independence, deletion cleanup, and `CancelledError` propagation. Add a
+scope independence, deletion cleanup, `CancelledError` propagation, and a
+matching replay whose exact replay precondition changed (no cursor or state
+mutation). Also prove a read hint followed by record removal and an atomic
+`IdempotencyReplay` produces a typed replay miss and no events/snapshots/new
+record. Add a
 real version-1 database fixture containing active and terminal Run/Workflow
 snapshots and assert upgrade backfills only the nonterminal ids in deterministic
 order without changing the Session version. Unknown/corrupt status data must
-abort upgrade and leave version 2 unapplied.
+abort upgrade and leave version 2 unapplied. Add orphan Run/Workflow/other
+Session-owned snapshots, cross-owner row/JSON identities, entity-id mismatch,
+version mismatch, and an event whose Session owner is absent; every case must
+fail closed. Explicitly cover every current M01 snapshot kind: `session`,
+`run`, `workflow`, `workflow_node`, `context_capsule`, `context_view`, and
+`evaluation`, plus an unknown kind.
 
 - [ ] **Step 2: Run RED and confirm the missing contract**
 
@@ -104,6 +128,11 @@ Create `storage/idempotency.py` with strict public values. Freeze nested result
 objects and serialize them back to detached JSON:
 
 ```python
+class IdempotencyError(ValueError): ...
+class IdempotencyValidationError(IdempotencyError): ...
+class IdempotencyConflictError(IdempotencyError): ...
+class IdempotencyCorruptionError(IdempotencyError): ...
+
 class IdempotencyRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -134,6 +163,11 @@ class IdempotencyWrite(NamedTuple):
     session_id: str
     result: dict[str, Any]
 
+class IdempotencyReplay(NamedTuple):
+    scope: str
+    key: str
+    request_fingerprint: str
+
 def fingerprint_command(command: str, arguments: Mapping[str, Any]) -> str:
     encoded = canonical_snapshot_data(
         {"command": command, "arguments": dict(arguments)}
@@ -142,7 +176,10 @@ def fingerprint_command(command: str, arguments: Mapping[str, Any]) -> str:
 ```
 
 Do not accept bytes, arbitrary Python objects, non-string mapping keys, NaN, or
-Infinity. Validation happens before any Store state is mutated.
+Infinity. Convert input/model validation to `IdempotencyValidationError` before
+any Store state is mutated. A stored row that cannot validate is
+`IdempotencyCorruptionError`. Matching/mismatching records never include stored
+request/result values in exception messages.
 
 - [ ] **Step 4: Extend the Store commit contract**
 
@@ -154,7 +191,8 @@ class CommitBatch(NamedTuple):
     snapshots: tuple[SnapshotWrite, ...] = ()
     preconditions: tuple[SnapshotPrecondition, ...] = ()
     event_preconditions: tuple[EventPrecondition, ...] = ()
-    idempotency: IdempotencyWrite | None = None
+    idempotency: IdempotencyWrite | IdempotencyReplay | None = None
+    replay_preconditions: tuple[SnapshotPrecondition, ...] = ()
 
 class CommitResult(NamedTuple):
     last_cursor: int
@@ -167,10 +205,15 @@ class StateStore(Protocol):
     ) -> IdempotencyRecord | None: ...
 ```
 
-Inside `InMemoryStore.commit`, validate the incoming write, acquire `_lock`,
+Inside `InMemoryStore.commit`, validate the incoming request, acquire `_lock`,
 look up `(scope, key)` before every normal precondition, and either replay,
-conflict, or stage all existing copies plus the new record. Publish the copies
-only after every event/snapshot validation succeeds. `delete_session` removes
+conflict, or stage all existing copies plus the new record. When the record
+exists, validate `replay_preconditions` before comparing its fingerprint or
+returning it. When no record exists, `IdempotencyReplay` raises
+`IdempotencyReplayMissError` without any write, while `IdempotencyWrite`
+validates normal preconditions and may insert.
+`replay_preconditions` without `idempotency` is invalid. Publish the copies only
+after every event/snapshot validation succeeds. `delete_session` removes
 records whose `session_id` matches.
 
 - [ ] **Step 5: Add and apply migration 2 atomically**
@@ -190,15 +233,57 @@ CREATE INDEX idempotency_records_session
     ON idempotency_records(session_id);
 ```
 
-Set `_SCHEMA_VERSION = 2`. For a new database, apply `0001_initial.sql`, record
-version 1, then apply `0002_idempotency.sql` and record version 2. For an exact
-version-1 database, apply only migration 2. Accept only final versions `(1, 2)`;
-continue rejecting gaps, duplicates, unknown future versions, malformed tables,
-and unexpected index shapes. Migration and its version insert share one SQLite
-transaction.
+Set `_SCHEMA_VERSION = 2`. Immediately after connecting, configure a finite
+SQLite `busy_timeout`, then establish `PRAGMA journal_mode=WAL` with bounded
+`SQLITE_BUSY`/`SQLITE_LOCKED` retry. Execute `BEGIN IMMEDIATE` with the same
+monotonic-deadline/event-loop-yield retry *before* reading `sqlite_master` or
+`schema_migrations`, then
+discover and validate the schema/version under that writer lock. For an empty
+database, apply `0001_initial.sql`, record version 1, then apply migration 2.
+For an exact version-1 database, validate the exact current M01 tables,
+indexes, `AUTOINCREMENT`, unique event id, aggregate index SQL, projection
+identities, and sole version row `(1,)`, then apply only migration 2. If a
+concurrent opener has already produced an exact version-2 database, validate it
+and finish without reapplying DDL or inserting another version row. Accept only
+the final version sequence `(1, 2)`; continue rejecting gaps, duplicates,
+unknown future versions, malformed tables, and unexpected index shapes.
+
+Do not call `aiosqlite.Connection.executescript` anywhere in this open/migration
+transaction because SQLite's script API changes transaction boundaries. Split
+every trusted packaged SQL resource, including version 1 for an empty database,
+with `sqlite3.complete_statement`, reject non-whitespace trailing text, and
+execute each complete statement through `connection.execute`:
+
+```python
+await _begin_immediate_with_busy_retry(connection, deadline=open_deadline)
+try:
+    state = await _discover_schema_state(connection)
+    if state is SchemaState.EMPTY:
+        await _apply_version_one(connection)
+        state = SchemaState.V1
+    if state is SchemaState.V1:
+        await _validate_schema(connection, expected_version=1)
+        for statement in complete_sql_statements(migration_sql):
+            await connection.execute(statement)
+        await _validate_and_backfill_v1_projections(connection)
+        await connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (2, now.isoformat()),
+        )
+    await _validate_schema(connection, expected_version=2)
+    commit_task = asyncio.create_task(connection.commit())
+    await _await_cleanup(commit_task)
+except BaseException:
+    await _rollback_connection_cancellation_safely(connection)
+    raise
+```
+
+`_MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"` is stable input to
+the checksum bootstrap in M02-T003. Table/index DDL, all backfill writes, the
+version insert, and final v2 validation share this one transaction.
 
 Before recording version 2 for an existing database, backfill the representation
-that Task 2 will validate. Under the same transaction:
+that Tasks 2-4 will validate. Under the same transaction:
 
 ```python
 for session_row in await _snapshot_rows("session"):
@@ -220,12 +305,69 @@ for session_row in await _snapshot_rows("session"):
     await _replace_snapshot_json(session_row, session)
 ```
 
+Strictly parse and transform every M01 Run by adding
+`execution_compatibility="legacy_unknown"`, `execution_descriptor=None`, and
+`tool_results=[]`; transform every M01 Workflow by adding
+`execution_compatibility="legacy_unknown"` and `execution_descriptor=None`.
+Do not change their row or aggregate versions. New T001 entities use `current`
+descriptors and never pass through this legacy transform.
+
 Validate entity/session ownership inside every decoded projection. Known M01
 nonterminal Run statuses are `created`, `running`, and `waiting_permission`;
 known terminal statuses are `completed` and `failed`. Known Workflow status is
 `running`, `completed`, or `failed`. Any other/malformed status aborts the whole
-migration. Keep the Session projection version unchanged: this is schema
-representation backfill, not a domain event.
+migration. Enumerate every snapshot globally, require its row `session_id` to
+resolve to a valid Session, reject unknown kinds, and apply these validators:
+
+- Session, Run, and Workflow row ids/session ids/versions equal their strict
+  JSON identities and legal status-derived versions;
+- every `workflow_node` parses as `WorkflowNodeSnapshot`, matches row
+  entity/session/version, resolves its owner Workflow, and equals that
+  Workflow's nested node with the same id;
+- every `context_capsule` is exactly `{session_id, capsule}`, has row version 1,
+  parses its nested `ContextCapsule`, and is referenced only by same-Session
+  Context views;
+- every `context_view` parses as `ContextView`, has `view_id == entity_id`,
+  matching Session and row version 1, and any `capsule_id` resolves to a
+  same-Session Context capsule;
+- every `evaluation` parses as `EvaluationResult`, has
+  `evaluation_id == entity_id`, matching Session,
+  `record_version == row.version`, and a same-Session subject Run;
+- every event owner Session exists. Event/projection facts are checked in both
+  directions: `session.created`, `run.created`, and `workflow.started` require
+  the same-owner aggregate snapshot; every Run/Workflow snapshot requires its
+  start event; Run/Workflow terminal event type must agree with terminal
+  snapshot status and nonterminal snapshots must not have a terminal event;
+  Workflow-node events are reduced in sequence as a legal
+  pending→running→completed/failed prefix, every historical payload must keep
+  the same owner/node/selected-Run identity, and only the reducer's final
+  status/version must equal the nested and standalone current snapshots;
+  Context view/capsule and Evaluation creation
+  events must resolve to their same-owner snapshots. Missing aggregate facts,
+  duplicate/inconsistent terminal facts, or cross-owner event payloads abort.
+
+Keep all aggregate versions unchanged: this is schema representation backfill,
+not a domain event. Add row/JSON cross-owner tests for each kind and missing
+Context/Evaluation reference tests. Add fixtures with
+`run.created`/`workflow.started` but missing projections, snapshots without
+start events, terminal-event/status mismatches, and Context/Evaluation creation
+events pointing at missing or cross-owner projections; every fixture must leave
+exact v1.
+
+Fault-inject after the table DDL, index DDL, each projection update, version
+insert, final validation, and during commit. For failures before commit, reopen
+and assert exact v1: no idempotency table/index, byte-identical snapshot JSON,
+and versions `(1,)`. For cancellation racing commit, settle the independent
+coordinator and then reopen: accept only exact v1 or complete schema-validated
+v2 with fully backfilled projections and `(1, 2)`; partial combinations fail the
+test. Add a two-connection concurrent-open test starting from v1: both opens
+synchronize at WAL/open and migration boundaries, both succeed, migration is
+applied exactly once, and both observe validated v2. Inject transient busy
+errors into `PRAGMA journal_mode=WAL` and `BEGIN IMMEDIATE`; assert retry and
+eventual success. Inject busy through the deadline; assert a stable retryable
+open conflict and an unchanged valid database rather than a hang. Add
+a documented test showing that an intentionally retained old writer is
+unsupported and must be quiesced before upgrade.
 
 - [ ] **Step 6: Implement SQLite arbitration and lazy forwarding**
 
@@ -235,10 +377,14 @@ preconditions:
 ```python
 existing = await self._read_idempotency(write.scope, write.key)
 if existing is not None:
+    await self._check_snapshot_preconditions(batch.replay_preconditions)
     if existing.request_fingerprint != write.request_fingerprint:
         raise IdempotencyConflictError("idempotency key was reused")
     await self._connection.rollback()
     return CommitResult(await self._last_cursor(), False, existing)
+
+if isinstance(write, IdempotencyReplay):
+    raise IdempotencyReplayMissError("idempotency replay record no longer exists")
 
 await self._check_event_preconditions(batch)
 await self._check_snapshot_preconditions(batch)
@@ -252,7 +398,11 @@ return CommitResult(await self._last_cursor(), True, record)
 Use the existing cancellation-safe rollback path. Implement
 `SQLiteStore.get_idempotency` under `_lock`, forward it from `_LazySQLiteStore`,
 and delete idempotency rows in the same `delete_session` transaction as events
-and snapshots.
+and snapshots. Test replay/delete ordering on two SQLite connections: if replay
+linearizes first it may return the pre-delete durable value; if `deleting`
+linearizes first, the exact replay precondition fails and the public command
+reloads to `INVALID_STATE`. No ordering launches a second task or resurrects
+facts.
 
 - [ ] **Step 7: Verify Task 1 and regress storage**
 
@@ -280,6 +430,7 @@ git commit -m "feat: add atomic command idempotency"
 **Files:**
 - Create: `src/agent_sdk/runtime/state_machine.py`
 - Create: `src/agent_sdk/runtime/session_lifecycle.py`
+- Create: `src/agent_sdk/runtime/idempotency.py`
 - Modify: `src/agent_sdk/runtime/models.py`
 - Modify: `src/agent_sdk/runtime/commands.py`
 - Modify: `src/agent_sdk/errors.py`
@@ -287,6 +438,10 @@ git commit -m "feat: add atomic command idempotency"
 - Modify: `src/agent_sdk/__init__.py`
 - Create: `tests/unit/runtime/test_session_state_machine.py`
 - Create: `tests/integration/runtime/test_session_lifecycle.py`
+- Modify: `tests/integration/context/test_public_context_api.py`
+- Modify: `tests/integration/evaluation/test_evaluation_slice.py`
+- Modify: `tests/integration/observability/test_queries.py`
+- Modify: `tests/integration/observability/test_subscriptions.py`
 
 **Interfaces:**
 - Consumes: Task 1 idempotent commit result, existing snapshot preconditions, SDK lifecycle admission.
@@ -329,7 +484,12 @@ async def test_empty_session_closes_immediately_and_delete_removes_it(sdk) -> No
 
 Also assert duplicate active/closing/closed/deleting ids are rejected, versions
 are positive, `close` is same-state idempotent, busy delete is `SessionBusyError`,
-and deletion retries from a deliberately retained `deleting` snapshot.
+and deletion retries from a deliberately retained `deleting` snapshot. A public
+`get` and `close`—even with a previously matching close key—must return
+`INVALID_STATE` while deletion is retained; only `delete` may resume it. Add
+concurrent public `sessions.create` tests for matching requests, different
+workspace requests with one key, empty/oversized keys, SQLite reopen, and a
+malformed stored replay result.
 
 - [ ] **Step 2: Run RED**
 
@@ -365,7 +525,10 @@ class SessionStateMachine:
 
 Make `SessionSnapshot` frozen/extra-forbid with empty tuple defaults for
 `active_run_ids` and `active_workflow_run_ids`; validate uniqueness and forbid
-active work for `closed`/`deleting`.
+active work for `closed`/`deleting`. Override `model_copy` so every update is
+rebuilt from JSON and passed through `SessionSnapshot.model_validate`; add tests
+that invalid copied versions, duplicate work ids, and closed-with-work updates
+raise `ValidationError`.
 
 - [ ] **Step 4: Implement safe Session loading and transition commits**
 
@@ -388,7 +551,7 @@ def session_transition_batch(
     updated: SessionSnapshot,
     event_type: str,
     *,
-    idempotency: IdempotencyWrite | None = None,
+    idempotency: IdempotencyWrite | IdempotencyReplay | None = None,
 ) -> CommitBatch:
     return CommitBatch(
         events=(EventEnvelope.new(
@@ -401,8 +564,14 @@ def session_transition_batch(
         snapshots=(session_write(updated),),
         preconditions=(exact_session_precondition(previous),),
         idempotency=idempotency,
+        replay_preconditions=(exact_session_precondition(previous),)
+        if idempotency is not None else (),
     )
 ```
+
+The internal loader accepts `deleting` so `delete_session` can resume. The
+public `get_session` wrapper rejects it with stable `INVALID_STATE`; query
+services continue to use Store facts directly and cannot create new state.
 
 Exact preconditions include version, owner Session id, and canonical snapshot
 data. Retry at most eight exact-precondition races, reloading each time.
@@ -413,6 +582,38 @@ data. Retry at most eight exact-precondition races, reloading each time.
 the exact ordered normalized workspace strings. A matching replay validates the
 stored result as `SessionSnapshot`; malformed replay data becomes sanitized
 `INTERNAL`.
+
+Translate idempotency failures exactly once with the shared
+`runtime/idempotency.py` boundary used by Runtime and Workflow commands:
+
+```python
+def _idempotency_public_error(error: IdempotencyError) -> AgentSDKError:
+    if isinstance(error, IdempotencyReplayMissError):
+        return AgentSDKError(
+            ErrorCode.CONFLICT, "idempotency replay changed concurrently", retryable=True
+        )
+    if isinstance(error, IdempotencyConflictError):
+        return AgentSDKError(
+            ErrorCode.CONFLICT, "idempotency key conflicts with another request", retryable=False
+        )
+    if isinstance(error, IdempotencyValidationError):
+        return AgentSDKError(
+            ErrorCode.INVALID_STATE, "idempotency key is invalid", retryable=False
+        )
+    return AgentSDKError(
+        ErrorCode.INTERNAL, "stored command result is invalid", retryable=False
+    )
+```
+
+Catch only `IdempotencyError` at this boundary, raise the mapped error `from
+None`, and let `asyncio.CancelledError` propagate unchanged. Workflow Task 4
+imports the same helper rather than allowing its broad Store-error mapping to
+turn conflicts into `INTERNAL`.
+
+Commands normally consume `IdempotencyReplayMissError` inside their bounded
+reload loop. The public mapping above is the fail-closed exhaustion fallback;
+it never becomes `INTERNAL` and never authorizes a fresh write from a stale
+present-record hint.
 
 `close_session` applies this decision table:
 
@@ -429,10 +630,15 @@ target = (
 event_type = "session.closed" if target is SessionStatus.CLOSED else "session.closing"
 ```
 
+Check `DELETING` before looking up or committing a close idempotency record.
+Thus an old matching close key cannot bypass the destructive retention boundary.
 When a key is supplied for a closing/closed no-op, use an idempotency-only
-`CommitBatch` with the exact Session precondition so its first returned snapshot
-is durable. A matching replay is resolved before the now-current snapshot is
-interpreted.
+`CommitBatch` with the exact Session precondition as both its normal and replay
+precondition so its first returned snapshot is durable. A matching replay is
+resolved after the current Session has been checked for `deleting`, but before
+other current status changes affect the first-result semantics. If delete races
+the commit, the replay precondition conflict reloads the Session and deletion
+wins with `INVALID_STATE`.
 
 Define the helper in `RuntimeCommands` rather than leaving a second command
 path implicit:
@@ -466,11 +672,18 @@ async def _record_session_result(
 ) -> SessionSnapshot:
     if key is None:
         return current
-    write = session_result_idempotency(current, key)
+    candidate = session_result_idempotency(current, key)
+    hint = await self._store.get_idempotency(candidate.scope, key)
+    write = (
+        IdempotencyReplay(candidate.scope, key, candidate.request_fingerprint)
+        if hint is not None
+        else candidate
+    )
     result = await self._store.commit(CommitBatch(
         events=(),
         preconditions=(exact_session_precondition(current),),
         idempotency=write,
+        replay_preconditions=(exact_session_precondition(current),),
     ))
     record = result.idempotency
     if record is None:
@@ -506,6 +719,11 @@ async def delete(self, session_id: str) -> None: ...
 All four methods use `_SDKLifecycle.admit`. Root-export `SessionStatus`,
 `SessionSnapshot`, and `SessionBusyError`.
 
+Update legacy SDK/Runtime test call sites that used command-level delete on an
+active empty Session: close through `RuntimeCommands.close_session` first. Raw
+`StateStore.delete_session` contract tests remain unchanged because the low-level
+retention primitive intentionally has no business-state policy.
+
 - [ ] **Step 7: Verify Task 2 and runtime compatibility**
 
 ```powershell
@@ -539,8 +757,8 @@ git commit -m "feat: add complete normal session lifecycle"
 - Modify: `tests/integration/tools/test_permissioned_tool_slice.py`
 
 **Interfaces:**
-- Consumes: Tasks 1-2, `RunSnapshot`, `_RunEmitter`, `RunHandle`, SDK task tracking.
-- Produces: internal `CommandOutcome[T]`, optional `RunAPI.start(..., idempotency_key=...)`, atomic Run attach/detach, and durable replay handles.
+- Consumes: Tasks 1-2, `RunSnapshot`, `_RunEmitter`, `RunHandle`, SDK task tracking, current AgentSpec and Tool schemas.
+- Produces: immutable `ExecutionDescriptor`, internal `CommandOutcome[T]`, optional `RunAPI.start(..., idempotency_key=...)`, atomic Run attach/detach, and durable replay handles.
 
 - [ ] **Step 1: Write failing ownership, race, and replay tests**
 
@@ -581,8 +799,18 @@ async def test_concurrent_duplicate_run_start_executes_once(sdk, completion) -> 
 Also test different request data with the same key, no-key creation, close/start
 races in both orderings, model failure detachment, terminal commit rollback,
 replay after completion, replay after SQLite reopen, and a caller cancellation
-after durable creation followed by key-based entity recovery. Completed and
-partially failed Tool Runs must return the exact ordered durable Tool results.
+at every command/registration boundary. In a live SDK, an independent shielded
+coordinator must finish task registration before the original cancellation is
+re-raised, and a key retry must attach to that task. A simulated process-crash
+gap may remain detached for T002 recovery. Completed and partially failed Tool
+Runs must return the exact ordered durable Tool results.
+Two AgentSpecs sharing the same name/revision string but differing in model or
+model params must conflict on one key. Corrupted descriptor/result replay data
+must return sanitized `INTERNAL` without invoking LiteLLM or a Tool. A retained
+`deleting` Session must reject an old matching Run key with `INVALID_STATE`, and
+a detached nonterminal Run after SQLite reopen must report retryable
+`CONFLICT: recovery required` from `result()` within the test timeout with zero
+provider/Tool/MCP calls.
 
 - [ ] **Step 2: Run RED**
 
@@ -604,28 +832,75 @@ class CommandOutcome(Generic[T]):
     replayed: bool
 ```
 
+Add a frozen, extra-forbid `ExecutionDescriptor` to `RunSnapshot`:
+
+```python
+class ExecutionDescriptor(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_name: str
+    agent_revision: str
+    agent_spec_hash: str
+    model: str
+    model_params: Mapping[str, Any]
+    initial_messages: tuple[Mapping[str, Any], ...]
+    tool_schemas: tuple[Mapping[str, Any], ...]
+    tool_schema_hash: str
+```
+
+Deep-freeze/detach JSON exactly as `AgentSpec.model_params` does. The AgentSpec
+hash covers `agent.model_dump(mode="json")`; Tool schemas are stored in stable
+registry order and hashed from canonical JSON. `RunAPI.start`, Workflow, and
+Subagent creation all build this descriptor from the exact request they will
+pass to `RunEngine`. `RunSnapshot` stores
+`execution_compatibility: Literal["current", "legacy_unknown"]`; new Runs
+require `current` plus a descriptor, while migrated M01 Runs default to
+`legacy_unknown`/`None` and are never automatically replayed.
+
+Override `RunSnapshot.model_copy` with JSON reconstruction plus
+`RunSnapshot.model_validate`. Tests must prove copy/update cannot create a
+nonterminal Run with Tool results, a current Run without a descriptor, or an
+invalid terminal result.
+
 `RuntimeCommands.start_run` accepts `idempotency_key`. On each bounded attempt:
 
 1. Load a valid Session.
-2. Require `status is ACTIVE`.
-3. Construct one Run id and preserve it across retry attempts.
-4. Add it once to `active_run_ids`, increment Session version, and create
+2. Reject `DELETING` before any idempotency fast-path lookup.
+3. If a key has a stored-record hint, validate it, preserve its original Run
+   id, but still submit an authoritative `IdempotencyReplay` built from the
+   *current request fingerprint* with the exact current Session in
+   `replay_preconditions`.
+4. If no record hint exists, require `status is ACTIVE`, construct one Run id,
+   and preserve it across retry attempts.
+5. Add a new id once to `active_run_ids`, increment Session version, and create
    `session.run.attached` plus `run.created`.
-5. Submit both projections/events and the exact Session precondition in one
-   optional-idempotent batch.
-6. Return the stored first Run snapshot and `replayed=True` when Store replayed.
+6. Submit both projections/events, the exact normal Session precondition, the
+   optional idempotency Write/Replay, and the exact Session replay precondition
+   in one batch.
+7. Return the stored first Run snapshot and `replayed=True` when Store replayed.
 
-The fingerprint contains the Session id, full agent revision, user input,
-parent/workflow/node ids, and canonical TaskEnvelope JSON. An idempotent replay
-is checked through `get_idempotency` before the current Session status is
-interpreted. An absent read is only a fast-path miss: the subsequent commit
-still carries the write and arbitrates atomically. Therefore a retry can recover
-the first Run after the Session has moved to closing/closed.
+The fingerprint contains the Session id, complete canonical execution
+descriptor, user input, parent/workflow/node ids, and canonical TaskEnvelope
+JSON. After the explicit `DELETING` rejection, an idempotent replay may be
+hinted through `get_idempotency` before other current Session statuses are
+interpreted. A read never returns the public result directly: the subsequent
+commit still carries the Write/Replay request and exact replay precondition and arbitrates
+atomically. Therefore a retry can recover the first Run after the Session has
+moved to closing/closed, but cannot win after deletion has linearized. If a
+delete race changes the Session after the hint, reload; `DELETING` maps to
+`INVALID_STATE` and completed cleanup maps to `NOT_FOUND`.
+
+If the hinted record disappears before the authoritative commit,
+`IdempotencyReplayMissError` causes a reload. The command never converts that
+stale hint into a new Run on a closing/closed Session.
 
 - [ ] **Step 4: Commit terminal Run and Session detachment together**
 
-Extend `_RunEmitter` with the shared Session lifecycle coordinator. For
-`COMPLETED`, `FAILED`, and every later terminal `RunStatus`, build one batch:
+Extend `_RunEmitter` with the shared Session lifecycle coordinator. Define
+`RUN_LIFECYCLE_FINAL_STATUSES = {COMPLETED, FAILED}` in T001 and extend it with
+`CANCELLED` in T004. `INTERRUPTED`, `WAITING_RECONCILIATION`, `PAUSED`, every
+waiting state, queued, created, and running remain Session-owned. Only a
+lifecycle-final transition builds the detach batch:
 
 ```python
 remaining = tuple(
@@ -636,7 +911,8 @@ close_now = (
     and not remaining
     and not session.active_workflow_run_ids
 )
-updated_session = session.model_copy(update={
+updated_session = SessionSnapshot.model_validate({
+    **session.model_dump(mode="json"),
     "active_run_ids": remaining,
     "status": SessionStatus.CLOSED if close_now else session.status,
     "version": session.version + 1,
@@ -655,10 +931,21 @@ states require the tuple to be empty. Both completed and failed terminal updates
 persist the results completed so far, and durable `RunResult` reconstruction
 uses that tuple rather than returning an empty substitute.
 
+The bounded Session-race loop uses eight attempts with event-based yielding
+(`await asyncio.sleep(0)`) between conflicts. Exhaustion maps to
+`AgentSDKError(CONFLICT, "session state changed concurrently", retryable=True)`;
+it never maps to not-found unless the Session projection is actually absent.
+
 - [ ] **Step 5: Prevent duplicate local execution and support durable handles**
 
 Add a per-`RunAPI` lock and `run_id -> Task[RunResult]` registry. The critical
-section covers command arbitration and initial task registration. A replay:
+section covers command arbitration and initial task registration. Execute it in
+an independent coordinator task and await it through `asyncio.shield`. If the
+public caller is cancelled, keep awaiting the coordinator under shield, create
+and register the engine task synchronously after an applied commit, then re-raise
+the first `CancelledError`. `_SDKLifecycle.admit` remains held until this handoff
+settles, so SDK close cannot cancel the coordinator between commit and registry.
+A replay:
 
 - reuses an existing local task;
 - returns a detached `RunHandle` for every replayed nonterminal Run when no
@@ -667,10 +954,21 @@ section covers command arbitration and initial task registration. A replay:
   failure from a terminal failed snapshot.
 
 Make `RunHandle` accept `task: Task[RunResult] | None`. Detached `result()` and
-`events()` poll bounded Store pages until a terminal event/snapshot; they do not
-start execution. Only a fresh `outcome.replayed is False` starts a task.
+`events()` never start execution. A detached handle exposes `attached=False`.
+`result()` loads once: it reconstructs terminal durable state, but for any
+nonterminal state immediately raises
+`AgentSDKError(CONFLICT, "recovery required", retryable=True)`. Detached
+`events()` yields only the currently available bounded Store pages and returns;
+callers may subscribe/query through observability APIs for later cross-process
+progress. Only a fresh `outcome.replayed is False` starts a task.
 M02-T002 later supplies interruption recovery and lease fencing for a genuinely
 abandoned nonterminal handle.
+
+Only an applied outcome owns task launch. Before T002, a detached legacy or
+abandoned `created` Run is observable but not executed by idempotency replay.
+T002 exposes explicit recovery after the application re-registers AgentSpecs,
+Tools/MCP capabilities, and verifies the persisted descriptor; SDK construction
+alone never silently executes external work.
 
 - [ ] **Step 6: Verify Task 3 and Tool regressions**
 
@@ -705,8 +1003,13 @@ git commit -m "feat: bind runs to session lifecycle"
 - Modify: `tests/integration/workflow/test_workflow_recovery.py`
 
 **Interfaces:**
-- Consumes: `CommandOutcome`, Session exact transition helper, Workflow IR hash and existing executor active-task map.
-- Produces: optional `WorkflowAPI.start(..., idempotency_key=...)`, atomic Workflow attach/detach, replay attachment/resume, and closing-safe Workflow failure settlement.
+- Consumes: `CommandOutcome`, Session exact transition helper, resolved
+  AgentSpecs, Tool schemas, Workflow IR hash, and existing executor active-task
+  map.
+- Produces: immutable `WorkflowExecutionDescriptor`, optional
+  `WorkflowAPI.start(..., idempotency_key=...)`, atomic Workflow attach/detach,
+  local replay attachment/detached recovery diagnostics, and closing-safe
+  Workflow failure settlement.
 
 - [ ] **Step 1: Write failing Workflow lifecycle tests**
 
@@ -738,7 +1041,26 @@ async def test_last_workflow_terminal_closes_closing_session(sdk, blocked_workfl
 Also test: close rejects new Workflow start; Workflow failure detaches; closing
 between nodes rejects the next Run/Child, persists Workflow failure, and closes;
 same key/different IR conflicts; replay after completion and SQLite reopen
-returns the original Workflow id without duplicate nodes/children.
+returns the original Workflow id without duplicate nodes/children. Empty or
+oversized keys map to `INVALID_STATE`; corrupted replay results map to sanitized
+`INTERNAL`; neither case launches a Workflow/Run/Child. Exercise both Session
+precondition conflict orderings, bounded-retry exhaustion, and caller
+cancellation before/after durable Workflow creation. The live-SDK coordinator
+must register the single Workflow task before re-raising cancellation. Also
+cover:
+
+- same Session/key/IR with a referenced AgentSpec that keeps its revision but
+  changes model/model params, or with changed Tool schemas, returns `CONFLICT`
+  and launches nothing;
+- a retained `deleting` Session rejects an old matching Workflow key with
+  `INVALID_STATE` and launches no Workflow/Run/Child;
+- after SQLite reopen, detached nonterminal `result()` and explicit
+  `Workflow.resume` return retryable `CONFLICT: recovery required` within the
+  test timeout and make zero provider/Tool/MCP calls;
+- while the original SDK still owns one active local Workflow task, a second
+  SDK instance cannot resume that Workflow; only the original provider/Tool
+  call occurs. Two reopened SDK instances both fail recovery-required rather
+  than racing side effects.
 
 - [ ] **Step 2: Run RED**
 
@@ -751,18 +1073,64 @@ Expected: Workflow start has no key and Session work ownership is absent.
 - [ ] **Step 3: Attach Workflow creation to active Session**
 
 Change `WorkflowState.create` to return `CommandOutcome[WorkflowRunSnapshot]`
-and accept an optional key. Validate the IR before generating durable state.
+and accept an optional key. Validate the IR and resolve all referenced
+AgentSpecs/Tool schemas before generating durable state. Add frozen,
+extra-forbid models like:
+
+```python
+class WorkflowAgentDescriptor(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    agent_name: str
+    agent_revision: str
+    agent_spec: Mapping[str, Any]
+    agent_spec_hash: str
+
+class WorkflowExecutionDescriptor(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    workflow_definition_hash: str
+    agents: tuple[WorkflowAgentDescriptor, ...]
+    tool_schemas: tuple[Mapping[str, Any], ...]
+    tool_schema_hash: str
+```
+
+Deep-freeze all nested JSON. Store referenced agents once in deterministic
+first-node order; each full canonical AgentSpec includes LiteLLM model and model
+params and must match its hash. Exact Tool schemas use stable registry order and
+must match their hash. `WorkflowRunSnapshot` contains
+`execution_compatibility: Literal["current", "legacy_unknown"]` and optional
+`execution_descriptor`; new Workflows require `current`, a descriptor matching
+their IR and referenced revisions, while migrated M01 Workflows are
+`legacy_unknown`/`None`.
+
+Load the current Session first and reject `DELETING` before reading a stored
+idempotency hint. A hint never returns directly; the authoritative commit
+uses `IdempotencyReplay` with the current request fingerprint and carries the
+exact current Session as `replay_preconditions`, just like Run start. A missing
+hint requires `ACTIVE`; matching replay may return after
+closing/closed, while a delete race reloads and returns `INVALID_STATE` or
+`NOT_FOUND` according to the deletion linearization. A replay miss reloads and
+never creates a Workflow from the stale hint.
+
 One commit contains:
 
 - `session.workflow.attached` at the next Session sequence;
 - `workflow.started` and every initial Workflow/node projection;
 - updated Session projection with the Workflow id;
 - exact Session precondition;
-- optional idempotency write whose fingerprint includes Session id and canonical
-  Workflow IR/definition hash, and whose result is the full first Workflow
-  snapshot.
+- optional idempotency write plus exact Session replay precondition; its
+  fingerprint includes Session id, canonical Workflow IR/definition hash, and
+  the full Workflow execution descriptor, and its result is the full first
+  Workflow snapshot.
 
 Preserve one generated Workflow id across exact-precondition retries.
+
+`WorkflowState` must not absorb `IdempotencyError` in its existing broad Store
+failure helper. Propagate those typed errors unchanged to `WorkflowExecutor`,
+translate them with the Task 2 `_idempotency_public_error` boundary, and preserve
+`CancelledError`. Other Store failures retain the existing sanitized `INTERNAL`
+mapping.
 
 - [ ] **Step 4: Detach every terminal Workflow in the terminal commit**
 
@@ -779,7 +1147,8 @@ that to Workflow/node failure; the failure commit must detach the Workflow.
 - [ ] **Step 5: Reuse active tasks and durable Workflow state on replay**
 
 Add `idempotency_key` to `WorkflowAPI.start` and `WorkflowExecutor.start`. Under
-an executor start lock, a fresh outcome calls `_start_task`; a replay only
+an executor start lock and the same shielded coordinator pattern as Run start, a
+fresh outcome calls `_start_task`; a replay only
 reuses an already registered task or returns a detached durable handle:
 
 ```python
@@ -792,8 +1161,21 @@ return self._start_task(outcome.value.workflow_run_id)
 
 An active local task is reused. A completed/failed durable Workflow gets a
 handle that returns/raises from durable state without rerunning terminal nodes.
-An abandoned nonterminal replay remains detached until explicit `resume` or the
-M02-T002 recovery path acquires its lease. Do not convert cancellation.
+An abandoned nonterminal replay returns a detached handle with
+`attached=False`; its `result()` loads durable state once and raises retryable
+`CONFLICT: recovery required` while nonterminal. It never polls forever.
+
+Narrow `WorkflowExecutor.resume` in T001. It may validate and return terminal
+state or attach to an existing non-done task in that executor's `_active` map.
+If the Workflow is nonterminal and there is no such local task, raise
+`AgentSDKError(CONFLICT, "recovery required", retryable=True)` and do not call
+`_start_task`. Only the explicit M02-T002 recovery API, after capability checks
+and lease/CAS admission, may advance abandoned durable Workflow state. Do not
+convert cancellation.
+
+Use the same eight-attempt/yield policy as Run/Session transitions. Exhaustion
+is public retryable `CONFLICT`, while a missing owner Session remains
+`NOT_FOUND`.
 
 - [ ] **Step 6: Verify Task 4 and Workflow/Child regressions**
 
@@ -868,7 +1250,13 @@ Then assert Session/Run/Workflow snapshots, events, Context/Evaluation/Analytics
 contributions inherited from the M01 scenario, and all Session-owned
 idempotency records are gone. A new `session.create` with the old key creates a
 new Session after deletion. Global cursor remains greater than its pre-delete
-value and holes are not reused.
+value and holes are not reused. Inject one cleanup failure after
+`session.deleting`, assert public get/close reject while a second delete resumes,
+then prove the same complete cleanup. The E2E also checks the persisted Run
+execution descriptor contains the AgentSpec hash and exact Tool-schema hash but
+contains no handler object or credential. Persist and inspect one Workflow too:
+its descriptor must contain the exact referenced AgentSpec hashes and Tool
+schema hash, and same IR/key with a changed capability binding must conflict.
 
 - [ ] **Step 2: Run RED or confirm the composed behavior is already GREEN**
 
@@ -886,6 +1274,16 @@ For each failure, first narrow it to a focused regression test in the owning
 Task 1-4 test module, observe RED, make the smallest production correction, and
 rerun both focused and E2E tests. Do not add force deletion, leases, Artifact
 storage, or generalized migration APIs in this task.
+
+Before accepting the composed test, explicitly cross-check the focused evidence
+for: concurrent matching/different public Session create; invalid key and
+corrupt replay mappings for Session/Run/Workflow; both close/start and
+close/terminal orderings; SQLite migration rollback at every phase; orphan and
+row/JSON identity rejection for every M01 snapshot kind; deleting cleanup and
+old-key replay races; detached nonterminal Run/Workflow bounded recovery
+diagnostics; abandoned Workflow resume refusal; capability-mismatched Workflow
+replay; and exact ToolResult replay. Do not treat the low-level Store contract
+as a substitute for these public command tests.
 
 - [ ] **Step 4: Preserve and extend the M01 vertical slice**
 

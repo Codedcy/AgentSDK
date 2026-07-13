@@ -4,7 +4,7 @@
 
 **Goal:** Execute every Workflow IR node durably with retries, waits, parallel joins, quality gates, and restart recovery.
 
-**Architecture:** The workflow executor is a persisted state machine. Each node attempt is claimed, started, and completed through events plus a projection transaction; external side effects use operation ids and explicit unknown-outcome handling.
+**Architecture:** The workflow executor is a persisted state machine. A generation-fenced Workflow scheduler lease gives one worker authority to advance nodes; each node attempt is claimed, started, and completed through events plus a projection transaction. A node's Run independently retains the M02 Run lease before external side effects, which use operation ids and explicit unknown-outcome handling.
 
 **Tech Stack:** asyncio TaskGroup, SQLite, pytest-asyncio, fault injection.
 
@@ -14,6 +14,9 @@
 - Retry policy distinguishes retryable failure, permanent failure, unknown outcome, and denied permission.
 - Approval/input waits release leases and resume from durable records.
 - Parallel/foreach scheduling is bounded and join semantics are deterministic.
+- Only the current Workflow scheduler lease generation may claim or project a
+  node attempt. Losing/stale workers fail before node dispatch, while every
+  agent node also requires the current M02 Run lease before external effects.
 
 ---
 
@@ -25,6 +28,7 @@
 - Modify: `src/agent_sdk/workflow/events.py`
 - Modify: `src/agent_sdk/storage/sqlite.py`
 - Create: `tests/integration/workflow/test_node_lifecycle.py`
+- Create: `tests/integration/workflow/test_workflow_leases.py`
 
 - [ ] **Step 1: Write failing lifecycle and retry tests**
 
@@ -39,11 +43,19 @@ async def test_retry_creates_distinct_attempts(workflow_runner, flaky_node) -> N
 async def test_permanent_failure_uses_failure_edge(workflow_runner) -> None:
     result = await workflow_runner.run(failing_workflow(on_failure="recover"))
     assert result.node("recover").status == "completed"
+
+@pytest.mark.asyncio
+async def test_stale_workflow_lease_cannot_dispatch_node(workflow_workers) -> None:
+    stale, current = await workflow_workers.rotate_lease("wfr_1")
+    await current.advance_once("wfr_1")
+    with pytest.raises(WorkflowLeaseLostError):
+        await stale.advance_once("wfr_1")
+    assert workflow_workers.external_effect_count == 1
 ```
 
 - [ ] **Step 2: Verify failure**
 
-Run: `uv run pytest tests/integration/workflow/test_node_lifecycle.py -v`
+Run: `uv run pytest tests/integration/workflow/test_node_lifecycle.py tests/integration/workflow/test_workflow_leases.py -v`
 
 Expected: durable attempts/retry/failure routing are incomplete.
 
@@ -62,11 +74,14 @@ async def execute_node(self, run: WorkflowRun, node: Node) -> NodeResult:
     return result
 ```
 
-Compute exponential backoff plus bounded jitter from persisted attempt number; persist next-attempt time before releasing the worker.
+`claim_attempt` verifies the current Workflow lease generation in the same
+transaction as the node-attempt projection. Compute exponential backoff plus
+bounded jitter from persisted attempt number; persist next-attempt time before
+releasing the worker.
 
 - [ ] **Step 4: Verify and commit**
 
-Run: `uv run pytest tests/integration/workflow/test_node_lifecycle.py -v`
+Run: `uv run pytest tests/integration/workflow/test_node_lifecycle.py tests/integration/workflow/test_workflow_leases.py -v`
 
 Expected: all node handlers, timeout, retry/backoff, failure edges, and quality-gate failures pass.
 
