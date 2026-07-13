@@ -1,13 +1,32 @@
+from collections.abc import AsyncIterator
+from pathlib import Path
+
 import pytest
 
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite
+from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore
 from agent_sdk.storage.memory import InMemoryStore
+from agent_sdk.storage.sqlite import SQLiteStore
+
+
+@pytest.fixture(params=("memory", "sqlite"), ids=("memory", "sqlite"))
+async def store(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> AsyncIterator[StateStore]:
+    if request.param == "memory":
+        yield InMemoryStore()
+        return
+
+    sqlite_store = await SQLiteStore.open(tmp_path / "state.db")
+    try:
+        yield sqlite_store
+    finally:
+        await sqlite_store.close()
 
 
 @pytest.mark.asyncio
-async def test_commit_assigns_cursor_and_snapshot_atomically() -> None:
-    store = InMemoryStore()
+async def test_commit_assigns_cursor_and_snapshot_atomically(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -31,8 +50,7 @@ async def test_commit_assigns_cursor_and_snapshot_atomically() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_session_removes_events_and_snapshots() -> None:
-    store = InMemoryStore()
+async def test_delete_session_removes_events_and_snapshots(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="session.created",
         session_id="ses_1",
@@ -60,8 +78,7 @@ async def test_delete_session_removes_events_and_snapshots() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_sequence_rolls_back_events_and_snapshots() -> None:
-    store = InMemoryStore()
+async def test_invalid_sequence_rolls_back_events_and_snapshots(store: StateStore) -> None:
     duplicate_sequence = (
         EventEnvelope.new(
             type="run.created",
@@ -98,8 +115,7 @@ async def test_invalid_sequence_rolls_back_events_and_snapshots() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_event_id_rolls_back_entire_batch() -> None:
-    store = InMemoryStore()
+async def test_duplicate_event_id_rolls_back_entire_batch(store: StateStore) -> None:
     first = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -145,8 +161,7 @@ async def test_duplicate_event_id_rolls_back_entire_batch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_event_id_rejects_replayed_commit() -> None:
-    store = InMemoryStore()
+async def test_duplicate_event_id_rejects_replayed_commit(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -177,8 +192,7 @@ async def test_duplicate_event_id_rejects_replayed_commit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_events_use_session_sequence_aggregate() -> None:
-    store = InMemoryStore()
+async def test_session_events_use_session_sequence_aggregate(store: StateStore) -> None:
     await store.commit(
         CommitBatch(
             events=(
@@ -222,8 +236,7 @@ async def test_session_events_use_session_sequence_aggregate() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_session_preserves_global_cursor_hole() -> None:
-    store = InMemoryStore()
+async def test_delete_session_preserves_global_cursor_hole(store: StateStore) -> None:
     first = EventEnvelope.new(
         type="session.created",
         session_id="ses_1",
@@ -248,8 +261,7 @@ async def test_delete_session_preserves_global_cursor_hole() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_session_uses_snapshot_ownership_field() -> None:
-    store = InMemoryStore()
+async def test_delete_session_uses_snapshot_ownership_field(store: StateStore) -> None:
     await store.commit(
         CommitBatch(
             events=(),
@@ -271,8 +283,7 @@ async def test_delete_session_uses_snapshot_ownership_field() -> None:
 
 
 @pytest.mark.asyncio
-async def test_event_schema_version_and_delivery_are_stable() -> None:
-    store = InMemoryStore()
+async def test_event_schema_version_and_delivery_are_stable(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -293,8 +304,7 @@ async def test_event_schema_version_and_delivery_are_stable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_commit_deeply_isolates_event_and_snapshot_inputs() -> None:
-    store = InMemoryStore()
+async def test_commit_deeply_isolates_event_and_snapshot_inputs(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -322,8 +332,7 @@ async def test_commit_deeply_isolates_event_and_snapshot_inputs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reads_return_deeply_isolated_event_and_snapshot_data() -> None:
-    store = InMemoryStore()
+async def test_reads_return_deeply_isolated_event_and_snapshot_data(store: StateStore) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -355,8 +364,10 @@ async def test_reads_return_deeply_isolated_event_and_snapshot_data() -> None:
 
 @pytest.mark.parametrize("version", [1, 0])
 @pytest.mark.asyncio
-async def test_snapshot_version_must_increase_from_existing(version: int) -> None:
-    store = InMemoryStore()
+async def test_snapshot_version_must_increase_from_existing(
+    version: int,
+    store: StateStore,
+) -> None:
     initial_event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",
@@ -406,8 +417,10 @@ async def test_snapshot_version_must_increase_from_existing(version: int) -> Non
 
 @pytest.mark.parametrize("second_version", [2, 1])
 @pytest.mark.asyncio
-async def test_snapshot_version_must_increase_within_batch(second_version: int) -> None:
-    store = InMemoryStore()
+async def test_snapshot_version_must_increase_within_batch(
+    second_version: int,
+    store: StateStore,
+) -> None:
     event = EventEnvelope.new(
         type="run.created",
         session_id="ses_1",

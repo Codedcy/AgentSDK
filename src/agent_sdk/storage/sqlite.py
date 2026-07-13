@@ -43,6 +43,10 @@ _EXPECTED_INDEXES = {
     "events_aggregate_sequence": (True, (None, "sequence")),
     "snapshots_session": (False, ("session_id",)),
 }
+_AGGREGATE_INDEX_SQL = (
+    "create unique index events_aggregate_sequence "
+    "on events(coalesce(run_id, session_id), sequence)"
+)
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
@@ -56,10 +60,15 @@ def _json_object(value: str) -> dict[str, Any]:
     return cast(dict[str, Any], decoded)
 
 
+def _normalized_sql(value: str) -> str:
+    return "".join(value.casefold().split())
+
+
 class SQLiteStore:
     def __init__(self, connection: aiosqlite.Connection) -> None:
         self._connection = connection
         self._lock = asyncio.Lock()
+        self._closed = False
 
     @classmethod
     async def open(cls, path: str | Path) -> SQLiteStore:
@@ -67,9 +76,8 @@ class SQLiteStore:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = await aiosqlite.connect(database_path)
         try:
-            await connection.execute("PRAGMA foreign_keys=ON")
-            await connection.execute("PRAGMA journal_mode=WAL")
             await cls._migrate(connection)
+            await cls._configure_connection(connection)
         except BaseException:
             await connection.close()
             raise
@@ -77,12 +85,16 @@ class SQLiteStore:
 
     async def close(self) -> None:
         async with self._lock:
+            if self._closed:
+                return
             await self._connection.close()
+            self._closed = True
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         async with self._lock:
-            await self._connection.execute("BEGIN IMMEDIATE")
+            self._ensure_open()
             try:
+                await self._connection.execute("BEGIN IMMEDIATE")
                 for event in batch.events:
                     await self._insert_event(event)
                 for snapshot in batch.snapshots:
@@ -91,7 +103,7 @@ class SQLiteStore:
                 await self._connection.commit()
                 return CommitResult(last_cursor=cursor)
             except BaseException:
-                await self._connection.rollback()
+                await self._rollback()
                 raise
 
     async def read_events(
@@ -101,6 +113,7 @@ class SQLiteStore:
         session_id: str | None = None,
     ) -> list[StoredEvent]:
         async with self._lock:
+            self._ensure_open()
             if session_id is None:
                 query = """
                     SELECT cursor, event_id, schema_version, type, session_id, run_id,
@@ -125,6 +138,7 @@ class SQLiteStore:
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         async with self._lock:
+            self._ensure_open()
             async with self._connection.execute(
                 "SELECT data_json FROM snapshots WHERE kind = ? AND entity_id = ?",
                 (kind, entity_id),
@@ -136,8 +150,9 @@ class SQLiteStore:
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
-            await self._connection.execute("BEGIN IMMEDIATE")
+            self._ensure_open()
             try:
+                await self._connection.execute("BEGIN IMMEDIATE")
                 await self._connection.execute(
                     "DELETE FROM events WHERE session_id = ?",
                     (session_id,),
@@ -148,8 +163,21 @@ class SQLiteStore:
                 )
                 await self._connection.commit()
             except BaseException:
-                await self._connection.rollback()
+                await self._rollback()
                 raise
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("SQLiteStore is closed")
+
+    async def _rollback(self) -> None:
+        rollback = asyncio.create_task(self._connection.rollback())
+        while not rollback.done():
+            try:
+                await asyncio.shield(rollback)
+            except asyncio.CancelledError:
+                continue
+        rollback.result()
 
     async def _insert_event(self, event: EventEnvelope) -> None:
         async with self._connection.execute(
@@ -289,6 +317,25 @@ class SQLiteStore:
 
         await cls._validate_schema(connection)
 
+    @staticmethod
+    async def _configure_connection(connection: aiosqlite.Connection) -> None:
+        try:
+            await connection.execute("PRAGMA foreign_keys=ON")
+            async with connection.execute("PRAGMA foreign_keys") as cursor:
+                foreign_keys = await cursor.fetchone()
+        except sqlite3.Error as error:
+            raise RuntimeError("failed to enable SQLite foreign_keys") from error
+        if foreign_keys != (1,):
+            raise RuntimeError("failed to enable SQLite foreign_keys")
+
+        try:
+            async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
+                journal_mode = await cursor.fetchone()
+        except sqlite3.Error as error:
+            raise RuntimeError("failed to enable SQLite journal_mode=WAL") from error
+        if journal_mode is None or cast(str, journal_mode[0]).lower() != "wal":
+            raise RuntimeError("failed to enable SQLite journal_mode=WAL")
+
     @classmethod
     async def _validate_schema(cls, connection: aiosqlite.Connection) -> None:
         for table_name, expected_info in _EXPECTED_TABLE_INFO.items():
@@ -328,6 +375,16 @@ class SQLiteStore:
                     tuple(cast(str | None, column_row[2]) for column_row in column_rows),
                 )
         if indexes != _EXPECTED_INDEXES:
+            raise ValueError("incompatible database schema")
+
+        async with connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("events_aggregate_sequence",),
+        ) as cursor:
+            aggregate_index = await cursor.fetchone()
+        if aggregate_index is None or _normalized_sql(cast(str, aggregate_index[0])) != (
+            _normalized_sql(_AGGREGATE_INDEX_SQL)
+        ):
             raise ValueError("incompatible database schema")
 
         async with connection.execute(
