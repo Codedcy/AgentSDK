@@ -5,7 +5,6 @@ from agent_sdk.mcp.config import (
     StreamableHTTPMCPTransport,
 )
 from agent_sdk.mcp.manager import MCPManager
-from agent_sdk.mcp.normalize import normalize_mcp_content, normalize_tool
 
 __all__ = [
     "MCPManager",
@@ -13,6 +12,4 @@ __all__ = [
     "MCPTransport",
     "StdioMCPTransport",
     "StreamableHTTPMCPTransport",
-    "normalize_mcp_content",
-    "normalize_tool",
 ]

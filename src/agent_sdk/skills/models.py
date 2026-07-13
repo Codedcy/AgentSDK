@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_serializer,
+    field_validator,
+)
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
+
+PathIdentity = tuple[int, int]
+
+
+def _stat_identity(value: os.stat_result) -> PathIdentity:
+    return (value.st_dev, value.st_ino)
+
+
+def _path_identity(path: Path) -> PathIdentity:
+    return _stat_identity(path.stat())
 
 
 class SkillMetadata(BaseModel):
@@ -63,6 +82,29 @@ class ActivatedSkill(BaseModel):
     metadata: SkillMetadata
     instructions: str
     root: Path
+    _root_identity: PathIdentity | None = PrivateAttr(default=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        del __context
+        try:
+            resolved = self.root.resolve(strict=True)
+            if resolved == self.root and resolved.is_dir():
+                self._root_identity = _path_identity(resolved)
+        except OSError:
+            self._root_identity = None
+
+    @classmethod
+    def _from_pinned(
+        cls,
+        *,
+        metadata: SkillMetadata,
+        instructions: str,
+        root: Path,
+        root_identity: PathIdentity,
+    ) -> ActivatedSkill:
+        activated = cls(metadata=metadata, instructions=instructions, root=root)
+        activated._root_identity = root_identity
+        return activated
 
     def model_copy(
         self,
@@ -74,7 +116,28 @@ class ActivatedSkill(BaseModel):
         data = self.model_dump(mode="json")
         if update is not None:
             data.update(update)
-        return type(self).model_validate(data)
+        copied = type(self).model_validate(data)
+        if copied.root == self.root:
+            copied._root_identity = self._root_identity
+        return copied
+
+    def _verified_root(self) -> Path:
+        try:
+            resolved = self.root.resolve(strict=True)
+            if (
+                resolved != self.root
+                or not resolved.is_dir()
+                or self._root_identity is None
+                or _path_identity(resolved) != self._root_identity
+            ):
+                raise ValueError("activated skill root identity changed")
+            return resolved
+        except (OSError, ValueError) as error:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "activated skill root changed",
+                retryable=False,
+            ) from error
 
     def resolve_member(self, member: str | Path) -> Path:
         requested = Path(member)
@@ -85,11 +148,10 @@ class ActivatedSkill(BaseModel):
                 retryable=False,
             )
         try:
-            real_root = self.root.resolve(strict=True)
-            if real_root != self.root:
-                raise ValueError("activated skill root was rebound")
+            real_root = self._verified_root()
             resolved = (real_root / requested).resolve(strict=True)
             resolved.relative_to(real_root)
+            self._verified_root()
         except FileNotFoundError as error:
             raise AgentSDKError(
                 ErrorCode.NOT_FOUND,
@@ -105,15 +167,43 @@ class ActivatedSkill(BaseModel):
         return resolved
 
     def read_text(self, member: str | Path) -> str:
-        resolved = self.resolve_member(member)
-        if not resolved.is_file():
+        try:
+            resolved = self.resolve_member(member)
+            with resolved.open("rb") as handle:
+                opened = os.fstat(handle.fileno())
+                if not stat.S_ISREG(opened.st_mode):
+                    raise AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "skill member must be a regular file",
+                        retryable=False,
+                    )
+                real_root = self._verified_root()
+                current = resolved.resolve(strict=True)
+                current.relative_to(real_root)
+                if current != resolved or _path_identity(current) != _stat_identity(opened):
+                    raise AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "skill member changed while opening",
+                        retryable=False,
+                    )
+                raw = handle.read()
+                self._verified_root()
+        except FileNotFoundError as error:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "skill member not found",
+                retryable=False,
+            ) from error
+        except AgentSDKError:
+            raise
+        except OSError as error:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
-                "skill member must be a regular file",
+                "failed to read skill member",
                 retryable=False,
-            )
+            ) from error
         try:
-            return resolved.read_text(encoding="utf-8")
+            return raw.decode("utf-8")
         except UnicodeDecodeError as error:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,

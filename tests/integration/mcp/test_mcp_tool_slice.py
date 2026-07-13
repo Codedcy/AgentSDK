@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -8,6 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 from mcp import types as mcp_types
 from pydantic import ValidationError
@@ -32,6 +34,7 @@ from agent_sdk.mcp import (
 )
 from agent_sdk.storage.memory import InMemoryStore
 import agent_sdk.mcp.manager as manager_module
+import agent_sdk.mcp as mcp_api
 
 
 PROTOCOL_VERSION = "2025-11-25"
@@ -695,3 +698,319 @@ async def test_default_connector_rejects_model_constructed_unknown_transport() -
 
     assert raised.value.code is ErrorCode.INVALID_STATE
     assert raised.value.message == "unsupported MCP transport"
+
+
+@pytest.mark.asyncio
+async def test_task_group_connector_is_entered_and_exited_by_same_owner_task() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    entered_by: asyncio.Task[Any] | None = None
+    exited_by: asyncio.Task[Any] | None = None
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            nonlocal entered_by, exited_by
+            async with anyio.create_task_group():
+                entered_by = asyncio.current_task()
+                try:
+                    yield session
+                finally:
+                    exited_by = asyncio.current_task()
+
+        return connected()
+
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    await manager.connect(
+        MCPServerConfig(name="demo", transport=StdioMCPTransport(command="ignored"))
+    )
+
+    await asyncio.create_task(manager.close())
+
+    assert entered_by is not None
+    assert exited_by is entered_by
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_waiter_does_not_cancel_manager_cleanup() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_finished = asyncio.Event()
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                close_started.set()
+                await release_close.wait()
+                close_finished.set()
+
+        return connected()
+
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    await manager.connect(
+        MCPServerConfig(name="demo", transport=StdioMCPTransport(command="ignored"))
+    )
+    cancelled_waiter = asyncio.create_task(manager.close())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+    assert not close_finished.is_set()
+
+    second_waiter = asyncio.create_task(manager.close())
+    release_close.set()
+    await asyncio.wait_for(second_waiter, timeout=1)
+    assert close_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_connect_closes_owner_context_before_propagating() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    initialize_started = asyncio.Event()
+    context_closed = asyncio.Event()
+
+    async def blocked_initialize() -> Any:
+        initialize_started.set()
+        await asyncio.Event().wait()
+
+    session.initialize = blocked_initialize  # type: ignore[method-assign]
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                context_closed.set()
+
+        return connected()
+
+    registry = ToolRegistry()
+    manager = MCPManager._for_test(registry, connector)
+    connecting = asyncio.create_task(
+        manager.connect(
+            MCPServerConfig(
+                name="demo", transport=StdioMCPTransport(command="ignored")
+            )
+        )
+    )
+    await asyncio.wait_for(initialize_started.wait(), timeout=1)
+
+    connecting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await connecting
+
+    assert context_closed.is_set()
+    assert registry.list() == ()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_closes_owner_context_without_orphan() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    context_closed = asyncio.Event()
+
+    async def blocked_initialize() -> Any:
+        await asyncio.Event().wait()
+
+    session.initialize = blocked_initialize  # type: ignore[method-assign]
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                context_closed.set()
+
+        return connected()
+
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await manager.connect(
+            MCPServerConfig(
+                name="demo",
+                startup_timeout=0.01,
+                transport=StdioMCPTransport(command="ignored"),
+            )
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "failed to connect MCP server"
+    assert context_closed.is_set()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_failed_connect_cleanup_is_not_rewritten() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="mcp.demo.echo",
+            description="application conflict",
+            input_schema={"type": "object"},
+        ),
+        _application_handler,
+    )
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                cleanup_finished.set()
+
+        return connected()
+
+    manager = MCPManager._for_test(registry, connector)
+    connecting = asyncio.create_task(
+        manager.connect(
+            MCPServerConfig(
+                name="demo", transport=StdioMCPTransport(command="ignored")
+            )
+        )
+    )
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+
+    connecting.cancel()
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await connecting
+
+    assert cleanup_finished.is_set()
+    assert registry.get("mcp.demo.echo").spec.source == "application"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_close_failure_is_replayed_to_every_waiter() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                raise RuntimeError("injected close failure")
+
+        return connected()
+
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    await manager.connect(
+        MCPServerConfig(name="demo", transport=StdioMCPTransport(command="ignored"))
+    )
+
+    with pytest.raises(AgentSDKError) as first:
+        await manager.close()
+    with pytest.raises(AgentSDKError) as second:
+        await manager.close()
+
+    assert first.value.code is ErrorCode.INTERNAL
+    assert first.value.message == "failed to close MCP manager"
+    assert second.value is first.value
+    assert isinstance(first.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_owner_is_reported_as_replayable_close_failure() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                raise asyncio.CancelledError
+
+        return connected()
+
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    await manager.connect(
+        MCPServerConfig(name="demo", transport=StdioMCPTransport(command="ignored"))
+    )
+
+    with pytest.raises(AgentSDKError) as first:
+        await manager.close()
+    with pytest.raises(AgentSDKError) as second:
+        await manager.close()
+
+    assert first.value.code is ErrorCode.INTERNAL
+    assert first.value.message == "failed to close MCP manager"
+    assert second.value is first.value
+    assert isinstance(first.value.__cause__, RuntimeError)
+    assert str(first.value.__cause__) == "MCP connection owner was cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_only_close_waiter_leaves_no_unretrieved_failure() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                cleanup_started.set()
+                await release_cleanup.wait()
+                raise RuntimeError("unretrieved close failure")
+
+        return connected()
+
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    diagnostics: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    await manager.connect(
+        MCPServerConfig(name="demo", transport=StdioMCPTransport(command="ignored"))
+    )
+    waiter = asyncio.create_task(manager.close())
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release_cleanup.set()
+        close_task = manager._close_task  # type: ignore[attr-defined]
+        assert close_task is not None
+        while not close_task.done():
+            await asyncio.sleep(0)
+
+        del waiter
+        del close_task
+        del manager
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+        assert not any(
+            item.get("message") == "Task exception was never retrieved"
+            for item in diagnostics
+        )
+    finally:
+        release_cleanup.set()
+        loop.set_exception_handler(previous_handler)
+
+
+def test_mcp_package_does_not_export_internal_normalizers() -> None:
+    assert "normalize_mcp_content" not in mcp_api.__all__
+    assert "normalize_tool" not in mcp_api.__all__
+    assert not hasattr(mcp_api, "normalize_mcp_content")
+    assert not hasattr(mcp_api, "normalize_tool")

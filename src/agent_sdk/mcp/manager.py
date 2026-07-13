@@ -46,8 +46,13 @@ _SessionConnector = Callable[[MCPServerConfig], _SessionContext]
 
 @dataclass
 class _Connection:
-    stack: AsyncExitStack
-    session: _Session
+    owner: asyncio.Task[None]
+    stop: asyncio.Event
+    tools: tuple[RegisteredTool, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedConnection:
     tools: tuple[RegisteredTool, ...]
 
 
@@ -100,6 +105,7 @@ class MCPManager:
         self._connections: dict[str, _Connection] = {}
         self._closed = False
         self._lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
 
     @classmethod
     def _for_test(
@@ -121,36 +127,38 @@ class MCPManager:
                     retryable=False,
                 )
 
-            stack = AsyncExitStack()
+            ready: asyncio.Future[_PreparedConnection] = (
+                asyncio.get_running_loop().create_future()
+            )
+            stop = asyncio.Event()
+            owner = asyncio.create_task(self._connection_owner(config, ready, stop))
+            owner.add_done_callback(self._task_finished)
             registered: list[RegisteredTool] = []
+            prepared = False
             try:
                 async with asyncio.timeout(config.startup_timeout):
-                    session = await stack.enter_async_context(self._connector(config))
-                    initialized = await session.initialize()
-                    if initialized.protocolVersion != _PROTOCOL_VERSION:
-                        raise AgentSDKError(
-                            ErrorCode.INVALID_STATE,
-                            "unsupported MCP protocol version",
-                            retryable=False,
-                        )
-                    normalized = await self._discover_tools(config.name, session)
-                self._validate_registration(normalized)
-                for tool in normalized:
+                    connection = await asyncio.shield(ready)
+                prepared = True
+                self._validate_registration(connection.tools)
+                for tool in connection.tools:
                     registered.append(self._registry.register(tool.spec, tool.handler))
-                connection = _Connection(stack, session, tuple(registered))
-                self._connections[config.name] = connection
+                self._connections[config.name] = _Connection(
+                    owner=owner,
+                    stop=stop,
+                    tools=tuple(registered),
+                )
                 return tuple(tool.spec for tool in registered)
             except asyncio.CancelledError:
                 self._rollback(registered)
-                await self._close_stack_safely(stack)
+                await self._settle_failed_owner(owner, stop, prepared=prepared)
                 raise
             except AgentSDKError:
                 self._rollback(registered)
-                await self._close_stack_safely(stack)
+                await self._settle_failed_owner(owner, stop, prepared=prepared)
                 raise
             except Exception as error:
                 self._rollback(registered)
-                await self._close_stack_safely(stack)
+                await self._settle_failed_owner(owner, stop, prepared=prepared)
                 raise AgentSDKError(
                     ErrorCode.INTERNAL,
                     "failed to connect MCP server",
@@ -173,27 +181,73 @@ class MCPManager:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._closed:
-                return
             self._closed = True
-            connections = self._connections
-            self._connections = {}
-            close_error: BaseException | None = None
-            for name in sorted(connections):
-                connection = connections[name]
-                for tool in connection.tools:
-                    self._registry.unregister(tool.spec.name, expected=tool)
-                try:
-                    await connection.stack.aclose()
-                except BaseException as error:
-                    if close_error is None:
-                        close_error = error
-            if close_error is not None:
-                raise AgentSDKError(
-                    ErrorCode.INTERNAL,
-                    "failed to close MCP manager",
-                    retryable=False,
-                ) from close_error
+            if self._close_task is None:
+                connections = self._connections
+                self._connections = {}
+                self._close_task = asyncio.create_task(
+                    self._close_connections(connections)
+                )
+                self._close_task.add_done_callback(self._task_finished)
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    async def _connection_owner(
+        self,
+        config: MCPServerConfig,
+        ready: asyncio.Future[_PreparedConnection],
+        stop: asyncio.Event,
+    ) -> None:
+        try:
+            async with self._connector(config) as session:
+                initialized = await session.initialize()
+                if initialized.protocolVersion != _PROTOCOL_VERSION:
+                    raise AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "unsupported MCP protocol version",
+                        retryable=False,
+                    )
+                tools = await self._discover_tools(config.name, session)
+                if not ready.done():
+                    ready.set_result(_PreparedConnection(tools=tools))
+                await stop.wait()
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.cancel()
+            raise
+        except Exception as error:
+            if not ready.done():
+                ready.set_exception(error)
+                return
+            raise
+
+    async def _close_connections(self, connections: dict[str, _Connection]) -> None:
+        ordered = tuple(connections[name] for name in sorted(connections))
+        for connection in ordered:
+            for tool in connection.tools:
+                self._registry.unregister(tool.spec.name, expected=tool)
+        for connection in ordered:
+            connection.stop.set()
+
+        close_error: Exception | None = None
+        for connection in ordered:
+            try:
+                await connection.owner
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                if close_error is None:
+                    close_error = RuntimeError("MCP connection owner was cancelled")
+            except Exception as error:
+                if close_error is None:
+                    close_error = error
+        if close_error is not None:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to close MCP manager",
+                retryable=False,
+            ) from close_error
 
     async def _discover_tools(
         self,
@@ -261,11 +315,37 @@ class MCPManager:
             )
 
     @staticmethod
-    async def _close_stack_safely(stack: AsyncExitStack) -> None:
-        try:
-            await stack.aclose()
-        except BaseException:
-            pass
+    def _task_finished(task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    @staticmethod
+    async def _settle_failed_owner(
+        owner: asyncio.Task[None],
+        stop: asyncio.Event,
+        *,
+        prepared: bool,
+    ) -> None:
+        if not owner.done():
+            if prepared:
+                stop.set()
+            else:
+                owner.cancel()
+        cancelled: asyncio.CancelledError | None = None
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError as error:
+                if owner.done():
+                    break
+                if cancelled is None:
+                    cancelled = error
+            except Exception:
+                break
+        if not owner.cancelled():
+            owner.exception()
+        if cancelled is not None:
+            raise cancelled
 
 
 __all__ = ["MCPManager"]

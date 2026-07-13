@@ -5,12 +5,14 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from agent_sdk import AgentSDKError, ErrorCode
 from agent_sdk.skills import SkillRegistry
 from agent_sdk.skills.loader import MAX_SKILL_FILE_BYTES
+import agent_sdk.skills.loader as loader_module
 
 
 def _skill_text(
@@ -215,6 +217,28 @@ def test_rejects_duplicate_yaml_frontmatter_keys(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "extra",
+    [
+        "unknown: &loop [*loop]\n",
+        f"unknown: {'[' * 80}0{']' * 80}\n",
+        f"unknown: [{','.join('0' for _ in range(4200))}]\n",
+    ],
+    ids=["cyclic-alias", "excessive-depth", "excessive-node-count"],
+)
+def test_rejects_cyclic_or_excessively_complex_yaml_stably(
+    tmp_path: Path, extra: str
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, text=_skill_text(extra=extra))
+
+    with pytest.raises(AgentSDKError) as raised:
+        SkillRegistry([root]).discover()
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "skill frontmatter exceeds complexity limits"
+
+
+@pytest.mark.parametrize(
     "raw",
     [b"\xff\xfe\x00", b"x" * (MAX_SKILL_FILE_BYTES + 1)],
     ids=["non-utf8", "oversized"],
@@ -378,3 +402,108 @@ def test_activation_rejects_skill_directory_rebound_with_same_digest(
         skills.activate("demo")
 
     assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_activation_rejects_same_digest_file_identity_replacement(
+    skill_root: Path,
+) -> None:
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    skill_file = skill_root / "demo" / "SKILL.md"
+    original = skill_file.read_bytes()
+    skill_file.unlink()
+    skill_file.write_bytes(original)
+
+    with pytest.raises(AgentSDKError) as raised:
+        skills.activate("demo")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_activation_rejects_same_path_skill_root_identity_replacement(
+    skill_root: Path,
+) -> None:
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    skill_dir = skill_root / "demo"
+    original = (skill_dir / "SKILL.md").read_bytes()
+    shutil.rmtree(skill_dir)
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_bytes(original)
+
+    with pytest.raises(AgentSDKError) as raised:
+        skills.activate("demo")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_activation_never_uses_a_root_rebound_after_stable_read(
+    skill_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    outside = tmp_path / "outside-during-activation"
+    (outside / "references").mkdir(parents=True)
+    original = (skill_root / "demo" / "SKILL.md").read_bytes()
+    (outside / "SKILL.md").write_bytes(original)
+    (outside / "references" / "secret.txt").write_text("secret", encoding="utf-8")
+    original_read = loader_module._read_bytes
+
+    def read_then_rebind(path: Path) -> Any:
+        stable_read = original_read(path)
+        shutil.rmtree(skill_root / "demo")
+        _symlink_or_skip(skill_root / "demo", outside, directory=True)
+        return stable_read
+
+    monkeypatch.setattr(loader_module, "_read_bytes", read_then_rebind)
+
+    with pytest.raises(AgentSDKError) as raised:
+        skills.activate("demo")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_activated_skill_rejects_same_path_root_identity_replacement(
+    skill_root: Path,
+) -> None:
+    reference = skill_root / "demo" / "references" / "guide.md"
+    reference.parent.mkdir()
+    reference.write_text("original", encoding="utf-8")
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    activated = skills.activate("demo")
+    skill_dir = skill_root / "demo"
+    shutil.rmtree(skill_dir)
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "references" / "guide.md").write_text("replacement", encoding="utf-8")
+
+    with pytest.raises(AgentSDKError) as raised:
+        activated.read_text("references/guide.md")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+def test_read_text_normalizes_read_time_os_error(
+    skill_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = skill_root / "demo" / "references" / "guide.md"
+    reference.parent.mkdir()
+    reference.write_text("guide", encoding="utf-8")
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    activated = skills.activate("demo")
+
+    def denied(*_: Any, **__: Any) -> Any:
+        raise PermissionError("filesystem secret")
+
+    monkeypatch.setattr(Path, "open", denied)
+
+    with pytest.raises(AgentSDKError) as raised:
+        activated.read_text("references/guide.md")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "failed to read skill member"
+    assert "filesystem secret" not in str(raised.value)
