@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Supported Python versions are 3.12, 3.13, and 3.14.
+- Supported Python versions are 3.12 and 3.13. Python 3.14 is a future promotion gate that requires an officially compatible LiteLLM artifact on supported operating systems.
 - SQLite is the default and memory storage remains explicitly selectable.
 - Compatibility fixtures pin recorded schema/protocol generations; latest dependency CI is non-blocking until qualified.
 - Performance gates use stable synthetic workloads and report environment metadata.
@@ -53,7 +53,7 @@ strategy:
   fail-fast: false
   matrix:
     os: [ubuntu-latest, windows-latest, macos-latest]
-    python: ["3.12", "3.13", "3.14"]
+    python: ["3.12", "3.13"]
 steps:
   - uses: actions/checkout@v4
   - uses: astral-sh/setup-uv@v6
@@ -68,7 +68,7 @@ Test LiteLLM non-stream/stream/tool/error/usage normalized shapes, MCP 2025-11-2
 
 Run: `uv run pytest tests/compat tests/integration/storage/test_migration_fixtures.py -v`
 
-Expected: local platform suite passes; CI configuration expands to nine OS/Python jobs plus protocol jobs.
+Expected: local platform suite passes; CI configuration expands to six OS/Python jobs plus protocol jobs.
 
 ```powershell
 git add .github/workflows tests/compat tests/fixtures/databases tests/integration/storage/test_migration_fixtures.py
@@ -158,9 +158,9 @@ Expected: final metadata/package assets are incomplete.
 
 ```toml
 [project]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-  "aiosqlite>=0.20,<1", "jinja2>=3.1,<4", "litellm>=1,<2",
+  "aiosqlite>=0.20,<1", "jinja2>=3.1,<4", "litellm>=1.91.3,<1.92",
   "mcp>=1,<2", "pydantic>=2,<3", "PyYAML>=6,<7",
 ]
 

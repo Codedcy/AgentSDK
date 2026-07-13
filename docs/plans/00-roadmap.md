@@ -6,11 +6,11 @@
 
 **Architecture:** A single `agent_sdk` Python package owns stable contracts for events, storage, runtime, tools, policy, context, workflows, children, evaluation, and analytics. The first milestone implements the smallest usable path through all contracts; later milestones strengthen behavior behind those boundaries.
 
-**Tech Stack:** Python 3.12–3.14, asyncio, uv, Pydantic v2, LiteLLM, aiosqlite, MCP Python SDK, PyYAML, pytest, pytest-asyncio, Hypothesis, Ruff, mypy, optional Typer/FastAPI/OpenTelemetry.
+**Tech Stack:** Python 3.12–3.13, asyncio, uv, Pydantic v2, LiteLLM, aiosqlite, MCP Python SDK, PyYAML, pytest, pytest-asyncio, Hypothesis, Ruff, mypy, optional Typer/FastAPI/OpenTelemetry.
 
 ## Global Constraints
 
-- Python minimum version is 3.12; CI covers 3.12, 3.13, and 3.14.
+- Supported Python versions are 3.12 and 3.13; CI covers both. Python 3.14 remains a future compatibility gate until LiteLLM officially supports it.
 - The import package is `agent_sdk`; source uses the `src/` layout.
 - LiteLLM is the only model integration and is wrapped only by the internal `LiteLLMGateway` seam.
 - Runtime code is asyncio-first; sync APIs are wrappers and never duplicate the engine.
@@ -38,7 +38,7 @@ Plan: [`milestones/M02-runtime-storage.md`](milestones/M02-runtime-storage.md)
 
 Adds complete Session lifecycle, leases, idempotency, migrations, Artifact lifecycle, cancellation, pause/resume, reconciliation, sync façade, and crash-boundary tests.
 
-Release gate: all runtime/store contract and recovery tests pass on Python 3.12–3.14.
+Release gate: all runtime/store contract and recovery tests pass on Python 3.12 and 3.13.
 
 ### M03 — Capabilities and Context Hardening
 

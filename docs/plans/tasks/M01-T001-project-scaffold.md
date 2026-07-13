@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Package/import name is `agent_sdk`.
-- Python floor is 3.12.
+- Supported Python range is `>=3.12,<3.14` because the approved LiteLLM dependency currently requires Python `<3.14`.
 - Configuration models are frozen and reject unknown fields.
 - Public errors expose stable `ErrorCode` values.
 
@@ -62,9 +62,9 @@ Expected: collection fails with `ModuleNotFoundError: No module named 'agent_sdk
 [project]
 name = "agent-sdk"
 version = "0.1.0.dev0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
-  "pydantic>=2,<3", "litellm>=1,<2", "aiosqlite>=0.20,<1",
+  "pydantic>=2,<3", "litellm>=1.91.3,<1.92", "aiosqlite>=0.20,<1",
   "mcp>=1,<2", "PyYAML>=6,<7",
 ]
 

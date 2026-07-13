@@ -6,11 +6,11 @@
 
 **Architecture:** The implementation is a modular Python package backed by an immutable event log and state projections. SQLite is the default durable store, LiteLLM is the only model layer, and every capability routes through shared runtime, policy, context, and observability contracts.
 
-**Tech Stack:** Python 3.12–3.14, asyncio, uv, Pydantic v2, LiteLLM, aiosqlite, official MCP Python SDK, PyYAML, pytest, pytest-asyncio, Hypothesis, Ruff, mypy, optional FastAPI/OpenTelemetry.
+**Tech Stack:** Python 3.12–3.13, asyncio, uv, Pydantic v2, LiteLLM, aiosqlite, official MCP Python SDK, PyYAML, pytest, pytest-asyncio, Hypothesis, Ruff, mypy, optional FastAPI/OpenTelemetry.
 
 ## Global Constraints
 
-- Python minimum version is 3.12; CI covers 3.12, 3.13, and 3.14.
+- Supported Python versions are 3.12 and 3.13; CI covers both. Python 3.14 is enabled only after LiteLLM publishes compatible artifacts and the compatibility matrix passes.
 - Model calls use LiteLLM only; no public provider abstraction is permitted.
 - SQLite is the default store; InMemoryStore is opt-in and custom stores must pass the contract suite.
 - Session close retains data; Session delete removes all SDK-managed session data and analytics contributions.
