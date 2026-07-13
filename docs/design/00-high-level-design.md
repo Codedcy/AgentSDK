@@ -82,13 +82,13 @@ AgentSpec -> Session -> Run -> Step -> ModelCall / ToolCall
 
 ## 5. 全局不变量
 
-1. 已提交事件不可修改；Schema 通过版本和 upcaster 演进。
+1. 在保留期内，已提交事件不可修改；显式 Session 删除会移除该 Session 的整条事件链和派生数据。
 2. 核心状态事件和状态投影在同一存储事务提交。
 3. 每个 Run 同时只能被一个有效执行租约推进。
 4. 所有副作用先完成 Schema 校验和权限决策。
 5. 子 Agent 权限是父权限与任务包限制的交集，不能自动扩大。
 6. 压缩只生成 Context View，不修改 Session Ledger。
-7. 关闭 Session 保留全部数据；删除 Session 清理 SDK 托管数据，但不回滚 workspace 文件。
+7. 关闭 Session 保留全部数据；删除 Session 清理 SDK 托管数据和派生分析，但不回滚 workspace 文件，也不撤销用户明确保存为全局配置的永久权限规则。
 8. 动态 Workflow 必须通过静态验证和风险预检；默认经用户确认后才执行。
 9. 未知的非幂等工具结果不得静默重试。
 10. Exporter、异步 Evaluator 和分析器失败不得破坏已完成的主执行。
@@ -140,6 +140,8 @@ AgentSpec -> Session -> Run -> Step -> ModelCall / ToolCall
 - Artifact 元数据；大 Payload 可保存到可配置 ArtifactStore。
 
 `InMemoryStore` 保持相同协议，供测试和临时任务使用。自定义 Store 必须通过 SDK 契约套件。SQLite 不被包装成通用分布式锁；若未来支持多进程 Worker，需要单独设计兼容租约语义的数据库实现。
+
+Session 删除会清除该 Session 的事件、投影、消息、Capsule、Evaluation、Analytics contribution、idempotency record 和托管 Artifact。全局 cursor 允许出现因删除形成的空洞；按 cursor 读取必须跳过空洞。已通过 Exporter 发送到 SDK 之外的数据不在本地删除事务范围内，SDK 只向当前订阅者发送非持久 deletion notification，供应用执行外部清理。
 
 ## 9. 配置模型
 
@@ -199,5 +201,4 @@ SDK 的可观测面由四层构成：
 - Agent Skills：严格验证官方必填字段；兼容性宽松模式只在应用显式开启时使用。
 - SQLite：每次 Schema 变更包含迁移和旧数据库升级测试。
 
-具体版本号属于实施计划和依赖锁文件，不写死在长期概要设计中。
-
+Python 最低版本固定为 3.12，首版 CI 覆盖 3.12、3.13 和 3.14。第三方依赖的精确 patch 版本由锁文件管理；兼容版本区间和升级测试写入实施计划。

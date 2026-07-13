@@ -25,14 +25,14 @@ available_input = model_window
 
 输入预算在系统片段、Capability Catalog、Workflow state、历史和当前输入之间分配。实际模型上下文限制通过 LiteLLM/模型配置获得；未知时要求应用显式设置保守值。
 
-默认阈值是相对比例并可配置：
+水位比例定义为 `predicted_prompt_tokens / available_input`。默认值可配置但首版固定为：
 
-- soft：优先 L1，无模型摘要调用。
-- target：允许 L2，恢复目标余量。
-- high：执行 L3 结构化摘要。
-- critical：执行 L4 Rebase；仍失败则在 ModelCall 前返回预算错误。
+- soft `0.70`：优先 L1，无模型摘要调用。
+- target `0.80`：允许 L2，压缩目标是回到 `0.75` 以下。
+- high `0.90`：执行 L3 结构化摘要。
+- critical `0.96`：执行 L4 Rebase；仍失败则在 ModelCall 前返回预算错误。
 
-具体默认百分比在实施计划通过基准测试确定，不成为长期 API 常量；配置语义固定为 `soft/target/high/critical`。
+配置必须满足 `0 < soft < target < high < critical < 1`。基准测试可以在后续 major/minor 版本提出默认值变更，但变更必须记录在 release notes 并进入版本指纹。
 
 ## 3. 压缩级别
 
@@ -162,4 +162,3 @@ Agent 可通过受控历史检索能力请求原文；应用也可在下一次 R
 - 摘要验证失败可靠回退，不把坏 Capsule 注入模型。
 - 原文能通过 Capsule 引用和搜索重新注入。
 - Child Context 不意外复制父 Session 全量历史。
-

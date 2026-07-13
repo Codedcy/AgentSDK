@@ -104,6 +104,7 @@ Scenario Runner 输出人类可读报告、JUnit 和结构化 JSON。
 - cursor/sequence。
 - lease generation。
 - migration 和 Session delete。
+- Session closing、force close/delete、detached Child 和 analytics contribution 清理。
 - 并发和故障恢复。
 
 ### Exporter Contract
@@ -202,4 +203,3 @@ Scenario Runner 输出人类可读报告、JUnit 和结构化 JSON。
 - 综合垂直切片在重启前后得到一致最终状态且无重复副作用。
 - golden trace 覆盖权限、压缩、Workflow、Child、usage、Evaluation 和 Analytics。
 - CI 可以从空环境安装并运行最小示例。
-

@@ -112,6 +112,8 @@ LiteLLM 异常映射为稳定 `ModelError`：
 
 提供任务理解、证据优先、工具使用、错误透明、权限等待、完成标准和结果汇报的默认行为。
 
+SDK 必须随包发布版本化资源 `profiles/general/system.md`。默认内容至少包含：身份与目标、持续执行/终止条件、工具调用协议、权限等待、事实与证据、错误透明、Context/压缩语义、Workflow/Child 协作和最终结果格式。它是可直接工作的默认系统提示词，不要求应用补充文本。
+
 ### Coding Profile
 
 在 General 基础上增加：
@@ -123,6 +125,8 @@ LiteLLM 异常映射为稳定 `ModelError`：
 - 复杂任务采用 Explore → Plan → Approve → Implement → Verify → Report 模板。
 
 Profile 是可版本化 Prompt 资源，不是 Runtime 硬编码分支。
+
+Coding Profile 以 `profiles/coding/system.md` 发布并组合在 General 之后。资源文件进入 package data、文档快照测试和 Prompt hash 测试。默认文本使用英文以获得跨模型一致性；应用可整体替换或追加其他语言片段。
 
 ## 9. 压缩模型和评估模型
 
@@ -139,4 +143,3 @@ Profile 是可版本化 Prompt 资源，不是 Runtime 硬编码分支。
 - Secret 不出现在事件、错误或 Prompt Manifest 明文中。
 - provider timeout、rate limit、流式中断和 malformed tool arguments 有稳定错误分类。
 - 未返回成本的模型不会被统计为零成本。
-

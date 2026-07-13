@@ -161,6 +161,7 @@ Insight 结构：
 
 - Evaluation 是不可变追加记录；撤销通过 superseding result 表达。
 - 小规模 SQLite 默认按事件增量更新基础聚合，并支持按需 SQL 查询。
+- 每个聚合保留可按 Session 删除的 contribution；Session 删除时移除 contribution 并重算/递减聚合，保证删除数据不继续影响成功率或工具指标。
 - 大规模外部仓库通过 Exporter 消费同一事件和 Evaluation。
 - 异步投影暴露 cursor，应用可等待达到目标 cursor 后再比较。
 
@@ -172,4 +173,3 @@ Insight 结构：
 - Tool usefulness 指标区分确定性信号与模型判断。
 - compare/insight 对样本量和 missing data 给出明确警告。
 - 每条归因和建议都能追溯证据、方法、版本和置信度。
-

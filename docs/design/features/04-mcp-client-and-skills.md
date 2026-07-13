@@ -9,7 +9,7 @@
 - stdio：SDK 启动本地 Server 子进程。
 - Streamable HTTP：连接远程 endpoint。
 
-Legacy HTTP+SSE 不作为首版必需 Transport；若官方 Python SDK 提供低成本兼容，可作为明确标记的可选模式，不能影响标准路径。
+Legacy HTTP+SSE 明确不在首版范围内。将来若增加，必须作为独立兼容特性设计和测试，不能改变 stdio/Streamable HTTP 的标准路径。
 
 ## 2. MCP Server 配置
 
@@ -133,4 +133,3 @@ Skill 目录至少包含 `SKILL.md`，支持官方字段：
 - 大/binary MCP 结果通过 Artifact 安全传递。
 - Skill discovery 只加载小型 Catalog；激活后才加载完整指令。
 - 非法 Skill、同名冲突、路径逃逸和脚本权限有明确诊断。
-
