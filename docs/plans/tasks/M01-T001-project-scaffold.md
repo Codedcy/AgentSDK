@@ -52,7 +52,7 @@ def test_core_contracts_are_stable() -> None:
 
 - [ ] **Step 2: Run the test and confirm the package is absent**
 
-Run: `uv run pytest tests/unit/test_core_config.py -v`
+Run: `python -m pytest tests/unit/test_core_config.py -v`
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'agent_sdk'`.
 
