@@ -1,5 +1,6 @@
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -15,3 +16,4 @@ class AgentSDKConfig(BaseModel):
 
     database_path: Path
     capture_level: CaptureLevel = CaptureLevel.PREVIEW
+    permission_default: Literal["allow", "deny", "ask"] = "ask"

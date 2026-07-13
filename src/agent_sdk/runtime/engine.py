@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from contextlib import suppress
 from typing import Any
 
@@ -11,10 +12,17 @@ from agent_sdk.models.litellm_gateway import (
     ModelCompleted,
     ModelRequest,
     TextDelta,
+    ToolCallCompleted,
     UsageReported,
 )
+from agent_sdk.permissions.broker import InProcessPermissionBridge
+from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
+from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.models import RunResult, RunSnapshot, RunStatus, TokenUsage
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore
+from agent_sdk.tools.executor import ToolExecutor
+from agent_sdk.tools.models import ToolContext, ToolResult
+from agent_sdk.tools.registry import ToolRegistry
 
 _DELTA_FLUSH_SECONDS = 0.05
 _DELTA_FLUSH_BYTES = 4 * 1024
@@ -31,6 +39,10 @@ class _RunEmitter:
         self._timer: asyncio.Task[None] | None = None
         self._timer_error: BaseException | None = None
 
+    @property
+    def current_snapshot(self) -> RunSnapshot:
+        return self._run
+
     async def emit(
         self,
         event_type: str,
@@ -41,6 +53,26 @@ class _RunEmitter:
         async with self._lock:
             self._raise_timer_error()
             await self._emit_locked(event_type, payload or {}, snapshot=snapshot)
+
+    async def transition(
+        self,
+        event_type: str,
+        status: RunStatus,
+        payload: dict[str, Any],
+        *,
+        update: dict[str, Any] | None = None,
+    ) -> RunSnapshot:
+        async with self._lock:
+            self._raise_timer_error()
+            values: dict[str, Any] = {
+                "status": status,
+                "version": self._run.version + 1,
+            }
+            if update is not None:
+                values.update(update)
+            snapshot = self._run.model_copy(update=values)
+            await self._emit_locked(event_type, payload, snapshot=snapshot)
+            return snapshot
 
     async def add_delta(self, text: str) -> None:
         cancelled_timer: asyncio.Task[None] | None = None
@@ -136,86 +168,246 @@ class _RunEmitter:
                 ),
             )
         await self._store.commit(CommitBatch(events=(event,), snapshots=snapshots))
+        if snapshot is not None:
+            self._run = snapshot
         self._sequence += 1
 
 
 class RunEngine:
-    def __init__(self, store: StateStore, models: LiteLLMGateway) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        models: LiteLLMGateway,
+        tools: ToolRegistry | None = None,
+        policy: PolicyEngine | None = None,
+        permission_bridge: InProcessPermissionBridge | None = None,
+    ) -> None:
         self._store = store
         self._models = models
+        self._tools = tools or ToolRegistry()
+        self._policy = policy or PolicyEngine()
+        self._permission_bridge = permission_bridge
 
     async def execute(self, run_id: str, request: ModelRequest) -> RunResult:
         created = await self._load_created_run(run_id)
         emitter = _RunEmitter(self._store, created)
-        running = created.model_copy(
-            update={"status": RunStatus.RUNNING, "version": 2}
-        )
-        await emitter.emit(
+        await emitter.transition(
             "run.started",
+            RunStatus.RUNNING,
             {"status": RunStatus.RUNNING.value},
-            snapshot=running,
         )
-        await emitter.emit("step.started")
-        await emitter.emit("model.call.started", {"model": request.model})
-
         chunks: list[str] = []
         usage = TokenUsage()
+        tool_results: list[ToolResult] = []
+        messages = deepcopy(list(request.messages))
+        executor = ToolExecutor(
+            self._tools,
+            self._policy,
+            self._permission_bridge,
+        )
         try:
-            async for event in self._models.stream(request):
-                if isinstance(event, TextDelta):
-                    chunks.append(event.text)
-                    await emitter.add_delta(event.text)
-                elif isinstance(event, UsageReported):
+            while True:
+                await emitter.emit("step.started")
+                await emitter.emit("model.call.started", {"model": request.model})
+                step_chunks: list[str] = []
+                calls: list[ToolCallCompleted] = []
+                model_request = ModelRequest(
+                    model=request.model,
+                    messages=tuple(deepcopy(messages)),
+                    tools=request.tools,
+                    params=dict(request.params),
+                )
+                try:
+                    async for event in self._models.stream(model_request):
+                        if isinstance(event, TextDelta):
+                            chunks.append(event.text)
+                            step_chunks.append(event.text)
+                            await emitter.add_delta(event.text)
+                        elif isinstance(event, ToolCallCompleted):
+                            calls.append(event)
+                        elif isinstance(event, UsageReported):
+                            await emitter.flush_delta()
+                            usage = _add_usage(usage, event.to_usage())
+                            await emitter.emit(
+                                "model.usage.reported",
+                                event.to_payload(),
+                            )
+                        elif isinstance(event, ModelCompleted):
+                            await emitter.flush_delta()
+                            await emitter.emit(
+                                "model.call.completed",
+                                event.to_payload(),
+                            )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as cause:
+                    failure = AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "model call failed",
+                        retryable=False,
+                    )
                     await emitter.flush_delta()
-                    usage = event.to_usage()
-                    await emitter.emit("model.usage.reported", event.to_payload())
-                elif isinstance(event, ModelCompleted):
-                    await emitter.flush_delta()
-                    await emitter.emit("model.call.completed", event.to_payload())
+                    await self._fail_run(
+                        emitter,
+                        failure,
+                        chunks,
+                        usage,
+                        tool_results,
+                        model_call_failed=True,
+                    )
+                    await emitter.close()
+                    raise failure from cause
+
+                if len(calls) > 1:
+                    failure = AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "multiple tool calls are not supported",
+                        retryable=False,
+                    )
+                    await self._fail_run(
+                        emitter,
+                        failure,
+                        chunks,
+                        usage,
+                        tool_results,
+                    )
+                    await emitter.close()
+                    raise failure
+
+                if not calls:
+                    await emitter.emit("step.completed")
+                    break
+
+                call = calls[0]
+                await emitter.emit(
+                    "tool.call.proposed",
+                    {"call_id": call.call_id, "tool_name": call.name},
+                )
+                tool_result = await executor.execute(
+                    call,
+                    ToolContext(
+                        run_id=run_id,
+                        session_id=emitter.current_snapshot.session_id,
+                    ),
+                    emit=emitter.emit,
+                    on_permission_requested=lambda permission, decision: (
+                        self._permission_transition(
+                            emitter,
+                            "permission.requested",
+                            RunStatus.WAITING_PERMISSION,
+                            permission,
+                            decision,
+                        )
+                    ),
+                    on_permission_resolved=lambda permission, decision: (
+                        self._permission_transition(
+                            emitter,
+                            "permission.resolved",
+                            RunStatus.RUNNING,
+                            permission,
+                            decision,
+                        )
+                    ),
+                )
+                tool_results.append(tool_result)
+                await emitter.emit("step.completed")
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "".join(step_chunks) or None,
+                        "tool_calls": [
+                            {
+                                "id": call.call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": call.name,
+                                    "arguments": call.arguments_json,
+                                },
+                            }
+                        ],
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "name": call.name,
+                        "content": tool_result.content,
+                    }
+                )
         except asyncio.CancelledError:
+            if self._permission_bridge is not None:
+                await asyncio.shield(self._permission_bridge.cancel_run(run_id))
             await emitter.close()
             raise
-        except Exception as cause:
-            failure = AgentSDKError(
-                ErrorCode.INTERNAL,
-                "model call failed",
-                retryable=False,
-            )
-            await emitter.flush_delta()
-            payload = {"error": failure.to_dict()}
-            await emitter.emit("model.call.failed", payload)
-            await emitter.emit("step.failed", payload)
-            failed = running.model_copy(
-                update={
-                    "status": RunStatus.FAILED,
-                    "version": 3,
-                    "output_text": "".join(chunks),
-                    "usage": usage,
-                }
-            )
-            await emitter.emit("run.failed", payload, snapshot=failed)
-            await emitter.close()
-            raise failure from cause
 
         await emitter.flush_delta()
-        await emitter.emit("step.completed")
         output_text = "".join(chunks)
-        completed = running.model_copy(
+        run_result = RunResult(
+            run_id=run_id,
+            output_text=output_text,
+            usage=usage,
+            tool_results=tuple(tool_results),
+        )
+        terminal_payload: dict[str, Any] = {
+            "output_text": output_text,
+            "usage": usage.model_dump(),
+        }
+        if tool_results:
+            terminal_payload["tool_results"] = [
+                tool_result.model_dump(mode="json")
+                for tool_result in tool_results
+            ]
+        await emitter.transition(
+            "run.completed",
+            RunStatus.COMPLETED,
+            terminal_payload,
             update={
-                "status": RunStatus.COMPLETED,
-                "version": 3,
                 "output_text": output_text,
                 "usage": usage,
-            }
-        )
-        result = RunResult(run_id=run_id, output_text=output_text, usage=usage)
-        await emitter.emit(
-            "run.completed",
-            {"output_text": output_text, "usage": usage.model_dump()},
-            snapshot=completed,
+            },
         )
         await emitter.close()
-        return result
+        return run_result
+
+    @staticmethod
+    async def _permission_transition(
+        emitter: _RunEmitter,
+        event_type: str,
+        status: RunStatus,
+        request: PermissionRequest,
+        decision: PermissionDecision | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "request": request.model_dump(mode="json"),
+        }
+        if decision is not None:
+            payload["decision"] = decision.model_dump(mode="json")
+        await emitter.transition(event_type, status, payload)
+
+    @staticmethod
+    async def _fail_run(
+        emitter: _RunEmitter,
+        failure: AgentSDKError,
+        chunks: list[str],
+        usage: TokenUsage,
+        tool_results: list[ToolResult],
+        *,
+        model_call_failed: bool = False,
+    ) -> None:
+        payload = {"error": failure.to_dict()}
+        if model_call_failed:
+            await emitter.emit("model.call.failed", payload)
+        await emitter.emit("step.failed", payload)
+        await emitter.transition(
+            "run.failed",
+            RunStatus.FAILED,
+            payload,
+            update={
+                "output_text": "".join(chunks),
+                "usage": usage,
+            },
+        )
 
     async def _load_created_run(self, run_id: str) -> RunSnapshot:
         data = await self._store.get_snapshot("run", run_id)
@@ -233,3 +425,18 @@ class RunEngine:
                 retryable=False,
             )
         return run
+
+
+def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    def add(first: int | None, second: int | None) -> int | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return first + second
+
+    return TokenUsage(
+        prompt_tokens=add(left.prompt_tokens, right.prompt_tokens),
+        completion_tokens=add(left.completion_tokens, right.completion_tokens),
+        total_tokens=add(left.total_tokens, right.total_tokens),
+    )

@@ -4,11 +4,14 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Literal, cast
 
 from agent_sdk.config import AgentSDKConfig
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
+from agent_sdk.permissions.broker import InProcessPermissionBridge
+from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
+from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.handles import RunHandle
@@ -21,8 +24,11 @@ from agent_sdk.runtime.models import (
 )
 from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
 from agent_sdk.storage.sqlite import SQLiteStore
+from agent_sdk.tools.registry import ToolRegistry
 
 _ACompletion = Callable[..., Awaitable[Any]]
+_PermissionDefault = Literal["allow", "deny", "ask"]
+_DEFAULT_PERMISSION_BRIDGE = object()
 
 
 class _LazySQLiteStore:
@@ -138,12 +144,14 @@ class RunAPI:
         engine: RunEngine,
         track_task: Callable[[asyncio.Task[RunResult]], None],
         lifecycle: _SDKLifecycle,
+        tools: ToolRegistry,
     ) -> None:
         self._store = store
         self._commands = commands
         self._engine = engine
         self._track_task = track_task
         self._lifecycle = lifecycle
+        self._tools = tools
 
     async def start(
         self,
@@ -166,6 +174,7 @@ class RunAPI:
             request = ModelRequest(
                 model=agent.model,
                 messages=({"role": "user", "content": user_input},),
+                tools=self._tools.schemas(),
                 params=mutable_model_params(agent.model_params),
             )
             task = asyncio.create_task(self._engine.execute(created.run_id, request))
@@ -192,10 +201,43 @@ class RunAPI:
             ) from error
 
 
+class PermissionAPI:
+    def __init__(self, bridge: InProcessPermissionBridge | None) -> None:
+        self._bridge = bridge
+
+    async def next_request(self, run_id: str) -> PermissionRequest:
+        if self._bridge is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "permission bridge unavailable",
+                retryable=False,
+            )
+        return await self._bridge.next_request(run_id)
+
+    async def resolve(
+        self,
+        request_id: str,
+        decision: PermissionDecision,
+    ) -> None:
+        if self._bridge is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "permission bridge unavailable",
+                retryable=False,
+            )
+        await self._bridge.resolve(request_id, decision)
+
+
 class AgentSDK:
     def __init__(self, config: AgentSDKConfig) -> None:
         store = _LazySQLiteStore(config.database_path)
-        self._initialize(store, LiteLLMGateway(), owned_close=store.close)
+        self._initialize(
+            store,
+            LiteLLMGateway(),
+            permission_default=config.permission_default,
+            permission_bridge=InProcessPermissionBridge(),
+            owned_close=store.close,
+        )
 
     @classmethod
     def for_test(
@@ -203,9 +245,24 @@ class AgentSDK:
         *,
         store: StateStore,
         acompletion: _ACompletion,
+        permission_default: _PermissionDefault = "ask",
+        permission_bridge: InProcessPermissionBridge | None | object = (
+            _DEFAULT_PERMISSION_BRIDGE
+        ),
     ) -> AgentSDK:
         sdk = cls.__new__(cls)
-        sdk._initialize(store, LiteLLMGateway._for_test(acompletion), owned_close=None)
+        bridge = (
+            InProcessPermissionBridge()
+            if permission_bridge is _DEFAULT_PERMISSION_BRIDGE
+            else cast(InProcessPermissionBridge | None, permission_bridge)
+        )
+        sdk._initialize(
+            store,
+            LiteLLMGateway._for_test(acompletion),
+            permission_default=permission_default,
+            permission_bridge=bridge,
+            owned_close=None,
+        )
         return sdk
 
     def _initialize(
@@ -213,13 +270,24 @@ class AgentSDK:
         store: StateStore,
         models: LiteLLMGateway,
         *,
+        permission_default: _PermissionDefault,
+        permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
         self._active_tasks: set[asyncio.Task[RunResult]] = set()
         self._owned_close = owned_close
         self._lifecycle = _SDKLifecycle()
         commands = RuntimeCommands(store)
-        engine = RunEngine(store, models)
+        tools = ToolRegistry()
+        engine = RunEngine(
+            store,
+            models,
+            tools,
+            PolicyEngine(permission_default),
+            permission_bridge,
+        )
+        self.tools = tools
+        self.permissions = PermissionAPI(permission_bridge)
         self.sessions = SessionAPI(commands, self._lifecycle)
         self.runs = RunAPI(
             store,
@@ -227,6 +295,7 @@ class AgentSDK:
             engine,
             self._track_task,
             self._lifecycle,
+            tools,
         )
 
     def _track_task(self, task: asyncio.Task[RunResult]) -> None:

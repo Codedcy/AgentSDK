@@ -1,7 +1,8 @@
-from agent_sdk.api import AgentSDK, RunAPI, SessionAPI
+from agent_sdk.api import AgentSDK, PermissionAPI, RunAPI, SessionAPI
 from agent_sdk.config import AgentSDKConfig, CaptureLevel
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.ids import new_id
+from agent_sdk.permissions import PermissionDecision, PermissionEffect, PermissionRequest
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.models import (
     AgentSpec,
@@ -11,6 +12,8 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     TokenUsage,
 )
+from agent_sdk.tools import ToolContext, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec
+from agent_sdk.tools.executor import ToolExecutor
 
 __all__ = [
     "AgentSDK",
@@ -19,6 +22,10 @@ __all__ = [
     "AgentSpec",
     "CaptureLevel",
     "ErrorCode",
+    "PermissionAPI",
+    "PermissionDecision",
+    "PermissionEffect",
+    "PermissionRequest",
     "RunAPI",
     "RunHandle",
     "RunResult",
@@ -27,5 +34,11 @@ __all__ = [
     "SessionAPI",
     "SessionSnapshot",
     "TokenUsage",
+    "ToolContext",
+    "ToolExecutor",
+    "ToolRegistry",
+    "ToolResult",
+    "ToolResultStatus",
+    "ToolSpec",
     "new_id",
 ]

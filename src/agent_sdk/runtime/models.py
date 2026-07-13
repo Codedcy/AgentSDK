@@ -6,10 +6,13 @@ from collections.abc import Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
+from agent_sdk.tools.models import ToolResult
+
 
 class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
+    WAITING_PERMISSION = "waiting_permission"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -83,6 +86,7 @@ class RunResult(BaseModel):
     run_id: str
     output_text: str
     usage: TokenUsage
+    tool_results: tuple[ToolResult, ...] = ()
 
 
 class SessionSnapshot(BaseModel):

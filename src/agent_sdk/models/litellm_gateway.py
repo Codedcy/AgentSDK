@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, TypeAlias, cast
 
@@ -49,7 +50,24 @@ class ModelCompleted:
         return {"finish_reason": self.finish_reason}
 
 
-ModelEvent: TypeAlias = TextDelta | UsageReported | ModelCompleted
+@dataclass(frozen=True)
+class ToolCallCompleted:
+    index: int
+    call_id: str
+    name: str
+    arguments_json: str
+
+
+@dataclass
+class _ToolCallParts:
+    call_id: str = ""
+    name: str = ""
+    arguments_json: str = ""
+
+
+ModelEvent: TypeAlias = (
+    TextDelta | ToolCallCompleted | UsageReported | ModelCompleted
+)
 
 
 def _value(container: object, name: str) -> Any:
@@ -77,13 +95,14 @@ class LiteLLMGateway:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         response = await self._acompletion(
             model=request.model,
-            messages=[dict(message) for message in request.messages],
-            tools=[dict(tool) for tool in request.tools],
+            messages=deepcopy(list(request.messages)),
+            tools=deepcopy(list(request.tools)),
             stream=True,
             **dict(request.params),
         )
         finish_reason: str | None = None
         usage: UsageReported | None = None
+        tool_calls: dict[int, _ToolCallParts] = {}
 
         async for chunk in response:
             choices = _value(chunk, "choices")
@@ -93,6 +112,24 @@ class LiteLLMGateway:
                 content = _value(delta, "content") if delta is not None else None
                 if isinstance(content, str) and content:
                     yield TextDelta(content)
+                raw_tool_calls = (
+                    _value(delta, "tool_calls") if delta is not None else None
+                )
+                if raw_tool_calls:
+                    for raw_tool_call in raw_tool_calls:
+                        index = int(_value(raw_tool_call, "index") or 0)
+                        parts = tool_calls.setdefault(index, _ToolCallParts())
+                        call_id = _value(raw_tool_call, "id")
+                        if isinstance(call_id, str):
+                            parts.call_id += call_id
+                        function = _value(raw_tool_call, "function")
+                        if function is not None:
+                            name = _value(function, "name")
+                            if isinstance(name, str):
+                                parts.name += name
+                            arguments = _value(function, "arguments")
+                            if isinstance(arguments, str):
+                                parts.arguments_json += arguments
                 current_finish_reason = _value(choice, "finish_reason")
                 if current_finish_reason is not None:
                     finish_reason = str(current_finish_reason)
@@ -105,6 +142,14 @@ class LiteLLMGateway:
                     total_tokens=_optional_int(_value(raw_usage, "total_tokens")),
                 )
 
+        for index in sorted(tool_calls):
+            parts = tool_calls[index]
+            yield ToolCallCompleted(
+                index=index,
+                call_id=parts.call_id,
+                name=parts.name,
+                arguments_json=parts.arguments_json,
+            )
         if usage is not None:
             yield usage
         yield ModelCompleted(finish_reason)

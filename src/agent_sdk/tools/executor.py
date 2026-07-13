@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+from typing import Any, cast
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
+
+from agent_sdk.errors import AgentSDKError
+from agent_sdk.ids import new_id
+from agent_sdk.models.litellm_gateway import ToolCallCompleted
+from agent_sdk.permissions.broker import InProcessPermissionBridge, PermissionBroker
+from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
+from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.tools.models import (
+    ToolContext,
+    ToolResult,
+    ToolResultStatus,
+    thaw_json,
+)
+from agent_sdk.tools.registry import ToolRegistry
+
+_Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
+_PermissionTransition = Callable[
+    [PermissionRequest, PermissionDecision | None], Awaitable[None]
+]
+
+
+class ToolExecutor:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        policy: PolicyEngine,
+        bridge: InProcessPermissionBridge | None,
+    ) -> None:
+        self._registry = registry
+        self._permissions = PermissionBroker(policy, bridge)
+
+    async def execute(
+        self,
+        call: ToolCallCompleted,
+        context: ToolContext,
+        *,
+        emit: _Emit,
+        on_permission_requested: _PermissionTransition,
+        on_permission_resolved: _PermissionTransition,
+    ) -> ToolResult:
+        try:
+            registered = self._registry.get(call.name)
+        except AgentSDKError:
+            return await self._complete_error(
+                call,
+                ToolResultStatus.FAILED,
+                "tool not found",
+                emit,
+            )
+
+        try:
+            decoded = json.loads(call.arguments_json)
+            if not isinstance(decoded, dict):
+                raise ValueError("tool arguments must be an object")
+            arguments = cast(dict[str, Any], decoded)
+            Draft202012Validator(
+                thaw_json(registered.spec.input_schema)
+            ).validate(arguments)
+        except (json.JSONDecodeError, ValueError, ValidationError):
+            return await self._complete_error(
+                call,
+                ToolResultStatus.INVALID_ARGUMENTS,
+                "invalid tool arguments",
+                emit,
+            )
+
+        request = PermissionRequest(
+            request_id=new_id("prm"),
+            run_id=context.run_id,
+            session_id=context.session_id,
+            tool_name=call.name,
+            arguments=arguments,
+            effects=registered.spec.effects,
+        )
+        decision = await self._permissions.authorize(
+            request,
+            on_requested=on_permission_requested,
+            on_resolved=on_permission_resolved,
+        )
+        if not decision.allowed:
+            return await self._complete_error(
+                call,
+                ToolResultStatus.DENIED,
+                decision.reason or "permission denied",
+                emit,
+            )
+
+        await emit(
+            "tool.call.authorized",
+            {"call_id": call.call_id, "tool_name": call.name},
+        )
+        await emit(
+            "tool.call.started",
+            {"call_id": call.call_id, "tool_name": call.name},
+        )
+        try:
+            invocation = registered.handler(
+                context,
+                **cast(dict[str, Any], thaw_json(arguments)),
+            )
+            if registered.spec.timeout_seconds is None:
+                value = await invocation
+            else:
+                async with asyncio.timeout(registered.spec.timeout_seconds):
+                    value = await invocation
+            try:
+                result = ToolResult.succeeded(call.call_id, call.name, value)
+            except ValueError:
+                result = ToolResult.normalized_error(
+                    call.call_id,
+                    call.name,
+                    ToolResultStatus.FAILED,
+                    "tool result is not JSON-compatible or exceeds size limit",
+                )
+        except TimeoutError:
+            result = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.TIMED_OUT,
+                "tool execution timed out",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            result = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.FAILED,
+                "tool handler failed",
+            )
+
+        await emit("tool.call.completed", self._result_payload(result))
+        return result
+
+    @staticmethod
+    async def _complete_error(
+        call: ToolCallCompleted,
+        status: ToolResultStatus,
+        message: str,
+        emit: _Emit,
+    ) -> ToolResult:
+        result = ToolResult.normalized_error(
+            call.call_id,
+            call.name,
+            status,
+            message,
+        )
+        await emit("tool.call.completed", ToolExecutor._result_payload(result))
+        return result
+
+    @staticmethod
+    def _result_payload(result: ToolResult) -> dict[str, Any]:
+        return result.model_dump(mode="json")
