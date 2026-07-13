@@ -786,6 +786,55 @@ async def test_permission_resolve_rejects_unknown_and_duplicate_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_in_flight_permission_resolutions_remain_duplicate_conflicts() -> None:
+    bridge = InProcessPermissionBridge()
+    request_ids = [f"prm_in_flight_{index}" for index in range(65)]
+    waiting: list[asyncio.Task[PermissionDecision]] = []
+
+    for request_id in request_ids:
+        request = PermissionRequest(
+            request_id=request_id,
+            run_id="run_in_flight",
+            session_id="ses_in_flight",
+            tool_name="in_flight",
+            arguments={},
+        )
+        waiting.append(asyncio.create_task(bridge.wait(request)))
+        assert (
+            await bridge.next_request("run_in_flight")
+        ).request_id == request_id
+
+    resolving = [
+        asyncio.create_task(
+            bridge.resolve(request_id, PermissionDecision.allow_once())
+        )
+        for request_id in request_ids
+    ]
+    try:
+        decisions = await asyncio.gather(*waiting)
+        assert all(decision.allowed for decision in decisions)
+        assert all(not task.done() for task in resolving)
+
+        with pytest.raises(AgentSDKError) as duplicate:
+            await bridge.resolve(
+                request_ids[0],
+                PermissionDecision.deny(),
+            )
+        assert duplicate.value.code is ErrorCode.CONFLICT
+        assert duplicate.value.message == "permission request already resolved"
+    finally:
+        for request_id in request_ids:
+            await bridge.mark_committed(request_id)
+        await asyncio.gather(*resolving, return_exceptions=True)
+
+    assert all(task.done() for task in waiting)
+    assert all(task.done() for task in resolving)
+    assert all(task.result() is None for task in resolving)
+    assert not bridge._pending  # type: ignore[attr-defined]
+    assert not bridge._queues  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_permission_resolution_history_is_bounded_without_re_resolve() -> None:
     bridge = InProcessPermissionBridge()
     history_limit = 64
@@ -810,6 +859,8 @@ async def test_permission_resolution_history_is_bounded_without_re_resolve() -> 
         assert (await waiting).allowed
         await bridge.mark_committed(request_id)
         await resolving
+
+    assert len(bridge._resolved_history) == history_limit  # type: ignore[attr-defined]
 
     with pytest.raises(AgentSDKError) as recent_duplicate:
         await bridge.resolve(request_ids[-1], PermissionDecision.deny())
@@ -1061,6 +1112,12 @@ async def test_cancelling_permission_wait_removes_pending_request() -> None:
                 PermissionDecision.allow_once(),
             )
         assert removed.value.code is ErrorCode.NOT_FOUND
+        with pytest.raises(AgentSDKError) as still_removed:
+            await sdk.permissions.resolve(
+                request.request_id,
+                PermissionDecision.deny(),
+            )
+        assert still_removed.value.code is ErrorCode.NOT_FOUND
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(
                 sdk.permissions.next_request(run.run_id),

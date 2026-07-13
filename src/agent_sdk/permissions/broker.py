@@ -78,6 +78,12 @@ class InProcessPermissionBridge:
                     "permission request not found",
                     retryable=False,
                 )
+            if pending.resolved:
+                raise AgentSDKError(
+                    ErrorCode.CONFLICT,
+                    "permission request already resolved",
+                    retryable=False,
+                )
             if decision.action == "ask":
                 raise AgentSDKError(
                     ErrorCode.INVALID_STATE,
@@ -85,7 +91,6 @@ class InProcessPermissionBridge:
                     retryable=False,
                 )
             pending.resolved = True
-            self._remember_resolution(request_id)
             pending.submitted.set_result(decision)
             committed = pending.committed
         await asyncio.shield(committed)
@@ -95,6 +100,7 @@ class InProcessPermissionBridge:
             pending = self._pending.pop(request_id, None)
             if pending is None:
                 return
+            self._remember_resolution(request_id)
             self._remove_from_queue(pending.request.run_id, request_id)
             if not pending.committed.done():
                 pending.committed.set_result(None)
@@ -108,6 +114,7 @@ class InProcessPermissionBridge:
             pending = self._pending.pop(request_id, None)
             if pending is None:
                 return
+            self._remember_resolution(request_id)
             self._remove_from_queue(pending.request.run_id, request_id)
             if not pending.committed.done():
                 pending.committed.set_exception(error)
