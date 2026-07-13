@@ -9,6 +9,14 @@ from typing import Any, AsyncIterator, Literal, cast
 
 from agent_sdk.analytics import AnalyticsQueries, AnalyticsResult
 from agent_sdk.config import AgentSDKConfig
+from agent_sdk.context import (
+    CompactionLevel,
+    CompactionPolicy,
+    ContextCapsule,
+    ContextPlanner,
+    ContextRetrieval,
+    ContextView,
+)
 from agent_sdk.evaluation import EvaluationEngine, EvaluationResult, Evaluator
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
@@ -322,6 +330,77 @@ class RunAPI:
             ) from error
 
 
+class ContextAPI:
+    def __init__(
+        self,
+        store: StateStore,
+        models: LiteLLMGateway,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._store = store
+        self._models = models
+        self._lifecycle = lifecycle
+        self._retrieval = ContextRetrieval(store)
+
+    async def build(
+        self,
+        session_id: str,
+        *,
+        model: str,
+        model_window: int,
+        output_reserve: int = 0,
+        tool_schema_tokens: int = 0,
+        safety_reserve: int = 0,
+        policy: CompactionPolicy | None = None,
+        force_level: CompactionLevel | str | None = None,
+        protected_event_ids: Iterable[str] = (),
+    ) -> ContextView:
+        async with self._lifecycle.admit():
+            planner = ContextPlanner(
+                self._store,
+                self._models,
+                model=model,
+                model_window=model_window,
+                output_reserve=output_reserve,
+                tool_schema_tokens=tool_schema_tokens,
+                safety_reserve=safety_reserve,
+                policy=policy,
+            )
+            return await planner.build(
+                session_id,
+                force_level=force_level,
+                protected_event_ids=protected_event_ids,
+            )
+
+    async def get_capsule(
+        self,
+        capsule_id: str,
+        *,
+        session_id: str,
+    ) -> ContextCapsule:
+        async with self._lifecycle.admit():
+            return await self._retrieval.get_capsule(
+                capsule_id,
+                session_id=session_id,
+            )
+
+    async def read_sources(
+        self,
+        capsule_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[ObservedEvent, ...]:
+        async with self._lifecycle.admit():
+            stored = await self._retrieval.read_sources(
+                capsule_id,
+                session_id=session_id,
+            )
+            return tuple(
+                ObservedEvent(cursor=item.cursor, event=item.event)
+                for item in stored
+            )
+
+
 class QueryAPI:
     def __init__(self, queries: QueryService, lifecycle: _SDKLifecycle) -> None:
         self._queries = queries
@@ -543,6 +622,7 @@ class AgentSDK:
             self._lifecycle,
             tools,
         )
+        self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)
         self.queries = QueryAPI(QueryService(store), self._lifecycle)
         self.events = EventAPI(
