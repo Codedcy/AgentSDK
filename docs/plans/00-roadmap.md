@@ -30,7 +30,10 @@ Plan: [`milestones/M01-vertical-slice.md`](milestones/M01-vertical-slice.md)
 
 Creates an installable package and one integrated scenario containing SQLite Session persistence, LiteLLM streaming, a permissioned tool, one MCP server, one Skill, forced context compaction, a generated workflow, one Child Run, live events, an Evaluator, basic analytics, restart recovery, and Session deletion.
 
-Release gate: `uv run pytest tests/e2e/test_vertical_slice.py -v` passes and the example CLI completes the scenario without private imports.
+Release gate: `uv run pytest tests/e2e/test_vertical_slice.py -v` passes. The E2E
+invokes the reference CLI's injectable public-API orchestration for the active phase,
+then the acceptance harness verifies quiescent reopen and Session deletion; the
+interactive CLI does not silently reopen or delete user state.
 
 ### M02 — Runtime and Storage Hardening
 

@@ -13,7 +13,16 @@
 - Do not add hardening behavior not needed by the vertical-slice acceptance test.
 - Public names must match `docs/plans/01-file-map.md`.
 - Every state change is represented by an EventEnvelope and persisted before it is exposed.
-- Use fake LiteLLM/MCP seams in tests; the example accepts real configuration.
+- Focused LiteLLM/MCP tests may use injected fake seams. The integrated E2E uses a real
+  local stdio MCP server, a scripted LiteLLM seam, and no network credentials.
+- M01 recovery means public read recovery after all active work and external
+  connections are quiescent; in-flight permission recovery starts in M02.
+- Generated Workflow YAML is application-confirmed before the existing Workflow API is
+  called. Durable dynamic proposals remain M04 scope.
+- The M01 write-like Tool is application-registered; built-in coding Tools and hardened
+  path/command policies remain M03 scope.
+- M01 ships a minimal public-API CLI; release-grade reference applications and the
+  monitor server remain M06 scope.
 - Every task must leave `uv run pytest -q` green.
 
 ---
