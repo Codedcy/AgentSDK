@@ -11,8 +11,8 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | done |
 | [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | done |
 | [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | done |
-| [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | in_progress |
-| [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | pending |
+| [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | done |
+| [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | in_progress |
 | [M01-T010](M01-T010-integrated-e2e.md) | Integrated vertical-slice CLI and E2E | M01 | T009 | pending |
 | [M02-T001](M02-T001-session-idempotency.md) | Complete Session lifecycle and idempotency | M02 | M01 | pending |
 | [M02-T002](M02-T002-leases-reconciliation.md) | Leases, interruption, and reconciliation | M02 | T001 | pending |
@@ -45,3 +45,4 @@ When a task completes, add its commit id and verification result below the table
 - M01-T005: implementation `ae1d523`, fixes `66256e1` and `933bc71`; Python 3.13 `pytest` 110 passed, Ruff passed, mypy passed; task review approved after permission-failure, cancellation, boundedness, and concurrent-resolution re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T005-report.md`.
 - M01-T006: implementation `eb2d59b`, fixes `1f71d2d` and `2259b85`; Python 3.13 `pytest` 186 passed, Ruff passed, mypy passed; task review approved after MCP task-affine lifecycle, cancellation/readiness settlement, YAML complexity, and Skill path-identity re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T006-report.md`.
 - M01-T007: implementation `b0b40e5`, fixes `c6d1340` and `29c38a6`; Python 3.13 `pytest` 246 passed, Ruff passed, mypy passed, wheel/sdist resources verified; task review approved after Session-delete atomicity, structured-usage validation, ContextView invariants, and provider traceback-local isolation re-reviews. TDD and packaging evidence is recorded in `.superpowers/sdd/M01-T007-report.md`.
+- M01-T008: implementation `24c19c7`, fixes `a5b5c3d` and `7fdd03d`; Python 3.13 `pytest` 306 passed, Ruff passed, mypy passed; task review approved after Workflow IR validation, recovery ownership, event final-drain boundedness, and child failure-isolation re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T008-report.md`.
