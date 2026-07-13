@@ -8,6 +8,7 @@ from typing import NoReturn
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.evaluation import EvaluationResult, EvaluationVerdict
 from agent_sdk.storage.base import StateStore, StoredEvent
+from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 from agent_sdk.tools import ToolResult, ToolResultStatus
 
 from .models import AnalyticsResult
@@ -166,7 +167,7 @@ class AnalyticsQueries:
 
 async def _latest_cursor(store: StateStore) -> int | _StoreFailure:
     try:
-        return await store.latest_cursor()
+        return validate_latest_cursor(await store.latest_cursor())
     except Exception:
         return _StoreFailure.FAILED
 
@@ -179,7 +180,12 @@ async def _scan(
     current = 0
     try:
         while current < up_to_cursor:
-            page = await store.read_events(
+            page = validate_event_page(
+                await store.read_events(
+                    after_cursor=current,
+                    up_to_cursor=up_to_cursor,
+                    limit=_PAGE_SIZE,
+                ),
                 after_cursor=current,
                 up_to_cursor=up_to_cursor,
                 limit=_PAGE_SIZE,
@@ -198,8 +204,6 @@ async def _scan(
             for stored in page:
                 visit(stored)
             current = page[-1].cursor
-            if len(page) < _PAGE_SIZE:
-                break
         return None
     except Exception:
         return _StoreFailure.FAILED
@@ -231,6 +235,9 @@ def _count_evaluation(
     if evaluator_id is not None and identity != evaluator_id:
         return
     counts.evidence.append(event.event_id)
+    if event.sequence != 1 or event.schema_version != 1:
+        counts.missing += 1
+        return
     parsed = _evaluation(event.payload)
     if (
         parsed is _StoreFailure.FAILED

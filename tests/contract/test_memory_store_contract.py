@@ -6,6 +6,9 @@ import pytest
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import (
     CommitBatch,
+    EventPrecondition,
+    EventPreconditionConflictError,
+    EventPreconditionNotFoundError,
     SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
@@ -53,6 +56,67 @@ async def test_commit_assigns_cursor_and_snapshot_atomically(store: StateStore) 
     assert snapshot is not None
     assert snapshot["status"] == "created"
     assert [item.cursor for item in await store.read_events(after_cursor=0)] == [1]
+
+
+@pytest.mark.parametrize(
+    ("case", "error_type"),
+    (
+        ("missing", EventPreconditionNotFoundError),
+        ("conflict", EventPreconditionConflictError),
+    ),
+    ids=("missing", "identity-conflict"),
+)
+@pytest.mark.asyncio
+async def test_event_precondition_failure_is_atomic(
+    store: StateStore,
+    case: str,
+    error_type: type[Exception],
+) -> None:
+    evidence = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={},
+    )
+    await store.commit(CommitBatch(events=(evidence,)))
+    precondition = EventPrecondition(
+        "evt_missing" if case == "missing" else evidence.event_id,
+        1 if case == "missing" else 2,
+        "ses_1",
+        "run_1",
+        "run.created",
+        1,
+    )
+    rejected = EventEnvelope.new(
+        type="evaluation.completed",
+        session_id="ses_1",
+        run_id="evl_rejected",
+        sequence=1,
+        payload={},
+    )
+
+    with pytest.raises(error_type):
+        await store.commit(
+            CommitBatch(
+                events=(rejected,),
+                snapshots=(
+                    SnapshotWrite(
+                        "evaluation",
+                        "evl_rejected",
+                        "ses_1",
+                        1,
+                        {"status": "rejected"},
+                    ),
+                ),
+                event_preconditions=(precondition,),
+            )
+        )
+
+    assert await store.get_snapshot("evaluation", "evl_rejected") is None
+    assert [item.event.event_id for item in await store.read_events(after_cursor=0)] == [
+        evidence.event_id
+    ]
 
 
 @pytest.mark.parametrize(

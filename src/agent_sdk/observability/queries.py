@@ -6,6 +6,7 @@ from typing import Any, NoReturn
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.runtime.models import RunSnapshot
 from agent_sdk.storage.base import StateStore, StoredEvent
+from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 
 from .models import (
     EventFilter,
@@ -54,16 +55,18 @@ class QueryService:
         for _ in range(_STABLE_READ_ATTEMPTS):
             before = await self._load_run(run_id)
             cursor = await self._latest_cursor()
-            events = await self._read_through(up_to_cursor=cursor)
+            events = _timeline_events(
+                await self._read_through(up_to_cursor=cursor),
+                run=before,
+                up_to_cursor=cursor,
+            )
+            if isinstance(events, _ReadFailure):
+                self._internal("failed to load run timeline")
             after = await self._load_run(run_id)
             if before == after:
                 return RunTimeline(
                     run_id=run_id,
-                    events=tuple(
-                        self._observed(stored)
-                        for stored in events
-                        if stored.cursor <= cursor and stored.event.run_id == run_id
-                    ),
+                    events=events,
                     as_of_cursor=cursor,
                 )
         raise AgentSDKError(
@@ -111,9 +114,7 @@ class QueryService:
         )
         return EventQueryResult(
             events=events,
-            next_cursor=(
-                stored_events[-1].cursor if len(stored_events) == limit else cursor
-            ),
+            next_cursor=(stored_events[-1].cursor if stored_events else cursor),
             as_of_cursor=cursor,
         )
 
@@ -150,6 +151,7 @@ class QueryService:
             and stored.event.session_id == root.session_id
         ]
         descendants = {root.run_id}
+        selected_ids: set[str] = set()
         selected: list[tuple[StoredEvent, RunSnapshot]] = []
         pending = created
         while pending:
@@ -160,12 +162,16 @@ class QueryService:
                 if isinstance(initial, _ReadFailure):
                     self._internal("failed to load execution tree")
                 if initial.run_id in descendants:
+                    if initial.run_id in selected_ids:
+                        self._internal("failed to load execution tree")
+                    selected_ids.add(initial.run_id)
                     selected.append((stored, initial))
                     progressed = True
                 elif initial.parent_run_id in descendants:
                     if initial.session_id != root.session_id:
                         self._internal("failed to load execution tree")
                     descendants.add(initial.run_id)
+                    selected_ids.add(initial.run_id)
                     selected.append((stored, initial))
                     progressed = True
                 else:
@@ -181,6 +187,7 @@ class QueryService:
                 or current.parent_run_id != initial.parent_run_id
                 or stored.event.session_id != current.session_id
                 or stored.event.run_id != current.run_id
+                or not _same_creation_identity(initial, current)
             ):
                 self._internal("failed to load execution tree")
             by_id[current.run_id] = ExecutionTreeNode(
@@ -197,8 +204,10 @@ class QueryService:
                 and stored.event.type == "run.created"
                 and stored.event.session_id != root.session_id
             ):
-                if parent_claim is _InvalidParent.INVALID:
+                if stored.event.run_id in descendants:
                     self._internal("failed to load execution tree")
+                if parent_claim is _InvalidParent.INVALID:
+                    continue
                 if parent_claim in descendants:
                     self._internal("failed to load execution tree")
         return tuple(by_id.values())
@@ -315,8 +324,6 @@ class QueryService:
                 self._internal("event page did not advance")
             events.extend(page)
             current = page[-1].cursor
-            if len(page) < _PAGE_SIZE:
-                break
         return events
 
     @staticmethod
@@ -347,6 +354,19 @@ def _parent_claim(payload: dict[str, Any]) -> str | None | _InvalidParent:
     return _InvalidParent.INVALID
 
 
+def _same_creation_identity(created: RunSnapshot, current: RunSnapshot) -> bool:
+    return (
+        created.run_id == current.run_id
+        and created.session_id == current.session_id
+        and created.agent_revision == current.agent_revision
+        and created.user_input == current.user_input
+        and created.parent_run_id == current.parent_run_id
+        and created.workflow_run_id == current.workflow_run_id
+        and created.workflow_node_id == current.workflow_node_id
+        and created.task_envelope == current.task_envelope
+    )
+
+
 async def _snapshot(
     store: StateStore,
     kind: str,
@@ -360,7 +380,7 @@ async def _snapshot(
 
 async def _cursor(store: StateStore) -> int | _ReadFailure:
     try:
-        return await store.latest_cursor()
+        return validate_latest_cursor(await store.latest_cursor())
     except Exception:
         return _ReadFailure.FAILED
 
@@ -373,7 +393,12 @@ async def _events(
     limit: int | None,
 ) -> list[StoredEvent] | _ReadFailure:
     try:
-        return await store.read_events(
+        return validate_event_page(
+            await store.read_events(
+                after_cursor=after_cursor,
+                up_to_cursor=up_to_cursor,
+                limit=limit,
+            ),
             after_cursor=after_cursor,
             up_to_cursor=up_to_cursor,
             limit=limit,
@@ -392,5 +417,27 @@ def _run_snapshot(data: dict[str, Any]) -> RunSnapshot | _ReadFailure:
 def _observed_event(stored: StoredEvent) -> ObservedEvent | _ReadFailure:
     try:
         return ObservedEvent(cursor=stored.cursor, event=stored.event)
+    except Exception:
+        return _ReadFailure.FAILED
+
+
+def _timeline_events(
+    stored_events: list[StoredEvent],
+    *,
+    run: RunSnapshot,
+    up_to_cursor: int,
+) -> tuple[ObservedEvent, ...] | _ReadFailure:
+    try:
+        selected: list[ObservedEvent] = []
+        for stored in stored_events:
+            if stored.cursor > up_to_cursor or stored.event.run_id != run.run_id:
+                continue
+            if stored.event.session_id != run.session_id:
+                return _ReadFailure.FAILED
+            observed = _observed_event(stored)
+            if isinstance(observed, _ReadFailure):
+                return _ReadFailure.FAILED
+            selected.append(observed)
+        return tuple(selected)
     except Exception:
         return _ReadFailure.FAILED

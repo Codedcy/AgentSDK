@@ -15,6 +15,8 @@ from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
     CommitResult,
+    EventPreconditionConflictError,
+    EventPreconditionNotFoundError,
     SnapshotPreconditionError,
     SnapshotWrite,
     StoredEvent,
@@ -106,6 +108,7 @@ class SQLiteStore:
             self._ensure_open()
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
+                await self._check_event_preconditions(batch)
                 await self._check_snapshot_preconditions(batch)
                 for event in batch.events:
                     await self._insert_event(event)
@@ -142,6 +145,31 @@ class SQLiteStore:
                 and cast(str, row[2]) != _canonical_json(precondition.data)
             ):
                 raise SnapshotPreconditionError("snapshot precondition failed")
+
+    async def _check_event_preconditions(self, batch: CommitBatch) -> None:
+        for precondition in batch.event_preconditions:
+            async with self._connection.execute(
+                """
+                SELECT cursor, session_id, run_id, type, sequence
+                FROM events WHERE event_id = ?
+                """,
+                (precondition.event_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                raise EventPreconditionNotFoundError(
+                    "event precondition failed"
+                )
+            if (
+                cast(int, row[0]) != precondition.cursor
+                or cast(str, row[1]) != precondition.session_id
+                or cast(str | None, row[2]) != precondition.run_id
+                or cast(str, row[3]) != precondition.type
+                or cast(int, row[4]) != precondition.sequence
+            ):
+                raise EventPreconditionConflictError(
+                    "event precondition failed"
+                )
 
     async def read_events(
         self,

@@ -34,10 +34,32 @@ class SnapshotPreconditionError(ValueError):
     """A required snapshot was missing or no longer at the expected version."""
 
 
+class EventPrecondition(NamedTuple):
+    event_id: str
+    cursor: int
+    session_id: str
+    run_id: str | None
+    type: str
+    sequence: int
+
+
+class EventPreconditionError(ValueError):
+    """A required evidence event was missing or had changed identity."""
+
+
+class EventPreconditionNotFoundError(EventPreconditionError):
+    """A required evidence event no longer exists."""
+
+
+class EventPreconditionConflictError(EventPreconditionError):
+    """A required evidence event exists with a different durable identity."""
+
+
 class CommitBatch(NamedTuple):
     events: tuple[EventEnvelope, ...]
     snapshots: tuple[SnapshotWrite, ...] = ()
     preconditions: tuple[SnapshotPrecondition, ...] = ()
+    event_preconditions: tuple[EventPrecondition, ...] = ()
 
 
 class CommitResult(NamedTuple):

@@ -326,3 +326,134 @@ async def test_subscription_rejects_malformed_store_page_without_spinning(
         for frame in frames
         for value in frame.f_locals.values()
     )
+
+
+class _InvalidEventPageStore(InMemoryStore):
+    def __init__(self, kind: str) -> None:
+        super().__init__()
+        valid = EventEnvelope.new(
+            type="skip",
+            session_id="ses_invalid_event",
+            run_id=None,
+            sequence=1,
+            payload={"secret": "must-not-leak-invalid-event-page"},
+        )
+        event: object
+        if kind == "object":
+            event = object()
+        elif kind == "model-construct":
+            event = EventEnvelope.model_construct(
+                **valid.model_dump(exclude={"type"})
+            )
+        else:
+            values = valid.model_dump()
+            values["payload"] = (
+                {
+                    "secret": "must-not-leak-invalid-event-page",
+                    "bad": object(),
+                }
+                if kind == "object-payload"
+                else {
+                    "secret": "must-not-leak-invalid-event-page",
+                    "bad": float("nan"),
+                }
+            )
+            event = EventEnvelope.model_construct(**values)
+        self._page = [StoredEvent(cursor=1, event=event)]
+        self.reads = 0
+
+    async def latest_cursor(self) -> int:
+        return 1
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        self.reads += 1
+        return self._page
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("object", "model-construct", "object-payload", "nan-payload"),
+)
+@pytest.mark.asyncio
+async def test_subscription_rejects_invalid_event_without_leak_or_reread(
+    kind: str,
+) -> None:
+    store = _InvalidEventPageStore(kind)
+    stream = SubscriptionService(store).subscribe(
+        filters=EventFilter(event_types=("match",)),
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await asyncio.wait_for(anext(stream), timeout=1)
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert store.reads == 1
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-invalid-event-page" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+
+
+class _OneEventSubscriptionStore(InMemoryStore):
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        return await super().read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_subscription_immediately_continues_across_short_nonempty_page() -> None:
+    store = _OneEventSubscriptionStore()
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="skip",
+                    session_id="ses_short_subscription",
+                    run_id=None,
+                    sequence=1,
+                    payload={},
+                ),
+                EventEnvelope.new(
+                    type="match",
+                    session_id="ses_short_subscription",
+                    run_id=None,
+                    sequence=2,
+                    payload={},
+                ),
+            )
+        )
+    )
+    stream = SubscriptionService(store, poll_interval=10).subscribe(
+        filters=EventFilter(event_types=("match",)),
+    )
+
+    observed = await asyncio.wait_for(anext(stream), timeout=1)
+    await stream.aclose()
+
+    assert observed.event.type == "match"

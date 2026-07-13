@@ -12,6 +12,7 @@ from agent_sdk.evaluation import EvaluationResult, EvaluationVerdict
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.storage.base import CommitBatch, StateStore
+from agent_sdk.storage.base import StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools import ToolResult, ToolResultStatus
@@ -89,6 +90,161 @@ def _tool_event(
         run_id=f"run_{call_id}",
         sequence=1,
         payload=result.model_dump(mode="json"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_evaluation_sequence_and_schema_are_attributable_missing() -> None:
+    store = InMemoryStore()
+    session = await RuntimeCommands(store).create_session(workspaces=[])
+    result = _evaluation(
+        evaluation_id="evl_immutable",
+        session_id=session.session_id,
+        evaluator_id="eval-a",
+        verdict=EvaluationVerdict.PASS,
+    )
+    invalid_schema = _evaluation(
+        evaluation_id="evl_schema_2",
+        session_id=session.session_id,
+        evaluator_id="eval-a",
+        verdict=EvaluationVerdict.PASS,
+    )
+    for event in (
+        _evaluation_event(result),
+        EventEnvelope.new(
+            type="evaluation.completed",
+            session_id=result.session_id,
+            run_id=result.evaluation_id,
+            sequence=2,
+            payload=result.model_dump(mode="json"),
+        ),
+        EventEnvelope.new(
+            schema_version=2,
+            type="evaluation.completed",
+            session_id=invalid_schema.session_id,
+            run_id=invalid_schema.evaluation_id,
+            sequence=1,
+            payload=invalid_schema.model_dump(mode="json"),
+        ),
+    ):
+        await store.commit(CommitBatch(events=(event,)))
+
+    metric = await AnalyticsQueries(store).success_rate()
+
+    assert metric.value == 1.0
+    assert metric.sample_count == 1
+    assert metric.missing_count == 2
+    assert len(metric.evidence_event_ids) == 3
+
+
+class _OneEventAnalyticsStore:
+    def __init__(self, delegate: InMemoryStore) -> None:
+        self.delegate = delegate
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        return await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=1,
+        )
+
+    async def latest_cursor(self) -> int:
+        return await self.delegate.latest_cursor()
+
+
+@pytest.mark.asyncio
+async def test_analytics_reads_all_valid_short_store_pages() -> None:
+    delegate = InMemoryStore()
+    session = await RuntimeCommands(delegate).create_session(workspaces=[])
+    for evaluation_id, verdict in (
+        ("evl_short_pass", EvaluationVerdict.PASS),
+        ("evl_short_fail", EvaluationVerdict.FAIL),
+    ):
+        await delegate.commit(
+            CommitBatch(
+                events=(
+                    _evaluation_event(
+                        _evaluation(
+                            evaluation_id=evaluation_id,
+                            session_id=session.session_id,
+                            evaluator_id="eval-a",
+                            verdict=verdict,
+                        )
+                    ),
+                )
+            )
+        )
+
+    metric = await AnalyticsQueries(_OneEventAnalyticsStore(delegate)).success_rate()
+
+    assert metric.value == 0.5
+    assert metric.sample_count == 2
+    assert metric.missing_count == 0
+
+
+class _InvalidAnalyticsStore:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        event = EventEnvelope.new(
+            type="noise",
+            session_id="ses_bad_analytics",
+            run_id=None,
+            sequence=1,
+            payload={"secret": "must-not-leak-invalid-analytics-store"},
+        )
+        cursor: object = "1" if mode == "string-page-cursor" else -1
+        stored_event: object = event
+        if mode == "event-object":
+            cursor = 1
+            stored_event = object()
+        self._page = [StoredEvent(cursor=cursor, event=stored_event)]
+
+    async def latest_cursor(self):
+        if self.mode == "negative-high-water":
+            return -1
+        if self.mode == "string-high-water":
+            return "1"
+        return 1
+
+    async def read_events(self, **_: object):
+        return self._page
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "negative-high-water",
+        "string-high-water",
+        "negative-page-cursor",
+        "string-page-cursor",
+        "event-object",
+    ),
+)
+@pytest.mark.asyncio
+async def test_analytics_rejects_invalid_store_values_without_leak(mode: str) -> None:
+    with pytest.raises(AgentSDKError) as captured:
+        await AnalyticsQueries(_InvalidAnalyticsStore(mode)).success_rate()
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-invalid-analytics-store" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
     )
 
 

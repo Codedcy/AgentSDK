@@ -9,8 +9,8 @@ from agent_sdk import AgentSDKError, ErrorCode
 from agent_sdk.observability import EventFilter, QueryService
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.commands import RuntimeCommands
-from agent_sdk.runtime.models import RunStatus
-from agent_sdk.storage.base import CommitBatch, StateStore
+from agent_sdk.runtime.models import RunSnapshot, RunStatus
+from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -99,6 +99,183 @@ async def test_timeline_filters_exact_run_and_returns_immutable_detached_events(
     persisted = await store.get_snapshot("run", first.run_id)
     assert persisted is not None
     assert persisted["status"] == RunStatus.CREATED.value
+
+
+@pytest.mark.asyncio
+async def test_timeline_rejects_same_run_event_from_another_session_without_leak() -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="agent:1",
+        user_input="timeline",
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="run.progress",
+                    session_id="ses_attacker",
+                    run_id=run.run_id,
+                    sequence=2,
+                    payload={"secret": "must-not-leak-cross-session-timeline"},
+                ),
+            )
+        )
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).timeline(run.run_id)
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-cross-session-timeline" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+
+
+class _OneEventQueryStore:
+    def __init__(self, delegate: InMemoryStore) -> None:
+        self.delegate = delegate
+
+    async def commit(self, batch: CommitBatch):
+        return await self.delegate.commit(batch)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        return await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=1,
+        )
+
+    async def get_snapshot(self, kind: str, entity_id: str):
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+    async def latest_cursor(self) -> int:
+        return await self.delegate.latest_cursor()
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.delegate.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_queries_continue_across_valid_short_store_pages() -> None:
+    delegate = InMemoryStore()
+    store = _OneEventQueryStore(delegate)
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="agent:1",
+        user_input="short pages",
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="run.progress",
+                    session_id=session.session_id,
+                    run_id=run.run_id,
+                    sequence=2,
+                    payload={"step": 1},
+                ),
+                EventEnvelope.new(
+                    type="run.progress",
+                    session_id=session.session_id,
+                    run_id=run.run_id,
+                    sequence=3,
+                    payload={"step": 2},
+                ),
+            )
+        )
+    )
+    service = QueryService(store)
+
+    first = await service.query_events(after_cursor=0, limit=100)
+    timeline = await service.timeline(run.run_id)
+
+    assert first.next_cursor == first.events[-1].cursor == 1
+    assert first.next_cursor < first.as_of_cursor
+    assert [item.event.type for item in timeline.events] == [
+        "run.created",
+        "run.progress",
+        "run.progress",
+    ]
+
+
+class _InvalidQueryStore:
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        event = EventEnvelope.new(
+            type="noise",
+            session_id="ses_bad_query",
+            run_id=None,
+            sequence=1,
+            payload={"secret": "must-not-leak-invalid-query-store"},
+        )
+        cursor: object = "1" if mode == "string-page-cursor" else -1
+        stored_event: object = event
+        if mode == "event-object":
+            cursor = 1
+            stored_event = object()
+        self._page = [StoredEvent(cursor=cursor, event=stored_event)]
+
+    async def latest_cursor(self):
+        if self.mode == "negative-high-water":
+            return -1
+        if self.mode == "string-high-water":
+            return "1"
+        return 1
+
+    async def read_events(self, **_: object):
+        return self._page
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "negative-high-water",
+        "string-high-water",
+        "negative-page-cursor",
+        "string-page-cursor",
+        "event-object",
+    ),
+)
+@pytest.mark.asyncio
+async def test_query_rejects_invalid_store_values_without_leak(mode: str) -> None:
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(_InvalidQueryStore(mode)).query_events()
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-invalid-query-store" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
 
 
 @pytest.mark.asyncio
@@ -407,7 +584,7 @@ async def test_execution_tree_final_confirmation_detects_eventless_session_delet
 
 
 @pytest.mark.asyncio
-async def test_execution_tree_sanitizes_unhashable_cross_session_parent_claim() -> None:
+async def test_execution_tree_ignores_unhashable_unrelated_cross_session_parent() -> None:
     store = InMemoryStore()
     commands = RuntimeCommands(store)
     session = await commands.create_session(workspaces=[])
@@ -430,10 +607,70 @@ async def test_execution_tree_sanitizes_unhashable_cross_session_parent_claim() 
         )
     )
 
-    with pytest.raises(Exception) as captured:
+    tree = await QueryService(store).execution_tree(root.run_id)
+
+    assert [node.snapshot.run_id for node in tree.nodes] == [root.run_id]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("immutable-mismatch", "duplicate-created", "cross-session-duplicate"),
+)
+@pytest.mark.asyncio
+async def test_execution_tree_rejects_inconsistent_run_creation(case: str) -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        session.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    if case == "immutable-mismatch":
+        await store.commit(
+            CommitBatch(
+                events=(),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        root.run_id,
+                        session.session_id,
+                        2,
+                        RunSnapshot.model_validate(
+                            {
+                                **root.model_dump(mode="json"),
+                                "agent_revision": "tampered:2",
+                                "status": "running",
+                                "version": 2,
+                            }
+                        ).model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+    else:
+        await store.commit(
+            CommitBatch(
+                events=(
+                    EventEnvelope.new(
+                        type="run.created",
+                        session_id=(
+                            "ses_foreign_duplicate"
+                            if case == "cross-session-duplicate"
+                            else session.session_id
+                        ),
+                        run_id=root.run_id,
+                        sequence=2,
+                        payload=root.model_dump(mode="json"),
+                    ),
+                )
+            )
+        )
+
+    with pytest.raises(AgentSDKError) as captured:
         await QueryService(store).execution_tree(root.run_id)
 
-    assert getattr(captured.value, "code", None).value == "internal"
+    assert captured.value.code is ErrorCode.INTERNAL
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
 

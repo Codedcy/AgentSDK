@@ -16,11 +16,12 @@ from agent_sdk.evaluation import (
     EvaluationVerdict,
     ExactOutputEvaluator,
 )
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.models import RunSnapshot
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore
+from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -208,6 +209,30 @@ class _DecisionEvaluator:
         return self.decision
 
 
+class _ModelConstructEvaluator:
+    id = "model-construct"
+    version = "1"
+    method = "adversarial"
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    async def evaluate(self, subject: EvaluationSubject) -> EvaluationDecision:
+        terminal = subject.timeline.events[-1].event.event_id
+        values: dict[str, object] = {
+            "verdict": EvaluationVerdict.PASS,
+            "metrics": {"score": 1.0},
+            "reason": "accepted",
+            "confidence": 1.0,
+            "evidence_event_ids": (terminal,),
+        }
+        if self.kind == "nan-metric":
+            values["metrics"] = {"must-not-leak": float("nan")}
+        else:
+            values["reason"] = object()
+        return EvaluationDecision.model_construct(**values)
+
+
 class _RaisingEvaluator:
     id = "raising"
     version = "1"
@@ -299,6 +324,28 @@ async def test_evaluator_failures_are_sanitized_with_zero_writes(case: str) -> N
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     assert "must-not-leak" not in str(captured.value)
+    _assert_no_extension_traceback(captured.value)
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await store.read_events(after_cursor=0)
+    )
+
+
+@pytest.mark.parametrize("kind", ("nan-metric", "invalid-reason"))
+@pytest.mark.asyncio
+async def test_model_construct_decision_is_revalidated_without_write(kind: str) -> None:
+    store = InMemoryStore()
+    _, terminal = await _terminal_run(store)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await EvaluationEngine(store).evaluate(
+            terminal.run_id,
+            _ModelConstructEvaluator(kind),
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
     _assert_no_extension_traceback(captured.value)
     assert not any(
         item.event.type == "evaluation.completed"
@@ -408,10 +455,166 @@ async def test_delete_recreate_same_ids_and_versions_cannot_satisfy_evaluation_c
     with pytest.raises(AgentSDKError) as captured:
         await task
 
-    assert captured.value.code is ErrorCode.CONFLICT
+    assert captured.value.code is ErrorCode.NOT_FOUND
     assert not any(
         item.event.type == "evaluation.completed"
         for item in await store.read_events(after_cursor=0)
+    )
+
+
+@pytest.mark.asyncio
+async def test_identical_snapshot_recreation_cannot_outlive_evidence() -> None:
+    store = InMemoryStore()
+    session_id, terminal = await _terminal_run(store)
+    session_data = await store.get_snapshot("session", session_id)
+    run_data = await store.get_snapshot("run", terminal.run_id)
+    assert session_data is not None
+    assert run_data is not None
+    evaluator = _BlockingEvaluator()
+    task = asyncio.create_task(EvaluationEngine(store).evaluate(terminal.run_id, evaluator))
+    await asyncio.wait_for(evaluator.started.wait(), timeout=1)
+
+    await store.delete_session(session_id)
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite("session", session_id, session_id, 1, session_data),
+                SnapshotWrite(
+                    "run",
+                    terminal.run_id,
+                    session_id,
+                    terminal.version,
+                    run_data,
+                ),
+            ),
+        )
+    )
+    evaluator.release.set()
+
+    with pytest.raises(AgentSDKError) as captured:
+        await task
+
+    assert captured.value.code is ErrorCode.NOT_FOUND
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await store.read_events(after_cursor=0)
+    )
+
+
+class _OneEventPageStore:
+    def __init__(self, delegate: InMemoryStore) -> None:
+        self.delegate = delegate
+
+    async def commit(self, batch: CommitBatch):
+        return await self.delegate.commit(batch)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        return await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=1,
+        )
+
+    async def get_snapshot(self, kind: str, entity_id: str):
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+    async def latest_cursor(self) -> int:
+        return await self.delegate.latest_cursor()
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.delegate.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_evaluation_reads_complete_subject_from_short_store_pages() -> None:
+    delegate = InMemoryStore()
+    store = _OneEventPageStore(delegate)
+    _, terminal = await _terminal_run(store)
+
+    result = await EvaluationEngine(store).evaluate(
+        terminal.run_id,
+        ExactOutputEvaluator(expected="ok"),
+    )
+
+    assert result.verdict is EvaluationVerdict.PASS
+    assert len(result.evidence_event_ids) == 1
+
+
+class _InvalidEvaluationStore(_OneEventPageStore):
+    def __init__(self, delegate: InMemoryStore, mode: str) -> None:
+        super().__init__(delegate)
+        self.mode = mode
+        event = EventEnvelope.new(
+            type="noise",
+            session_id="ses_bad_evaluation",
+            run_id=None,
+            sequence=1,
+            payload={"secret": "must-not-leak-invalid-evaluation-store"},
+        )
+        cursor: object = "1" if mode == "string-page-cursor" else -1
+        stored_event: object = event
+        if mode == "event-object":
+            cursor = 1
+            stored_event = object()
+        self._page = [StoredEvent(cursor=cursor, event=stored_event)]
+
+    async def latest_cursor(self):
+        if self.mode == "negative-high-water":
+            return -1
+        if self.mode == "string-high-water":
+            return "1"
+        return await self.delegate.latest_cursor()
+
+    async def read_events(self, **_: object):
+        return self._page
+
+
+@pytest.mark.parametrize(
+    "mode",
+    (
+        "negative-high-water",
+        "string-high-water",
+        "negative-page-cursor",
+        "string-page-cursor",
+        "event-object",
+    ),
+)
+@pytest.mark.asyncio
+async def test_evaluation_rejects_invalid_store_values_without_leak(mode: str) -> None:
+    delegate = InMemoryStore()
+    _, terminal = await _terminal_run(delegate)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await EvaluationEngine(_InvalidEvaluationStore(delegate, mode)).evaluate(
+            terminal.run_id,
+            ExactOutputEvaluator(expected="ok"),
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-invalid-evaluation-store" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await delegate.read_events(after_cursor=0)
     )
 
 

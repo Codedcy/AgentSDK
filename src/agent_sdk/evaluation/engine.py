@@ -12,6 +12,9 @@ from agent_sdk.observability import ObservedEvent, RunTimeline
 from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
 from agent_sdk.storage.base import (
     CommitBatch,
+    EventPrecondition,
+    EventPreconditionConflictError,
+    EventPreconditionNotFoundError,
     SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
@@ -19,6 +22,7 @@ from agent_sdk.storage.base import (
     StoredEvent,
     canonical_snapshot_data,
 )
+from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 
 from .evaluators import Evaluator
 from .models import (
@@ -38,6 +42,8 @@ class _Failure(Enum):
 
 class _CommitFailure(Enum):
     PRECONDITION = "precondition"
+    EVENT_NOT_FOUND = "event_not_found"
+    EVENT_CONFLICT = "event_conflict"
     VALUE = "value"
     FAILED = "failed"
 
@@ -130,8 +136,24 @@ class EvaluationEngine:
                         data=observation.run_data,
                     ),
                 ),
+                event_preconditions=_evidence_preconditions(
+                    observation.subject,
+                    decision,
+                ),
             ),
         )
+        if commit is _CommitFailure.EVENT_NOT_FOUND:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "evaluation evidence no longer exists",
+                retryable=False,
+            )
+        if commit is _CommitFailure.EVENT_CONFLICT:
+            raise AgentSDKError(
+                ErrorCode.CONFLICT,
+                "evaluation evidence changed",
+                retryable=True,
+            )
         if commit is _CommitFailure.PRECONDITION:
             await self._raise_changed_subject(observation)
         if commit is _CommitFailure.VALUE:
@@ -278,7 +300,10 @@ async def _invoke_evaluator(
         evaluator_id = _metadata(evaluator.id)
         version = _metadata(evaluator.version)
         method = _metadata(evaluator.method)
-        decision = EvaluationDecision.model_validate(await evaluator.evaluate(subject))
+        raw_decision: object = await evaluator.evaluate(subject)
+        if isinstance(raw_decision, EvaluationDecision):
+            raw_decision = raw_decision.model_dump(mode="python", warnings="error")
+        decision = EvaluationDecision.model_validate(raw_decision, strict=True)
         available_evidence = {
             item.event.event_id for item in subject.timeline.events
         }
@@ -306,7 +331,7 @@ async def _get_snapshot(
 
 async def _latest_cursor(store: StateStore) -> int | _Failure:
     try:
-        return await store.latest_cursor()
+        return validate_latest_cursor(await store.latest_cursor())
     except Exception:
         return _Failure.FAILED
 
@@ -319,7 +344,12 @@ async def _read_through(
     current = 0
     try:
         while current < up_to_cursor:
-            page = await store.read_events(
+            page = validate_event_page(
+                await store.read_events(
+                    after_cursor=current,
+                    up_to_cursor=up_to_cursor,
+                    limit=_PAGE_SIZE,
+                ),
                 after_cursor=current,
                 up_to_cursor=up_to_cursor,
                 limit=_PAGE_SIZE,
@@ -330,8 +360,6 @@ async def _read_through(
                 return _Failure.FAILED
             events.extend(page)
             current = page[-1].cursor
-            if len(page) < _PAGE_SIZE:
-                break
         return events
     except Exception:
         return _Failure.FAILED
@@ -379,6 +407,26 @@ def _subject_timeline(
         return _Failure.FAILED
 
 
+def _evidence_preconditions(
+    subject: EvaluationSubject,
+    decision: EvaluationDecision,
+) -> tuple[EventPrecondition, ...]:
+    required = set(decision.evidence_event_ids)
+    required.add(subject.timeline.events[-1].event.event_id)
+    return tuple(
+        EventPrecondition(
+            event_id=item.event.event_id,
+            cursor=item.cursor,
+            session_id=item.event.session_id,
+            run_id=item.event.run_id,
+            type=item.event.type,
+            sequence=item.event.sequence,
+        )
+        for item in subject.timeline.events
+        if item.event.event_id in required
+    )
+
+
 async def _commit(
     store: StateStore,
     batch: CommitBatch,
@@ -386,6 +434,10 @@ async def _commit(
     try:
         await store.commit(batch)
         return None
+    except EventPreconditionNotFoundError:
+        return _CommitFailure.EVENT_NOT_FOUND
+    except EventPreconditionConflictError:
+        return _CommitFailure.EVENT_CONFLICT
     except SnapshotPreconditionError:
         return _CommitFailure.PRECONDITION
     except ValueError:

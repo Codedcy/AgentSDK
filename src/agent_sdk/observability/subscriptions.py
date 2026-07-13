@@ -6,6 +6,7 @@ from enum import Enum
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.storage.base import StateStore, StoredEvent
+from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 
 from .models import EventFilter, ObservedEvent
 
@@ -94,7 +95,7 @@ class SubscriptionService:
                             retryable=False,
                         )
                     yield observed
-            if len(page) == _PAGE_SIZE:
+            if page:
                 continue
             if await self._wait_for_close():
                 return
@@ -116,7 +117,7 @@ class SubscriptionService:
 
 async def _latest_cursor(store: StateStore) -> int | _StoreFailure:
     try:
-        return await store.latest_cursor()
+        return validate_latest_cursor(await store.latest_cursor())
     except Exception:
         return _StoreFailure.FAILED
 
@@ -126,20 +127,14 @@ async def _read_page(
     after_cursor: int,
 ) -> list[StoredEvent] | _StoreFailure:
     try:
-        page = await store.read_events(
+        return validate_event_page(
+            await store.read_events(
+                after_cursor=after_cursor,
+                limit=_PAGE_SIZE,
+            ),
             after_cursor=after_cursor,
             limit=_PAGE_SIZE,
         )
-        if not page:
-            return page
-        if not 1 <= len(page) <= _PAGE_SIZE:
-            return _StoreFailure.FAILED
-        previous_cursor = after_cursor
-        for stored in page:
-            if type(stored.cursor) is not int or stored.cursor <= previous_cursor:
-                return _StoreFailure.FAILED
-            previous_cursor = stored.cursor
-        return page
     except Exception:
         return _StoreFailure.FAILED
 

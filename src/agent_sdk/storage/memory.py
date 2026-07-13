@@ -7,6 +7,8 @@ from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
     CommitResult,
+    EventPreconditionConflictError,
+    EventPreconditionNotFoundError,
     SnapshotPreconditionError,
     SnapshotWrite,
     StoredEvent,
@@ -31,20 +33,41 @@ class InMemoryStore:
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         async with self._lock:
-            for precondition in batch.preconditions:
+            if batch.event_preconditions:
+                events_by_id = {
+                    stored.event.event_id: stored for stored in self._events
+                }
+                for event_precondition in batch.event_preconditions:
+                    stored = events_by_id.get(event_precondition.event_id)
+                    if stored is None:
+                        raise EventPreconditionNotFoundError(
+                            "event precondition failed"
+                        )
+                    event = stored.event
+                    if (
+                        stored.cursor != event_precondition.cursor
+                        or event.session_id != event_precondition.session_id
+                        or event.run_id != event_precondition.run_id
+                        or event.type != event_precondition.type
+                        or event.sequence != event_precondition.sequence
+                    ):
+                        raise EventPreconditionConflictError(
+                            "event precondition failed"
+                        )
+            for snapshot_precondition in batch.preconditions:
                 snapshot = self._snapshots.get(
-                    (precondition.kind, precondition.entity_id)
+                    (snapshot_precondition.kind, snapshot_precondition.entity_id)
                 )
                 if snapshot is None or (
-                    precondition.version is not None
-                    and snapshot.version != precondition.version
+                    snapshot_precondition.version is not None
+                    and snapshot.version != snapshot_precondition.version
                 ) or (
-                    precondition.session_id is not None
-                    and snapshot.session_id != precondition.session_id
+                    snapshot_precondition.session_id is not None
+                    and snapshot.session_id != snapshot_precondition.session_id
                 ) or (
-                    precondition.data is not None
+                    snapshot_precondition.data is not None
                     and canonical_snapshot_data(snapshot.data)
-                    != canonical_snapshot_data(precondition.data)
+                    != canonical_snapshot_data(snapshot_precondition.data)
                 ):
                     raise SnapshotPreconditionError(
                         "snapshot precondition failed"
