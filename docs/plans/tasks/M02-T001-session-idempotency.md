@@ -81,7 +81,11 @@ async def test_mismatched_idempotency_reuse_is_atomic(store_factory: StoreFactor
 
 Also cover: empty/over-256 keys, invalid fingerprints, non-JSON/non-finite
 results, returned-result defensive copying, concurrent matching commits, key
-scope independence, deletion cleanup, and `CancelledError` propagation.
+scope independence, deletion cleanup, and `CancelledError` propagation. Add a
+real version-1 database fixture containing active and terminal Run/Workflow
+snapshots and assert upgrade backfills only the nonterminal ids in deterministic
+order without changing the Session version. Unknown/corrupt status data must
+abort upgrade and leave version 2 unapplied.
 
 - [ ] **Step 2: Run RED and confirm the missing contract**
 
@@ -192,6 +196,36 @@ version-1 database, apply only migration 2. Accept only final versions `(1, 2)`;
 continue rejecting gaps, duplicates, unknown future versions, malformed tables,
 and unexpected index shapes. Migration and its version insert share one SQLite
 transaction.
+
+Before recording version 2 for an existing database, backfill the representation
+that Task 2 will validate. Under the same transaction:
+
+```python
+for session_row in await _snapshot_rows("session"):
+    session = _strict_json_object(session_row.data_json)
+    if set(session) != {"session_id", "status", "workspaces", "version"}:
+        raise ValueError("incompatible version-1 session projection")
+    if session["status"] != "active":
+        raise ValueError("incompatible version-1 session status")
+    session["active_run_ids"] = sorted(
+        row.entity_id
+        for row in await _owned_snapshot_rows(session["session_id"], "run")
+        if _v1_run_is_nonterminal(row.data_json)
+    )
+    session["active_workflow_run_ids"] = sorted(
+        row.entity_id
+        for row in await _owned_snapshot_rows(session["session_id"], "workflow")
+        if _v1_workflow_is_nonterminal(row.data_json)
+    )
+    await _replace_snapshot_json(session_row, session)
+```
+
+Validate entity/session ownership inside every decoded projection. Known M01
+nonterminal Run statuses are `created`, `running`, and `waiting_permission`;
+known terminal statuses are `completed` and `failed`. Known Workflow status is
+`running`, `completed`, or `failed`. Any other/malformed status aborts the whole
+migration. Keep the Session projection version unchanged: this is schema
+representation backfill, not a domain event.
 
 - [ ] **Step 6: Implement SQLite arbitration and lazy forwarding**
 

@@ -252,6 +252,15 @@ version 2. A new database applies versions 1 and 2. Unsupported, missing,
 duplicate, or malformed version rows remain fail-closed. The generalized
 checksum/dry-run migration engine belongs to M02-T003.
 
+Version-1 Session JSON does not contain the new ownership tuples. During the
+same v1-to-v2 migration transaction, SQLite scans Session-owned Run and Workflow
+snapshots, validates their known status schemas, and backfills each Session with
+deterministically ordered nonterminal ids. The representation upgrade keeps the
+existing Session version because it adds derived fields rather than a domain
+transition. A corrupt/unknown snapshot aborts the migration instead of risking a
+false `closed` decision. New databases need no backfill because no projections
+exist before the current runtime writes them.
+
 Memory and SQLite Stores have identical replay, conflict, deletion, defensive
 copy, and cursor behavior. Idempotent replay does not allocate a new global
 event cursor.
@@ -280,6 +289,8 @@ The task is accepted only when tests prove:
   Memory/SQLite parity;
 - concurrent same-key callers create one Session, Run, or Workflow;
 - same key survives SQLite reopen and returns the first result;
+- a version-1 database with nonterminal Run/Workflow snapshots upgrades with
+  exact active ownership and cannot be closed prematurely;
 - different keys continue to create different entities;
 - close/start and close/terminal races resolve without orphaned work;
 - a Run or Workflow terminal transition automatically closes the final closing
