@@ -461,13 +461,30 @@ class AgentSDK:
     def for_test(
         cls,
         *,
-        store: StateStore,
         acompletion: _ACompletion,
+        store: StateStore | None = None,
+        database_path: str | Path | None = None,
         permission_default: _PermissionDefault = "ask",
         permission_bridge: InProcessPermissionBridge | None | object = (
             _DEFAULT_PERMISSION_BRIDGE
         ),
     ) -> AgentSDK:
+        if (store is None) == (database_path is None):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "exactly one test Store or database path is required",
+                retryable=False,
+            )
+        selected_store: StateStore
+        owned_close: Callable[[], Awaitable[None]] | None
+        if database_path is not None:
+            lazy_store = _LazySQLiteStore(Path(database_path))
+            selected_store = lazy_store
+            owned_close = lazy_store.close
+        else:
+            assert store is not None
+            selected_store = store
+            owned_close = None
         sdk = cls.__new__(cls)
         bridge = (
             InProcessPermissionBridge()
@@ -475,11 +492,11 @@ class AgentSDK:
             else cast(InProcessPermissionBridge | None, permission_bridge)
         )
         sdk._initialize(
-            store,
+            selected_store,
             LiteLLMGateway._for_test(acompletion),
             permission_default=permission_default,
             permission_bridge=bridge,
-            owned_close=None,
+            owned_close=owned_close,
         )
         return sdk
 
