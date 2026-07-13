@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Generic, TypeAlias, TypeVar
 
 import litellm
@@ -56,6 +57,11 @@ class StructuredCompletion(Generic[_StructuredModel]):
     @property
     def value(self) -> _StructuredModel:
         return self.parsed
+
+
+class _StructuredFailure(Enum):
+    PROVIDER = "provider"
+    RESPONSE = "response"
 
 
 @dataclass(frozen=True)
@@ -117,8 +123,26 @@ class LiteLLMGateway:
         request: ModelRequest,
         schema: type[_StructuredModel],
     ) -> StructuredCompletion[_StructuredModel]:
-        provider_failed = False
-        response: Any = None
+        result = await self._complete_structured(request, schema)
+        if result is _StructuredFailure.PROVIDER:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "structured model call failed",
+                retryable=False,
+            )
+        if result is _StructuredFailure.RESPONSE:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "structured model response invalid",
+                retryable=False,
+            )
+        return result
+
+    async def _complete_structured(
+        self,
+        request: ModelRequest,
+        schema: type[_StructuredModel],
+    ) -> StructuredCompletion[_StructuredModel] | _StructuredFailure:
         try:
             params = deepcopy(dict(request.params))
             params["stream"] = False
@@ -130,17 +154,8 @@ class LiteLLMGateway:
                 **params,
             )
         except Exception:
-            provider_failed = True
-        if provider_failed:
-            raise AgentSDKError(
-                ErrorCode.INTERNAL,
-                "structured model call failed",
-                retryable=False,
-            )
+            return _StructuredFailure.PROVIDER
 
-        response_invalid = False
-        value: _StructuredModel | None = None
-        usage: UsageReported | None = None
         try:
             choices = _value(response, "choices")
             if (
@@ -182,15 +197,7 @@ class LiteLLMGateway:
                 ),
             )
         except Exception:
-            response_invalid = True
-        if response_invalid:
-            raise AgentSDKError(
-                ErrorCode.INTERNAL,
-                "structured model response invalid",
-                retryable=False,
-            )
-        assert value is not None
-        assert usage is not None
+            return _StructuredFailure.RESPONSE
         return StructuredCompletion(parsed=value, usage=usage)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:

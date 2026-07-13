@@ -34,6 +34,45 @@ from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
 
+def _traceback_frame_locals(
+    error: BaseException,
+) -> list[tuple[str, dict[str, Any]]]:
+    frames: list[tuple[str, dict[str, Any]]] = []
+    cursor = error.__traceback__
+    while cursor is not None:
+        frames.append(
+            (cursor.tb_frame.f_code.co_name, dict(cursor.tb_frame.f_locals))
+        )
+        cursor = cursor.tb_next
+    return frames
+
+
+def _assert_public_structured_failure_frame_is_sanitized(
+    frames: list[tuple[str, dict[str, Any]]],
+) -> None:
+    public_frames = [
+        frame_locals
+        for name, frame_locals in frames
+        if name == "complete_structured"
+    ]
+    assert len(public_frames) == 1
+    forbidden_raw_locals = {
+        "choices",
+        "content",
+        "message",
+        "params",
+        "parsed",
+        "raw_usage",
+        "response",
+        "usage",
+        "value",
+    }
+    assert forbidden_raw_locals.isdisjoint(public_frames[0])
+    assert not any(
+        isinstance(value, BaseException) for value in public_frames[0].values()
+    )
+
+
 def _event(
     event_id: str,
     event_type: str,
@@ -378,9 +417,9 @@ async def test_gateway_sanitizes_malformed_structured_responses(
 
 
 @pytest.mark.asyncio
-async def test_gateway_sanitizes_provider_failure_and_propagates_cancellation() -> None:
+async def test_gateway_provider_failure_drops_raw_traceback_frame_locals() -> None:
     async def failed(**_: object) -> object:
-        raise RuntimeError("provider secret")
+        raise RuntimeError("provider-frame-local-secret")
 
     with pytest.raises(AgentSDKError) as raised:
         await LiteLLMGateway._for_test(failed).complete_structured(
@@ -388,13 +427,22 @@ async def test_gateway_sanitizes_provider_failure_and_propagates_cancellation() 
             ContextCapsule,
         )
     assert raised.value.message == "structured model call failed"
-    assert "provider secret" not in str(raised.value)
+    assert "provider-frame-local-secret" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
-    assert "provider secret" not in "".join(
+    assert "provider-frame-local-secret" not in "".join(
         traceback.format_exception(raised.value)
     )
+    frames = _traceback_frame_locals(raised.value)
+    assert all(
+        "provider-frame-local-secret" not in repr(frame_locals)
+        for _, frame_locals in frames
+    )
+    _assert_public_structured_failure_frame_is_sanitized(frames)
 
+
+@pytest.mark.asyncio
+async def test_gateway_structured_completion_propagates_cancellation() -> None:
     async def cancelled(**_: object) -> object:
         raise asyncio.CancelledError
 
@@ -407,11 +455,9 @@ async def test_gateway_sanitizes_provider_failure_and_propagates_cancellation() 
 
 @pytest.mark.asyncio
 async def test_gateway_structured_parse_failure_drops_raw_payload_exception_chain() -> None:
-    raw_secret = "raw-provider-payload-secret"
-
     async def acompletion(**_: object) -> dict[str, object]:
         malformed = _capsule_data(["evt_1"])
-        malformed["objective"] = {"secret": raw_secret}
+        malformed["objective"] = {"secret": "raw-parsed-frame-local-secret"}
         return {"choices": [{"message": {"parsed": malformed}}]}
 
     with pytest.raises(AgentSDKError) as raised:
@@ -422,7 +468,15 @@ async def test_gateway_structured_parse_failure_drops_raw_payload_exception_chai
     assert raised.value.message == "structured model response invalid"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
-    assert raw_secret not in "".join(traceback.format_exception(raised.value))
+    assert "raw-parsed-frame-local-secret" not in "".join(
+        traceback.format_exception(raised.value)
+    )
+    frames = _traceback_frame_locals(raised.value)
+    assert all(
+        "raw-parsed-frame-local-secret" not in repr(frame_locals)
+        for _, frame_locals in frames
+    )
+    _assert_public_structured_failure_frame_is_sanitized(frames)
 
 
 @pytest.mark.asyncio
