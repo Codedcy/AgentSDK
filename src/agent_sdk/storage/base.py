@@ -1,6 +1,17 @@
+import json
 from typing import Any, NamedTuple, Protocol
 
 from agent_sdk.events.models import EventEnvelope
+
+
+def canonical_snapshot_data(value: dict[str, Any]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class SnapshotWrite(NamedTuple):
@@ -15,6 +26,8 @@ class SnapshotPrecondition(NamedTuple):
     kind: str
     entity_id: str
     version: int | None = None
+    session_id: str | None = None
+    data: dict[str, Any] | None = None
 
 
 class SnapshotPreconditionError(ValueError):
@@ -44,8 +57,12 @@ class StateStore(Protocol):
         *,
         after_cursor: int,
         session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
     ) -> list[StoredEvent]: ...
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None: ...
+
+    async def latest_cursor(self) -> int: ...
 
     async def delete_session(self, session_id: str) -> None: ...

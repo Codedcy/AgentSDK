@@ -4,6 +4,7 @@ from typing import Any, TypeAlias
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import (
+    canonical_snapshot_data,
     CommitBatch,
     CommitResult,
     SnapshotPreconditionError,
@@ -37,6 +38,13 @@ class InMemoryStore:
                 if snapshot is None or (
                     precondition.version is not None
                     and snapshot.version != precondition.version
+                ) or (
+                    precondition.session_id is not None
+                    and snapshot.session_id != precondition.session_id
+                ) or (
+                    precondition.data is not None
+                    and canonical_snapshot_data(snapshot.data)
+                    != canonical_snapshot_data(precondition.data)
                 ):
                     raise SnapshotPreconditionError(
                         "snapshot precondition failed"
@@ -79,14 +87,26 @@ class InMemoryStore:
         *,
         after_cursor: int,
         session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
     ) -> list[StoredEvent]:
+        if up_to_cursor is not None and up_to_cursor < after_cursor:
+            raise ValueError("event cursor window is inverted")
+        if limit is not None and limit <= 0:
+            raise ValueError("event read limit must be positive")
         async with self._lock:
-            return [
-                deepcopy(stored)
-                for stored in self._events
-                if stored.cursor > after_cursor
-                and (session_id is None or stored.event.session_id == session_id)
-            ]
+            selected: list[StoredEvent] = []
+            for stored in self._events:
+                if stored.cursor <= after_cursor:
+                    continue
+                if up_to_cursor is not None and stored.cursor > up_to_cursor:
+                    break
+                if session_id is not None and stored.event.session_id != session_id:
+                    continue
+                selected.append(deepcopy(stored))
+                if limit is not None and len(selected) == limit:
+                    break
+            return selected
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         async with self._lock:
@@ -94,6 +114,10 @@ class InMemoryStore:
             if snapshot is None:
                 return None
             return deepcopy(snapshot.data)
+
+    async def latest_cursor(self) -> int:
+        async with self._lock:
+            return self._last_cursor
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:

@@ -1,4 +1,16 @@
-from agent_sdk.api import AgentAPI, AgentSDK, PermissionAPI, RunAPI, SessionAPI, WorkflowAPI
+from agent_sdk.analytics import AnalyticsQueries, AnalyticsResult
+from agent_sdk.api import (
+    AgentAPI,
+    AgentSDK,
+    AnalyticsAPI,
+    EvaluationAPI,
+    EventAPI,
+    PermissionAPI,
+    QueryAPI,
+    RunAPI,
+    SessionAPI,
+    WorkflowAPI,
+)
 from agent_sdk.config import AgentSDKConfig, CaptureLevel
 from agent_sdk.context import (
     CompactionLevel,
@@ -11,6 +23,15 @@ from agent_sdk.context import (
     ContextView,
 )
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.evaluation import (
+    EvaluationDecision,
+    EvaluationEngine,
+    EvaluationResult,
+    EvaluationSubject,
+    EvaluationVerdict,
+    Evaluator,
+    ExactOutputEvaluator,
+)
 from agent_sdk.ids import new_id
 from agent_sdk.mcp import (
     MCPManager,
@@ -19,6 +40,17 @@ from agent_sdk.mcp import (
     StreamableHTTPMCPTransport,
 )
 from agent_sdk.permissions import PermissionDecision, PermissionEffect, PermissionRequest
+from agent_sdk.observability import (
+    EventFilter,
+    EventQueryResult,
+    ExecutionTree,
+    ExecutionTreeNode,
+    ObservedEvent,
+    ObservedRun,
+    QueryService,
+    RunTimeline,
+    SubscriptionService,
+)
 from agent_sdk.prompts import BuiltPrompt, PromptComposer, PromptManifest
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.models import (
@@ -56,6 +88,9 @@ __all__ = [
     "AgentSDKConfig",
     "AgentSDKError",
     "AgentSpec",
+    "AnalyticsAPI",
+    "AnalyticsQueries",
+    "AnalyticsResult",
     "CaptureLevel",
     "ChildResult",
     "ChildUsage",
@@ -68,12 +103,27 @@ __all__ = [
     "ContextRetrieval",
     "ContextView",
     "ErrorCode",
+    "EvaluationAPI",
+    "EvaluationDecision",
+    "EvaluationEngine",
+    "EvaluationResult",
+    "EvaluationSubject",
+    "EvaluationVerdict",
+    "Evaluator",
+    "EventAPI",
+    "EventFilter",
+    "EventQueryResult",
+    "ExactOutputEvaluator",
+    "ExecutionTree",
+    "ExecutionTreeNode",
     "MCPManager",
     "MCPServerConfig",
     "PermissionAPI",
     "PermissionDecision",
     "PermissionEffect",
     "PermissionRequest",
+    "ObservedEvent",
+    "ObservedRun",
     "PromptComposer",
     "PromptManifest",
     "BuiltPrompt",
@@ -83,6 +133,9 @@ __all__ = [
     "RunResult",
     "RunSnapshot",
     "RunStatus",
+    "RunTimeline",
+    "QueryAPI",
+    "QueryService",
     "SessionAPI",
     "SessionSnapshot",
     "SkillMetadata",
@@ -90,6 +143,7 @@ __all__ = [
     "ActivatedSkill",
     "StdioMCPTransport",
     "SubagentService",
+    "SubscriptionService",
     "TaskEnvelope",
     "StreamableHTTPMCPTransport",
     "TokenUsage",

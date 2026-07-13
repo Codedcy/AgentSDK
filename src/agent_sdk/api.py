@@ -7,12 +7,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, cast
 
+from agent_sdk.analytics import AnalyticsQueries, AnalyticsResult
 from agent_sdk.config import AgentSDKConfig
+from agent_sdk.evaluation import EvaluationEngine, EvaluationResult, Evaluator
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.observability import (
+    EventFilter,
+    EventQueryResult,
+    ExecutionTree,
+    ObservedEvent,
+    ObservedRun,
+    QueryService,
+    RunTimeline,
+    SubscriptionService,
+)
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import RunEngine
@@ -60,14 +72,21 @@ class _LazySQLiteStore:
         *,
         after_cursor: int,
         session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
     ) -> list[StoredEvent]:
         return await (await self._get()).read_events(
             after_cursor=after_cursor,
             session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
         )
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         return await (await self._get()).get_snapshot(kind, entity_id)
+
+    async def latest_cursor(self) -> int:
+        return await (await self._get()).latest_cursor()
 
     async def delete_session(self, session_id: str) -> None:
         await (await self._get()).delete_session(session_id)
@@ -95,6 +114,7 @@ class _SDKLifecycle:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._closing = False
+        self._close_signal = asyncio.Event()
         self._close_task: asyncio.Task[None] | None = None
 
     @asynccontextmanager
@@ -113,16 +133,28 @@ class _SDKLifecycle:
         active_tasks: set[asyncio.Task[Any]],
         owned_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
-        async with self._lock:
-            self._closing = True
-            if self._close_task is None:
-                active = tuple(active_tasks)
-                self._close_task = asyncio.create_task(
-                    self._close_resources(active, owned_close)
-                )
-                self._close_task.add_done_callback(self._close_finished)
-            close_task = self._close_task
+        self._closing = True
+        self._close_signal.set()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._coordinate_close(active_tasks, owned_close)
+            )
+            self._close_task.add_done_callback(self._close_finished)
+        close_task = self._close_task
         await asyncio.shield(close_task)
+
+    async def _coordinate_close(
+        self,
+        active_tasks: set[asyncio.Task[Any]],
+        owned_close: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        async with self._lock:
+            active = tuple(active_tasks)
+        await self._close_resources(active, owned_close)
+
+    @property
+    def close_signal(self) -> asyncio.Event:
+        return self._close_signal
 
     @staticmethod
     def _close_finished(close_task: asyncio.Task[None]) -> None:
@@ -290,6 +322,103 @@ class RunAPI:
             ) from error
 
 
+class QueryAPI:
+    def __init__(self, queries: QueryService, lifecycle: _SDKLifecycle) -> None:
+        self._queries = queries
+        self._lifecycle = lifecycle
+
+    async def get_run(self, run_id: str) -> ObservedRun:
+        async with self._lifecycle.admit():
+            return await self._queries.get_run(run_id)
+
+    async def timeline(self, run_id: str) -> RunTimeline:
+        async with self._lifecycle.admit():
+            return await self._queries.timeline(run_id)
+
+    async def execution_tree(self, root_run_id: str) -> ExecutionTree:
+        async with self._lifecycle.admit():
+            return await self._queries.execution_tree(root_run_id)
+
+    async def query_events(
+        self,
+        filters: EventFilter | None = None,
+        *,
+        after_cursor: int = 0,
+        limit: int = 100,
+    ) -> EventQueryResult:
+        async with self._lifecycle.admit():
+            return await self._queries.query_events(
+                filters,
+                after_cursor=after_cursor,
+                limit=limit,
+            )
+
+
+class EventAPI:
+    def __init__(self, subscriptions: SubscriptionService) -> None:
+        self._subscriptions = subscriptions
+
+    def subscribe(
+        self,
+        *,
+        filters: EventFilter | None = None,
+        cursor: int = 0,
+    ) -> AsyncIterator[ObservedEvent]:
+        return self._subscriptions.subscribe(filters=filters, cursor=cursor)
+
+
+class EvaluationAPI:
+    def __init__(
+        self,
+        evaluations: EvaluationEngine,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._evaluations = evaluations
+        self._lifecycle = lifecycle
+
+    async def evaluate(
+        self,
+        run_id: str,
+        evaluator: Evaluator,
+    ) -> EvaluationResult:
+        async with self._lifecycle.admit():
+            return await self._evaluations.evaluate(run_id, evaluator)
+
+
+class AnalyticsAPI:
+    def __init__(
+        self,
+        analytics: AnalyticsQueries,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._analytics = analytics
+        self._lifecycle = lifecycle
+
+    async def success_rate(
+        self,
+        *,
+        evaluator_id: str | None = None,
+    ) -> AnalyticsResult:
+        async with self._lifecycle.admit():
+            return await self._analytics.success_rate(evaluator_id=evaluator_id)
+
+    async def tool_failures(
+        self,
+        *,
+        tool_name: str | None = None,
+    ) -> AnalyticsResult:
+        async with self._lifecycle.admit():
+            return await self._analytics.tool_failures(tool_name=tool_name)
+
+    async def tool_failure_rate(
+        self,
+        *,
+        tool_name: str | None = None,
+    ) -> AnalyticsResult:
+        async with self._lifecycle.admit():
+            return await self._analytics.tool_failure_rate(tool_name=tool_name)
+
+
 class PermissionAPI:
     def __init__(self, bridge: InProcessPermissionBridge | None) -> None:
         self._bridge = bridge
@@ -398,6 +527,12 @@ class AgentSDK:
             tools,
         )
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)
+        self.queries = QueryAPI(QueryService(store), self._lifecycle)
+        self.events = EventAPI(
+            SubscriptionService(store, close_signal=self._lifecycle.close_signal)
+        )
+        self.evaluations = EvaluationAPI(EvaluationEngine(store), self._lifecycle)
+        self.analytics = AnalyticsAPI(AnalyticsQueries(store), self._lifecycle)
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._active_tasks.add(task)

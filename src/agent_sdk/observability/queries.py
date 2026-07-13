@@ -1,0 +1,396 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import Any, NoReturn
+
+from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.runtime.models import RunSnapshot
+from agent_sdk.storage.base import StateStore, StoredEvent
+
+from .models import (
+    EventFilter,
+    EventQueryResult,
+    ExecutionTree,
+    ExecutionTreeNode,
+    ObservedEvent,
+    ObservedRun,
+    RunTimeline,
+)
+
+_STABLE_READ_ATTEMPTS = 4
+_PAGE_SIZE = 100
+
+
+class _InvalidParent(Enum):
+    INVALID = "invalid"
+
+
+class _ReadFailure(Enum):
+    FAILED = "failed"
+
+
+class QueryService:
+    def __init__(self, store: StateStore) -> None:
+        self._store = store
+
+    async def get_run(self, run_id: str) -> ObservedRun:
+        saw_transition = False
+        for _ in range(_STABLE_READ_ATTEMPTS):
+            before = await self._load_run(run_id)
+            cursor = await self._latest_cursor()
+            after = await self._load_run(run_id)
+            if before == after:
+                return ObservedRun(snapshot=after, as_of_cursor=cursor)
+            saw_transition = True
+        if saw_transition:
+            raise AgentSDKError(
+                ErrorCode.CONFLICT,
+                "run changed while it was being observed",
+                retryable=True,
+            )
+        raise AssertionError("unreachable")
+
+    async def timeline(self, run_id: str) -> RunTimeline:
+        for _ in range(_STABLE_READ_ATTEMPTS):
+            before = await self._load_run(run_id)
+            cursor = await self._latest_cursor()
+            events = await self._read_through(up_to_cursor=cursor)
+            after = await self._load_run(run_id)
+            if before == after:
+                return RunTimeline(
+                    run_id=run_id,
+                    events=tuple(
+                        self._observed(stored)
+                        for stored in events
+                        if stored.cursor <= cursor and stored.event.run_id == run_id
+                    ),
+                    as_of_cursor=cursor,
+                )
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "run changed while its timeline was being observed",
+            retryable=True,
+        )
+
+    async def query_events(
+        self,
+        filters: EventFilter | None = None,
+        *,
+        after_cursor: int = 0,
+        limit: int = 100,
+    ) -> EventQueryResult:
+        if after_cursor < 0:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "event cursor must not be negative",
+                retryable=False,
+            )
+        if not 1 <= limit <= 1000:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "event query limit must be between 1 and 1000",
+                retryable=False,
+            )
+        selected = filters or EventFilter()
+        cursor = await self._latest_cursor()
+        if after_cursor > cursor:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "event cursor is ahead of durable high-water",
+                retryable=False,
+            )
+        stored_events = await self._read_events(
+            after_cursor=after_cursor,
+            up_to_cursor=cursor,
+            limit=limit,
+        )
+        events = tuple(
+            self._observed(stored)
+            for stored in stored_events
+            if stored.cursor <= cursor and _matches(stored, selected)
+        )
+        return EventQueryResult(
+            events=events,
+            next_cursor=(
+                stored_events[-1].cursor if len(stored_events) == limit else cursor
+            ),
+            as_of_cursor=cursor,
+        )
+
+    async def execution_tree(self, root_run_id: str) -> ExecutionTree:
+        for _ in range(_STABLE_READ_ATTEMPTS):
+            root = await self._load_run(root_run_id)
+            cursor = await self._latest_cursor()
+            stored_events = await self._read_through(up_to_cursor=cursor)
+            nodes = await self._assemble_tree(root, stored_events, cursor)
+            after = await self._load_run(root_run_id)
+            if root == after and await self._tree_is_stable(root, nodes, cursor):
+                return ExecutionTree(
+                    root_run_id=root_run_id,
+                    nodes=nodes,
+                    as_of_cursor=cursor,
+                )
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "execution tree changed while it was being observed",
+            retryable=True,
+        )
+
+    async def _assemble_tree(
+        self,
+        root: RunSnapshot,
+        stored_events: list[StoredEvent],
+        cursor: int,
+    ) -> tuple[ExecutionTreeNode, ...]:
+        created = [
+            stored
+            for stored in stored_events
+            if stored.cursor <= cursor
+            and stored.event.type == "run.created"
+            and stored.event.session_id == root.session_id
+        ]
+        descendants = {root.run_id}
+        selected: list[tuple[StoredEvent, RunSnapshot]] = []
+        pending = created
+        while pending:
+            progressed = False
+            remaining: list[StoredEvent] = []
+            for stored in pending:
+                initial = _run_snapshot(stored.event.payload)
+                if isinstance(initial, _ReadFailure):
+                    self._internal("failed to load execution tree")
+                if initial.run_id in descendants:
+                    selected.append((stored, initial))
+                    progressed = True
+                elif initial.parent_run_id in descendants:
+                    if initial.session_id != root.session_id:
+                        self._internal("failed to load execution tree")
+                    descendants.add(initial.run_id)
+                    selected.append((stored, initial))
+                    progressed = True
+                else:
+                    remaining.append(stored)
+            if not progressed:
+                break
+            pending = remaining
+        by_id: dict[str, ExecutionTreeNode] = {}
+        for stored, initial in sorted(selected, key=lambda item: item[0].cursor):
+            current = await self._load_run(initial.run_id)
+            if (
+                current.session_id != root.session_id
+                or current.parent_run_id != initial.parent_run_id
+                or stored.event.session_id != current.session_id
+                or stored.event.run_id != current.run_id
+            ):
+                self._internal("failed to load execution tree")
+            by_id[current.run_id] = ExecutionTreeNode(
+                snapshot=current,
+                parent_run_id=current.parent_run_id,
+                created_cursor=stored.cursor,
+            )
+        if root.run_id not in by_id:
+            self._internal("failed to load execution tree")
+        for stored in stored_events:
+            parent_claim = _parent_claim(stored.event.payload)
+            if (
+                stored.cursor <= cursor
+                and stored.event.type == "run.created"
+                and stored.event.session_id != root.session_id
+            ):
+                if parent_claim is _InvalidParent.INVALID:
+                    self._internal("failed to load execution tree")
+                if parent_claim in descendants:
+                    self._internal("failed to load execution tree")
+        return tuple(by_id.values())
+
+    async def _tree_is_stable(
+        self,
+        root: RunSnapshot,
+        nodes: tuple[ExecutionTreeNode, ...],
+        cursor: int,
+    ) -> bool:
+        descendants = {node.snapshot.run_id for node in nodes}
+        for node in nodes:
+            try:
+                current = await self._load_run(node.snapshot.run_id)
+            except AgentSDKError as error:
+                if error.code is ErrorCode.NOT_FOUND:
+                    return False
+                raise
+            if current != node.snapshot:
+                return False
+        tail_cursor = await self._latest_cursor()
+        later = await self._read_through(
+            after_cursor=cursor,
+            up_to_cursor=tail_cursor,
+        )
+        for stored in later:
+            if stored.event.type != "run.created":
+                continue
+            parent_run_id = _parent_claim(stored.event.payload)
+            if parent_run_id is _InvalidParent.INVALID:
+                self._internal("failed to load execution tree")
+            if parent_run_id not in descendants:
+                continue
+            if stored.event.session_id != root.session_id:
+                self._internal("failed to load execution tree")
+            return False
+        for node in nodes:
+            try:
+                current = await self._load_run(node.snapshot.run_id)
+            except AgentSDKError as error:
+                if error.code is ErrorCode.NOT_FOUND:
+                    return False
+                raise
+            if (
+                current != node.snapshot
+                or current.session_id != root.session_id
+                or current.run_id != node.snapshot.run_id
+            ):
+                return False
+        return True
+
+    async def _load_run(self, run_id: str) -> RunSnapshot:
+        data = await _snapshot(self._store, "run", run_id)
+        if isinstance(data, _ReadFailure):
+            self._internal("failed to load run")
+        if data is None:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "run not found",
+                retryable=False,
+            )
+        run = _run_snapshot(data)
+        if isinstance(run, _ReadFailure):
+            self._internal("failed to load run")
+        return run
+
+    async def _latest_cursor(self) -> int:
+        cursor = await _cursor(self._store)
+        if isinstance(cursor, _ReadFailure):
+            self._internal("failed to read event cursor")
+        return cursor
+
+    async def _read_events(
+        self,
+        *,
+        after_cursor: int,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredEvent]:
+        events = await _events(
+            self._store,
+            after_cursor=after_cursor,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+        if isinstance(events, _ReadFailure):
+            self._internal("failed to read events")
+        return events
+
+    async def _read_through(
+        self,
+        *,
+        up_to_cursor: int,
+        after_cursor: int = 0,
+    ) -> list[StoredEvent]:
+        events: list[StoredEvent] = []
+        current = after_cursor
+        while current < up_to_cursor:
+            page = await self._read_events(
+                after_cursor=current,
+                up_to_cursor=up_to_cursor,
+                limit=_PAGE_SIZE,
+            )
+            if not page:
+                break
+            if (
+                page[0].cursor <= current
+                or any(
+                    left.cursor >= right.cursor
+                    for left, right in zip(page, page[1:], strict=False)
+                )
+                or page[-1].cursor > up_to_cursor
+            ):
+                self._internal("event page did not advance")
+            events.extend(page)
+            current = page[-1].cursor
+            if len(page) < _PAGE_SIZE:
+                break
+        return events
+
+    @staticmethod
+    def _observed(stored: StoredEvent) -> ObservedEvent:
+        observed = _observed_event(stored)
+        if isinstance(observed, _ReadFailure):
+            QueryService._internal("failed to load event")
+        return observed
+
+    @staticmethod
+    def _internal(message: str) -> NoReturn:
+        raise AgentSDKError(ErrorCode.INTERNAL, message, retryable=False) from None
+
+
+def _matches(stored: StoredEvent, filters: EventFilter) -> bool:
+    event = stored.event
+    return (
+        (filters.session_id is None or event.session_id == filters.session_id)
+        and (filters.run_id is None or event.run_id == filters.run_id)
+        and (not filters.event_types or event.type in filters.event_types)
+    )
+
+
+def _parent_claim(payload: dict[str, Any]) -> str | None | _InvalidParent:
+    value = payload.get("parent_run_id")
+    if value is None or isinstance(value, str):
+        return value
+    return _InvalidParent.INVALID
+
+
+async def _snapshot(
+    store: StateStore,
+    kind: str,
+    entity_id: str,
+) -> dict[str, Any] | None | _ReadFailure:
+    try:
+        return await store.get_snapshot(kind, entity_id)
+    except Exception:
+        return _ReadFailure.FAILED
+
+
+async def _cursor(store: StateStore) -> int | _ReadFailure:
+    try:
+        return await store.latest_cursor()
+    except Exception:
+        return _ReadFailure.FAILED
+
+
+async def _events(
+    store: StateStore,
+    *,
+    after_cursor: int,
+    up_to_cursor: int | None,
+    limit: int | None,
+) -> list[StoredEvent] | _ReadFailure:
+    try:
+        return await store.read_events(
+            after_cursor=after_cursor,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+    except Exception:
+        return _ReadFailure.FAILED
+
+
+def _run_snapshot(data: dict[str, Any]) -> RunSnapshot | _ReadFailure:
+    try:
+        return RunSnapshot.model_validate(data)
+    except Exception:
+        return _ReadFailure.FAILED
+
+
+def _observed_event(stored: StoredEvent) -> ObservedEvent | _ReadFailure:
+    try:
+        return ObservedEvent(cursor=stored.cursor, event=stored.event)
+    except Exception:
+        return _ReadFailure.FAILED

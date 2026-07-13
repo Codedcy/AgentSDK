@@ -118,6 +118,143 @@ async def test_snapshot_precondition_failure_rolls_back_entire_batch(
     }
 
 
+@pytest.mark.parametrize(
+    "precondition",
+    [
+        SnapshotPrecondition(
+            "session",
+            "ses_1",
+            version=1,
+            session_id="ses_recreated",
+        ),
+        SnapshotPrecondition(
+            "session",
+            "ses_1",
+            version=1,
+            data={"session_id": "ses_1", "version": 1, "changed": True},
+        ),
+    ],
+    ids=("wrong-owner", "wrong-canonical-data"),
+)
+@pytest.mark.asyncio
+async def test_snapshot_exact_precondition_rejects_same_version_replacement(
+    store: StateStore,
+    precondition: SnapshotPrecondition,
+) -> None:
+    data = {"session_id": "ses_1", "version": 1}
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(SnapshotWrite("session", "ses_1", "ses_1", 1, data),),
+        )
+    )
+
+    with pytest.raises(SnapshotPreconditionError):
+        await store.commit(
+            CommitBatch(
+                events=(
+                    EventEnvelope.new(
+                        type="evaluation.completed",
+                        session_id="ses_1",
+                        run_id="evl_rejected",
+                        sequence=1,
+                        payload={},
+                    ),
+                ),
+                preconditions=(precondition,),
+            )
+        )
+
+    assert await store.read_events(after_cursor=0) == []
+
+
+@pytest.mark.asyncio
+async def test_read_events_applies_upper_bound_and_limit_in_cursor_order(
+    store: StateStore,
+) -> None:
+    for sequence in range(1, 6):
+        await store.commit(
+            CommitBatch(
+                events=(
+                    EventEnvelope.new(
+                        type="session.progress",
+                        session_id="ses_page",
+                        run_id=None,
+                        sequence=sequence,
+                        payload={"sequence": sequence},
+                    ),
+                )
+            )
+        )
+
+    page = await store.read_events(
+        after_cursor=1,
+        up_to_cursor=4,
+        limit=2,
+    )
+
+    assert [item.cursor for item in page] == [2, 3]
+
+
+@pytest.mark.parametrize(
+    "values",
+    (
+        {"after_cursor": 2, "up_to_cursor": 1},
+        {"after_cursor": 0, "limit": 0},
+        {"after_cursor": 0, "limit": -1},
+    ),
+)
+@pytest.mark.asyncio
+async def test_read_events_rejects_invalid_window_before_read(
+    store: StateStore,
+    values: dict[str, int],
+) -> None:
+    with pytest.raises(ValueError):
+        await store.read_events(**values)
+
+
+@pytest.mark.parametrize(
+    ("stored_value", "expected_value"),
+    ((1, True), (1, 1.0)),
+)
+@pytest.mark.asyncio
+async def test_snapshot_data_precondition_uses_canonical_json_identity(
+    store: StateStore,
+    stored_value: object,
+    expected_value: object,
+) -> None:
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "subject",
+                    "subject_1",
+                    "ses_1",
+                    1,
+                    {"value": stored_value},
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(SnapshotPreconditionError):
+        await store.commit(
+            CommitBatch(
+                events=(),
+                preconditions=(
+                    SnapshotPrecondition(
+                        "subject",
+                        "subject_1",
+                        version=1,
+                        session_id="ses_1",
+                        data={"value": expected_value},
+                    ),
+                ),
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_snapshot_precondition_accepts_existence_and_exact_version(
     store: StateStore,

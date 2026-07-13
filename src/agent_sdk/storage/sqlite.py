@@ -12,6 +12,7 @@ import aiosqlite
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import (
+    canonical_snapshot_data,
     CommitBatch,
     CommitResult,
     SnapshotPreconditionError,
@@ -56,7 +57,7 @@ _AGGREGATE_INDEX_SQL = (
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return canonical_snapshot_data(value)
 
 
 def _json_object(value: str) -> dict[str, Any]:
@@ -120,14 +121,25 @@ class SQLiteStore:
     async def _check_snapshot_preconditions(self, batch: CommitBatch) -> None:
         for precondition in batch.preconditions:
             async with self._connection.execute(
-                "SELECT version FROM snapshots WHERE kind = ? AND entity_id = ?",
+                """
+                SELECT version, session_id, data_json
+                FROM snapshots WHERE kind = ? AND entity_id = ?
+                """,
                 (precondition.kind, precondition.entity_id),
             ) as cursor:
                 row = await cursor.fetchone()
-            version = None if row is None else cast(int, row[0])
-            if version is None or (
+            if row is None:
+                raise SnapshotPreconditionError("snapshot precondition failed")
+            version = cast(int, row[0])
+            if (
                 precondition.version is not None
                 and version != precondition.version
+            ) or (
+                precondition.session_id is not None
+                and cast(str, row[1]) != precondition.session_id
+            ) or (
+                precondition.data is not None
+                and cast(str, row[2]) != _canonical_json(precondition.data)
             ):
                 raise SnapshotPreconditionError("snapshot precondition failed")
 
@@ -136,28 +148,34 @@ class SQLiteStore:
         *,
         after_cursor: int,
         session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
     ) -> list[StoredEvent]:
+        if up_to_cursor is not None and up_to_cursor < after_cursor:
+            raise ValueError("event cursor window is inverted")
+        if limit is not None and limit <= 0:
+            raise ValueError("event read limit must be positive")
         async with self._lock:
             self._ensure_open()
-            if session_id is None:
-                query = """
-                    SELECT cursor, event_id, schema_version, type, session_id, run_id,
-                           sequence, payload_json, occurred_at
-                    FROM events
-                    WHERE cursor > ?
-                    ORDER BY cursor
-                """
-                parameters: tuple[object, ...] = (after_cursor,)
-            else:
-                query = """
-                    SELECT cursor, event_id, schema_version, type, session_id, run_id,
-                           sequence, payload_json, occurred_at
-                    FROM events
-                    WHERE cursor > ? AND session_id = ?
-                    ORDER BY cursor
-                """
-                parameters = (after_cursor, session_id)
-            async with self._connection.execute(query, parameters) as cursor:
+            predicates = ["cursor > ?"]
+            parameters: list[object] = [after_cursor]
+            if session_id is not None:
+                predicates.append("session_id = ?")
+                parameters.append(session_id)
+            if up_to_cursor is not None:
+                predicates.append("cursor <= ?")
+                parameters.append(up_to_cursor)
+            query = f"""
+                SELECT cursor, event_id, schema_version, type, session_id, run_id,
+                       sequence, payload_json, occurred_at
+                FROM events
+                WHERE {" AND ".join(predicates)}
+                ORDER BY cursor
+            """
+            if limit is not None:
+                query += " LIMIT ?"
+                parameters.append(limit)
+            async with self._connection.execute(query, tuple(parameters)) as cursor:
                 rows = await cursor.fetchall()
             return [self._stored_event(row) for row in rows]
 
@@ -172,6 +190,11 @@ class SQLiteStore:
             if row is None:
                 return None
             return _json_object(cast(str, row[0]))
+
+    async def latest_cursor(self) -> int:
+        async with self._lock:
+            self._ensure_open()
+            return await self._last_cursor()
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
