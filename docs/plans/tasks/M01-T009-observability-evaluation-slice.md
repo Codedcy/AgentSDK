@@ -12,8 +12,10 @@
 
 - Runtime truth remains durable events plus snapshots. Observability never creates a second hidden trace store and never makes Runtime depend on an exporter or UI.
 - Every query/aggregate exposes `as_of_cursor`. The Store exposes a durable `latest_cursor()` high-water mark that does not move backwards when a Session is deleted and cursor holes appear.
+- Every event query/aggregate first captures high-water `H`, reads the current durable rows, and accepts only rows with `cursor <= H`; a concurrent later commit belongs to the next observation. A caller cursor greater than the captured Store high-water is rejected as INVALID_STATE rather than silently moved backwards or allowed to skip future events.
 - Query results are immutable and detached from Store-owned dictionaries. Missing/deleted records return stable NOT_FOUND; corrupt records and ordinary extension failures cross the public boundary only as sanitized `AgentSDKError` values.
 - Event subscription is at-least-once from the caller's acknowledged cursor. It advances over nonmatching events, tolerates deletion-created cursor holes, creates no background task, and propagates `asyncio.CancelledError` without swallowing or replacing it.
+- A long-lived subscription never holds `_SDKLifecycle.admit()` and never keeps SDK close waiting indefinitely. Lifecycle exposes a shared close signal: idle polling waits interruptibly for poll timeout or close; once closing is observable the iterator stops without any later Store read. A newly consumed iterator after closing fails with stable INVALID_STATE.
 - Evaluations are append-only facts separate from Run completion. An evaluator cannot change Run status, forge subject/evaluator identity, cite another Run's events, or persist after its Session/Run was deleted.
 - Analytics success is based only on explicit evaluation verdicts. Tool failure is based only on terminal `tool.call.completed` statuses. Unknown/malformed samples are counted as missing and never silently guessed.
 - This slice provides success rate and Tool failure count/rate with optional exact evaluator/tool filters. Failure taxonomy, failure stage/root-cause attribution, Tool usefulness, comparisons and improvement insights remain M05 and must not be represented as causal here.
@@ -78,6 +80,8 @@ For this slice `execution_tree(root_run_id)` means the requested Run plus the tr
 
 Return a flat, deterministic tuple of `ExecutionTreeNode(snapshot, parent_run_id, created_cursor)` in creation-cursor order. Validate exact Session ownership and every relationship against the current Run snapshots. Detect relevant Run transitions/new Child creation during assembly with a bounded re-read and fail closed on inconsistent/cross-Session records. Do not enumerate mutable in-process task state.
 
+Do not require the global high-water to remain equal during tree assembly: unrelated Sessions/Runs may continue committing forever. Re-read only events after captured `H`; retry when those events transition an already-selected Run or create a Child whose parent is in the selected tree. Ignore malformed records that provably belong to an unrelated Session/tree, while a cross-Session record that claims a selected parent is an integrity failure.
+
 - [ ] **Step 5: Verify Task 1**
 
 ```powershell
@@ -109,10 +113,11 @@ Also cover:
 - consumer `aclose()` and task cancellation with no leaked polling/background task;
 - cancellation while waiting propagates the same `CancelledError` instance where Python task semantics expose it;
 - invalid negative cursors fail before any Store read.
+- a cursor greater than the Store's current durable high-water fails with stable INVALID_STATE before polling.
 
 - [ ] **Step 2: Implement a stateless polling async iterator**
 
-Read durable batches after the local cursor. For every stored event, update the local cursor before deciding whether it matches; yield only matches. If the batch is empty, use a short configurable internal poll interval and an interruptible `asyncio.sleep`. Do not create a producer task or unbounded queue in M01.
+Read durable batches after the local cursor. For every stored event, update the local cursor before deciding whether it matches; yield only matches. If the batch is empty, wait on the SDK lifecycle close signal with a short configurable timeout (or the equivalent cancellation-safe primitive), then poll again. Do not create a producer task or unbounded queue in M01. If close races with a Store call, suppress a closed-Store error only after confirming the close signal; otherwise sanitize it as an SDK error.
 
 The yielded `ObservedEvent.cursor` is the application acknowledgement token. Delivery after reconnect is at least once: the application resumes from the last cursor it durably acknowledged and may deduplicate by immutable `event_id`.
 
@@ -158,6 +163,7 @@ Cover:
 - parameterized `CancelledError` propagates unchanged and creates no evaluation record;
 - concurrent Session deletion or changed Run version before commit cannot resurrect data;
 - multiple evaluations append independent immutable records;
+- an evaluation id collision/duplicate aggregate commit is rolled back atomically and mapped to stable retryable CONFLICT rather than a raw Store `ValueError`;
 - SQLite reopen loads the same evaluation record.
 
 - [ ] **Step 3: Implement frozen contracts and the built-in evaluator**
@@ -168,9 +174,11 @@ Cover:
 
 - [ ] **Step 4: Implement fail-closed evaluation persistence**
 
-Load a stable terminal `EvaluationSubject(snapshot, timeline, as_of_cursor)`, obtain and validate evaluator identity, and invoke the evaluator. Catch ordinary extension exceptions inside a private helper and expose only stable SDK errors; never catch `BaseException`/`CancelledError`.
+Load `EvaluationSubject(snapshot, timeline, as_of_cursor)` as one stable observation: capture `H`, read only subject events through `H`, and confirm the same terminal snapshot/Session still exists. Do not compose two independently timed public query results. Obtain evaluator metadata and invoke/await the evaluator inside a private helper; metadata getters, invocation, await and return validation all belong to the extension boundary. Catch ordinary extension exceptions there and expose only stable SDK errors with no cause/context/extension traceback locals; never catch `BaseException`/`CancelledError`.
 
-Commit `evaluation.completed` plus snapshot with atomic preconditions on both owning Session existence and the exact terminal Run snapshot version. Map a failed precondition to stable NOT_FOUND/CONFLICT based on a fresh read. Do not update the Run or execute any model. The public result is returned only after commit succeeds.
+Commit `evaluation.completed` plus snapshot with atomic preconditions on owning Session existence and the exact terminal Run observation. Extend snapshot preconditions with expected Session ownership and expected canonical snapshot data (or an equivalent exact fingerprint), while preserving existing callers that require only existence/version. This prevents delete/recreate with the same id/version from satisfying the evaluation commit. Map a failed precondition to stable NOT_FOUND/CONFLICT based on a fresh read. Do not update the Run or execute any model. The public result is returned only after commit succeeds.
+
+The evaluation id is random and both its event aggregate (`sequence=1`) and snapshot are written in one Store transaction. Any id/aggregate collision must roll back the whole batch and become retryable CONFLICT; it must never overwrite an earlier immutable evaluation.
 
 - [ ] **Step 5: Verify Task 3**
 
@@ -207,9 +215,18 @@ Create terminal Runs with pass/fail/unknown evaluation records and successful/fa
 - no known denominator returns `value=None`, never a fabricated zero-rate conclusion;
 - each result includes metric name, sample/missing counts, method, filters, evidence ids and `as_of_cursor`.
 
+Define aggregation units exactly:
+
+- each immutable `EvaluationResult` event is one success-rate candidate, even when one Run has multiple results from the same evaluator;
+- `sample_count` is the known denominator (`pass + fail` for success, known terminal calls for Tool metrics); `missing_count` contains unknown verdicts and malformed attributable candidates;
+- success rate and Tool failure rate return `value=None` when `sample_count == 0`; Tool failure *count* returns `0.0` when no known failures exist;
+- with an exact evaluator/tool filter, a malformed candidate missing the filter identity cannot be attributed and is ignored; if identity matches but verdict/status is invalid it increments missing;
+- cursor holes created by Session deletion are absence, never missing samples;
+- `evidence_event_ids` contains every durable candidate event counted as known or missing, including the event id of an attributable malformed fact.
+
 - [ ] **Step 2: Implement cursor-bounded fact aggregation**
 
-Capture `latest_cursor()`, read the durable log and ignore any later cursor. Parse only `evaluation.completed` and `tool.call.completed` typed payloads. Count malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down.
+Capture `latest_cursor()` as `H`, read the durable log and ignore every row with `cursor > H`. Parse only `evaluation.completed` and `tool.call.completed` typed payloads using the exact counting/filter rules above. Count attributable malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down.
 
 These methods report deterministic counting methods such as `explicit_evaluation_verdict` and `terminal_tool_status`. Do not emit failure stage, root cause, usefulness, attribution or recommendations in this slice.
 
@@ -247,6 +264,8 @@ Expected: results are explicit, cursor-qualified, filterable, missing-aware, res
 Use only imports from `agent_sdk` and an `AgentSDK.for_test` instance. Run, query, subscribe, evaluate and aggregate through the public façade. Verify default SQLite construction exposes the same APIs without eager database opening.
 
 Mutation methods participate in `_SDKLifecycle`: a newly-started evaluation is rejected once closing begins, and close cannot cut through an admitted evaluation commit. An already-open subscription terminates cleanly when SDK close begins rather than touching a closed owned Store; a new subscription/evaluation after closing yields stable INVALID_STATE. Read-only query behavior should match existing `runs.get`/`workflows.get` conventions and never leak raw closed-Store exceptions.
+
+All new public queries, event reads, subscriptions, evaluations and analytics invoked after closing begins use `ErrorCode.INVALID_STATE` with stable sanitized messages. Ordinary exceptions from a custom StateStore are normalized in private helpers with no cause/context/Store traceback locals; their `CancelledError` propagates unchanged. Short query/analytics/evaluation calls may use lifecycle admission so close waits for the admitted operation, but subscriptions use only the shared close signal described above.
 
 - [ ] **Step 2: Keep application presentation outside the SDK**
 
