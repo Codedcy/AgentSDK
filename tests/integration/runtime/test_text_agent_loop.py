@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.storage.base import CommitBatch, CommitResult, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
+from agent_sdk.storage.sqlite import SQLiteStore
 
 
 @pytest.fixture
@@ -599,6 +601,86 @@ class _FailingSnapshotStore(InMemoryStore):
 
 
 @pytest.mark.asyncio
+async def test_run_get_normalizes_store_failure() -> None:
+    sdk = AgentSDK.for_test(store=_FailingSnapshotStore(), acompletion=_scripted_success)
+    try:
+        with pytest.raises(AgentSDKError) as raised:
+            await sdk.runs.get("run_store_failure")
+
+        assert raised.value.code is ErrorCode.INTERNAL
+        assert raised.value.message == "failed to load run"
+        assert raised.value.retryable is False
+        assert "raw store failure" not in str(raised.value)
+        assert isinstance(raised.value.__cause__, RuntimeError)
+    finally:
+        await sdk.close()
+
+
+class _InvalidRunSnapshotStore(InMemoryStore):
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        del kind
+        return {"run_id": entity_id, "status": "corrupt"}
+
+
+@pytest.mark.asyncio
+async def test_run_get_normalizes_invalid_snapshot() -> None:
+    sdk = AgentSDK.for_test(
+        store=_InvalidRunSnapshotStore(),
+        acompletion=_scripted_success,
+    )
+    try:
+        with pytest.raises(AgentSDKError) as raised:
+            await sdk.runs.get("run_invalid")
+
+        assert raised.value.code is ErrorCode.INTERNAL
+        assert raised.value.message == "failed to load run"
+        assert raised.value.retryable is False
+        assert "corrupt" not in str(raised.value)
+        assert isinstance(raised.value.__cause__, ValidationError)
+    finally:
+        await sdk.close()
+
+
+class _AgentSDKErrorSnapshotStore(InMemoryStore):
+    def __init__(self, error: AgentSDKError) -> None:
+        super().__init__()
+        self._error = error
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        del kind, entity_id
+        raise self._error
+
+
+@pytest.mark.asyncio
+async def test_run_get_preserves_agent_sdk_error() -> None:
+    expected = AgentSDKError(ErrorCode.INVALID_STATE, "store unavailable", retryable=True)
+    sdk = AgentSDK.for_test(
+        store=_AgentSDKErrorSnapshotStore(expected),
+        acompletion=_scripted_success,
+    )
+    try:
+        with pytest.raises(AgentSDKError) as raised:
+            await sdk.runs.get("run_sdk_error")
+
+        assert raised.value is expected
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_run_get_missing_snapshot_remains_not_found(store: InMemoryStore) -> None:
+    sdk = AgentSDK.for_test(store=store, acompletion=_scripted_success)
+    try:
+        with pytest.raises(AgentSDKError) as raised:
+            await sdk.runs.get("run_missing")
+
+        assert raised.value.code is ErrorCode.NOT_FOUND
+        assert raised.value.message == "run not found"
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
 async def test_events_normalizes_store_failure_after_task_done() -> None:
     store = _FailingSnapshotStore()
     run_id = "run_store_failure"
@@ -927,3 +1009,107 @@ async def test_configured_sdk_does_not_lazy_reopen_after_close(tmp_path: Path) -
         await sdk.close()
     finally:
         await sdk._owned_close()  # type: ignore[misc]
+
+
+def _install_failing_sqlite_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[asyncio.Event, asyncio.Event, asyncio.Event]:
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    close_failed = asyncio.Event()
+    original_close = SQLiteStore.close
+
+    async def failing_close(store: SQLiteStore) -> None:
+        close_started.set()
+        await release_close.wait()
+        await original_close(store)
+        close_failed.set()
+        raise RuntimeError("owned close failure")
+
+    monkeypatch.setattr(SQLiteStore, "close", failing_close)
+    return close_started, release_close, close_failed
+
+
+@pytest.mark.asyncio
+async def test_cancelled_only_close_waiter_leaves_no_unretrieved_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started, release_close, close_failed = _install_failing_sqlite_close(
+        monkeypatch
+    )
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    diagnostics: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+    sdk = AgentSDK(AgentSDKConfig(database_path=tmp_path / "state.db"))
+    close_waiter: asyncio.Task[None] | None = None
+    try:
+        await sdk.sessions.create(workspaces=[])
+        close_waiter = asyncio.create_task(sdk.close())
+        await asyncio.wait_for(close_started.wait(), timeout=1)
+
+        close_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_waiter
+        release_close.set()
+        await asyncio.wait_for(close_failed.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        del close_waiter
+        close_waiter = None
+        del sdk
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+        assert not any(
+            diagnostic.get("message") == "Task exception was never retrieved"
+            for diagnostic in diagnostics
+        )
+    finally:
+        release_close.set()
+        if close_waiter is not None and not close_waiter.done():
+            close_waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await close_waiter
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_second_close_replays_failure_after_only_waiter_is_cancelled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started, release_close, close_failed = _install_failing_sqlite_close(
+        monkeypatch
+    )
+    sdk = AgentSDK(AgentSDKConfig(database_path=tmp_path / "state.db"))
+    await sdk.sessions.create(workspaces=[])
+    close_waiter = asyncio.create_task(sdk.close())
+    await asyncio.wait_for(close_started.wait(), timeout=1)
+
+    close_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_waiter
+    release_close.set()
+    await asyncio.wait_for(close_failed.wait(), timeout=1)
+
+    with pytest.raises(RuntimeError, match="owned close failure"):
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_close_failure_reaches_normal_waiter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    close_started, release_close, _ = _install_failing_sqlite_close(monkeypatch)
+    sdk = AgentSDK(AgentSDKConfig(database_path=tmp_path / "state.db"))
+    await sdk.sessions.create(workspaces=[])
+    release_close.set()
+
+    with pytest.raises(RuntimeError, match="owned close failure"):
+        await sdk.close()
+
+    assert close_started.is_set()

@@ -100,8 +100,14 @@ class _SDKLifecycle:
                 self._close_task = asyncio.create_task(
                     self._close_resources(active, owned_close)
                 )
+                self._close_task.add_done_callback(self._close_finished)
             close_task = self._close_task
         await asyncio.shield(close_task)
+
+    @staticmethod
+    def _close_finished(close_task: asyncio.Task[None]) -> None:
+        if not close_task.cancelled():
+            close_task.exception()
 
     @staticmethod
     async def _close_resources(
@@ -167,14 +173,23 @@ class RunAPI:
             return RunHandle(created.run_id, self._store, task)
 
     async def get(self, run_id: str) -> RunSnapshot:
-        data = await self._store.get_snapshot("run", run_id)
-        if data is None:
+        try:
+            data = await self._store.get_snapshot("run", run_id)
+            if data is None:
+                raise AgentSDKError(
+                    ErrorCode.NOT_FOUND,
+                    "run not found",
+                    retryable=False,
+                )
+            return RunSnapshot.model_validate(data)
+        except AgentSDKError:
+            raise
+        except Exception as error:
             raise AgentSDKError(
-                ErrorCode.NOT_FOUND,
-                "run not found",
+                ErrorCode.INTERNAL,
+                "failed to load run",
                 retryable=False,
-            )
-        return RunSnapshot.model_validate(data)
+            ) from error
 
 
 class AgentSDK:
