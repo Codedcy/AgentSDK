@@ -128,11 +128,12 @@ timeout or changed `permission_default`.
 Run:
 
 ```powershell
-uv run --python 3.13 pytest tests/contract/test_idempotency_store_contract.py tests/integration/storage/test_sqlite_spine.py -q
+uv run --python 3.13 pytest tests/contract/test_idempotency_store_contract.py tests/unit/runtime/test_execution_descriptors.py tests/integration/storage/test_sqlite_spine.py -q
 ```
 
-Expected: collection/import failures for the new idempotency types and missing
-Store behavior. Existing SQLite tests remain independently runnable.
+Expected: collection/import failures for the new idempotency/descriptor types
+and missing Store behavior. Existing SQLite tests remain independently
+runnable.
 
 - [ ] **Step 3: Implement immutable values and deterministic fingerprints**
 
