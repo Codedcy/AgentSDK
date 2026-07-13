@@ -290,3 +290,150 @@ async def test_event_schema_version_and_delivery_are_stable() -> None:
     assert first_delivery == second_delivery
     assert first_delivery[0].event.event_id == event.event_id
     assert await store.read_events(after_cursor=0, session_id="ses_2") == []
+
+
+@pytest.mark.asyncio
+async def test_commit_deeply_isolates_event_and_snapshot_inputs() -> None:
+    store = InMemoryStore()
+    event = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={"nested": {"status": "committed"}},
+    )
+    snapshot = SnapshotWrite(
+        "run",
+        "run_1",
+        "ses_1",
+        1,
+        {"nested": {"status": "committed"}},
+    )
+    await store.commit(CommitBatch(events=(event,), snapshots=(snapshot,)))
+
+    event.payload["nested"]["status"] = "mutated through input"
+    snapshot.data["nested"]["status"] = "mutated through input"
+
+    stored_event = (await store.read_events(after_cursor=0))[0]
+    stored_snapshot = await store.get_snapshot("run", "run_1")
+    assert stored_snapshot is not None
+    assert stored_event.event.payload["nested"]["status"] == "committed"
+    assert stored_snapshot["nested"]["status"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_reads_return_deeply_isolated_event_and_snapshot_data() -> None:
+    store = InMemoryStore()
+    event = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={"nested": {"status": "committed"}},
+    )
+    snapshot = SnapshotWrite(
+        "run",
+        "run_1",
+        "ses_1",
+        1,
+        {"nested": {"status": "committed"}},
+    )
+    await store.commit(CommitBatch(events=(event,), snapshots=(snapshot,)))
+
+    first_event = (await store.read_events(after_cursor=0))[0]
+    first_snapshot = await store.get_snapshot("run", "run_1")
+    assert first_snapshot is not None
+    first_event.event.payload["nested"]["status"] = "mutated through read"
+    first_snapshot["nested"]["status"] = "mutated through read"
+
+    stored_event = (await store.read_events(after_cursor=0))[0]
+    stored_snapshot = await store.get_snapshot("run", "run_1")
+    assert stored_snapshot is not None
+    assert stored_event.event.payload["nested"]["status"] == "committed"
+    assert stored_snapshot["nested"]["status"] == "committed"
+
+
+@pytest.mark.parametrize("version", [1, 0])
+@pytest.mark.asyncio
+async def test_snapshot_version_must_increase_from_existing(version: int) -> None:
+    store = InMemoryStore()
+    initial_event = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={},
+    )
+    await store.commit(
+        CommitBatch(
+            events=(initial_event,),
+            snapshots=(
+                SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "created"}),
+            ),
+        )
+    )
+    rejected_event = EventEnvelope.new(
+        type="run.completed",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=2,
+        payload={},
+    )
+
+    with pytest.raises(ValueError, match="snapshot version"):
+        await store.commit(
+            CommitBatch(
+                events=(rejected_event,),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        "run_1",
+                        "ses_1",
+                        version,
+                        {"status": "rejected"},
+                    ),
+                ),
+            )
+        )
+
+    assert [item.cursor for item in await store.read_events(after_cursor=0)] == [1]
+    snapshot = await store.get_snapshot("run", "run_1")
+    assert snapshot is not None
+    assert snapshot["status"] == "created"
+    result = await store.commit(CommitBatch(events=(rejected_event,)))
+    assert result.last_cursor == 2
+
+
+@pytest.mark.parametrize("second_version", [2, 1])
+@pytest.mark.asyncio
+async def test_snapshot_version_must_increase_within_batch(second_version: int) -> None:
+    store = InMemoryStore()
+    event = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={},
+    )
+
+    with pytest.raises(ValueError, match="snapshot version"):
+        await store.commit(
+            CommitBatch(
+                events=(event,),
+                snapshots=(
+                    SnapshotWrite("run", "run_1", "ses_1", 2, {"status": "created"}),
+                    SnapshotWrite(
+                        "run",
+                        "run_1",
+                        "ses_1",
+                        second_version,
+                        {"status": "rejected"},
+                    ),
+                ),
+            )
+        )
+
+    assert await store.read_events(after_cursor=0) == []
+    assert await store.get_snapshot("run", "run_1") is None
+    result = await store.commit(CommitBatch(events=(event,)))
+    assert result.last_cursor == 1

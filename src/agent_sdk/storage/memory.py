@@ -1,4 +1,5 @@
 import asyncio
+from copy import deepcopy
 from typing import Any, TypeAlias
 
 from agent_sdk.events.models import EventEnvelope
@@ -44,10 +45,17 @@ class InMemoryStore:
                     raise ValueError("event sequence must be strictly increasing")
                 sequences[aggregate] = event.sequence
                 last_cursor += 1
-                events.append(StoredEvent(last_cursor, event))
+                events.append(StoredEvent(last_cursor, deepcopy(event)))
 
             for snapshot in batch.snapshots:
-                snapshots[(snapshot.kind, snapshot.entity_id)] = snapshot
+                key = (snapshot.kind, snapshot.entity_id)
+                previous_snapshot = snapshots.get(key)
+                if (
+                    previous_snapshot is not None
+                    and snapshot.version <= previous_snapshot.version
+                ):
+                    raise ValueError("snapshot version must be strictly increasing")
+                snapshots[key] = deepcopy(snapshot)
 
             self._events = events
             self._snapshots = snapshots
@@ -62,7 +70,7 @@ class InMemoryStore:
     ) -> list[StoredEvent]:
         async with self._lock:
             return [
-                stored
+                deepcopy(stored)
                 for stored in self._events
                 if stored.cursor > after_cursor
                 and (session_id is None or stored.event.session_id == session_id)
@@ -73,7 +81,7 @@ class InMemoryStore:
             snapshot = self._snapshots.get((kind, entity_id))
             if snapshot is None:
                 return None
-            return snapshot.data.copy()
+            return deepcopy(snapshot.data)
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
