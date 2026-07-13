@@ -1,4 +1,4 @@
-from agent_sdk.api import AgentSDK, PermissionAPI, RunAPI, SessionAPI
+from agent_sdk.api import AgentAPI, AgentSDK, PermissionAPI, RunAPI, SessionAPI, WorkflowAPI
 from agent_sdk.config import AgentSDKConfig, CaptureLevel
 from agent_sdk.context import (
     CompactionLevel,
@@ -30,15 +30,34 @@ from agent_sdk.runtime.models import (
     TokenUsage,
 )
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
+from agent_sdk.subagents import ChildResult, ChildUsage, SubagentService, TaskEnvelope
 from agent_sdk.tools import ToolContext, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec
 from agent_sdk.tools.executor import ToolExecutor
+from agent_sdk.workflow import (
+    AgentNode,
+    WorkflowCompiler,
+    WorkflowDefinition,
+    WorkflowEdge,
+    WorkflowExecutor,
+    WorkflowFailure,
+    WorkflowHandle,
+    WorkflowIR,
+    WorkflowNodeSnapshot,
+    WorkflowNodeStatus,
+    WorkflowResult,
+    WorkflowRunSnapshot,
+    WorkflowRunStatus,
+)
 
 __all__ = [
     "AgentSDK",
+    "AgentAPI",
     "AgentSDKConfig",
     "AgentSDKError",
     "AgentSpec",
     "CaptureLevel",
+    "ChildResult",
+    "ChildUsage",
     "CompactionLevel",
     "CompactionPolicy",
     "ContextBudget",
@@ -68,6 +87,8 @@ __all__ = [
     "SkillRegistry",
     "ActivatedSkill",
     "StdioMCPTransport",
+    "SubagentService",
+    "TaskEnvelope",
     "StreamableHTTPMCPTransport",
     "TokenUsage",
     "ToolContext",
@@ -76,5 +97,19 @@ __all__ = [
     "ToolResult",
     "ToolResultStatus",
     "ToolSpec",
+    "AgentNode",
+    "WorkflowAPI",
+    "WorkflowCompiler",
+    "WorkflowDefinition",
+    "WorkflowEdge",
+    "WorkflowExecutor",
+    "WorkflowFailure",
+    "WorkflowHandle",
+    "WorkflowIR",
+    "WorkflowNodeSnapshot",
+    "WorkflowNodeStatus",
+    "WorkflowResult",
+    "WorkflowRunSnapshot",
+    "WorkflowRunStatus",
     "new_id",
 ]

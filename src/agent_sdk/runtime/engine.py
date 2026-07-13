@@ -19,7 +19,13 @@ from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.models import RunResult, RunSnapshot, RunStatus, TokenUsage
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    SnapshotWrite,
+    StateStore,
+)
 from agent_sdk.tools.executor import ToolExecutor
 from agent_sdk.tools.models import ToolContext, ToolResult
 from agent_sdk.tools.registry import ToolRegistry
@@ -167,7 +173,23 @@ class _RunEmitter:
                     snapshot.model_dump(mode="json"),
                 ),
             )
-        await self._store.commit(CommitBatch(events=(event,), snapshots=snapshots))
+        try:
+            await self._store.commit(
+                CommitBatch(
+                    events=(event,),
+                    snapshots=snapshots,
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        SnapshotPrecondition("run", self._run.run_id, self._run.version),
+                    ),
+                )
+            )
+        except SnapshotPreconditionError:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "run session no longer exists",
+                retryable=False,
+            ) from None
         if snapshot is not None:
             self._run = snapshot
         self._sequence += 1

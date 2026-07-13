@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 from agent_sdk.tools.models import ToolResult
+from agent_sdk.subagents.models import TaskEnvelope
 
 
 class RunStatus(StrEnum):
@@ -97,6 +98,8 @@ class SessionSnapshot(BaseModel):
 
 
 class RunSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     run_id: str
     session_id: str
     agent_revision: str
@@ -105,3 +108,7 @@ class RunSnapshot(BaseModel):
     version: int = 1
     output_text: str | None = None
     usage: TokenUsage | None = None
+    parent_run_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_node_id: str | None = None
+    task_envelope: TaskEnvelope | None = None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, cast
 
@@ -13,6 +14,7 @@ from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.models import (
@@ -25,10 +27,22 @@ from agent_sdk.runtime.models import (
 from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.registry import ToolRegistry
+from agent_sdk.workflow import (
+    WorkflowCompiler,
+    WorkflowDefinition,
+    WorkflowExecutor,
+    WorkflowHandle,
+    WorkflowIR,
+    WorkflowRunSnapshot,
+)
 
 _ACompletion = Callable[..., Awaitable[Any]]
 _PermissionDefault = Literal["allow", "deny", "ask"]
 _DEFAULT_PERMISSION_BRIDGE = object()
+
+
+class _WorkflowCompileFailure(Enum):
+    INVALID = "invalid"
 
 
 class _LazySQLiteStore:
@@ -96,7 +110,7 @@ class _SDKLifecycle:
 
     async def close(
         self,
-        active_tasks: set[asyncio.Task[RunResult]],
+        active_tasks: set[asyncio.Task[Any]],
         owned_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
         async with self._lock:
@@ -117,7 +131,7 @@ class _SDKLifecycle:
 
     @staticmethod
     async def _close_resources(
-        active_tasks: tuple[asyncio.Task[RunResult], ...],
+        active_tasks: tuple[asyncio.Task[Any], ...],
         owned_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
         if active_tasks:
@@ -134,6 +148,81 @@ class SessionAPI:
     async def create(self, *, workspaces: Iterable[str | Path]) -> SessionSnapshot:
         async with self._lifecycle.admit():
             return await self._commands.create_session(workspaces=workspaces)
+
+    async def delete(self, session_id: str) -> None:
+        async with self._lifecycle.admit():
+            await self._commands.delete_session(session_id)
+
+
+class AgentAPI:
+    def __init__(self, registry: AgentRegistry) -> None:
+        self._registry = registry
+
+    def define(self, spec: AgentSpec) -> AgentSpec:
+        return self._registry.define(spec)
+
+
+class WorkflowAPI:
+    def __init__(
+        self,
+        executor: WorkflowExecutor,
+        compiler: WorkflowCompiler,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._executor = executor
+        self._compiler = compiler
+        self._lifecycle = lifecycle
+
+    async def start(
+        self,
+        session_id: str,
+        definition: WorkflowIR | WorkflowDefinition | str,
+    ) -> WorkflowHandle:
+        async with self._lifecycle.admit():
+            workflow = self._compile(definition)
+            return await self._executor.start(session_id, workflow)
+
+    async def resume(
+        self,
+        workflow_run_id: str,
+        *,
+        expected_workflow: WorkflowIR | WorkflowDefinition | str | None = None,
+    ) -> WorkflowHandle:
+        async with self._lifecycle.admit():
+            expected = None if expected_workflow is None else self._compile(expected_workflow)
+            return await self._executor.resume(
+                workflow_run_id,
+                expected_workflow=expected,
+            )
+
+    async def get(self, workflow_run_id: str) -> WorkflowRunSnapshot:
+        return await self._executor.get(workflow_run_id)
+
+    def _compile(self, definition: WorkflowIR | WorkflowDefinition | str) -> WorkflowIR:
+        result = _compile_workflow(self._compiler, definition)
+        if result is _WorkflowCompileFailure.INVALID:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "workflow definition is invalid",
+                retryable=False,
+            )
+        return result
+
+
+def _compile_workflow(
+    compiler: WorkflowCompiler,
+    definition: WorkflowIR | WorkflowDefinition | str,
+) -> WorkflowIR | _WorkflowCompileFailure:
+    try:
+        if isinstance(definition, WorkflowIR):
+            return definition
+        if isinstance(definition, WorkflowDefinition):
+            return compiler.compile(definition)
+        if isinstance(definition, str):
+            return compiler.compile_yaml(definition)
+        return _WorkflowCompileFailure.INVALID
+    except Exception:
+        return _WorkflowCompileFailure.INVALID
 
 
 class RunAPI:
@@ -274,7 +363,7 @@ class AgentSDK:
         permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
-        self._active_tasks: set[asyncio.Task[RunResult]] = set()
+        self._active_tasks: set[asyncio.Task[Any]] = set()
         self._owned_close = owned_close
         self._lifecycle = _SDKLifecycle()
         commands = RuntimeCommands(store)
@@ -286,7 +375,18 @@ class AgentSDK:
             PolicyEngine(permission_default),
             permission_bridge,
         )
+        agents = AgentRegistry()
+        workflows = WorkflowExecutor(
+            store,
+            commands,
+            engine,
+            agents,
+            tool_schemas=tools.schemas,
+            track_run_task=self._track_task,
+            track_workflow_task=self._track_task,
+        )
         self.tools = tools
+        self.agents = AgentAPI(agents)
         self.permissions = PermissionAPI(permission_bridge)
         self.sessions = SessionAPI(commands, self._lifecycle)
         self.runs = RunAPI(
@@ -297,12 +397,13 @@ class AgentSDK:
             self._lifecycle,
             tools,
         )
+        self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)
 
-    def _track_task(self, task: asyncio.Task[RunResult]) -> None:
+    def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._active_tasks.add(task)
         task.add_done_callback(self._task_finished)
 
-    def _task_finished(self, task: asyncio.Task[RunResult]) -> None:
+    def _task_finished(self, task: asyncio.Task[Any]) -> None:
         self._active_tasks.discard(task)
         if not task.cancelled():
             task.exception()
