@@ -23,7 +23,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._registered: dict[str, RegisteredTool] = {}
 
-    def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
+    def register(self, spec: ToolSpec, handler: ToolHandler) -> RegisteredTool:
         if spec.name in self._registered:
             raise AgentSDKError(
                 ErrorCode.CONFLICT,
@@ -38,7 +38,21 @@ class ToolRegistry:
                 "tool schema is invalid",
                 retryable=False,
             ) from error
-        self._registered[spec.name] = RegisteredTool(spec, handler)
+        registered = RegisteredTool(spec, handler)
+        self._registered[spec.name] = registered
+        return registered
+
+    def unregister(
+        self,
+        name: str,
+        *,
+        expected: RegisteredTool | None = None,
+    ) -> bool:
+        registered = self._registered.get(name)
+        if registered is None or (expected is not None and registered is not expected):
+            return False
+        del self._registered[name]
+        return True
 
     def get(self, name: str) -> RegisteredTool:
         try:
