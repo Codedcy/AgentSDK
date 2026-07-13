@@ -179,7 +179,7 @@ class ContextView(_DetachedModel):
     view_id: StrictStr = Field(min_length=1)
     session_id: StrictStr = Field(min_length=1)
     message_refs: tuple[StrictStr, ...]
-    capsule_id: StrictStr | None
+    capsule_id: StrictStr | None = Field(min_length=1)
     estimated_tokens: StrictInt = Field(ge=0)
     recommended_level: CompactionLevel = CompactionLevel.L0
     applied_level: CompactionLevel = CompactionLevel.L0
@@ -189,6 +189,15 @@ class ContextView(_DetachedModel):
     def _validate_unique_message_refs(self) -> ContextView:
         if len(set(self.message_refs)) != len(self.message_refs):
             raise ValueError("context message references must be unique")
+        has_capsule = self.capsule_id is not None
+        applied_capsule = self.applied_level in {
+            CompactionLevel.L3,
+            CompactionLevel.L4,
+        }
+        if has_capsule != applied_capsule:
+            raise ValueError(
+                "context capsule and applied level must describe the same state"
+            )
         return self
 
     @property

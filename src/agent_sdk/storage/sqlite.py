@@ -11,7 +11,13 @@ from typing import Any, cast
 import aiosqlite
 
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.storage.base import CommitBatch, CommitResult, SnapshotWrite, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    SnapshotPreconditionError,
+    SnapshotWrite,
+    StoredEvent,
+)
 
 _SCHEMA_VERSION = 1
 _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
@@ -99,6 +105,7 @@ class SQLiteStore:
             self._ensure_open()
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
+                await self._check_snapshot_preconditions(batch)
                 for event in batch.events:
                     await self._insert_event(event)
                 for snapshot in batch.snapshots:
@@ -109,6 +116,20 @@ class SQLiteStore:
             except BaseException:
                 await self._rollback()
                 raise
+
+    async def _check_snapshot_preconditions(self, batch: CommitBatch) -> None:
+        for precondition in batch.preconditions:
+            async with self._connection.execute(
+                "SELECT version FROM snapshots WHERE kind = ? AND entity_id = ?",
+                (precondition.kind, precondition.entity_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            version = None if row is None else cast(int, row[0])
+            if version is None or (
+                precondition.version is not None
+                and version != precondition.version
+            ):
+                raise SnapshotPreconditionError("snapshot precondition failed")
 
     async def read_events(
         self,

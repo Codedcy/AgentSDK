@@ -11,9 +11,20 @@ class SnapshotWrite(NamedTuple):
     data: dict[str, Any]
 
 
+class SnapshotPrecondition(NamedTuple):
+    kind: str
+    entity_id: str
+    version: int | None = None
+
+
+class SnapshotPreconditionError(ValueError):
+    """A required snapshot was missing or no longer at the expected version."""
+
+
 class CommitBatch(NamedTuple):
     events: tuple[EventEnvelope, ...]
     snapshots: tuple[SnapshotWrite, ...] = ()
+    preconditions: tuple[SnapshotPrecondition, ...] = ()
 
 
 class CommitResult(NamedTuple):

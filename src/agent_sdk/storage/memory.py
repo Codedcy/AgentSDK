@@ -6,6 +6,7 @@ from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
+    SnapshotPreconditionError,
     SnapshotWrite,
     StoredEvent,
 )
@@ -29,6 +30,17 @@ class InMemoryStore:
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         async with self._lock:
+            for precondition in batch.preconditions:
+                snapshot = self._snapshots.get(
+                    (precondition.kind, precondition.entity_id)
+                )
+                if snapshot is None or (
+                    precondition.version is not None
+                    and snapshot.version != precondition.version
+                ):
+                    raise SnapshotPreconditionError(
+                        "snapshot precondition failed"
+                    )
             events = self._events.copy()
             snapshots = self._snapshots.copy()
             last_cursor = self._last_cursor

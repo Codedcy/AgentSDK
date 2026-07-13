@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeAlias, TypeVar, cast
+from typing import Any, Generic, TypeAlias, TypeVar
 
 import litellm
 from pydantic import BaseModel
@@ -95,12 +95,11 @@ def _value(container: object, name: str) -> Any:
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("usage token count must be an integer")
-    normalized = int(cast(int, value))
-    if normalized < 0:
+    if value < 0:
         raise ValueError("usage token count must be non-negative")
-    return normalized
+    return value
 
 
 class LiteLLMGateway:
@@ -118,6 +117,8 @@ class LiteLLMGateway:
         request: ModelRequest,
         schema: type[_StructuredModel],
     ) -> StructuredCompletion[_StructuredModel]:
+        provider_failed = False
+        response: Any = None
         try:
             params = deepcopy(dict(request.params))
             params["stream"] = False
@@ -128,13 +129,18 @@ class LiteLLMGateway:
                 tools=deepcopy(list(request.tools)),
                 **params,
             )
-        except Exception as error:
+        except Exception:
+            provider_failed = True
+        if provider_failed:
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
                 "structured model call failed",
                 retryable=False,
-            ) from error
+            )
 
+        response_invalid = False
+        value: _StructuredModel | None = None
+        usage: UsageReported | None = None
         try:
             choices = _value(response, "choices")
             if (
@@ -175,12 +181,16 @@ class LiteLLMGateway:
                     else None
                 ),
             )
-        except Exception as error:
+        except Exception:
+            response_invalid = True
+        if response_invalid:
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
                 "structured model response invalid",
                 retryable=False,
-            ) from error
+            )
+        assert value is not None
+        assert usage is not None
         return StructuredCompletion(parsed=value, usage=usage)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:

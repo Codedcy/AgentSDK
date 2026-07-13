@@ -21,7 +21,14 @@ from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, UsageReported
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    SnapshotWrite,
+    StateStore,
+    StoredEvent,
+)
 
 _Role = Literal["system", "user", "assistant", "tool"]
 _APPLICATION_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -327,7 +334,15 @@ class ContextPlanner:
                 view.model_dump(mode="json"),
             ),
         )
-        await self._commit(CommitBatch(events=events, snapshots=snapshots))
+        await self._commit(
+            CommitBatch(
+                events=events,
+                snapshots=snapshots,
+                preconditions=(
+                    SnapshotPrecondition("session", session_id),
+                ),
+            )
+        )
         return view
 
     async def _persist_fallback(
@@ -368,6 +383,9 @@ class ContextPlanner:
                         view.model_dump(mode="json"),
                     ),
                 ),
+                preconditions=(
+                    SnapshotPrecondition("session", session_id),
+                ),
             )
         )
         return view
@@ -392,6 +410,9 @@ class ContextPlanner:
                         1,
                         view.model_dump(mode="json"),
                     ),
+                ),
+                preconditions=(
+                    SnapshotPrecondition("session", session_id),
                 ),
             )
         )
@@ -436,14 +457,24 @@ class ContextPlanner:
         return count
 
     async def _commit(self, batch: CommitBatch) -> None:
+        failure: AgentSDKError | None = None
         try:
             await self._store.commit(batch)
+        except SnapshotPreconditionError:
+            failure = AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "context session no longer exists",
+                retryable=False,
+            )
         except Exception as error:
-            raise AgentSDKError(
+            del error
+            failure = AgentSDKError(
                 ErrorCode.INTERNAL,
                 "context persistence failed",
                 retryable=False,
-            ) from error
+            )
+        if failure is not None:
+            raise failure
 
     @staticmethod
     def _raw_view(

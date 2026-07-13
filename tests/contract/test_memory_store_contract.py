@@ -4,7 +4,13 @@ from pathlib import Path
 import pytest
 
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    SnapshotWrite,
+    StateStore,
+)
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -47,6 +53,111 @@ async def test_commit_assigns_cursor_and_snapshot_atomically(store: StateStore) 
     assert snapshot is not None
     assert snapshot["status"] == "created"
     assert [item.cursor for item in await store.read_events(after_cursor=0)] == [1]
+
+
+@pytest.mark.parametrize(
+    "precondition",
+    [
+        SnapshotPrecondition("session", "ses_missing"),
+        SnapshotPrecondition("session", "ses_1", version=2),
+    ],
+    ids=("missing", "wrong-version"),
+)
+@pytest.mark.asyncio
+async def test_snapshot_precondition_failure_rolls_back_entire_batch(
+    store: StateStore,
+    precondition: SnapshotPrecondition,
+) -> None:
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "session",
+                    "ses_1",
+                    "ses_1",
+                    1,
+                    {"session_id": "ses_1", "version": 1},
+                ),
+            ),
+        )
+    )
+    rejected = EventEnvelope.new(
+        type="context.view.created",
+        session_id="ses_1",
+        run_id="view_rejected",
+        sequence=1,
+        payload={},
+    )
+
+    with pytest.raises(
+        SnapshotPreconditionError,
+        match="snapshot precondition failed",
+    ):
+        await store.commit(
+            CommitBatch(
+                events=(rejected,),
+                snapshots=(
+                    SnapshotWrite(
+                        "context_view",
+                        "view_rejected",
+                        "ses_1",
+                        1,
+                        {"view_id": "view_rejected"},
+                    ),
+                ),
+                preconditions=(precondition,),
+            )
+        )
+
+    assert await store.read_events(after_cursor=0) == []
+    assert await store.get_snapshot("context_view", "view_rejected") is None
+    assert await store.get_snapshot("session", "ses_1") == {
+        "session_id": "ses_1",
+        "version": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_snapshot_precondition_accepts_existence_and_exact_version(
+    store: StateStore,
+) -> None:
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "session",
+                    "ses_1",
+                    "ses_1",
+                    3,
+                    {"session_id": "ses_1", "version": 3},
+                ),
+            ),
+        )
+    )
+    event = EventEnvelope.new(
+        type="context.view.created",
+        session_id="ses_1",
+        run_id="view_committed",
+        sequence=1,
+        payload={},
+    )
+
+    result = await store.commit(
+        CommitBatch(
+            events=(event,),
+            preconditions=(
+                SnapshotPrecondition("session", "ses_1"),
+                SnapshotPrecondition("session", "ses_1", version=3),
+            ),
+        )
+    )
+
+    assert result.last_cursor == 1
+    assert [item.event.event_id for item in await store.read_events(after_cursor=0)] == [
+        event.event_id
+    ]
 
 
 @pytest.mark.asyncio

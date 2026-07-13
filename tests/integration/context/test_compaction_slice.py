@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+import traceback
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,7 @@ from agent_sdk.context import (
     ContextCapsule,
     ContextPlanner,
     ContextRetrieval,
+    ContextView,
 )
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
@@ -269,6 +272,31 @@ def test_budget_reserve_arithmetic_is_exact_and_strict() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("capsule_id", "applied_level"),
+    [
+        (None, CompactionLevel.L3),
+        (None, CompactionLevel.L4),
+        ("cap_unexpected", CompactionLevel.L0),
+        ("cap_unexpected", CompactionLevel.L1),
+        ("cap_unexpected", CompactionLevel.L2),
+    ],
+)
+def test_context_view_rejects_contradictory_capsule_and_applied_level(
+    capsule_id: str | None,
+    applied_level: CompactionLevel,
+) -> None:
+    with pytest.raises(ValidationError):
+        ContextView(
+            view_id="view_invalid",
+            session_id="ses_invalid",
+            message_refs=(),
+            capsule_id=capsule_id,
+            estimated_tokens=0,
+            applied_level=applied_level,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("response_kind", ["model", "mapping", "json"])
 async def test_gateway_structured_completion_accepts_supported_shapes_and_usage(
@@ -361,6 +389,11 @@ async def test_gateway_sanitizes_provider_failure_and_propagates_cancellation() 
         )
     assert raised.value.message == "structured model call failed"
     assert "provider secret" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert "provider secret" not in "".join(
+        traceback.format_exception(raised.value)
+    )
 
     async def cancelled(**_: object) -> object:
         raise asyncio.CancelledError
@@ -370,6 +403,26 @@ async def test_gateway_sanitizes_provider_failure_and_propagates_cancellation() 
             ModelRequest(model="fake/model", messages=()),
             ContextCapsule,
         )
+
+
+@pytest.mark.asyncio
+async def test_gateway_structured_parse_failure_drops_raw_payload_exception_chain() -> None:
+    raw_secret = "raw-provider-payload-secret"
+
+    async def acompletion(**_: object) -> dict[str, object]:
+        malformed = _capsule_data(["evt_1"])
+        malformed["objective"] = {"secret": raw_secret}
+        return {"choices": [{"message": {"parsed": malformed}}]}
+
+    with pytest.raises(AgentSDKError) as raised:
+        await LiteLLMGateway._for_test(acompletion).complete_structured(
+            ModelRequest(model="fake/model", messages=()),
+            ContextCapsule,
+        )
+    assert raised.value.message == "structured model response invalid"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert raw_secret not in "".join(traceback.format_exception(raised.value))
 
 
 @pytest.mark.asyncio
@@ -407,6 +460,58 @@ async def test_gateway_sanitizes_nonstandard_response_parsing_failures(
     assert "raw response secret" not in str(raised.value)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_usage", [1.5, "2", -1, True])
+async def test_gateway_structured_usage_requires_a_non_negative_real_int(
+    invalid_usage: object,
+) -> None:
+    async def acompletion(**_: object) -> dict[str, object]:
+        return {
+            "choices": [
+                {"message": {"parsed": _capsule_data(["evt_usage"])}}
+            ],
+            "usage": {
+                "prompt_tokens": invalid_usage,
+                "completion_tokens": 1,
+                "total_tokens": 1,
+            },
+        }
+
+    with pytest.raises(AgentSDKError) as raised:
+        await LiteLLMGateway._for_test(acompletion).complete_structured(
+            ModelRequest(model="fake/model", messages=()),
+            ContextCapsule,
+        )
+    assert raised.value.message == "structured model response invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_usage", [1.5, "2", -1, True])
+async def test_gateway_stream_usage_requires_a_non_negative_real_int(
+    invalid_usage: object,
+) -> None:
+    async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": invalid_usage,
+                    "completion_tokens": 1,
+                    "total_tokens": 1,
+                },
+            }
+
+        return chunks()
+
+    with pytest.raises(ValueError, match="usage token count"):
+        _ = [
+            event
+            async for event in LiteLLMGateway._for_test(acompletion).stream(
+                ModelRequest(model="fake/model", messages=())
+            )
+        ]
+
+
 class _RecordingStore:
     def __init__(self, delegate: StateStore) -> None:
         self.delegate = delegate
@@ -433,6 +538,16 @@ class _RecordingStore:
 
     async def delete_session(self, session_id: str) -> None:
         await self.delegate.delete_session(session_id)
+
+
+class _AttemptRecordingStore(_RecordingStore):
+    def __init__(self, delegate: StateStore) -> None:
+        super().__init__(delegate)
+        self.attempts: list[CommitBatch] = []
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        self.attempts.append(batch)
+        return await self.delegate.commit(batch)
 
 
 async def _seed_projection(store: StateStore, *, session_id: str = "ses_projection") -> None:
@@ -847,6 +962,84 @@ async def test_success_is_one_atomic_commit_with_capsule_view_and_events() -> No
         "context.view.created",
     ]
     assert all(event.run_id == view.view_id for event in batch.events)
+
+
+async def _assert_delete_wins_blocked_compaction(
+    store: _AttemptRecordingStore,
+    delete_session: Callable[[], Awaitable[None]],
+) -> None:
+    await _seed_projection(store, session_id="ses_projection")
+    store.attempts.clear()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def acompletion(**_: object) -> dict[str, object]:
+        entered.set()
+        await release.wait()
+        return _structured_response(
+            ["evt_projection_tool", "evt_projection_latest"]
+        )
+
+    task = asyncio.create_task(
+        _planner(store, acompletion).build(
+            "ses_projection",
+            force_level="L3",
+            protected_event_ids={"evt_projection_tool"},
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        await asyncio.wait_for(delete_session(), timeout=1)
+        release.set()
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(task, timeout=1)
+        assert raised.value.code is ErrorCode.NOT_FOUND
+        assert raised.value.message == "context session no longer exists"
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+        assert await store.get_snapshot("session", "ses_projection") is None
+        assert await store.read_events(
+            after_cursor=0,
+            session_id="ses_projection",
+        ) == []
+        attempted = store.attempts[-1]
+        assert attempted.preconditions
+        for snapshot in attempted.snapshots:
+            assert await store.get_snapshot(snapshot.kind, snapshot.entity_id) is None
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+            with suppress(BaseException):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_in_memory_delete_cannot_be_undone_by_blocked_compaction() -> None:
+    store = _AttemptRecordingStore(InMemoryStore())
+    await _assert_delete_wins_blocked_compaction(
+        store,
+        lambda: store.delete_session("ses_projection"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_delete_on_independent_connection_cannot_be_undone_by_compaction(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "context-delete-race.db"
+    planner_connection = await SQLiteStore.open(database)
+    deleter_connection = await SQLiteStore.open(database)
+    store = _AttemptRecordingStore(planner_connection)
+    try:
+        await _assert_delete_wins_blocked_compaction(
+            store,
+            lambda: deleter_connection.delete_session("ses_projection"),
+        )
+    finally:
+        await planner_connection.close()
+        await deleter_connection.close()
 
 
 class _RejectingCommitStore(_RecordingStore):
