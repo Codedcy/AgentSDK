@@ -12,7 +12,7 @@
 
 - Runtime truth remains durable events plus snapshots. Observability never creates a second hidden trace store and never makes Runtime depend on an exporter or UI.
 - Every query/aggregate exposes `as_of_cursor`. The Store exposes a durable `latest_cursor()` high-water mark that does not move backwards when a Session is deleted and cursor holes appear.
-- Every event query/aggregate first captures high-water `H`, reads the current durable rows, and accepts only rows with `cursor <= H`; a concurrent later commit belongs to the next observation. A caller cursor greater than the captured Store high-water is rejected as INVALID_STATE rather than silently moved backwards or allowed to skip future events.
+- Every event query/aggregate first captures high-water `H`, reads bounded durable pages with `cursor <= H`, and accepts only rows through `H`; a concurrent later commit belongs to the next observation. A caller cursor greater than the captured Store high-water is rejected as INVALID_STATE rather than silently moved backwards or allowed to skip future events.
 - Query results are immutable and detached from Store-owned dictionaries. Missing/deleted records return stable NOT_FOUND; corrupt records and ordinary extension failures cross the public boundary only as sanitized `AgentSDKError` values.
 - Event subscription is at-least-once from the caller's acknowledged cursor. It advances over nonmatching events, tolerates deletion-created cursor holes, creates no background task, and propagates `asyncio.CancelledError` without swallowing or replacing it.
 - A long-lived subscription never holds `_SDKLifecycle.admit()` and never keeps SDK close waiting indefinitely. Lifecycle exposes a shared close signal: idle polling waits interruptibly for poll timeout or close; once closing is observable the iterator stops without any later Store read. A newly consumed iterator after closing fails with stable INVALID_STATE.
@@ -38,10 +38,10 @@
 
 **Public interfaces:**
 - `StateStore.latest_cursor()`
-- `EventFilter`, `ObservedEvent`, `ObservedRun`, `RunTimeline`
+- `EventFilter`, `ObservedEvent`, `EventQueryResult`, `ObservedRun`, `RunTimeline`
 - `ExecutionTreeNode`, `ExecutionTree`
 - `QueryService.get_run`, `QueryService.timeline`, `QueryService.execution_tree`
-- `QueryService.query_events`
+- `QueryService.query_events(*, after_cursor=0, limit=100)`
 
 - [ ] **Step 1: Write high-water and immutable query RED tests**
 
@@ -50,6 +50,7 @@ Cover InMemory and SQLite parity. Create a Run, move it through several states, 
 - `get_run(run_id)` returns the exact `RunSnapshot` plus a positive `as_of_cursor`;
 - `timeline(run_id)` contains only that Run's events in cursor order and exposes the same-or-newer durable cursor;
 - `query_events(EventFilter(...), after_cursor=...)` filters by exact Session, Run and event types while its next cursor advances over unrelated records;
+- `query_events` reads at most the validated public `limit` (1..1000) raw cursor records, so an empty filtered page may still advance `next_cursor`; the caller continues until `next_cursor == as_of_cursor`;
 - returned models/tuples/payloads cannot be mutated through aliases;
 - `latest_cursor()` remains at the allocated high-water after deleting the Session that owned the last event.
 
@@ -64,15 +65,17 @@ timeline = await sdk.queries.timeline(run_id)
 assert timeline.events[-1].event.type == "run.completed"
 ```
 
-- [ ] **Step 2: Implement durable Store high-water**
+- [ ] **Step 2: Implement durable Store high-water and bounded reads**
 
 Add `latest_cursor()` to the StateStore contract, InMemoryStore, SQLiteStore and the SDK's lazy SQLite adapter. InMemory returns its monotonic allocation counter under the Store lock. SQLite reads `sqlite_sequence` under its existing lock, preserving the allocated cursor even if rows were deleted. Do not derive this value only from `MAX(events.cursor)`.
+
+Extend `StateStore.read_events` with optional keyword-only `up_to_cursor` and `limit` parameters, defaulting to the existing unbounded behavior for source compatibility. InMemory applies the cursor/session predicates and then slices under its lock; SQLite applies `cursor <= ?`, ordered `LIMIT ?` in SQL. Internal callers in this slice use a fixed bounded page size. Validate nonpositive limits/inverted cursor windows before touching storage.
 
 - [ ] **Step 3: Implement bounded, stable Run observations**
 
 `get_run` validates a `RunSnapshot`, captures a cursor and confirms the snapshot still exists and is byte-for-byte equivalent before returning. This detects a concurrent transition or Session deletion; retry a small bounded number of times, then return retryable CONFLICT rather than mixing state from different moments. A transition after the confirmation is allowed: the result is linearized at the confirmation read.
 
-`timeline` first proves the Run exists, captures the high-water cursor, reads events only up to that cursor, filters by exact `run_id`, then confirms the Run still exists. It never leaks another Run or a deleted Session. Corrupt snapshot/event data becomes a context-free INTERNAL public error.
+`timeline` first proves the Run exists, captures the high-water cursor, reads bounded pages only up to that cursor, filters by exact `run_id`, then confirms the exact same Run identity, Session ownership and immutable relationship fields still exist. A Session delete creates no durable event, so final identity confirmation—not only a tail event read—is required. It never leaks another Run or a deleted Session. Corrupt snapshot/event data becomes a context-free INTERNAL public error.
 
 - [ ] **Step 4: Implement the M01 descendant execution tree**
 
@@ -80,7 +83,7 @@ For this slice `execution_tree(root_run_id)` means the requested Run plus the tr
 
 Return a flat, deterministic tuple of `ExecutionTreeNode(snapshot, parent_run_id, created_cursor)` in creation-cursor order. Validate exact Session ownership and every relationship against the current Run snapshots. Detect relevant Run transitions/new Child creation during assembly with a bounded re-read and fail closed on inconsistent/cross-Session records. Do not enumerate mutable in-process task state.
 
-Do not require the global high-water to remain equal during tree assembly: unrelated Sessions/Runs may continue committing forever. Re-read only events after captured `H`; retry when those events transition an already-selected Run or create a Child whose parent is in the selected tree. Ignore malformed records that provably belong to an unrelated Session/tree, while a cross-Session record that claims a selected parent is an integrity failure.
+Do not require the global high-water to remain equal during tree assembly: unrelated Sessions/Runs may continue committing forever. Re-read bounded pages only after captured `H`; retry when those events transition an already-selected Run or create a Child whose parent is in the selected tree. After the tail check, re-read root and every selected Run snapshot and require exact equality/session ownership with the assembled observation; this catches Session deletion or same-id replacement that emits no retained event. Ignore malformed records that provably belong to an unrelated Session/tree, while a cross-Session record that claims a selected parent is an integrity failure.
 
 - [ ] **Step 5: Verify Task 1**
 
@@ -110,6 +113,7 @@ Also cover:
 - global and Session/Run/type filters;
 - a cursor whose event was removed by Session deletion;
 - no events yet followed by a later commit;
+- a large backlog of nonmatching events is processed in fixed pages, allows cancellation/close between pages, and does not allocate the whole backlog at once;
 - consumer `aclose()` and task cancellation with no leaked polling/background task;
 - cancellation while waiting propagates the same `CancelledError` instance where Python task semantics expose it;
 - invalid negative cursors fail before any Store read.
@@ -117,7 +121,7 @@ Also cover:
 
 - [ ] **Step 2: Implement a stateless polling async iterator**
 
-Read durable batches after the local cursor. For every stored event, update the local cursor before deciding whether it matches; yield only matches. If the batch is empty, wait on the SDK lifecycle close signal with a short configurable timeout (or the equivalent cancellation-safe primitive), then poll again. Do not create a producer task or unbounded queue in M01. If close races with a Store call, suppress a closed-Store error only after confirming the close signal; otherwise sanitize it as an SDK error.
+Read durable batches with the Store `limit` set to a small fixed page size. For every stored event, update the local cursor before deciding whether it matches; yield only matches. Check cancellation/close between pages. If the batch is empty, wait on the SDK lifecycle close signal with a short configurable timeout (or the equivalent cancellation-safe primitive), then poll again. Do not create a producer task or unbounded queue in M01. If close races with a Store call, suppress a closed-Store error only after confirming the close signal; otherwise sanitize it as an SDK error.
 
 The yielded `ObservedEvent.cursor` is the application acknowledgement token. Delivery after reconnect is at least once: the application resumes from the last cursor it durably acknowledged and may deduplicate by immutable `event_id`.
 
@@ -169,6 +173,8 @@ Cover:
 - [ ] **Step 3: Implement frozen contracts and the built-in evaluator**
 
 `EvaluationDecision` contains only evaluator-controlled claims: verdict, metrics, reason, confidence and evidence event ids. `EvaluationResult` adds SDK-controlled `evaluation_id`, Session/subject identity, subject type, evaluator id/version, method, `created_at`, schema/record version and the captured subject cursor. Freeze and detach metric mappings; reject non-finite values, duplicate evidence and extra fields.
+
+The `Evaluator` protocol declares read-only `id`, `version` and `method` metadata plus `evaluate(subject)`. The engine validates all three strings in the same private extension helper and copies them into `EvaluationResult`; it never guesses a custom evaluator's method. `ExactOutputEvaluator.method` is the stable deterministic label `deterministic_exact_match`.
 
 `ExactOutputEvaluator` compares the terminal `output_text` exactly, emits confidence `1.0`, cites the terminal Run event, and never invokes LiteLLM. It is the one deterministic best-practice validation included in M01; applications may supply their own protocol implementation.
 
@@ -226,7 +232,7 @@ Define aggregation units exactly:
 
 - [ ] **Step 2: Implement cursor-bounded fact aggregation**
 
-Capture `latest_cursor()` as `H`, read the durable log and ignore every row with `cursor > H`. Parse only `evaluation.completed` and `tool.call.completed` typed payloads using the exact counting/filter rules above. Count attributable malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down.
+Capture `latest_cursor()` as `H`, page through the durable log with `up_to_cursor=H` and a fixed `limit`, and aggregate in constant memory. Parse only `evaluation.completed` and `tool.call.completed` typed payloads using the exact counting/filter rules above. Count attributable malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down (the returned evidence tuple is result-sized by definition; event scanning itself is bounded).
 
 These methods report deterministic counting methods such as `explicit_evaluation_verdict` and `terminal_tool_status`. Do not emit failure stage, root cause, usefulness, attribution or recommendations in this slice.
 
@@ -257,7 +263,7 @@ Expected: results are explicit, cursor-qualified, filterable, missing-aware, res
 - `sdk.events.subscribe`
 - `sdk.evaluations.evaluate`
 - `sdk.analytics.success_rate/tool_failures/tool_failure_rate`
-- Package-root exports for all public contracts named in Tasks 1-4.
+- Package-root exports for all public contracts named in Tasks 1-4, including `EventQueryResult` returned by the public event query.
 
 - [ ] **Step 1: Write public-only façade RED tests**
 
