@@ -219,10 +219,25 @@ close. The sync runner thread cannot call `run_sync` recursively.
 The shared execution-domain guard records the first async loop that uses an SDK.
 If already bound to a user async loop, `run_sync` returns `INVALID_STATE`; if
 bound to the sync runner, direct public async use from another loop returns
-`INVALID_STATE` rather than touching cross-loop resources. Add repeated calls,
-24 calls from concurrent threads, provider/store exceptions, `close_sync`
-during/after work, double close, call-after-close, async-then-sync rejection,
-and recursive runner-thread rejection tests. Never use per-call `asyncio.run`.
+`INVALID_STATE` rather than touching cross-loop resources.
+
+Place `execution_domain.admit_async()` at the first line of every public async
+entry point, before Store/lazy-open, permission bridge, lifecycle/registry lock,
+active task, subscription, MCP, or other loop-owned access. This includes all
+Session, Run/RunHandle, Workflow/WorkflowHandle, Context, Query/events/
+subscription, Evaluation, Analytics, Permission, MCP, Skill, recovery/control,
+and `AgentSDK.close` methods; read-only `get`/event paths are not exempt. Same
+owner-loop nested calls are reentrant, while a different loop fails before any
+side effect.
+
+Add repeated calls, 24 calls from concurrent threads, provider/store
+exceptions, `close_sync` during/after work, double close, call-after-close,
+async-bound→sync rejection, and recursive runner-thread rejection tests. Also
+bind an SDK by one successful `run_sync`, then parameterize direct async calls
+from a foreign loop across sessions, runs/handles, workflows/handles,
+queries/events/subscriptions, permissions, context/evaluation/analytics, MCP,
+Skills, recovery/control, and close; every call must return `INVALID_STATE`
+with zero Store/bridge/task access. Never use per-call `asyncio.run`.
 
 - [ ] **Step 7: Verify**
 

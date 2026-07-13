@@ -85,7 +85,11 @@ Expected: missing Artifact/Migration types.
 
 - [ ] **Step 3: Implement atomic FileArtifactStore**
 
-Hash bytes with SHA-256, write `<hash>.tmp-<id>`, flush/fsync, `os.replace` to `<hash>`, then persist metadata. Existing hash reuses content but records Session ownership separately.
+Use a durable per-digest, generation-fenced two-phase state machine. SQLite
+transactions only reserve/CAS metadata; all temp-file fsync, `os.replace`,
+`unlink`, and directory scanning occur outside transactions. Artifact states are
+`publishing`, `ready`, `delete_pending`, and `deleting`; operation claims carry
+generation, claim token, and expiry. Readers expose only `ready` content.
 
 ```python
 async def put(self, session_id: str, content: bytes, mime_type: str) -> ArtifactMetadata:
@@ -93,15 +97,29 @@ async def put(self, session_id: str, content: bytes, mime_type: str) -> Artifact
     target = self._root / digest
     staged = await asyncio.to_thread(write_staged_bytes, target, content)
     try:
-        async with self._metadata.immediate_transaction() as transaction:
-            if not target.exists():
-                await asyncio.to_thread(os.replace, staged, target)
-            return await transaction.add_owner(
-                session_id, digest, len(content), mime_type
-            )
+        reservation = await self._metadata.reserve_publish(
+            session_id, digest, len(content), mime_type
+        )
+        if reservation.ready:
+            return reservation.metadata
+        if reservation.publisher:
+            await asyncio.to_thread(os.replace, staged, target)
+            return await self._metadata.finish_publish(reservation)
+        return await self._help_or_wait_publish(reservation)
     finally:
         await asyncio.to_thread(unlink_if_exists, staged)
 ```
+
+`reserve_publish` atomically records a pending owner and one publishing
+generation/claim, or adds the owner to an already-ready digest. Concurrent puts
+for identical bytes join that generation; only its publisher performs replace.
+`finish_publish` is a short CAS transaction from the same generation/claim to
+`ready` and activates all pending owners. A stale publisher cannot finalize a
+newer generation. Replace failure records a retryable failed/releasable claim;
+crash leaves durable `publishing` state that a helper/startup recovery worker can
+reclaim after expiry. `read` either returns verified `ready` content or a stable
+retryable pending error/helps the durable operation; it never exposes a target
+whose metadata is not ready.
 
 - [ ] **Step 4: Implement ordered checksum migrations**
 
@@ -152,10 +170,11 @@ bootstrapped checksums or Artifact tables remain.
 
 - [ ] **Step 5: Wire Session deletion**
 
-Delete Artifact ownership/contributions and create anonymous cleanup jobs in the
-same SQLite transaction. A cleanup job contains only its stable job id, content
-digest/path, and state—not the deleted Session id. After commit, a retryable
-worker removes files. Do not emit Session-linked durable events after deletion.
+Delete Artifact ownership/contributions and create anonymous `delete_pending`
+cleanup jobs in the same SQLite transaction. A cleanup job contains only its
+stable job id, digest/path, generation, and state—not the deleted Session id.
+After commit, a retryable two-phase worker performs unlink outside SQLite. Do
+not emit Session-linked durable events after deletion.
 
 ```python
 async def delete_session_artifacts(self, session_id: str) -> None:
@@ -168,24 +187,25 @@ async def delete_session_artifacts(self, session_id: str) -> None:
     await self._cleanup.run_pending()
 ```
 
-The cleanup worker claims one job, opens `BEGIN IMMEDIATE`, rechecks that the
-digest still has no owner, removes the file idempotently while the metadata
-writer lock prevents a concurrent `put` finalization, marks the job complete,
-and commits. A missing file counts as success. `put` stages/fsyncs its temp file
-before its metadata transaction, then rechecks/replaces the target and adds the
-owner while holding the same writer serialization. Fault-inject after ownership
-removal, job insertion, transaction commit, file removal, and job completion;
-every crash leaves either a live owner+file or a durable retryable cleanup job,
-never an untracked orphan caused by Session deletion.
+The cleanup worker uses a short transaction to CAS `delete_pending -> deleting`
+with generation/claim/expiry, commits, unlinks outside the transaction (missing
+is success), then uses a second short CAS transaction to complete/remove the
+same generation. A stale cleanup claimant cannot complete a newer state. A put
+that sees unclaimed `delete_pending` may atomically cancel it and restore ready
+ownership if the verified target remains. A put that sees claimed `deleting`
+waits/helps it finish, then reserves a newer publish generation; it never
+publishes a target that an older cleanup claimant may still unlink. Expired
+claims are reclaimable and every command has bounded retry/pending behavior.
 
-Because SQLite and the filesystem cannot share one atomic commit, add an
-idempotent startup/maintenance sweep under the same metadata writer
-serialization. It removes stale temp files and enqueues anonymous cleanup jobs
-for content-hash files that have neither an Artifact owner/metadata row nor an
-existing cleanup job. This recovers a crash after `os.replace` but before the
-metadata transaction commits. Fault-inject every `put` boundary (temp fsync,
-transaction begin, replace, metadata insert, commit) and prove reopen+sweep
-converges without deleting a newly committed owner.
+Because SQLite and the filesystem cannot share one atomic commit, startup/
+maintenance recovery first queries pending/expired metadata claims, performs
+their replace/unlink outside transactions, and CAS-finishes them. It separately
+enumerates temp/content files outside SQLite, then opens short transactions per
+candidate to recheck metadata and enqueue anonymous cleanup for truly
+unreferenced files. It never scans, fsyncs, replaces, or unlinks while a
+transaction is open. Fault-inject every publish/delete boundary and prove
+reopen+sweep converges without deleting a ready owner or leaking an
+unrecoverable file.
 
 - [ ] **Step 6: Verify**
 
