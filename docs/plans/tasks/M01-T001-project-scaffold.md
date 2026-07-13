@@ -28,7 +28,7 @@
 - Create: `tests/unit/test_core_config.py`
 
 **Interfaces:**
-- Produces: `AgentSDKConfig`, `SQLiteConfig`, `CaptureLevel`, `AgentSDKError`, `ErrorCode`, `new_id(prefix: str) -> str`.
+- Produces: `AgentSDKConfig`, `CaptureLevel`, `AgentSDKError`, `ErrorCode`, `new_id(prefix: str) -> str`.
 - Consumes: no project interfaces.
 
 - [ ] **Step 1: Write the failing core test**
