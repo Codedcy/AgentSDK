@@ -8,7 +8,7 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T002](M01-T002-event-storage-contracts.md) | Event and storage contracts | M01 | T001 | done |
 | [M01-T003](M01-T003-sqlite-runtime-spine.md) | SQLite Session and Run spine | M01 | T002 | done |
 | [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | done |
-| [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | pending |
+| [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | in_progress |
 | [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | pending |
 | [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | pending |
 | [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | pending |
