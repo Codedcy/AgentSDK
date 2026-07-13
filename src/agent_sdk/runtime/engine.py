@@ -274,6 +274,22 @@ class RunEngine:
                     await emitter.close()
                     raise failure
 
+                if calls and tool_results:
+                    failure = AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "additional tool calls are not supported",
+                        retryable=False,
+                    )
+                    await self._fail_run(
+                        emitter,
+                        failure,
+                        chunks,
+                        usage,
+                        tool_results,
+                    )
+                    await emitter.close()
+                    raise failure
+
                 if not calls:
                     await emitter.emit("step.completed")
                     break
@@ -283,32 +299,62 @@ class RunEngine:
                     "tool.call.proposed",
                     {"call_id": call.call_id, "tool_name": call.name},
                 )
-                tool_result = await executor.execute(
-                    call,
-                    ToolContext(
-                        run_id=run_id,
-                        session_id=emitter.current_snapshot.session_id,
-                    ),
-                    emit=emitter.emit,
-                    on_permission_requested=lambda permission, decision: (
-                        self._permission_transition(
-                            emitter,
-                            "permission.requested",
-                            RunStatus.WAITING_PERMISSION,
-                            permission,
-                            decision,
+                try:
+                    tool_result = await executor.execute(
+                        call,
+                        ToolContext(
+                            run_id=run_id,
+                            session_id=emitter.current_snapshot.session_id,
+                        ),
+                        emit=emitter.emit,
+                        on_permission_requested=lambda permission, decision: (
+                            self._permission_transition(
+                                emitter,
+                                "permission.requested",
+                                RunStatus.WAITING_PERMISSION,
+                                permission,
+                                decision,
+                            )
+                        ),
+                        on_permission_resolved=lambda permission, decision: (
+                            self._permission_transition(
+                                emitter,
+                                "permission.resolved",
+                                RunStatus.RUNNING,
+                                permission,
+                                decision,
+                            )
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as cause:
+                    failure = (
+                        cause
+                        if isinstance(cause, AgentSDKError)
+                        else AgentSDKError(
+                            ErrorCode.INTERNAL,
+                            "tool execution failed",
+                            retryable=False,
                         )
-                    ),
-                    on_permission_resolved=lambda permission, decision: (
-                        self._permission_transition(
+                    )
+                    try:
+                        await self._fail_run(
                             emitter,
-                            "permission.resolved",
-                            RunStatus.RUNNING,
-                            permission,
-                            decision,
+                            failure,
+                            chunks,
+                            usage,
+                            tool_results,
                         )
-                    ),
-                )
+                    except Exception:
+                        pass
+                    try:
+                        await emitter.close()
+                    except Exception:
+                        pass
+                    if failure is cause:
+                        raise failure
+                    raise failure from cause
                 tool_results.append(tool_result)
                 await emitter.emit("step.completed")
                 messages.append(

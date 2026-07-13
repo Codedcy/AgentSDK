@@ -5,7 +5,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, field_serializer, field_validator
 
-from agent_sdk.tools.models import freeze_json, thaw_json
+from agent_sdk.tools.models import bounded_text, freeze_json, thaw_json
 
 
 class PermissionEffect(BaseModel):
@@ -58,6 +58,13 @@ class PermissionDecision(BaseModel):
     scope: Literal["once", "run", "session", "persistent"] | None = None
     reason: str | None = None
 
+    @field_validator("reason", mode="after")
+    @classmethod
+    def _bound_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return bounded_text(value, max_bytes=512)
+
     @property
     def allowed(self) -> bool:
         return self.action == "allow"
@@ -68,7 +75,7 @@ class PermissionDecision(BaseModel):
 
     @classmethod
     def deny(cls, reason: str = "permission denied") -> PermissionDecision:
-        return cls(action="deny", scope="once", reason=reason[:512])
+        return cls(action="deny", scope="once", reason=reason)
 
     @classmethod
     def ask(cls) -> PermissionDecision:

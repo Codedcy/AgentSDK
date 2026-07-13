@@ -32,7 +32,9 @@ from agent_sdk.models.litellm_gateway import (
     ToolCallCompleted,
     UsageReported,
 )
+from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.storage.base import CommitBatch, CommitResult
 from agent_sdk.storage.memory import InMemoryStore
 
 
@@ -97,6 +99,20 @@ class _TwoStepModel:
                 }
 
         return chunks()
+
+
+class _FailOncePermissionResolvedStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failed = False
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        if not self.failed and any(
+            event.type == "permission.resolved" for event in batch.events
+        ):
+            self.failed = True
+            raise RuntimeError("raw permission resolved storage secret")
+        return await super().commit(batch)
 
 
 async def _add(_: ToolContext, a: int, b: int) -> int:
@@ -521,6 +537,67 @@ async def test_invalid_arguments_do_not_request_permission_or_call_handler(
         await sdk.close()
 
 
+@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
+@pytest.mark.asyncio
+async def test_nonfinite_json_constants_are_invalid_before_permission(
+    constant: str,
+) -> None:
+    store = InMemoryStore()
+    model = _TwoStepModel(
+        _tool_call_chunks(
+            f'{{"value":{constant}}}',
+            name="measure",
+            call_id="call_measure",
+        )
+    )
+    handler_calls = 0
+
+    async def handler(_: ToolContext, value: float) -> float:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(store=store, acompletion=model, permission_default="ask")
+    try:
+        sdk.tools.register(
+            ToolSpec(
+                name="measure",
+                description="Measure a number",
+                input_schema={
+                    "type": "object",
+                    "properties": {"value": {"type": "number"}},
+                    "required": ["value"],
+                    "additionalProperties": False,
+                },
+            ),
+            handler,
+        )
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "reject nonfinite",
+        )
+        result = await asyncio.wait_for(run.result(), timeout=1)
+
+        assert result.tool_results[0].status is ToolResultStatus.INVALID_ARGUMENTS
+        assert handler_calls == 0
+        assert (await sdk.runs.get(run.run_id)).status is RunStatus.COMPLETED
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+        ]
+        assert "permission.requested" not in event_types
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                sdk.permissions.next_request(run.run_id),
+                timeout=0.05,
+            )
+    finally:
+        await sdk.close()
+
+
 @pytest.mark.parametrize(
     ("permission_default", "expected_status", "expected_calls"),
     (
@@ -709,6 +786,147 @@ async def test_permission_resolve_rejects_unknown_and_duplicate_ids() -> None:
 
 
 @pytest.mark.asyncio
+async def test_permission_resolution_history_is_bounded_without_re_resolve() -> None:
+    bridge = InProcessPermissionBridge()
+    history_limit = 64
+    request_ids = [
+        f"prm_history_{index}"
+        for index in range(history_limit + 1)
+    ]
+
+    for request_id in request_ids:
+        request = PermissionRequest(
+            request_id=request_id,
+            run_id="run_history",
+            session_id="ses_history",
+            tool_name="history",
+            arguments={},
+        )
+        waiting = asyncio.create_task(bridge.wait(request))
+        assert (await bridge.next_request("run_history")).request_id == request_id
+        resolving = asyncio.create_task(
+            bridge.resolve(request_id, PermissionDecision.allow_once())
+        )
+        assert (await waiting).allowed
+        await bridge.mark_committed(request_id)
+        await resolving
+
+    with pytest.raises(AgentSDKError) as recent_duplicate:
+        await bridge.resolve(request_ids[-1], PermissionDecision.deny())
+    assert recent_duplicate.value.code is ErrorCode.CONFLICT
+
+    with pytest.raises(AgentSDKError) as evicted_duplicate:
+        await bridge.resolve(request_ids[0], PermissionDecision.allow_once())
+    assert evicted_duplicate.value.code is ErrorCode.NOT_FOUND
+
+    with pytest.raises(AgentSDKError) as still_not_resolvable:
+        await bridge.resolve(request_ids[0], PermissionDecision.deny())
+    assert still_not_resolvable.value.code is ErrorCode.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_permission_request_queues_do_not_grow_for_unknown_waiters() -> None:
+    bridge = InProcessPermissionBridge()
+    unknown_waiters = [
+        asyncio.create_task(bridge.next_request(f"run_unknown_{index}"))
+        for index in range(100)
+    ]
+    await asyncio.sleep(0)
+    for waiter in unknown_waiters:
+        waiter.cancel()
+    await asyncio.gather(*unknown_waiters, return_exceptions=True)
+
+    assert not bridge._queues  # type: ignore[attr-defined]
+
+    request = PermissionRequest(
+        request_id="prm_queue_cleanup",
+        run_id="run_queue_cleanup",
+        session_id="ses_queue_cleanup",
+        tool_name="cleanup",
+        arguments={},
+    )
+    waiting = asyncio.create_task(bridge.wait(request))
+    try:
+        assert (
+            await bridge.next_request("run_queue_cleanup")
+        ).request_id == request.request_id
+        assert "run_queue_cleanup" not in bridge._queues  # type: ignore[attr-defined]
+    finally:
+        await bridge.cancel(request.request_id)
+        await asyncio.gather(waiting, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_permission_resolved_commit_failure_unblocks_and_fails_run() -> None:
+    store = _FailOncePermissionResolvedStore()
+    model = _TwoStepModel(_tool_call_chunks('{"a":2,"b":3}'))
+    handler_called = False
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        nonlocal handler_called
+        handler_called = True
+        return a + b
+
+    sdk = AgentSDK.for_test(store=store, acompletion=model, permission_default="ask")
+    try:
+        _register_add(sdk, handler)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "fail permission commit",
+        )
+        request = await asyncio.wait_for(
+            sdk.permissions.next_request(run.run_id),
+            timeout=1,
+        )
+
+        with pytest.raises(AgentSDKError) as resolve_error:
+            await asyncio.wait_for(
+                sdk.permissions.resolve(
+                    request.request_id,
+                    PermissionDecision.allow_once(),
+                ),
+                timeout=1,
+            )
+        assert resolve_error.value.code is ErrorCode.INTERNAL
+        assert resolve_error.value.message == "permission resolution failed"
+
+        with pytest.raises(AgentSDKError) as run_error:
+            await asyncio.wait_for(run.result(), timeout=1)
+        assert run_error.value.code is ErrorCode.INTERNAL
+        assert run_error.value.message == "permission resolution failed"
+        assert handler_called is False
+
+        snapshot = await sdk.runs.get(run.run_id)
+        assert snapshot.status is RunStatus.FAILED
+        assert snapshot.version == 4
+        events = [
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+        ]
+        assert [event.type for event in events][-2:] == ["step.failed", "run.failed"]
+        assert "raw permission resolved storage secret" not in str(
+            [event.payload for event in events]
+        )
+
+        with pytest.raises(AgentSDKError) as duplicate:
+            await sdk.permissions.resolve(
+                request.request_id,
+                PermissionDecision.deny(),
+            )
+        assert duplicate.value.code is ErrorCode.CONFLICT
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                sdk.permissions.next_request(run.run_id),
+                timeout=0.05,
+            )
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
 async def test_asked_permission_can_be_denied_without_authorizing_handler() -> None:
     store = InMemoryStore()
     model = _TwoStepModel(_tool_call_chunks('{"a":2,"b":3}'))
@@ -750,6 +968,63 @@ async def test_asked_permission_can_be_denied_without_authorizing_handler() -> N
         assert "permission.resolved" in event_types
         assert "tool.call.authorized" not in event_types
         assert "tool.call.started" not in event_types
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_permission_reason_and_tool_error_are_utf8_byte_bounded() -> None:
+    store = InMemoryStore()
+    model = _TwoStepModel(_tool_call_chunks('{"a":2,"b":3}'))
+    long_reason = "😀" * 512
+    sdk = AgentSDK.for_test(store=store, acompletion=model, permission_default="ask")
+    try:
+        _register_add(sdk)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "unicode deny",
+        )
+        request = await asyncio.wait_for(
+            sdk.permissions.next_request(run.run_id),
+            timeout=1,
+        )
+        await sdk.permissions.resolve(
+            request.request_id,
+            PermissionDecision.deny(long_reason),
+        )
+        result = await asyncio.wait_for(run.result(), timeout=1)
+
+        tool_result = result.tool_results[0]
+        assert tool_result.status is ToolResultStatus.DENIED
+        assert tool_result.error is not None
+        assert len(tool_result.error.encode("utf-8")) <= 512
+        assert len(tool_result.content.encode("utf-8")) <= 16 * 1024
+        assert (await sdk.runs.get(run.run_id)).status is RunStatus.COMPLETED
+
+        resolved = next(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+            and stored.event.type == "permission.resolved"
+        )
+        persisted_reason = resolved.payload["decision"]["reason"]
+        assert isinstance(persisted_reason, str)
+        assert len(persisted_reason.encode("utf-8")) <= 512
+        assert persisted_reason != long_reason
+
+        direct = PermissionDecision(action="deny", reason=long_reason)
+        assert direct.reason == persisted_reason
+        direct_result = ToolResult(
+            call_id="call_direct",
+            tool_name="add",
+            status=ToolResultStatus.DENIED,
+            content=long_reason * 20,
+            error=long_reason,
+        )
+        assert len(direct_result.error.encode("utf-8")) <= 512  # type: ignore[union-attr]
+        assert len(direct_result.content.encode("utf-8")) <= 16 * 1024
     finally:
         await sdk.close()
 
@@ -827,6 +1102,92 @@ async def test_handler_timeout_is_normalized_without_success() -> None:
             if stored.event.run_id == run.run_id
         ]
         assert "succeeded" not in str(event_payloads)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_timeout_ignores_handler_late_success_after_cancel() -> None:
+    store = InMemoryStore()
+    model = _TwoStepModel(_tool_call_chunks('{"a":2,"b":3}'))
+    handler_cancelled = asyncio.Event()
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        del a, b
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            return 999
+
+    sdk = AgentSDK.for_test(store=store, acompletion=model, permission_default="allow")
+    try:
+        _register_add(sdk, handler, timeout_seconds=0.01)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "late timeout success",
+        )
+        result = await asyncio.wait_for(run.result(), timeout=1)
+        await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+        completed = [
+            stored.event.payload
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+            and stored.event.type == "tool.call.completed"
+        ]
+
+        assert result.tool_results[0].status is ToolResultStatus.TIMED_OUT
+        assert len(completed) == 1
+        assert completed[0]["status"] == ToolResultStatus.TIMED_OUT.value
+        assert len(model.requests) == 2
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_cannot_be_swallowed_by_handler_late_success() -> None:
+    store = InMemoryStore()
+    model = _TwoStepModel(_tool_call_chunks('{"a":2,"b":3}'))
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        del a, b
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            return 999
+
+    sdk = AgentSDK.for_test(store=store, acompletion=model, permission_default="allow")
+    try:
+        _register_add(sdk, handler)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "cancel run",
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+        run._task.cancel()  # type: ignore[attr-defined]
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(run.result(), timeout=1)
+        await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+        await asyncio.sleep(0)
+
+        assert raised.value.message == "run execution failed"
+        assert len(model.requests) == 1
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
+        ]
+        assert "tool.call.completed" not in event_types
+        assert "run.completed" not in event_types
     finally:
         await sdk.close()
 
@@ -933,8 +1294,10 @@ async def test_multiple_tool_calls_in_one_step_fail_stably() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sequential_tool_results_are_immutable_ordered_and_usage_aggregates() -> None:
+async def test_second_model_tool_call_fails_before_second_handler() -> None:
     requests: list[dict[str, object]] = []
+    handler_calls = 0
+    store = InMemoryStore()
 
     async def acompletion(**kwargs: object) -> AsyncIterator[dict[str, object]]:
         requests.append(kwargs)
@@ -979,32 +1342,38 @@ async def test_sequential_tool_results_are_immutable_ordered_and_usage_aggregate
         return chunks()
 
     sdk = AgentSDK.for_test(
-        store=InMemoryStore(),
+        store=store,
         acompletion=acompletion,
         permission_default="allow",
     )
     try:
-        _register_add(sdk)
+        async def handler(_: ToolContext, a: int, b: int) -> int:
+            nonlocal handler_calls
+            handler_calls += 1
+            return a + b
+
+        _register_add(sdk, handler)
         session = await sdk.sessions.create(workspaces=[])
         run = await sdk.runs.start(
             session.session_id,
             AgentSpec(name="test", model="fake/model"),
             "two sequential calls",
         )
-        result = await asyncio.wait_for(run.result(), timeout=1)
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(run.result(), timeout=1)
 
-        assert isinstance(result.tool_results, tuple)
-        assert [tool_result.call_id for tool_result in result.tool_results] == [
-            "call_one",
-            "call_two",
+        assert raised.value.code is ErrorCode.INVALID_STATE
+        assert raised.value.message == "additional tool calls are not supported"
+        assert handler_calls == 1
+        assert len(requests) == 2
+        snapshot = await sdk.runs.get(run.run_id)
+        assert snapshot.status is RunStatus.FAILED
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run.run_id
         ]
-        assert [tool_result.value for tool_result in result.tool_results] == [3, 7]
-        assert result.usage == TokenUsage(
-            prompt_tokens=6,
-            completion_tokens=3,
-            total_tokens=9,
-        )
-        assert result.output_text == "ten"
-        assert len(requests) == 3
+        assert event_types.count("tool.call.started") == 1
+        assert event_types[-2:] == ["step.failed", "run.failed"]
     finally:
         await sdk.close()

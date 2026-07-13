@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -12,6 +12,7 @@ from agent_sdk.permissions.policy import PolicyEngine
 _PermissionCallback = Callable[
     [PermissionRequest, PermissionDecision | None], Awaitable[None]
 ]
+_RESOLUTION_HISTORY_LIMIT = 64
 
 
 @dataclass
@@ -25,9 +26,9 @@ class _PendingPermission:
 class InProcessPermissionBridge:
     def __init__(self) -> None:
         self._condition = asyncio.Condition()
-        self._queues: dict[str, deque[str]] = defaultdict(deque)
+        self._queues: dict[str, deque[str]] = {}
         self._pending: dict[str, _PendingPermission] = {}
-        self._resolved_ids: set[str] = set()
+        self._resolved_history: OrderedDict[str, None] = OrderedDict()
 
     async def wait(self, request: PermissionRequest) -> PermissionDecision:
         loop = asyncio.get_running_loop()
@@ -36,18 +37,23 @@ class InProcessPermissionBridge:
             submitted=loop.create_future(),
             committed=loop.create_future(),
         )
+        pending.committed.add_done_callback(_consume_future_error)
         async with self._condition:
             self._pending[request.request_id] = pending
-            self._queues[request.run_id].append(request.request_id)
+            self._queues.setdefault(request.run_id, deque()).append(
+                request.request_id
+            )
             self._condition.notify_all()
         return await pending.submitted
 
     async def next_request(self, run_id: str) -> PermissionRequest:
         async with self._condition:
             while True:
-                queue = self._queues[run_id]
+                queue = self._queues.get(run_id)
                 while queue:
                     request_id = queue.popleft()
+                    if not queue:
+                        self._queues.pop(run_id, None)
                     pending = self._pending.get(request_id)
                     if pending is not None:
                         return pending.request.model_copy(deep=True)
@@ -59,7 +65,7 @@ class InProcessPermissionBridge:
         decision: PermissionDecision,
     ) -> None:
         async with self._condition:
-            if request_id in self._resolved_ids:
+            if request_id in self._resolved_history:
                 raise AgentSDKError(
                     ErrorCode.CONFLICT,
                     "permission request already resolved",
@@ -79,7 +85,7 @@ class InProcessPermissionBridge:
                     retryable=False,
                 )
             pending.resolved = True
-            self._resolved_ids.add(request_id)
+            self._remember_resolution(request_id)
             pending.submitted.set_result(decision)
             committed = pending.committed
         await asyncio.shield(committed)
@@ -92,6 +98,20 @@ class InProcessPermissionBridge:
             self._remove_from_queue(pending.request.run_id, request_id)
             if not pending.committed.done():
                 pending.committed.set_result(None)
+
+    async def mark_failed(
+        self,
+        request_id: str,
+        error: AgentSDKError,
+    ) -> None:
+        async with self._condition:
+            pending = self._pending.pop(request_id, None)
+            if pending is None:
+                return
+            self._remove_from_queue(pending.request.run_id, request_id)
+            if not pending.committed.done():
+                pending.committed.set_exception(error)
+            self._condition.notify_all()
 
     async def cancel(self, request_id: str) -> None:
         async with self._condition:
@@ -132,6 +152,12 @@ class InProcessPermissionBridge:
         if not queue:
             self._queues.pop(run_id, None)
 
+    def _remember_resolution(self, request_id: str) -> None:
+        self._resolved_history[request_id] = None
+        self._resolved_history.move_to_end(request_id)
+        if len(self._resolved_history) > _RESOLUTION_HISTORY_LIMIT:
+            self._resolved_history.popitem(last=False)
+
 
 class PermissionBroker:
     def __init__(
@@ -164,3 +190,18 @@ class PermissionBroker:
         except asyncio.CancelledError:
             await asyncio.shield(self._bridge.cancel(request.request_id))
             raise
+        except Exception as cause:
+            failure = AgentSDKError(
+                ErrorCode.INTERNAL,
+                "permission resolution failed",
+                retryable=False,
+            )
+            await asyncio.shield(
+                self._bridge.mark_failed(request.request_id, failure)
+            )
+            raise failure from cause
+
+
+def _consume_future_error(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()

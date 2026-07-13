@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+from pydantic import ValidationError as PydanticValidationError
 
 from agent_sdk.errors import AgentSDKError
 from agent_sdk.ids import new_id
@@ -58,14 +59,30 @@ class ToolExecutor:
             )
 
         try:
-            decoded = json.loads(call.arguments_json)
+            decoded = json.loads(
+                call.arguments_json,
+                parse_constant=_reject_json_constant,
+            )
             if not isinstance(decoded, dict):
                 raise ValueError("tool arguments must be an object")
             arguments = cast(dict[str, Any], decoded)
             Draft202012Validator(
                 thaw_json(registered.spec.input_schema)
             ).validate(arguments)
-        except (json.JSONDecodeError, ValueError, ValidationError):
+            request = PermissionRequest(
+                request_id=new_id("prm"),
+                run_id=context.run_id,
+                session_id=context.session_id,
+                tool_name=call.name,
+                arguments=arguments,
+                effects=registered.spec.effects,
+            )
+        except (
+            json.JSONDecodeError,
+            ValueError,
+            ValidationError,
+            PydanticValidationError,
+        ):
             return await self._complete_error(
                 call,
                 ToolResultStatus.INVALID_ARGUMENTS,
@@ -73,14 +90,6 @@ class ToolExecutor:
                 emit,
             )
 
-        request = PermissionRequest(
-            request_id=new_id("prm"),
-            run_id=context.run_id,
-            session_id=context.session_id,
-            tool_name=call.name,
-            arguments=arguments,
-            effects=registered.spec.effects,
-        )
         decision = await self._permissions.authorize(
             request,
             on_requested=on_permission_requested,
@@ -107,27 +116,40 @@ class ToolExecutor:
                 context,
                 **cast(dict[str, Any], thaw_json(arguments)),
             )
-            if registered.spec.timeout_seconds is None:
-                value = await invocation
-            else:
-                async with asyncio.timeout(registered.spec.timeout_seconds):
-                    value = await invocation
+            handler_task = asyncio.ensure_future(invocation)
+            handler_task.add_done_callback(_consume_handler_completion)
             try:
-                result = ToolResult.succeeded(call.call_id, call.name, value)
-            except ValueError:
+                if registered.spec.timeout_seconds is None:
+                    value = await asyncio.shield(handler_task)
+                else:
+                    try:
+                        value = await asyncio.wait_for(
+                            asyncio.shield(handler_task),
+                            timeout=registered.spec.timeout_seconds,
+                        )
+                    except TimeoutError:
+                        handler_task.cancel()
+                        value = _HANDLER_TIMED_OUT
+            except asyncio.CancelledError:
+                handler_task.cancel()
+                raise
+            if value is _HANDLER_TIMED_OUT:
                 result = ToolResult.normalized_error(
                     call.call_id,
                     call.name,
-                    ToolResultStatus.FAILED,
-                    "tool result is not JSON-compatible or exceeds size limit",
+                    ToolResultStatus.TIMED_OUT,
+                    "tool execution timed out",
                 )
-        except TimeoutError:
-            result = ToolResult.normalized_error(
-                call.call_id,
-                call.name,
-                ToolResultStatus.TIMED_OUT,
-                "tool execution timed out",
-            )
+            else:
+                try:
+                    result = ToolResult.succeeded(call.call_id, call.name, value)
+                except ValueError:
+                    result = ToolResult.normalized_error(
+                        call.call_id,
+                        call.name,
+                        ToolResultStatus.FAILED,
+                        "tool result is not JSON-compatible or exceeds size limit",
+                    )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -160,3 +182,15 @@ class ToolExecutor:
     @staticmethod
     def _result_payload(result: ToolResult) -> dict[str, Any]:
         return result.model_dump(mode="json")
+
+
+_HANDLER_TIMED_OUT = object()
+
+
+def _consume_handler_completion(handler: asyncio.Future[Any]) -> None:
+    if not handler.cancelled():
+        handler.exception()
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")

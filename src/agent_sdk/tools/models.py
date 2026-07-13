@@ -49,6 +49,14 @@ def json_text(value: Any, *, max_bytes: int) -> tuple[Any, str]:
     return frozen, text
 
 
+def bounded_text(value: str, *, max_bytes: int) -> str:
+    sanitized = value.encode("utf-8", errors="replace").decode("utf-8")
+    encoded = sanitized.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return sanitized
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
 class ToolSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
@@ -111,6 +119,18 @@ class ToolResult(BaseModel):
     value: Any = None
     error: str | None = None
 
+    @field_validator("content", mode="after")
+    @classmethod
+    def _bound_content(cls, value: str) -> str:
+        return bounded_text(value, max_bytes=16 * 1024)
+
+    @field_validator("error", mode="after")
+    @classmethod
+    def _bound_error(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return bounded_text(value, max_bytes=512)
+
     @field_validator("value", mode="after")
     @classmethod
     def _freeze_value(cls, value: Any) -> Any:
@@ -139,10 +159,10 @@ class ToolResult(BaseModel):
         status: ToolResultStatus,
         message: str,
     ) -> ToolResult:
-        bounded = message[:512]
+        bounded = bounded_text(message, max_bytes=512)
         _, content = json_text(
             {"status": status.value, "error": bounded},
-            max_bytes=1024,
+            max_bytes=4 * 1024,
         )
         return cls(
             call_id=call_id,
