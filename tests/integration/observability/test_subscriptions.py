@@ -8,7 +8,7 @@ from agent_sdk import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.observability import EventFilter, SubscriptionService
 from agent_sdk.runtime.commands import RuntimeCommands
-from agent_sdk.storage.base import CommitBatch
+from agent_sdk.storage.base import CommitBatch, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
 
 
@@ -249,3 +249,80 @@ async def test_busy_nonmatching_backlog_is_bounded_and_checks_close_between_page
         await asyncio.wait_for(anext(stream), timeout=1)
 
     assert store.limits == [100]
+
+
+class _MalformedPageStore(InMemoryStore):
+    def __init__(self, cursors: list[int]) -> None:
+        super().__init__()
+        self.reads = 0
+        self._page = [
+            StoredEvent(
+                cursor=cursor,
+                event=EventEnvelope.new(
+                    type="skip",
+                    session_id="ses_malformed",
+                    run_id=None,
+                    sequence=index,
+                    payload={"secret": "must-not-leak-invalid-store-page"},
+                ),
+            )
+            for index, cursor in enumerate(cursors, start=1)
+        ]
+
+    async def latest_cursor(self) -> int:
+        return 10_000
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredEvent]:
+        self.reads += 1
+        await asyncio.sleep(0)
+        return self._page
+
+
+@pytest.mark.parametrize(
+    "cursors",
+    (
+        list(range(1, 102)),
+        [0, 1],
+        [1] * 100,
+        [2, 1],
+    ),
+    ids=(
+        "oversized",
+        "first-cursor-not-after-current",
+        "duplicate-full-page",
+        "descending",
+    ),
+)
+@pytest.mark.asyncio
+async def test_subscription_rejects_malformed_store_page_without_spinning(
+    cursors: list[int],
+) -> None:
+    store = _MalformedPageStore(cursors)
+    stream = SubscriptionService(store, poll_interval=0.001).subscribe(
+        filters=EventFilter(event_types=("match",)),
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await asyncio.wait_for(anext(stream), timeout=1)
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert store.reads == 1
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-invalid-store-page" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )

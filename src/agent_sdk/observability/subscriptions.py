@@ -126,10 +126,20 @@ async def _read_page(
     after_cursor: int,
 ) -> list[StoredEvent] | _StoreFailure:
     try:
-        return await store.read_events(
+        page = await store.read_events(
             after_cursor=after_cursor,
             limit=_PAGE_SIZE,
         )
+        if not page:
+            return page
+        if not 1 <= len(page) <= _PAGE_SIZE:
+            return _StoreFailure.FAILED
+        previous_cursor = after_cursor
+        for stored in page:
+            if type(stored.cursor) is not int or stored.cursor <= previous_cursor:
+                return _StoreFailure.FAILED
+            previous_cursor = stored.cursor
+        return page
     except Exception:
         return _StoreFailure.FAILED
 
