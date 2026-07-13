@@ -9,7 +9,7 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T003](M01-T003-sqlite-runtime-spine.md) | SQLite Session and Run spine | M01 | T002 | done |
 | [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | done |
 | [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | done |
-| [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | in_progress |
+| [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | done |
 | [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | pending |
 | [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | pending |
 | [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | pending |
@@ -43,3 +43,4 @@ When a task completes, add its commit id and verification result below the table
 - M01-T003: implementation `fce50b5`, fixes `363989a` and `5ee5c97`; Python 3.13 `pytest` 47 passed, Ruff passed, mypy passed; task review approved after cancellation-safety re-review. TDD and packaging evidence is recorded in `.superpowers/sdd/M01-T003-report.md`.
 - M01-T004: implementation `9680fad`, fixes `8058c60` and `6eae6a1`; Python 3.13 `pytest` 80 passed, Ruff passed, mypy passed; task review approved after lifecycle, termination, immutability, and public-error re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T004-report.md`.
 - M01-T005: implementation `ae1d523`, fixes `66256e1` and `933bc71`; Python 3.13 `pytest` 110 passed, Ruff passed, mypy passed; task review approved after permission-failure, cancellation, boundedness, and concurrent-resolution re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T005-report.md`.
+- M01-T006: implementation `eb2d59b`, fixes `1f71d2d` and `2259b85`; Python 3.13 `pytest` 186 passed, Ruff passed, mypy passed; task review approved after MCP task-affine lifecycle, cancellation/readiness settlement, YAML complexity, and Skill path-identity re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T006-report.md`.
