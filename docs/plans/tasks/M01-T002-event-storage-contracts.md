@@ -40,7 +40,7 @@ from agent_sdk.storage.memory import InMemoryStore
 async def test_commit_assigns_cursor_and_snapshot_atomically() -> None:
     store = InMemoryStore()
     event = EventEnvelope.new(type="run.created", session_id="ses_1", run_id="run_1", sequence=1, payload={})
-    result = await store.commit(CommitBatch(events=(event,), snapshots=(SnapshotWrite("run", "run_1", 1, {"status": "created"}),)))
+    result = await store.commit(CommitBatch(events=(event,), snapshots=(SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "created"}),)))
     assert result.last_cursor == 1
     assert (await store.get_snapshot("run", "run_1"))["status"] == "created"
     assert [item.cursor for item in await store.read_events(after_cursor=0)] == [1]
@@ -49,10 +49,22 @@ async def test_commit_assigns_cursor_and_snapshot_atomically() -> None:
 async def test_delete_session_removes_events_and_snapshots() -> None:
     store = InMemoryStore()
     event = EventEnvelope.new(type="session.created", session_id="ses_1", run_id=None, sequence=1, payload={})
-    await store.commit(CommitBatch(events=(event,), snapshots=(SnapshotWrite("session", "ses_1", 1, {"session_id": "ses_1"}),)))
+    await store.commit(CommitBatch(events=(event,), snapshots=(SnapshotWrite("session", "ses_1", "ses_1", 1, {"session_id": "ses_1"}),)))
     await store.delete_session("ses_1")
     assert await store.read_events(after_cursor=0) == []
     assert await store.get_snapshot("session", "ses_1") is None
+
+@pytest.mark.asyncio
+async def test_invalid_sequence_rolls_back_events_and_snapshots() -> None:
+    store = InMemoryStore()
+    duplicate_sequence = (
+        EventEnvelope.new(type="run.created", session_id="ses_1", run_id="run_1", sequence=1, payload={}),
+        EventEnvelope.new(type="run.completed", session_id="ses_1", run_id="run_1", sequence=1, payload={}),
+    )
+    with pytest.raises(ValueError, match="sequence"):
+        await store.commit(CommitBatch(events=duplicate_sequence, snapshots=(SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "completed"}),)))
+    assert await store.read_events(after_cursor=0) == []
+    assert await store.get_snapshot("run", "run_1") is None
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -79,11 +91,13 @@ class EventEnvelope(BaseModel):
         return cls(event_id=new_id("evt"), occurred_at=datetime.now(UTC), **values)
 
 class SnapshotWrite(NamedTuple):
-    kind: str; entity_id: str; version: int; data: dict[str, Any]
+    kind: str; entity_id: str; session_id: str; version: int; data: dict[str, Any]
 class CommitBatch(NamedTuple):
     events: tuple[EventEnvelope, ...]; snapshots: tuple[SnapshotWrite, ...] = ()
 class CommitResult(NamedTuple):
     last_cursor: int
+class StoredEvent(NamedTuple):
+    cursor: int; event: EventEnvelope
 ```
 
 - [ ] **Step 4: Implement the Protocol and in-memory transaction**
@@ -102,7 +116,7 @@ Use one `asyncio.Lock`; validate duplicate event ids and monotonically increasin
 
 Run: `uv run pytest tests/contract/test_memory_store_contract.py -v && uv run mypy src && uv run ruff check src tests`
 
-Expected: two tests pass; mypy/Ruff exit 0.
+Expected: three tests pass; mypy/Ruff exit 0.
 
 - [ ] **Step 6: Commit**
 
