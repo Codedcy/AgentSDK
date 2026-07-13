@@ -1,7 +1,10 @@
 from enum import StrEnum
-from typing import Literal
+from types import MappingProxyType
+from typing import Any, Literal
 
-from pydantic import BaseModel
+from collections.abc import Mapping
+
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 
 class RunStatus(StrEnum):
@@ -9,6 +12,65 @@ class RunStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+def _freeze_model_param(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_model_param(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_model_param(item) for item in value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise ValueError("model params must contain only JSON-like values")
+
+
+def mutable_model_params(value: Mapping[str, Any]) -> dict[str, Any]:
+    def thaw(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {key: thaw(nested) for key, nested in item.items()}
+        if isinstance(item, tuple):
+            return [thaw(nested) for nested in item]
+        return item
+
+    return {key: thaw(item) for key, item in value.items()}
+
+
+class AgentSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    model: str
+    model_params: Mapping[str, Any] = Field(default_factory=dict)
+    revision: str = "1"
+
+    @field_validator("model_params", mode="after")
+    @classmethod
+    def _freeze_params(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = _freeze_model_param(value)
+        assert isinstance(frozen, Mapping)
+        return frozen
+
+    @field_serializer("model_params")
+    def _serialize_params(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return mutable_model_params(value)
+
+
+class TokenUsage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+class RunResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    output_text: str
+    usage: TokenUsage
 
 
 class SessionSnapshot(BaseModel):
@@ -25,3 +87,5 @@ class RunSnapshot(BaseModel):
     status: RunStatus
     user_input: str
     version: int = 1
+    output_text: str | None = None
+    usage: TokenUsage | None = None
