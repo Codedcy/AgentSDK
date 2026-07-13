@@ -507,3 +507,39 @@ def test_read_text_normalizes_read_time_os_error(
     assert raised.value.code is ErrorCode.INVALID_STATE
     assert raised.value.message == "failed to read skill member"
     assert "filesystem secret" not in str(raised.value)
+
+
+def test_read_text_normalizes_post_open_containment_rebind(
+    skill_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = skill_root / "demo" / "references" / "guide.md"
+    reference.parent.mkdir()
+    reference.write_text("guide", encoding="utf-8")
+    outside = tmp_path / "outside-secret.md"
+    outside.write_text("secret", encoding="utf-8")
+    skills = SkillRegistry([skill_root])
+    skills.discover()
+    activated = skills.activate("demo")
+    original_resolve = Path.resolve
+    reference_resolved = reference.resolve()
+    outside_resolved = outside.resolve()
+    reference_resolutions = 0
+
+    def rebind_after_open(path: Path, strict: bool = False) -> Path:
+        nonlocal reference_resolutions
+        resolved = original_resolve(path, strict=strict)
+        if resolved == reference_resolved:
+            reference_resolutions += 1
+            if reference_resolutions == 2:
+                return outside_resolved
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", rebind_after_open)
+
+    with pytest.raises(AgentSDKError) as raised:
+        activated.read_text("references/guide.md")
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "failed to read skill member"

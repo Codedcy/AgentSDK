@@ -196,7 +196,7 @@ class ActivatedSkill(BaseModel):
             ) from error
         except AgentSDKError:
             raise
-        except OSError as error:
+        except (OSError, ValueError) as error:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
                 "failed to read skill member",

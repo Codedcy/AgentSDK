@@ -768,6 +768,33 @@ async def test_cancelled_close_waiter_does_not_cancel_manager_cleanup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owner_cancellation_before_readiness_is_a_connection_failure() -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+
+    async def cancelled_initialize() -> Any:
+        raise asyncio.CancelledError("owner-internal secret")
+
+    session.initialize = cancelled_initialize  # type: ignore[method-assign]
+    manager = MCPManager._for_test(ToolRegistry(), session.connector)
+    caller = asyncio.current_task()
+    assert caller is not None
+    assert caller.cancelling() == 0
+
+    with pytest.raises(AgentSDKError) as raised:
+        await manager.connect(
+            MCPServerConfig(
+                name="demo", transport=StdioMCPTransport(command="ignored")
+            )
+        )
+
+    assert caller.cancelling() == 0
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "failed to connect MCP server"
+    assert "owner-internal secret" not in str(raised.value)
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_connect_closes_owner_context_before_propagating() -> None:
     session = FakeMCPSession(_one_page(_remote_tool("echo")))
     initialize_started = asyncio.Event()
@@ -844,6 +871,67 @@ async def test_connect_timeout_closes_owner_context_without_orphan() -> None:
     assert raised.value.message == "failed to connect MCP server"
     assert context_closed.is_set()
     await manager.close()
+
+
+@pytest.mark.parametrize("termination", ["timeout", "caller-cancel"])
+@pytest.mark.asyncio
+async def test_failed_connect_cleanup_retrieves_readiness_exception(
+    termination: str,
+) -> None:
+    session = FakeMCPSession(_one_page(_remote_tool("echo")))
+    initialize_started = asyncio.Event()
+
+    async def blocked_initialize() -> Any:
+        initialize_started.set()
+        await asyncio.Event().wait()
+
+    session.initialize = blocked_initialize  # type: ignore[method-assign]
+
+    def connector(_: MCPServerConfig) -> Any:
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[FakeMCPSession]:
+            try:
+                yield session
+            finally:
+                raise RuntimeError("cleanup credential secret")
+
+        return connected()
+
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    diagnostics: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: diagnostics.append(context))
+    manager = MCPManager._for_test(ToolRegistry(), connector)
+    connecting: asyncio.Task[tuple[ToolSpec, ...]] | None = None
+    try:
+        config = MCPServerConfig(
+            name="demo",
+            startup_timeout=0.01 if termination == "timeout" else 1,
+            transport=StdioMCPTransport(command="ignored"),
+        )
+        if termination == "timeout":
+            with pytest.raises(AgentSDKError) as raised:
+                await manager.connect(config)
+            assert raised.value.code is ErrorCode.INTERNAL
+            assert raised.value.message == "failed to connect MCP server"
+            del raised
+        else:
+            connecting = asyncio.create_task(manager.connect(config))
+            await asyncio.wait_for(initialize_started.wait(), timeout=1)
+            connecting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connecting
+
+        await manager.close()
+        del connecting
+        del manager
+        for _ in range(3):
+            gc.collect()
+            await asyncio.sleep(0)
+
+        assert diagnostics == []
+    finally:
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio

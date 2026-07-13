@@ -130,9 +130,10 @@ class MCPManager:
             ready: asyncio.Future[_PreparedConnection] = (
                 asyncio.get_running_loop().create_future()
             )
+            ready.add_done_callback(self._future_finished)
             stop = asyncio.Event()
             owner = asyncio.create_task(self._connection_owner(config, ready, stop))
-            owner.add_done_callback(self._task_finished)
+            owner.add_done_callback(self._future_finished)
             registered: list[RegisteredTool] = []
             prepared = False
             try:
@@ -188,7 +189,7 @@ class MCPManager:
                 self._close_task = asyncio.create_task(
                     self._close_connections(connections)
                 )
-                self._close_task.add_done_callback(self._task_finished)
+                self._close_task.add_done_callback(self._future_finished)
             close_task = self._close_task
         await asyncio.shield(close_task)
 
@@ -213,7 +214,13 @@ class MCPManager:
                 await stop.wait()
         except asyncio.CancelledError:
             if not ready.done():
-                ready.cancel()
+                ready.set_exception(
+                    AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "failed to connect MCP server",
+                        retryable=False,
+                    )
+                )
             raise
         except Exception as error:
             if not ready.done():
@@ -315,9 +322,9 @@ class MCPManager:
             )
 
     @staticmethod
-    def _task_finished(task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
+    def _future_finished(future: asyncio.Future[Any]) -> None:
+        if not future.cancelled():
+            future.exception()
 
     @staticmethod
     async def _settle_failed_owner(
