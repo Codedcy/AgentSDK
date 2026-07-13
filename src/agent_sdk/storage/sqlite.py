@@ -87,8 +87,12 @@ class SQLiteStore:
         async with self._lock:
             if self._closed:
                 return
-            await self._connection.close()
-            self._closed = True
+            close = asyncio.create_task(self._connection.close())
+            try:
+                await self._await_cleanup(close)
+            finally:
+                if close.done() and not close.cancelled() and close.exception() is None:
+                    self._closed = True
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         async with self._lock:
@@ -172,12 +176,22 @@ class SQLiteStore:
 
     async def _rollback(self) -> None:
         rollback = asyncio.create_task(self._connection.rollback())
-        while not rollback.done():
+        await self._await_cleanup(rollback)
+
+    @staticmethod
+    async def _await_cleanup(cleanup: asyncio.Task[None]) -> None:
+        cancelled: asyncio.CancelledError | None = None
+        while not cleanup.done():
             try:
-                await asyncio.shield(rollback)
-            except asyncio.CancelledError:
-                continue
-        rollback.result()
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as error:
+                if cancelled is None:
+                    cancelled = error
+            except BaseException:
+                break
+        cleanup.result()
+        if cancelled is not None:
+            raise cancelled
 
     async def _insert_event(self, event: EventEnvelope) -> None:
         async with self._connection.execute(

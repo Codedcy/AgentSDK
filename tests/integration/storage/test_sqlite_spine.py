@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +275,23 @@ def _cancel_after_begin(
     monkeypatch.setattr(store._connection, "execute", execute_with_cancel)
 
 
+def _block_rollback(
+    store: SQLiteStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[asyncio.Event, asyncio.Event]:
+    rollback = store._connection.rollback
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_rollback() -> None:
+        started.set()
+        await release.wait()
+        await rollback()
+
+    monkeypatch.setattr(store._connection, "rollback", blocked_rollback)
+    return started, release
+
+
 @pytest.mark.asyncio
 async def test_cancelled_commit_rolls_back_open_transaction(
     tmp_path: Path,
@@ -322,6 +340,137 @@ async def test_cancelled_delete_rolls_back_open_transaction(
         await store.delete_session("ses_1")
         assert await store.read_events(after_cursor=0) == []
     finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_commit_propagates_cancellation_received_during_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "state.db")
+    created = EventEnvelope.new(
+        type="run.created",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=1,
+        payload={},
+    )
+    await store.commit(
+        CommitBatch(
+            events=(created,),
+            snapshots=(
+                SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "created"}),
+            ),
+        )
+    )
+    rejected = EventEnvelope.new(
+        type="run.failed",
+        session_id="ses_1",
+        run_id="run_1",
+        sequence=2,
+        payload={},
+    )
+    task: asyncio.Task[object] | None = None
+    release: asyncio.Event | None = None
+    try:
+        with monkeypatch.context() as race:
+            rollback_started, release = _block_rollback(store, race)
+            task = asyncio.create_task(
+                store.commit(
+                    CommitBatch(
+                        events=(rejected,),
+                        snapshots=(
+                            SnapshotWrite(
+                                "run",
+                                "run_1",
+                                "ses_1",
+                                1,
+                                {"status": "failed"},
+                            ),
+                        ),
+                    )
+                )
+            )
+            await asyncio.wait_for(rollback_started.wait(), timeout=1)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        result = await store.commit(CommitBatch(events=(rejected,)))
+        assert result.last_cursor == 2
+        snapshot = await store.get_snapshot("run", "run_1")
+        assert snapshot is not None
+        assert snapshot["status"] == "created"
+    finally:
+        if release is not None:
+            release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(BaseException):
+                await task
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_propagates_cancellation_received_during_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "state.db")
+    first = EventEnvelope.new(
+        type="session.created",
+        session_id="ses_1",
+        run_id=None,
+        sequence=1,
+        payload={},
+    )
+    await store.commit(CommitBatch(events=(first,)))
+    task: asyncio.Task[object] | None = None
+    release: asyncio.Event | None = None
+    try:
+        with monkeypatch.context() as race:
+            execute = store._connection.execute
+
+            def fail_snapshot_delete(sql: str, *args: Any, **kwargs: Any) -> Any:
+                if "DELETE FROM snapshots" not in sql:
+                    return execute(sql, *args, **kwargs)
+
+                async def fail() -> None:
+                    raise ValueError("original failure")
+
+                return fail()
+
+            race.setattr(store._connection, "execute", fail_snapshot_delete)
+            rollback_started, release = _block_rollback(store, race)
+            task = asyncio.create_task(store.delete_session("ses_1"))
+            await asyncio.wait_for(rollback_started.wait(), timeout=1)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        second = EventEnvelope.new(
+            type="session.created",
+            session_id="ses_2",
+            run_id=None,
+            sequence=1,
+            payload={},
+        )
+        result = await store.commit(CommitBatch(events=(second,)))
+        assert result.last_cursor == 2
+        assert [item.event.session_id for item in await store.read_events(after_cursor=0)] == [
+            "ses_1",
+            "ses_2",
+        ]
+    finally:
+        if release is not None:
+            release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(BaseException):
+                await task
         await store.close()
 
 
@@ -382,3 +531,40 @@ async def test_closed_store_rejects_public_operations_stably(tmp_path: Path) -> 
     for operation in operations:
         with pytest.raises(RuntimeError, match="SQLiteStore is closed"):
             await operation()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_keeps_store_stably_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "state.db")
+    close_finished = asyncio.Event()
+    release = asyncio.Event()
+    task: asyncio.Task[None] | None = None
+    try:
+        with monkeypatch.context() as race:
+            close = store._connection.close
+
+            async def close_then_block() -> None:
+                await close()
+                close_finished.set()
+                await release.wait()
+
+            race.setattr(store._connection, "close", close_then_block)
+            task = asyncio.create_task(store.close())
+            await asyncio.wait_for(close_finished.wait(), timeout=1)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=1)
+
+        with pytest.raises(RuntimeError, match="SQLiteStore is closed"):
+            await store.read_events(after_cursor=0)
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(BaseException):
+                await task
+        await store.close()
