@@ -13,6 +13,8 @@
 - Event append and snapshot update occur in the same transaction.
 - SQLite creates parent directories but does not silently replace an incompatible database.
 - Session delete removes its events and snapshots.
+- SQLite matches the M01-T002 Store contract for duplicate event ids, aggregate sequence, strict snapshot version increases, deep isolation, and non-reused cursor holes.
+- One `asyncio.Lock` serializes operations on the single aiosqlite connection; callers never observe a partially applied transaction.
 
 ---
 
@@ -44,6 +46,24 @@ async def test_session_and_run_survive_reopen(tmp_path: Path) -> None:
     assert (await reopened.get_snapshot("session", session.session_id))["status"] == "active"
     assert (await reopened.get_snapshot("run", run.run_id))["status"] == "created"
     assert len(await reopened.read_events(after_cursor=0, session_id=session.session_id)) == 2
+
+@pytest.mark.asyncio
+async def test_sqlite_stale_snapshot_rolls_back_event_and_cursor(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "state.db")
+    created = EventEnvelope.new(type="run.created", session_id="ses_1", run_id="run_1", sequence=1, payload={})
+    await store.commit(CommitBatch(events=(created,), snapshots=(SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "created"}),)))
+    stale = EventEnvelope.new(type="run.failed", session_id="ses_1", run_id="run_1", sequence=2, payload={})
+    with pytest.raises(ValueError, match="snapshot version"):
+        await store.commit(CommitBatch(events=(stale,), snapshots=(SnapshotWrite("run", "run_1", "ses_1", 1, {"status": "failed"}),)))
+    assert [item.cursor for item in await store.read_events(after_cursor=0)] == [1]
+
+@pytest.mark.asyncio
+async def test_sqlite_delete_leaves_global_cursor_hole(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "state.db")
+    await store.commit(CommitBatch(events=(EventEnvelope.new(type="session.created", session_id="ses_1", run_id=None, sequence=1, payload={}),)))
+    await store.delete_session("ses_1")
+    result = await store.commit(CommitBatch(events=(EventEnvelope.new(type="session.created", session_id="ses_2", run_id=None, sequence=1, payload={}),)))
+    assert result.last_cursor == 2
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -60,11 +80,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applie
 CREATE TABLE events(cursor INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE NOT NULL, session_id TEXT NOT NULL, run_id TEXT, sequence INTEGER NOT NULL, type TEXT NOT NULL, schema_version INTEGER NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL);
 CREATE TABLE snapshots(kind TEXT NOT NULL, entity_id TEXT NOT NULL, session_id TEXT NOT NULL, version INTEGER NOT NULL, data_json TEXT NOT NULL, PRIMARY KEY(kind, entity_id));
 CREATE INDEX events_session_cursor ON events(session_id, cursor);
+CREATE UNIQUE INDEX events_aggregate_sequence ON events(COALESCE(run_id, session_id), sequence);
+CREATE INDEX snapshots_session ON snapshots(session_id);
 ```
 
 - [ ] **Step 4: Implement SQLite commit/read/delete**
 
-Open one aiosqlite connection, enable foreign keys/WAL, run migrations, and serialize with canonical JSON (`sort_keys=True`, compact separators). In `commit`, execute `BEGIN IMMEDIATE`, insert every event, upsert snapshots only when incoming version is greater, then commit; rollback on any exception.
+Open one aiosqlite connection, enable foreign keys/WAL, run migrations, and serialize with canonical JSON (`sort_keys=True`, compact separators). In `commit`, acquire the Store lock, execute `BEGIN IMMEDIATE`, validate every snapshot version against the database and earlier writes in the same batch, insert every event, write only strictly newer snapshots, then commit; rollback on any exception. Convert SQLite duplicate-id/aggregate-sequence constraints to stable `ValueError` contract errors. Use `AUTOINCREMENT` cursor state so Session deletion never reuses a cursor.
 
 ```python
 async def commit(self, batch: CommitBatch) -> CommitResult:

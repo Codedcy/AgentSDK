@@ -6,7 +6,7 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 |---|---|---|---|---|
 | [M01-T001](M01-T001-project-scaffold.md) | Project scaffold and core configuration | M01 | — | done |
 | [M01-T002](M01-T002-event-storage-contracts.md) | Event and storage contracts | M01 | T001 | done |
-| [M01-T003](M01-T003-sqlite-runtime-spine.md) | SQLite Session and Run spine | M01 | T002 | pending |
+| [M01-T003](M01-T003-sqlite-runtime-spine.md) | SQLite Session and Run spine | M01 | T002 | in_progress |
 | [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | pending |
 | [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | pending |
 | [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | pending |
