@@ -1,0 +1,28 @@
+[project]
+name = "agent-sdk"
+version = "0.1.0.dev0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "pydantic>=2,<3", "litellm>=1.91.3,<1.92", "aiosqlite>=0.20,<1",
+  "mcp>=1,<2", "PyYAML>=6,<7",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.25,<1", "hypothesis>=6,<7", "ruff>=0.9,<1", "mypy>=1.14,<2"]
+
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["agent_sdk"]
