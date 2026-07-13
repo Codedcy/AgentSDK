@@ -1,104 +1,272 @@
 # M01-T009 Observability, Evaluation, and Analytics Slice Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILLS: use `superpowers:test-driven-development` while implementing and `superpowers:verification-before-completion` before reporting completion. Execute this task in the current worktree; do not create another worktree.
 
-**Goal:** Query current execution state, subscribe by cursor, evaluate one Run, and aggregate success/tool failure counts.
+**Goal:** Expose durable current Run state, timeline and Child execution-tree queries; resume event consumption from a global cursor; append one evidence-backed deterministic Run evaluation; and compute deletion-aware success and Tool failure aggregates from durable facts.
 
-**Architecture:** QueryService reads snapshots/events; SubscriptionService polls durable cursors for the slice. EvaluationEngine appends immutable results, and AnalyticsQueries aggregate facts directly from SQLite/InMemory records.
+**Architecture:** `QueryService` combines immutable Run snapshots with the Store's durable high-water cursor. `SubscriptionService` is a stateless polling async iterator over the same cursor-ordered event log, so applications decide when and how to display Trace data. `EvaluationEngine` executes an application-supplied `Evaluator`, validates its evidence against the subject timeline, and appends an immutable Session-owned evaluation aggregate. `AnalyticsQueries` computes small M01 aggregates directly from immutable evaluation/tool events at a captured cursor; it reports observations, never causality.
 
-**Tech Stack:** Pydantic, async iterators, StateStore, SQLite JSON queries.
+**Tech Stack:** Pydantic v2 frozen contracts, asyncio async iterators, existing StateStore/EventEnvelope/RunSnapshot, SQLite and InMemory stores, pytest-asyncio.
 
 ## Global Constraints
 
-- Query results expose `as_of_cursor`.
-- Evaluations include method, evidence refs, and version.
-- Analytics never infer causality in the slice.
+- Runtime truth remains durable events plus snapshots. Observability never creates a second hidden trace store and never makes Runtime depend on an exporter or UI.
+- Every query/aggregate exposes `as_of_cursor`. The Store exposes a durable `latest_cursor()` high-water mark that does not move backwards when a Session is deleted and cursor holes appear.
+- Query results are immutable and detached from Store-owned dictionaries. Missing/deleted records return stable NOT_FOUND; corrupt records and ordinary extension failures cross the public boundary only as sanitized `AgentSDKError` values.
+- Event subscription is at-least-once from the caller's acknowledged cursor. It advances over nonmatching events, tolerates deletion-created cursor holes, creates no background task, and propagates `asyncio.CancelledError` without swallowing or replacing it.
+- Evaluations are append-only facts separate from Run completion. An evaluator cannot change Run status, forge subject/evaluator identity, cite another Run's events, or persist after its Session/Run was deleted.
+- Analytics success is based only on explicit evaluation verdicts. Tool failure is based only on terminal `tool.call.completed` statuses. Unknown/malformed samples are counted as missing and never silently guessed.
+- This slice provides success rate and Tool failure count/rate with optional exact evaluator/tool filters. Failure taxonomy, failure stage/root-cause attribution, Tool usefulness, comparisons and improvement insights remain M05 and must not be represented as causal here.
+- Evaluation events/snapshots and their analytics contribution are Session-owned. Existing `delete_session` removes them automatically; recomputing analytics after deletion cannot retain a deleted Session's contribution.
+- Existing LiteLLM-only execution, Workflow/Child recovery, permissions, context compaction and public APIs remain compatible.
 
 ---
 
-### Task 1: Add query/subscription/evaluation/aggregate contracts
+### Task 1: Add cursor-aware event and Run query contracts
 
 **Files:**
+- Modify: `src/agent_sdk/storage/base.py`
+- Modify: `src/agent_sdk/storage/memory.py`
+- Modify: `src/agent_sdk/storage/sqlite.py`
+- Create: `src/agent_sdk/observability/__init__.py`
+- Create: `src/agent_sdk/observability/models.py`
 - Create: `src/agent_sdk/observability/queries.py`
-- Create: `src/agent_sdk/observability/subscriptions.py`
-- Create: `src/agent_sdk/evaluation/models.py`
-- Create: `src/agent_sdk/evaluation/engine.py`
-- Create: `src/agent_sdk/analytics/models.py`
-- Create: `src/agent_sdk/analytics/queries.py`
-- Create: `tests/integration/observability/test_observability_slice.py`
+- Create: `tests/integration/observability/test_queries.py`
+- Modify: Store test doubles only where their exercised surface requires `latest_cursor()`.
 
-**Interfaces:**
-- Produces: `QueryService.get_run/timeline/execution_tree`, `SubscriptionService.subscribe`, `Evaluator`, `EvaluationResult`, `EvaluationEngine.evaluate`, `AnalyticsQueries.success_rate/tool_failures`.
-- Consumes: `StateStore`, Run/Workflow/Tool events and snapshots.
+**Public interfaces:**
+- `StateStore.latest_cursor()`
+- `EventFilter`, `ObservedEvent`, `ObservedRun`, `RunTimeline`
+- `ExecutionTreeNode`, `ExecutionTree`
+- `QueryService.get_run`, `QueryService.timeline`, `QueryService.execution_tree`
+- `QueryService.query_events`
 
-- [ ] **Step 1: Write a cursor/evaluation/aggregate test**
+- [ ] **Step 1: Write high-water and immutable query RED tests**
 
-```python
-@pytest.mark.asyncio
-async def test_run_is_queryable_evaluated_and_aggregated(sdk: AgentSDK) -> None:
-    run = await sdk.fixtures.completed_run(output="ok", one_failed_tool=True)
-    snapshot = await sdk.queries.get_run(run.run_id)
-    assert snapshot.status == "completed" and snapshot.as_of_cursor > 0
-    evaluation = await sdk.evaluations.evaluate(run.run_id, ExactOutputEvaluator("ok"))
-    assert evaluation.verdict == "pass" and evaluation.evidence_event_ids
-    metrics = await sdk.analytics.success_rate()
-    assert metrics.sample_count == 1 and metrics.value == 1.0
-    assert (await sdk.analytics.tool_failures()).value == 1
-```
+Cover InMemory and SQLite parity. Create a Run, move it through several states, and assert:
 
-- [ ] **Step 2: Verify failure**
+- `get_run(run_id)` returns the exact `RunSnapshot` plus a positive `as_of_cursor`;
+- `timeline(run_id)` contains only that Run's events in cursor order and exposes the same-or-newer durable cursor;
+- `query_events(EventFilter(...), after_cursor=...)` filters by exact Session, Run and event types while its next cursor advances over unrelated records;
+- returned models/tuples/payloads cannot be mutated through aliases;
+- `latest_cursor()` remains at the allocated high-water after deleting the Session that owned the last event.
 
-Run: `uv run pytest tests/integration/observability/test_observability_slice.py -v`
-
-Expected: missing observability/evaluation/analytics modules.
-
-- [ ] **Step 3: Implement query and cursor subscription**
-
-`get_run` returns Run snapshot plus store's latest cursor. `timeline` filters Run events. `execution_tree` joins parent/Workflow/Child ids from payloads. Subscription repeatedly reads after cursor, yields StoredEvents, and stops on cancellation.
+The public result shapes are composition-based rather than copies of `RunSnapshot` fields:
 
 ```python
-async def subscribe(self, after_cursor: int = 0) -> AsyncIterator[StoredEvent]:
-    cursor = after_cursor
-    while True:
-        events = await self._store.read_events(after_cursor=cursor)
-        if not events:
-            await self._notifier.wait_after(cursor)
-            continue
-        for event in events:
-            yield event
-            cursor = event.cursor
+observed = await sdk.queries.get_run(run_id)
+assert observed.snapshot.status == RunStatus.COMPLETED
+assert observed.as_of_cursor >= 1
+
+timeline = await sdk.queries.timeline(run_id)
+assert timeline.events[-1].event.type == "run.completed"
 ```
 
-- [ ] **Step 4: Implement Evaluator result persistence**
+- [ ] **Step 2: Implement durable Store high-water**
 
-```python
-class EvaluationResult(BaseModel):
-    evaluation_id: str; subject_id: str; evaluator_id: str; evaluator_version: str
-    verdict: Literal["pass", "fail", "unknown"]; metrics: dict[str, float]
-    method: str; confidence: float | None; evidence_event_ids: tuple[str, ...]
-```
+Add `latest_cursor()` to the StateStore contract, InMemoryStore, SQLiteStore and the SDK's lazy SQLite adapter. InMemory returns its monotonic allocation counter under the Store lock. SQLite reads `sqlite_sequence` under its existing lock, preserving the allocated cursor even if rows were deleted. Do not derive this value only from `MAX(events.cursor)`.
 
-Persist `evaluation.completed` and an Evaluation snapshot; do not change Run status.
+- [ ] **Step 3: Implement bounded, stable Run observations**
 
-- [ ] **Step 5: Implement simple aggregate results**
+`get_run` validates a `RunSnapshot`, captures a cursor and confirms the snapshot still exists and is byte-for-byte equivalent before returning. This detects a concurrent transition or Session deletion; retry a small bounded number of times, then return retryable CONFLICT rather than mixing state from different moments. A transition after the confirmation is allowed: the result is linearized at the confirmation read.
 
-```python
-class AnalyticsResult(BaseModel):
-    metric: str; value: float; sample_count: int; missing_count: int
-    method: str; as_of_cursor: int
-```
+`timeline` first proves the Run exists, captures the high-water cursor, reads events only up to that cursor, filters by exact `run_id`, then confirms the Run still exists. It never leaks another Run or a deleted Session. Corrupt snapshot/event data becomes a context-free INTERNAL public error.
 
-Success rate uses explicit Run Evaluation verdicts; tool failure count uses terminal ToolCall events.
+- [ ] **Step 4: Implement the M01 descendant execution tree**
 
-- [ ] **Step 6: Verify**
+For this slice `execution_tree(root_run_id)` means the requested Run plus the transitive Runs whose persisted `run.created` payload has `parent_run_id` pointing into that tree. It is sufficient for the parent/Child Workflow slice; joining arbitrary Workflow sibling nodes and external trace/span formats remains M05.
 
-Run: `uv run pytest tests/integration/observability/test_observability_slice.py -v`
+Return a flat, deterministic tuple of `ExecutionTreeNode(snapshot, parent_run_id, created_cursor)` in creation-cursor order. Validate exact Session ownership and every relationship against the current Run snapshots. Detect relevant Run transitions/new Child creation during assembly with a bounded re-read and fail closed on inconsistent/cross-Session records. Do not enumerate mutable in-process task state.
 
-Expected: snapshot/cursor, Evaluation evidence, and aggregates match the seeded Run.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Verify Task 1**
 
 ```powershell
-git add src/agent_sdk/observability src/agent_sdk/evaluation src/agent_sdk/analytics tests/integration/observability
-git commit -m "feat: add observability and evaluation slice"
+uv run --python 3.13 pytest tests/integration/observability/test_queries.py -v
+```
+
+Expected: snapshot/timeline/tree values are cursor-qualified, immutable, Session-safe, and equivalent across SQLite/InMemory including deletion-created cursor holes.
+
+---
+
+### Task 2: Implement resumable filtered subscriptions
+
+**Files:**
+- Create: `src/agent_sdk/observability/subscriptions.py`
+- Create: `tests/integration/observability/test_subscriptions.py`
+
+**Public interfaces:**
+- `SubscriptionService.subscribe(*, filters=None, cursor=0)`
+
+- [ ] **Step 1: Write cursor recovery and cancellation RED tests**
+
+Start a subscription after a known cursor, append an unrelated event followed by a matching event, and prove the iterator yields the matching event once without rereading/spinning on the filtered event. Recreate the iterator from the last yielded cursor and prove the next matching event is delivered.
+
+Also cover:
+
+- global and Session/Run/type filters;
+- a cursor whose event was removed by Session deletion;
+- no events yet followed by a later commit;
+- consumer `aclose()` and task cancellation with no leaked polling/background task;
+- cancellation while waiting propagates the same `CancelledError` instance where Python task semantics expose it;
+- invalid negative cursors fail before any Store read.
+
+- [ ] **Step 2: Implement a stateless polling async iterator**
+
+Read durable batches after the local cursor. For every stored event, update the local cursor before deciding whether it matches; yield only matches. If the batch is empty, use a short configurable internal poll interval and an interruptible `asyncio.sleep`. Do not create a producer task or unbounded queue in M01.
+
+The yielded `ObservedEvent.cursor` is the application acknowledgement token. Delivery after reconnect is at least once: the application resumes from the last cursor it durably acknowledged and may deduplicate by immutable `event_id`.
+
+- [ ] **Step 3: Verify Task 2**
+
+```powershell
+uv run --python 3.13 pytest tests/integration/observability/test_subscriptions.py -v
+```
+
+Expected: matching delivery resumes by cursor, unrelated/deleted events cannot stall progress, idle waiting is cancellable, and there are no background-task lifecycle leaks.
+
+---
+
+### Task 3: Append an evidence-backed deterministic Run evaluation
+
+**Files:**
+- Create: `src/agent_sdk/evaluation/__init__.py`
+- Create: `src/agent_sdk/evaluation/models.py`
+- Create: `src/agent_sdk/evaluation/evaluators.py`
+- Create: `src/agent_sdk/evaluation/engine.py`
+- Create: `tests/integration/evaluation/test_evaluation_slice.py`
+
+**Public interfaces:**
+- `Evaluator` protocol and `EvaluationDecision`
+- `EvaluationSubject`, `EvaluationVerdict`, `EvaluationResult`
+- `ExactOutputEvaluator`
+- `EvaluationEngine.evaluate(run_id, evaluator)`
+
+- [ ] **Step 1: Write evaluator and immutable-persistence RED tests**
+
+Evaluate a terminal Run with `ExactOutputEvaluator(expected="ok")` and assert a pass/fail verdict, `exact_match` metric, deterministic method, evaluator id/version, terminal Run event evidence, creation time and immutable record version. Assert `evaluation.completed` and the matching `evaluation` snapshot are committed atomically while the original Run snapshot/status remain unchanged.
+
+An evaluation event is its own aggregate: use `evaluation_id` in the current envelope's aggregate `run_id` slot, `sequence=1`, and retain `subject_run_id` in the typed payload. This avoids competing for the already-terminal Run's event sequence and permits multiple evaluators/results for one Run.
+
+- [ ] **Step 2: Write extension-boundary and race RED tests**
+
+Cover:
+
+- CREATED/RUNNING/WAITING Run rejection; COMPLETED and FAILED Runs are eligible terminal subjects;
+- evaluator metadata/result schema validation before persistence;
+- evidence ids must be unique members of the subject timeline at its captured cursor;
+- user evaluator ordinary exception, invalid return and malicious evidence are sanitized with no cause/context/traceback-local leak and zero evaluation writes;
+- parameterized `CancelledError` propagates unchanged and creates no evaluation record;
+- concurrent Session deletion or changed Run version before commit cannot resurrect data;
+- multiple evaluations append independent immutable records;
+- SQLite reopen loads the same evaluation record.
+
+- [ ] **Step 3: Implement frozen contracts and the built-in evaluator**
+
+`EvaluationDecision` contains only evaluator-controlled claims: verdict, metrics, reason, confidence and evidence event ids. `EvaluationResult` adds SDK-controlled `evaluation_id`, Session/subject identity, subject type, evaluator id/version, method, `created_at`, schema/record version and the captured subject cursor. Freeze and detach metric mappings; reject non-finite values, duplicate evidence and extra fields.
+
+`ExactOutputEvaluator` compares the terminal `output_text` exactly, emits confidence `1.0`, cites the terminal Run event, and never invokes LiteLLM. It is the one deterministic best-practice validation included in M01; applications may supply their own protocol implementation.
+
+- [ ] **Step 4: Implement fail-closed evaluation persistence**
+
+Load a stable terminal `EvaluationSubject(snapshot, timeline, as_of_cursor)`, obtain and validate evaluator identity, and invoke the evaluator. Catch ordinary extension exceptions inside a private helper and expose only stable SDK errors; never catch `BaseException`/`CancelledError`.
+
+Commit `evaluation.completed` plus snapshot with atomic preconditions on both owning Session existence and the exact terminal Run snapshot version. Map a failed precondition to stable NOT_FOUND/CONFLICT based on a fresh read. Do not update the Run or execute any model. The public result is returned only after commit succeeds.
+
+- [ ] **Step 5: Verify Task 3**
+
+```powershell
+uv run --python 3.13 pytest tests/integration/evaluation/test_evaluation_slice.py -v
+```
+
+Expected: deterministic evaluation is immutable, evidence-backed, append-only, recovery-safe and isolated from application evaluator failures/cancellation.
+
+---
+
+### Task 4: Add deletion-aware success and Tool failure aggregates
+
+**Files:**
+- Create: `src/agent_sdk/analytics/__init__.py`
+- Create: `src/agent_sdk/analytics/models.py`
+- Create: `src/agent_sdk/analytics/queries.py`
+- Create: `tests/integration/analytics/test_analytics_slice.py`
+
+**Public interfaces:**
+- `AnalyticsResult`
+- `AnalyticsQueries.success_rate(*, evaluator_id=None)`
+- `AnalyticsQueries.tool_failures(*, tool_name=None)`
+- `AnalyticsQueries.tool_failure_rate(*, tool_name=None)`
+
+- [ ] **Step 1: Write explicit-success and Tool terminal-fact RED tests**
+
+Create terminal Runs with pass/fail/unknown evaluation records and successful/failed/timed-out/denied Tool terminal events. Assert:
+
+- success rate is `pass / (pass + fail)`, with unknown verdicts in `missing_count`;
+- Tool failure count includes every known terminal non-`succeeded` status;
+- Tool failure rate is `failures / known terminal calls`;
+- evaluator/tool exact filters affect both numerator and denominator;
+- no known denominator returns `value=None`, never a fabricated zero-rate conclusion;
+- each result includes metric name, sample/missing counts, method, filters, evidence ids and `as_of_cursor`.
+
+- [ ] **Step 2: Implement cursor-bounded fact aggregation**
+
+Capture `latest_cursor()`, read the durable log and ignore any later cursor. Parse only `evaluation.completed` and `tool.call.completed` typed payloads. Count malformed/unknown candidate facts as missing rather than crashing or treating them as success/failure. Preserve evidence event ids so applications can drill down.
+
+These methods report deterministic counting methods such as `explicit_evaluation_verdict` and `terminal_tool_status`. Do not emit failure stage, root cause, usefulness, attribution or recommendations in this slice.
+
+- [ ] **Step 3: Prove restart and deletion behavior**
+
+Run the same aggregates on InMemory and SQLite, close/reopen SQLite and compare results. Delete one contributing Session and assert its evaluation snapshot/event and Tool events are absent and all aggregate numerators/denominators/missing counts are recomputed without that Session.
+
+- [ ] **Step 4: Verify Task 4**
+
+```powershell
+uv run --python 3.13 pytest tests/integration/analytics/test_analytics_slice.py -v
+```
+
+Expected: results are explicit, cursor-qualified, filterable, missing-aware, restart-safe and deletion-aware, with no causal inference.
+
+---
+
+### Task 5: Wire public SDK façades, lifecycle and package exports
+
+**Files:**
+- Modify: `src/agent_sdk/api.py`
+- Modify: `src/agent_sdk/__init__.py`
+- Modify: package `__init__.py` files above
+- Create: `tests/integration/observability/test_public_observability_api.py`
+
+**Public interfaces:**
+- `sdk.queries.get_run/timeline/execution_tree/query_events`
+- `sdk.events.subscribe`
+- `sdk.evaluations.evaluate`
+- `sdk.analytics.success_rate/tool_failures/tool_failure_rate`
+- Package-root exports for all public contracts named in Tasks 1-4.
+
+- [ ] **Step 1: Write public-only façade RED tests**
+
+Use only imports from `agent_sdk` and an `AgentSDK.for_test` instance. Run, query, subscribe, evaluate and aggregate through the public façade. Verify default SQLite construction exposes the same APIs without eager database opening.
+
+Mutation methods participate in `_SDKLifecycle`: a newly-started evaluation is rejected once closing begins, and close cannot cut through an admitted evaluation commit. An already-open subscription terminates cleanly when SDK close begins rather than touching a closed owned Store; a new subscription/evaluation after closing yields stable INVALID_STATE. Read-only query behavior should match existing `runs.get`/`workflows.get` conventions and never leak raw closed-Store exceptions.
+
+- [ ] **Step 2: Keep application presentation outside the SDK**
+
+The façade returns query records, cursor streams, evaluation records and aggregate values only. Do not add an HTTP server, dashboard, logging side effects or automatic console output. This preserves the product decision that applications choose when/how Trace and analysis are displayed; M06 provides a reference monitor as a best-practice validation.
+
+- [ ] **Step 3: Run the task gate**
+
+```powershell
+uv run --python 3.13 pytest tests/integration/observability tests/integration/evaluation tests/integration/analytics -v
+uv run --python 3.13 pytest -q
+uv run --python 3.13 ruff check src tests
+uv run --python 3.13 mypy src
+git diff --check
+```
+
+Expected: all existing and new tests pass; there are no ignored/xfailed acceptance paths; public models are immutable; custom evaluators/cancellation are isolated; SQLite restart and Session deletion are proven.
+
+- [ ] **Step 4: Commit**
+
+```powershell
+git add docs/plans/tasks/M01-T009-observability-evaluation-slice.md src/agent_sdk tests
+git commit -m "feat: add observability evaluation slice"
 ```
