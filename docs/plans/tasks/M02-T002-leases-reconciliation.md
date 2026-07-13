@@ -69,6 +69,7 @@ M02-T001 Run or Workflow execution descriptor before Run-lease/CAS admission.
 - Create: `tests/integration/runtime/test_recovery_admission.py`
 - Create: `tests/faults/test_model_call_unknown_outcome.py`
 - Create: `tests/integration/workflow/test_workflow_recovery_admission.py`
+- Create: `tests/integration/storage/test_sqlite_v3_migration.py`
 - Create: `tests/e2e/test_unknown_tool_outcome.py`
 
 **Interfaces:**
@@ -159,11 +160,17 @@ async def test_pre_t002_running_without_checkpoint_requires_resolution(legacy_cr
     recovered = await legacy_crash.upgrade_and_recover(run_id)
     assert recovered.status == "waiting_reconciliation"
     assert legacy_crash.provider_calls_after_upgrade == 0
+
+@pytest.mark.asyncio
+async def test_real_v2_database_upgrades_atomically_to_v3(version_two_database) -> None:
+    first, second = await open_concurrently(version_two_database, count=2)
+    assert await migration_versions(first) == (1, 2, 3)
+    assert await migration_versions(second) == (1, 2, 3)
 ```
 
 - [ ] **Step 2: Verify failure**
 
-Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
+Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
 
 Expected: Lease/Reconciliation types missing.
 
@@ -222,14 +229,30 @@ request fingerprint, provider/Tool identity, lease generation, status, detached
 outcome, and recovery metadata. Unique `(run_id, turn, kind, operation_id)` plus
 lease-generation preconditions prevent duplicate progress records.
 
+Set SQLite `_SCHEMA_VERSION = 3` and extend the T001 lock-before-discovery
+opener rather than merely adding a SQL file. Under the existing WAL/busy retry,
+`BEGIN IMMEDIATE` first, then rediscover EMPTY/v1/v2/v3. New databases apply
+1→2→3; exact v1 applies both forward transforms; exact v2 is validated with all
+T001 schema/representation/event invariants before applying
+`0003_leases.sql`; exact v3 is fully validated and opened without reapplying.
+Execute complete statements without `executescript`, insert version 3, validate
+the complete v3 tables/indexes/data constraints inside the transaction, and use
+the cancellation-safe commit/rollback coordinator. Two concurrent v2 opens
+must both succeed with one migration. Fault-inject after every v3 DDL/index,
+version insert, validation, and commit race; reopen observes exact v2 or complete
+v3, never partial. Add real v2 fixtures plus malformed/gapped/future version
+rows and transient/exhausted busy tests.
+
 - [ ] **Step 4: Implement recovery scan**
 
 At SDK open, a read/write recovery scan may mark stale leased Runs interrupted,
 but it must not invoke LiteLLM, Tools, MCP, or Workflow execution. Application
 setup then registers AgentSpecs/Tools/MCP and explicitly calls
 `sdk.recovery.recover_run(...)` or `recover_workflow(...)`. Verify the persisted
-AgentSpec content hash, model params, initial messages, and Tool schemas against
-registered capabilities before acquiring a new lease. Inspect unresolved model
+AgentSpec content hash, model params, initial messages, full ToolSpec capability
+hashes/versions, and effective Policy hash against registered capabilities
+before acquiring a new lease. A changed Tool effect/timeout/source/version or
+permission default fails recovery even when model-visible schemas match. Inspect unresolved model
 operations before the next model turn: use an authoritative registered provider
 status query when available, otherwise create a model-call reconciliation
 request without invoking LiteLLM. Then inspect started ToolCalls without
@@ -274,7 +297,8 @@ durable cancel/terminate path performs the lifecycle-final detach in the same
 commit as the Run outcome.
 
 `RecoveryAPI.recover_workflow` first verifies the persisted
-`WorkflowExecutionDescriptor` against current AgentSpecs/Tools. It then claims
+`WorkflowExecutionDescriptor` against current AgentSpecs/full Tool
+capabilities/effective Policy. It then claims
 the next M01 sequential Workflow transition with an exact Workflow snapshot
 precondition. If the node already selected a Run, recover that same Run; if a
 pending node has no Run, only the CAS winner creates/selects one. RunEngine then
@@ -298,7 +322,7 @@ Require evidence/actor metadata; RETRY remains forbidden unless user explicitly 
 
 - [ ] **Step 6: Verify crash boundary**
 
-Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
+Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
 
 Expected: fencing works; side effect count stays one until explicit resolution;
 interrupted/reconciliation work keeps Session ownership; mismatched or missing
@@ -310,6 +334,6 @@ resolve automatically.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add src/agent_sdk/runtime src/agent_sdk/workflow src/agent_sdk/storage tests/integration/runtime tests/integration/workflow/test_workflow_recovery_admission.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py
+git add src/agent_sdk/runtime src/agent_sdk/workflow src/agent_sdk/storage tests/integration/runtime tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py
 git commit -m "feat: add run leases and reconciliation"
 ```

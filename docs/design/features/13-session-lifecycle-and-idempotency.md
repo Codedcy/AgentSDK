@@ -254,12 +254,19 @@ version containing the Run id, and commits these facts atomically:
 
 The Run snapshot also persists an immutable `ExecutionDescriptor` containing
 the canonical full AgentSpec identity/content hash, LiteLLM model and model
-parameters, initial messages/input, and the exact Tool schemas plus their hash.
+parameters, initial messages/input, the exact full `ToolSpec` capability
+descriptors plus their hash, and the execution-relevant Policy configuration
+plus its hash. Full Tool capability identity includes name, description, input
+schema, version, source, effects, and timeout. `ToolSpec.version` is the
+application-declared handler/capability implementation version and must be
+bumped when handler semantics change. Handler objects and credentials remain
+application-owned and are never serialized. The current Policy descriptor
+covers `permission_default`; later policy engines must add every
+execution-affecting rule/config field before recovery can claim compatibility.
 The start-command fingerprint covers that descriptor and all parent/workflow
-relationships, so two AgentSpecs that reuse a revision string cannot match.
-Handlers and credentials remain application-owned; T002 recovery begins only
-after the application re-registers capabilities whose schemas match the
-descriptor.
+relationships, so reused revision/schema strings with different behavior cannot
+match. T002 recovery begins only after the application re-registers exact Tool
+capabilities and Policy configuration matching the descriptor.
 
 On an exact-precondition race, the command reloads and retries a bounded number
 of times. If close wins, start returns `INVALID_STATE`; if start wins, close sees
@@ -294,11 +301,13 @@ instead of creating or executing another Workflow.
 
 `WorkflowRunSnapshot` also persists a `WorkflowExecutionDescriptor`. It covers
 the canonical Workflow definition hash, the full canonical `AgentSpec` and
-content hash for every referenced agent revision, and the exact Tool schemas
-plus schema hash used to construct its node Runs. Workflow start fingerprints
+content hash for every referenced agent revision, the exact full Tool
+capability descriptors/hash, and execution Policy descriptor/hash used to
+construct its node Runs. Workflow start fingerprints
 this descriptor with the Session id and Workflow IR. Thus a key cannot replay
 across SDK instances that bind the same IR/revision strings to different
-models, model parameters, or Tool schemas. Migrated M01 Workflows are marked
+models, model parameters, Tool behavior/timeout/effects, or permission policy.
+Migrated M01 Workflows are marked
 `legacy_unknown` and require explicit T002 resolution rather than resume.
 
 Until T002 exists, `Workflow.resume` is deliberately limited: terminal state is

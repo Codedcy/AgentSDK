@@ -25,7 +25,7 @@
 **Files:**
 - Modify: `src/agent_sdk/workflow/executor.py`
 - Modify: `src/agent_sdk/workflow/state.py`
-- Modify: `src/agent_sdk/workflow/events.py`
+- Create: `src/agent_sdk/workflow/events.py`
 - Modify: `src/agent_sdk/storage/sqlite.py`
 - Create: `tests/integration/workflow/test_node_lifecycle.py`
 - Create: `tests/integration/workflow/test_workflow_leases.py`
@@ -63,19 +63,21 @@ Expected: durable attempts/retry/failure routing are incomplete.
 
 ```python
 async def execute_node(self, run: WorkflowRun, node: Node) -> NodeResult:
-    attempt = await self._state.claim_attempt(run.id, node.id)
-    await self._events.append(node_started(run, node, attempt))
+    attempt = await self._state.start_attempt(run.id, node.id)
     try:
         result = await self._dispatch(node, operation_id=attempt.operation_id)
     except AgentSDKError as error:
-        return await self._handle_failure(run, node, attempt, error)
-    await self._state.complete_attempt(attempt, result)
-    await self._events.append(node_completed(run, node, attempt, result))
-    return result
+        return await self._state.fail_attempt(attempt, error)
+    return await self._state.complete_attempt(attempt, result)
 ```
 
-`claim_attempt` verifies the current Workflow lease generation in the same
-transaction as the node-attempt projection. Compute exponential backoff plus
+`start_attempt` verifies the current Workflow lease generation and atomically
+commits the attempt claim/projection plus `workflow.node.started` event.
+`complete_attempt` and `fail_attempt` each atomically commit their terminal
+attempt/node projections and matching completed/failed event. No public state
+method exposes a projection-only or event-only transition. Fault-inject before
+and after each commit and assert event/projection parity after restart.
+Compute exponential backoff plus
 bounded jitter from persisted attempt number; persist next-attempt time before
 releasing the worker.
 
@@ -95,7 +97,7 @@ git commit -m "feat: add durable workflow node lifecycle"
 ### Task 2: Implement bounded parallelism, foreach, waits, and restart
 
 **Files:**
-- Modify: `src/agent_sdk/workflow/scheduler.py`
+- Create: `src/agent_sdk/workflow/scheduler.py`
 - Modify: `src/agent_sdk/workflow/executor.py`
 - Modify: `src/agent_sdk/runtime/reconciliation.py`
 - Create: `tests/integration/workflow/test_parallel_waits.py`

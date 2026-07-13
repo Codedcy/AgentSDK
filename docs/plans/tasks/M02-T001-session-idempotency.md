@@ -37,12 +37,17 @@
 
 **Files:**
 - Create: `src/agent_sdk/storage/idempotency.py`
+- Create: `src/agent_sdk/runtime/execution.py`
 - Modify: `src/agent_sdk/storage/base.py`
 - Modify: `src/agent_sdk/storage/memory.py`
 - Modify: `src/agent_sdk/storage/sqlite.py`
 - Modify: `src/agent_sdk/api.py`
+- Modify: `src/agent_sdk/runtime/models.py`
+- Modify: `src/agent_sdk/workflow/models.py`
+- Modify: `src/agent_sdk/tools/models.py`
 - Create: `src/agent_sdk/storage/migrations/0002_idempotency.sql`
 - Create: `tests/contract/test_idempotency_store_contract.py`
+- Create: `tests/unit/runtime/test_execution_descriptors.py`
 - Modify: `tests/integration/storage/test_sqlite_spine.py`
 
 **Interfaces:**
@@ -52,7 +57,9 @@
   `IdempotencyConflictError`, `IdempotencyCorruptionError`, internal
   `IdempotencyReplayMissError`, `fingerprint_command`, replay-only exact
   snapshot preconditions, `CommitResult.applied`, `CommitResult.idempotency`,
-  and `StateStore.get_idempotency`.
+  `ToolCapabilityDescriptor`, `ExecutionPolicyDescriptor`, Run/Workflow
+  execution descriptor base models, strict `SessionStatus`/`SessionSnapshot`,
+  legacy/current Run/Workflow snapshot invariants, and `StateStore.get_idempotency`.
 
 - [ ] **Step 1: Write failing Store contract tests**
 
@@ -110,6 +117,11 @@ version mismatch, and an event whose Session owner is absent; every case must
 fail closed. Explicitly cover every current M01 snapshot kind: `session`,
 `run`, `workflow`, `workflow_node`, `context_capsule`, `context_view`, and
 `evaluation`, plus an unknown kind.
+After migration, load every Run through public `runs.get` and every Workflow
+through `workflows.get`/`WorkflowState.load`; strict models must accept the
+legacy compatibility fields. Add unit tests for full Tool capability and Policy
+hashes, including equal input schema with changed Tool version/source/effects/
+timeout or changed `permission_default`.
 
 - [ ] **Step 2: Run RED and confirm the missing contract**
 
@@ -180,6 +192,30 @@ Infinity. Convert input/model validation to `IdempotencyValidationError` before
 any Store state is mutated. A stored row that cannot validate is
 `IdempotencyCorruptionError`. Matching/mismatching records never include stored
 request/result values in exception messages.
+
+Create `runtime/execution.py` in this task, before the migration transform, with
+frozen/extra-forbid `ToolCapabilityDescriptor`, `ExecutionPolicyDescriptor`,
+`ExecutionDescriptor`, `WorkflowAgentDescriptor`, and
+`WorkflowExecutionDescriptor` base models. A Tool capability stores the entire
+canonical `ToolSpec` plus a hash; make `ToolSpec.version`/`source` nonempty and
+document `version` as the application-maintained handler/capability version.
+The Policy descriptor stores canonical execution-affecting config and hash
+(`permission_default` in M02). Hashes use detached canonical JSON and validators
+recompute them. Handler callables and credentials are forbidden from serialized
+descriptors.
+
+In the same Task 1 commit, introduce `SessionStatus` and make `SessionSnapshot`
+frozen/extra-forbid with positive version, unique deterministic active Run/
+Workflow tuples, and the closed/deleting-no-work invariant. Existing creation
+defaults to active/empty. Add to `RunSnapshot` the compatibility flag,
+optional `ExecutionDescriptor`, and ordered `tool_results`; add to
+`WorkflowRunSnapshot` its compatibility flag and optional
+`WorkflowExecutionDescriptor`. Defaults keep existing M01-created entities
+`legacy_unknown`/`None`. Validators require legacy→no descriptor and
+current→valid descriptor, and preserve all terminal/nonterminal invariants.
+Tasks 3 and 4 later change new public Run/Workflow creation to build `current`
+descriptors; they do not introduce these model fields. This makes the Task 1
+migration and its independent commit readable through strict public models.
 
 - [ ] **Step 4: Extend the Store commit contract**
 
@@ -283,7 +319,8 @@ the checksum bootstrap in M02-T003. Table/index DDL, all backfill writes, the
 version insert, and final v2 validation share this one transaction.
 
 Before recording version 2 for an existing database, backfill the representation
-that Tasks 2-4 will validate. Under the same transaction:
+that Task 1's strict Session/Run/Workflow models validate. Under the same
+transaction:
 
 ```python
 for session_row in await _snapshot_rows("session"):
@@ -409,8 +446,8 @@ facts.
 Run:
 
 ```powershell
-uv run --python 3.13 pytest tests/contract/test_idempotency_store_contract.py tests/contract/test_memory_store_contract.py tests/integration/storage/test_sqlite_spine.py -q
-uv run --python 3.13 ruff check src/agent_sdk/storage src/agent_sdk/api.py tests/contract tests/integration/storage
+uv run --python 3.13 pytest tests/contract/test_idempotency_store_contract.py tests/contract/test_memory_store_contract.py tests/unit/runtime/test_execution_descriptors.py tests/integration/storage/test_sqlite_spine.py -q
+uv run --python 3.13 ruff check src/agent_sdk/storage src/agent_sdk/runtime/execution.py src/agent_sdk/runtime/models.py src/agent_sdk/workflow/models.py src/agent_sdk/tools/models.py src/agent_sdk/api.py tests/contract tests/unit/runtime/test_execution_descriptors.py tests/integration/storage
 uv run --python 3.13 mypy src/agent_sdk
 ```
 
@@ -419,7 +456,7 @@ Expected: all selected tests pass; Ruff and mypy report no errors.
 - [ ] **Step 8: Commit Task 1**
 
 ```powershell
-git add src/agent_sdk/storage src/agent_sdk/api.py tests/contract tests/integration/storage/test_sqlite_spine.py
+git add src/agent_sdk/storage src/agent_sdk/runtime/execution.py src/agent_sdk/runtime/models.py src/agent_sdk/workflow/models.py src/agent_sdk/tools/models.py src/agent_sdk/api.py tests/contract tests/unit/runtime/test_execution_descriptors.py tests/integration/storage/test_sqlite_spine.py
 git commit -m "feat: add atomic command idempotency"
 ```
 
@@ -444,8 +481,12 @@ git commit -m "feat: add atomic command idempotency"
 - Modify: `tests/integration/observability/test_subscriptions.py`
 
 **Interfaces:**
-- Consumes: Task 1 idempotent commit result, existing snapshot preconditions, SDK lifecycle admission.
-- Produces: `SessionStatus`, `SessionStateMachine.transition`, frozen `SessionSnapshot`, `SessionBusyError`, `RuntimeCommands.get_session/close_session/delete_session`, and public `sessions.get/close/delete`.
+- Consumes: Task 1 idempotent commit result, strict `SessionStatus`/
+  `SessionSnapshot`, existing snapshot preconditions, and SDK lifecycle
+  admission.
+- Produces: `SessionStateMachine.transition`, `SessionBusyError`,
+  `RuntimeCommands.get_session/close_session/delete_session`, and public
+  `sessions.get/close/delete`.
 
 - [ ] **Step 1: Write state-machine and empty-Session lifecycle tests**
 
@@ -523,12 +564,11 @@ class SessionStateMachine:
         return target
 ```
 
-Make `SessionSnapshot` frozen/extra-forbid with empty tuple defaults for
-`active_run_ids` and `active_workflow_run_ids`; validate uniqueness and forbid
-active work for `closed`/`deleting`. Override `model_copy` so every update is
-rebuilt from JSON and passed through `SessionSnapshot.model_validate`; add tests
-that invalid copied versions, duplicate work ids, and closed-with-work updates
-raise `ValidationError`.
+Use Task 1's strict `SessionSnapshot` and `SessionStatus`; do not redefine or
+weaken them. Implement the transition table and validated transition helpers.
+Retain the Task 1 `model_copy` override/validated reconstruction path and add
+state-machine tests that invalid copied versions, duplicate work ids, and
+closed-with-work updates raise `ValidationError`.
 
 - [ ] **Step 4: Implement safe Session loading and transition commits**
 
@@ -751,14 +791,18 @@ git commit -m "feat: add complete normal session lifecycle"
 - Modify: `src/agent_sdk/runtime/commands.py`
 - Modify: `src/agent_sdk/runtime/engine.py`
 - Modify: `src/agent_sdk/runtime/handles.py`
+- Modify: `src/agent_sdk/permissions/policy.py`
 - Modify: `src/agent_sdk/api.py`
 - Create: `tests/integration/runtime/test_run_session_ownership.py`
 - Modify: `tests/integration/runtime/test_text_agent_loop.py`
 - Modify: `tests/integration/tools/test_permissioned_tool_slice.py`
 
 **Interfaces:**
-- Consumes: Tasks 1-2, `RunSnapshot`, `_RunEmitter`, `RunHandle`, SDK task tracking, current AgentSpec and Tool schemas.
-- Produces: immutable `ExecutionDescriptor`, internal `CommandOutcome[T]`, optional `RunAPI.start(..., idempotency_key=...)`, atomic Run attach/detach, and durable replay handles.
+- Consumes: Tasks 1-2, `RunSnapshot`, `_RunEmitter`, `RunHandle`, SDK task
+  tracking, current AgentSpec, full Tool capabilities, and effective Policy.
+- Produces: current `ExecutionDescriptor` builders, internal
+  `CommandOutcome[T]`, optional `RunAPI.start(..., idempotency_key=...)`, atomic
+  Run attach/detach, and durable replay handles.
 
 - [ ] **Step 1: Write failing ownership, race, and replay tests**
 
@@ -805,7 +849,9 @@ re-raised, and a key retry must attach to that task. A simulated process-crash
 gap may remain detached for T002 recovery. Completed and partially failed Tool
 Runs must return the exact ordered durable Tool results.
 Two AgentSpecs sharing the same name/revision string but differing in model or
-model params must conflict on one key. Corrupted descriptor/result replay data
+model params must conflict on one key. So must equal input schemas with changed
+Tool version/source/effects/timeout, or a changed `permission_default` Policy.
+Corrupted descriptor/result replay data
 must return sanitized `INTERNAL` without invoking LiteLLM or a Tool. A retained
 `deleting` Session must reject an old matching Run key with `INVALID_STATE`, and
 a detached nonterminal Run after SQLite reopen must report retryable
@@ -832,7 +878,8 @@ class CommandOutcome(Generic[T]):
     replayed: bool
 ```
 
-Add a frozen, extra-forbid `ExecutionDescriptor` to `RunSnapshot`:
+Use the frozen, extra-forbid Task 1 `ExecutionDescriptor` already present on
+`RunSnapshot`:
 
 ```python
 class ExecutionDescriptor(BaseModel):
@@ -844,18 +891,27 @@ class ExecutionDescriptor(BaseModel):
     model: str
     model_params: Mapping[str, Any]
     initial_messages: tuple[Mapping[str, Any], ...]
-    tool_schemas: tuple[Mapping[str, Any], ...]
-    tool_schema_hash: str
+    tool_capabilities: tuple[ToolCapabilityDescriptor, ...]
+    tool_capability_hash: str
+    policy: ExecutionPolicyDescriptor
+    policy_hash: str
 ```
 
 Deep-freeze/detach JSON exactly as `AgentSpec.model_params` does. The AgentSpec
-hash covers `agent.model_dump(mode="json")`; Tool schemas are stored in stable
-registry order and hashed from canonical JSON. `RunAPI.start`, Workflow, and
-Subagent creation all build this descriptor from the exact request they will
-pass to `RunEngine`. `RunSnapshot` stores
-`execution_compatibility: Literal["current", "legacy_unknown"]`; new Runs
-require `current` plus a descriptor, while migrated M01 Runs default to
-`legacy_unknown`/`None` and are never automatically replayed.
+hash covers `agent.model_dump(mode="json")`; full ToolSpecs are stored in the
+exact registry/request order and hashed from canonical JSON, and the current
+Policy descriptor/hash covers `permission_default`. `ToolSpec.version` is the
+explicit application-maintained handler capability version. `RunAPI.start`,
+Workflow, and Subagent creation all build this descriptor from the exact request
+and effective Policy they pass to `RunEngine`. They set new Runs to `current`;
+migrated/intermediate M01 Runs remain `legacy_unknown`/`None` and are never
+automatically replayed.
+
+Expose a detached `PolicyEngine.execution_config()` containing every current
+execution-affecting setting (`permission_default` in M02), pass the same Policy
+instance/config to RunAPI and WorkflowExecutor, and build descriptors from it.
+Do not introspect private fields or assume the default. Tests construct two SDKs
+with different defaults and prove one key conflicts before execution.
 
 Override `RunSnapshot.model_copy` with JSON reconstruction plus
 `RunSnapshot.model_validate`. Tests must prove copy/update cannot create a
@@ -1004,7 +1060,7 @@ git commit -m "feat: bind runs to session lifecycle"
 
 **Interfaces:**
 - Consumes: `CommandOutcome`, Session exact transition helper, resolved
-  AgentSpecs, Tool schemas, Workflow IR hash, and existing executor active-task
+  AgentSpecs, full Tool capabilities, effective Policy, Workflow IR hash, and existing executor active-task
   map.
 - Produces: immutable `WorkflowExecutionDescriptor`, optional
   `WorkflowAPI.start(..., idempotency_key=...)`, atomic Workflow attach/detach,
@@ -1050,8 +1106,9 @@ must register the single Workflow task before re-raising cancellation. Also
 cover:
 
 - same Session/key/IR with a referenced AgentSpec that keeps its revision but
-  changes model/model params, or with changed Tool schemas, returns `CONFLICT`
-  and launches nothing;
+  changes model/model params, with the same schema but changed Tool
+  version/source/effects/timeout, or with changed effective Policy, returns
+  `CONFLICT` and launches nothing;
 - a retained `deleting` Session rejects an old matching Workflow key with
   `INVALID_STATE` and launches no Workflow/Run/Child;
 - after SQLite reopen, detached nonterminal `result()` and explicit
@@ -1074,8 +1131,8 @@ Expected: Workflow start has no key and Session work ownership is absent.
 
 Change `WorkflowState.create` to return `CommandOutcome[WorkflowRunSnapshot]`
 and accept an optional key. Validate the IR and resolve all referenced
-AgentSpecs/Tool schemas before generating durable state. Add frozen,
-extra-forbid models like:
+AgentSpecs, full Tool capabilities, and effective Policy before generating
+durable state. Use the Task 1 frozen models:
 
 ```python
 class WorkflowAgentDescriptor(BaseModel):
@@ -1091,18 +1148,19 @@ class WorkflowExecutionDescriptor(BaseModel):
 
     workflow_definition_hash: str
     agents: tuple[WorkflowAgentDescriptor, ...]
-    tool_schemas: tuple[Mapping[str, Any], ...]
-    tool_schema_hash: str
+    tool_capabilities: tuple[ToolCapabilityDescriptor, ...]
+    tool_capability_hash: str
+    policy: ExecutionPolicyDescriptor
+    policy_hash: str
 ```
 
 Deep-freeze all nested JSON. Store referenced agents once in deterministic
 first-node order; each full canonical AgentSpec includes LiteLLM model and model
-params and must match its hash. Exact Tool schemas use stable registry order and
-must match their hash. `WorkflowRunSnapshot` contains
-`execution_compatibility: Literal["current", "legacy_unknown"]` and optional
-`execution_descriptor`; new Workflows require `current`, a descriptor matching
-their IR and referenced revisions, while migrated M01 Workflows are
-`legacy_unknown`/`None`.
+params and must match its hash. Full Tool capabilities use exact registry/request
+order and must match their hash; effective Policy config must match its hash.
+Set new Workflows to `current` with a descriptor matching their IR, referenced
+revisions, Tool capabilities, and Policy. Migrated M01 Workflows remain
+`legacy_unknown`/`None` as established in Task 1.
 
 Load the current Session first and reject `DELETING` before reading a stored
 idempotency hint. A hint never returns directly; the authoritative commit
@@ -1253,10 +1311,11 @@ new Session after deletion. Global cursor remains greater than its pre-delete
 value and holes are not reused. Inject one cleanup failure after
 `session.deleting`, assert public get/close reject while a second delete resumes,
 then prove the same complete cleanup. The E2E also checks the persisted Run
-execution descriptor contains the AgentSpec hash and exact Tool-schema hash but
-contains no handler object or credential. Persist and inspect one Workflow too:
-its descriptor must contain the exact referenced AgentSpec hashes and Tool
-schema hash, and same IR/key with a changed capability binding must conflict.
+execution descriptor contains the AgentSpec, full Tool-capability, and Policy
+hashes but contains no handler object or credential.
+Persist and inspect one Workflow too: its descriptor must contain the exact
+referenced AgentSpec, Tool-capability, and Policy hashes, and same IR/key with a
+changed capability binding must conflict.
 
 - [ ] **Step 2: Run RED or confirm the composed behavior is already GREEN**
 
