@@ -1,0 +1,96 @@
+import asyncio
+from typing import Any, TypeAlias
+
+from agent_sdk.events.models import EventEnvelope
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    SnapshotWrite,
+    StoredEvent,
+)
+
+_AggregateKey: TypeAlias = tuple[str, str]
+_SnapshotKey: TypeAlias = tuple[str, str]
+
+
+def _aggregate_key(event: EventEnvelope) -> _AggregateKey:
+    if event.run_id is not None:
+        return ("run", event.run_id)
+    return ("session", event.session_id)
+
+
+class InMemoryStore:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._events: list[StoredEvent] = []
+        self._snapshots: dict[_SnapshotKey, SnapshotWrite] = {}
+        self._last_cursor = 0
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        async with self._lock:
+            events = self._events.copy()
+            snapshots = self._snapshots.copy()
+            last_cursor = self._last_cursor
+            sequences = self._latest_sequences(events)
+            event_ids = {stored.event.event_id for stored in events}
+
+            for event in batch.events:
+                if event.event_id in event_ids:
+                    raise ValueError("event id must be unique")
+                event_ids.add(event.event_id)
+                aggregate = _aggregate_key(event)
+                previous_sequence = sequences.get(aggregate)
+                if previous_sequence is not None and event.sequence <= previous_sequence:
+                    raise ValueError("event sequence must be strictly increasing")
+                sequences[aggregate] = event.sequence
+                last_cursor += 1
+                events.append(StoredEvent(last_cursor, event))
+
+            for snapshot in batch.snapshots:
+                snapshots[(snapshot.kind, snapshot.entity_id)] = snapshot
+
+            self._events = events
+            self._snapshots = snapshots
+            self._last_cursor = last_cursor
+            return CommitResult(last_cursor)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+    ) -> list[StoredEvent]:
+        async with self._lock:
+            return [
+                stored
+                for stored in self._events
+                if stored.cursor > after_cursor
+                and (session_id is None or stored.event.session_id == session_id)
+            ]
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            snapshot = self._snapshots.get((kind, entity_id))
+            if snapshot is None:
+                return None
+            return snapshot.data.copy()
+
+    async def delete_session(self, session_id: str) -> None:
+        async with self._lock:
+            events = [
+                stored for stored in self._events if stored.event.session_id != session_id
+            ]
+            snapshots = {
+                key: snapshot
+                for key, snapshot in self._snapshots.items()
+                if snapshot.session_id != session_id
+            }
+            self._events = events
+            self._snapshots = snapshots
+
+    @staticmethod
+    def _latest_sequences(events: list[StoredEvent]) -> dict[_AggregateKey, int]:
+        sequences: dict[_AggregateKey, int] = {}
+        for stored in events:
+            sequences[_aggregate_key(stored.event)] = stored.event.sequence
+        return sequences
