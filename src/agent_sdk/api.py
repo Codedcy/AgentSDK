@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from agent_sdk.config import AgentSDKConfig
 from agent_sdk.errors import AgentSDKError, ErrorCode
@@ -27,7 +28,9 @@ _ACompletion = Callable[..., Awaitable[Any]]
 class _LazySQLiteStore:
     def __init__(self, path: Path) -> None:
         self._path = path
+        self._lock = asyncio.Lock()
         self._open_task: asyncio.Task[SQLiteStore] | None = None
+        self._closed = False
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         return await (await self._get()).commit(batch)
@@ -50,23 +53,75 @@ class _LazySQLiteStore:
         await (await self._get()).delete_session(session_id)
 
     async def close(self) -> None:
-        if self._open_task is None:
-            return
-        store = await self._open_task
-        await store.close()
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._open_task is None:
+                return
+            store = await self._open_task
+            await store.close()
 
     async def _get(self) -> SQLiteStore:
-        if self._open_task is None:
-            self._open_task = asyncio.create_task(SQLiteStore.open(self._path))
-        return await self._open_task
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("SQLiteStore is closed")
+            if self._open_task is None:
+                self._open_task = asyncio.create_task(SQLiteStore.open(self._path))
+            return await self._open_task
+
+
+class _SDKLifecycle:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._closing = False
+        self._close_task: asyncio.Task[None] | None = None
+
+    @asynccontextmanager
+    async def admit(self) -> AsyncIterator[None]:
+        async with self._lock:
+            if self._closing:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "SDK is closing",
+                    retryable=False,
+                )
+            yield
+
+    async def close(
+        self,
+        active_tasks: set[asyncio.Task[RunResult]],
+        owned_close: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        async with self._lock:
+            self._closing = True
+            if self._close_task is None:
+                active = tuple(active_tasks)
+                self._close_task = asyncio.create_task(
+                    self._close_resources(active, owned_close)
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+    @staticmethod
+    async def _close_resources(
+        active_tasks: tuple[asyncio.Task[RunResult], ...],
+        owned_close: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        if owned_close is not None:
+            await owned_close()
 
 
 class SessionAPI:
-    def __init__(self, commands: RuntimeCommands) -> None:
+    def __init__(self, commands: RuntimeCommands, lifecycle: _SDKLifecycle) -> None:
         self._commands = commands
+        self._lifecycle = lifecycle
 
     async def create(self, *, workspaces: Iterable[str | Path]) -> SessionSnapshot:
-        return await self._commands.create_session(workspaces=workspaces)
+        async with self._lifecycle.admit():
+            return await self._commands.create_session(workspaces=workspaces)
 
 
 class RunAPI:
@@ -76,11 +131,13 @@ class RunAPI:
         commands: RuntimeCommands,
         engine: RunEngine,
         track_task: Callable[[asyncio.Task[RunResult]], None],
+        lifecycle: _SDKLifecycle,
     ) -> None:
         self._store = store
         self._commands = commands
         self._engine = engine
         self._track_task = track_task
+        self._lifecycle = lifecycle
 
     async def start(
         self,
@@ -88,25 +145,26 @@ class RunAPI:
         agent: AgentSpec,
         user_input: str,
     ) -> RunHandle:
-        if await self._store.get_snapshot("session", session_id) is None:
-            raise AgentSDKError(
-                ErrorCode.NOT_FOUND,
-                "session not found",
-                retryable=False,
+        async with self._lifecycle.admit():
+            if await self._store.get_snapshot("session", session_id) is None:
+                raise AgentSDKError(
+                    ErrorCode.NOT_FOUND,
+                    "session not found",
+                    retryable=False,
+                )
+            created = await self._commands.start_run(
+                session_id,
+                agent_revision=agent.revision,
+                user_input=user_input,
             )
-        created = await self._commands.start_run(
-            session_id,
-            agent_revision=agent.revision,
-            user_input=user_input,
-        )
-        request = ModelRequest(
-            model=agent.model,
-            messages=({"role": "user", "content": user_input},),
-            params=mutable_model_params(agent.model_params),
-        )
-        task = asyncio.create_task(self._engine.execute(created.run_id, request))
-        self._track_task(task)
-        return RunHandle(created.run_id, self._store, task)
+            request = ModelRequest(
+                model=agent.model,
+                messages=({"role": "user", "content": user_input},),
+                params=mutable_model_params(agent.model_params),
+            )
+            task = asyncio.create_task(self._engine.execute(created.run_id, request))
+            self._track_task(task)
+            return RunHandle(created.run_id, self._store, task)
 
     async def get(self, run_id: str) -> RunSnapshot:
         data = await self._store.get_snapshot("run", run_id)
@@ -144,11 +202,17 @@ class AgentSDK:
     ) -> None:
         self._active_tasks: set[asyncio.Task[RunResult]] = set()
         self._owned_close = owned_close
-        self._close_task: asyncio.Task[None] | None = None
+        self._lifecycle = _SDKLifecycle()
         commands = RuntimeCommands(store)
         engine = RunEngine(store, models)
-        self.sessions = SessionAPI(commands)
-        self.runs = RunAPI(store, commands, engine, self._track_task)
+        self.sessions = SessionAPI(commands, self._lifecycle)
+        self.runs = RunAPI(
+            store,
+            commands,
+            engine,
+            self._track_task,
+            self._lifecycle,
+        )
 
     def _track_task(self, task: asyncio.Task[RunResult]) -> None:
         self._active_tasks.add(task)
@@ -160,13 +224,4 @@ class AgentSDK:
             task.exception()
 
     async def close(self) -> None:
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_resources())
-        await asyncio.shield(self._close_task)
-
-    async def _close_resources(self) -> None:
-        active = tuple(self._active_tasks)
-        if active:
-            await asyncio.gather(*active, return_exceptions=True)
-        if self._owned_close is not None:
-            await self._owned_close()
+        await self._lifecycle.close(self._active_tasks, self._owned_close)

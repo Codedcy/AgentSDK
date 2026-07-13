@@ -7,6 +7,7 @@ from typing import Any
 
 import litellm
 import pytest
+from pydantic import ValidationError
 
 from agent_sdk import (
     AgentSDK,
@@ -14,6 +15,8 @@ from agent_sdk import (
     AgentSDKError,
     AgentSpec,
     ErrorCode,
+    RunHandle,
+    RunResult,
     RunStatus,
     TokenUsage,
 )
@@ -135,6 +138,52 @@ def test_agent_spec_recursively_detaches_and_freezes_model_params() -> None:
         spec.model_params["new"] = "mutation"  # type: ignore[index]
     with pytest.raises(TypeError):
         spec.model_params["metadata"]["labels"][0] = "mutation"  # type: ignore[index]
+
+
+def test_agent_spec_model_copy_update_detaches_nested_model_params() -> None:
+    source = {"metadata": {"labels": ["copied"]}}
+    original = AgentSpec(name="test", model="fake/model")
+
+    copied = original.model_copy(update={"model_params": source})
+    source["metadata"]["labels"].append("external mutation")
+
+    assert copied.model_params["metadata"]["labels"] == ("copied",)
+
+
+def test_agent_spec_model_copy_update_returns_frozen_nested_values() -> None:
+    original = AgentSpec(name="test", model="fake/model")
+    copied = original.model_copy(
+        update={"model_params": {"metadata": {"labels": ["copied"]}}}
+    )
+
+    with pytest.raises(TypeError):
+        copied.model_params["metadata"]["labels"][0] = "mutation"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        copied.model_params["metadata"]["new"] = "mutation"  # type: ignore[index]
+
+
+def test_agent_spec_model_copy_deep_succeeds_with_independent_equal_values() -> None:
+    original = AgentSpec(
+        name="test",
+        model="fake/model",
+        model_params={"metadata": {"labels": ["original"]}},
+    )
+
+    copied = original.model_copy(deep=True)
+
+    assert copied == original
+    assert copied is not original
+    assert copied.model_params is not original.model_params
+    assert copied.model_params["metadata"] is not original.model_params["metadata"]
+
+
+def test_agent_spec_model_copy_revalidates_updates() -> None:
+    original = AgentSpec(name="test", model="fake/model")
+
+    with pytest.raises(ValidationError):
+        original.model_copy(update={"unknown": "forbidden"})
+    with pytest.raises(ValidationError):
+        original.model_copy(update={"name": 42})
 
 
 @pytest.mark.asyncio
@@ -420,6 +469,155 @@ async def _collect_events(events: AsyncIterator[StoredEvent]) -> list[StoredEven
     return [stored async for stored in events]
 
 
+async def _created_run(store: InMemoryStore) -> tuple[str, int]:
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="1",
+        user_input="startup",
+    )
+    cursor = (await store.read_events(after_cursor=0))[-1].cursor
+    return run.run_id, cursor
+
+
+@pytest.mark.asyncio
+async def test_events_terminates_and_normalizes_failed_task_without_terminal(
+    store: InMemoryStore,
+) -> None:
+    run_id, cursor = await _created_run(store)
+
+    async def fail_startup() -> RunResult:
+        raise RuntimeError("raw provider startup failure")
+
+    task = asyncio.create_task(fail_startup())
+    await asyncio.sleep(0)
+    handle = RunHandle(run_id, store, task)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await asyncio.wait_for(
+            _collect_events(handle.events(cursor=cursor)),
+            timeout=0.1,
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "run execution failed"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_result_normalizes_raw_startup_failure(store: InMemoryStore) -> None:
+    run_id, _ = await _created_run(store)
+
+    async def fail_startup() -> RunResult:
+        raise RuntimeError("raw provider startup failure")
+
+    handle = RunHandle(run_id, store, asyncio.create_task(fail_startup()))
+
+    with pytest.raises(AgentSDKError) as raised:
+        await handle.result()
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "run execution failed"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_events_preserves_agent_sdk_error_without_terminal(
+    store: InMemoryStore,
+) -> None:
+    run_id, cursor = await _created_run(store)
+    expected = AgentSDKError(ErrorCode.INVALID_STATE, "startup rejected", retryable=False)
+
+    async def fail_startup() -> RunResult:
+        raise expected
+
+    task = asyncio.create_task(fail_startup())
+    await asyncio.sleep(0)
+    handle = RunHandle(run_id, store, task)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await asyncio.wait_for(
+            _collect_events(handle.events(cursor=cursor)),
+            timeout=0.1,
+        )
+
+    assert raised.value is expected
+
+
+@pytest.mark.asyncio
+async def test_events_normalizes_cancelled_task_without_terminal(
+    store: InMemoryStore,
+) -> None:
+    run_id, cursor = await _created_run(store)
+
+    async def wait_forever() -> RunResult:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(wait_forever())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    handle = RunHandle(run_id, store, task)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await asyncio.wait_for(
+            _collect_events(handle.events(cursor=cursor)),
+            timeout=0.1,
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "run execution failed"
+
+
+@pytest.mark.asyncio
+async def test_events_normalizes_successful_task_with_missing_snapshot(
+    store: InMemoryStore,
+) -> None:
+    run_id = "run_missing"
+
+    async def finish_without_terminal() -> RunResult:
+        return RunResult(run_id=run_id, output_text="bad", usage=TokenUsage())
+
+    task = asyncio.create_task(finish_without_terminal())
+    await asyncio.sleep(0)
+    handle = RunHandle(run_id, store, task)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await asyncio.wait_for(_collect_events(handle.events()), timeout=0.1)
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "run execution failed"
+
+
+class _FailingSnapshotStore(InMemoryStore):
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        del kind, entity_id
+        raise RuntimeError("raw store failure")
+
+
+@pytest.mark.asyncio
+async def test_events_normalizes_store_failure_after_task_done() -> None:
+    store = _FailingSnapshotStore()
+    run_id = "run_store_failure"
+
+    async def finish_without_terminal() -> RunResult:
+        return RunResult(run_id=run_id, output_text="bad", usage=TokenUsage())
+
+    task = asyncio.create_task(finish_without_terminal())
+    await asyncio.sleep(0)
+    handle = RunHandle(run_id, store, task)
+
+    with pytest.raises(AgentSDKError) as raised:
+        await _collect_events(handle.events())
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "run execution failed"
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
 class _BlockingTerminalStore:
     def __init__(self) -> None:
         self._store = InMemoryStore()
@@ -502,6 +700,117 @@ class _CloseTrackingStore:
 
     async def delete_session(self, session_id: str) -> None:
         await self._store.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_session_create_is_rejected_once_close_begins(store: InMemoryStore) -> None:
+    sdk = AgentSDK.for_test(store=store, acompletion=_scripted_success)
+    await sdk.close()
+
+    with pytest.raises(AgentSDKError) as raised:
+        await sdk.sessions.create(workspaces=[])
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "SDK is closing"
+
+
+@pytest.mark.asyncio
+async def test_run_start_is_rejected_once_close_begins(store: InMemoryStore) -> None:
+    sdk = AgentSDK.for_test(store=store, acompletion=_scripted_success)
+    session = await sdk.sessions.create(workspaces=[])
+    await sdk.close()
+
+    with pytest.raises(AgentSDKError) as raised:
+        await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "late run",
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "SDK is closing"
+
+
+class _BlockingRunCreatedStore:
+    def __init__(self) -> None:
+        self._store = InMemoryStore()
+        self.run_created_commit_started = asyncio.Event()
+        self.release_run_created_commit = asyncio.Event()
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        if any(event.type == "run.created" for event in batch.events):
+            self.run_created_commit_started.set()
+            await self.release_run_created_commit.wait()
+        return await self._store.commit(batch)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+    ) -> list[StoredEvent]:
+        return await self._store.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+        )
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        return await self._store.get_snapshot(kind, entity_id)
+
+    async def delete_session(self, session_id: str) -> None:
+        await self._store.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_calls_wait_for_start_admission_and_active_run() -> None:
+    store = _BlockingRunCreatedStore()
+    provider_waiting = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def fake_acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {"choices": [{"delta": {"content": "hello"}}]}
+            provider_waiting.set()
+            await release_provider.wait()
+            yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+        return chunks()
+
+    sdk = AgentSDK.for_test(store=store, acompletion=fake_acompletion)
+    session = await sdk.sessions.create(workspaces=[])
+    start_task = asyncio.create_task(
+        sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "race close",
+        )
+    )
+    close_tasks: tuple[asyncio.Task[None], ...] = ()
+    handle = None
+    try:
+        await asyncio.wait_for(store.run_created_commit_started.wait(), timeout=1)
+        close_tasks = (asyncio.create_task(sdk.close()), asyncio.create_task(sdk.close()))
+        completed_close_tasks, _ = await asyncio.wait(close_tasks, timeout=0.05)
+
+        assert completed_close_tasks == set()
+
+        store.release_run_created_commit.set()
+        handle = await asyncio.wait_for(start_task, timeout=1)
+        await asyncio.wait_for(provider_waiting.wait(), timeout=1)
+        assert not any(task.done() for task in close_tasks)
+
+        release_provider.set()
+        await asyncio.wait_for(asyncio.gather(*close_tasks), timeout=1)
+        assert (await handle.result()).output_text == "hello"
+    finally:
+        store.release_run_created_commit.set()
+        release_provider.set()
+        if handle is None:
+            handle = await start_task
+        await handle.result()
+        if close_tasks:
+            await asyncio.gather(*close_tasks)
+        await sdk.close()
 
 
 @pytest.mark.asyncio
@@ -601,3 +910,20 @@ async def test_configured_sdk_owns_and_closes_sqlite_store(
     await sdk.close()
 
     database_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_configured_sdk_does_not_lazy_reopen_after_close(tmp_path: Path) -> None:
+    database_path = tmp_path / "state.db"
+    sdk = AgentSDK(AgentSDKConfig(database_path=database_path))
+    try:
+        await sdk.close()
+
+        with pytest.raises(AgentSDKError) as raised:
+            await sdk.sessions.create(workspaces=[])
+
+        assert raised.value.code is ErrorCode.INVALID_STATE
+        assert not database_path.exists()
+        await sdk.close()
+    finally:
+        await sdk._owned_close()  # type: ignore[misc]

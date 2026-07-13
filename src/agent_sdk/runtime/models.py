@@ -1,6 +1,6 @@
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 from collections.abc import Mapping
 
@@ -55,6 +55,18 @@ class AgentSpec(BaseModel):
     @field_serializer("model_params")
     def _serialize_params(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return mutable_model_params(value)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        data = self.model_dump(mode="json")
+        if update is not None:
+            data.update(update)
+        return type(self).model_validate(data)
 
 
 class TokenUsage(BaseModel):
