@@ -7,7 +7,7 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T001](M01-T001-project-scaffold.md) | Project scaffold and core configuration | M01 | — | done |
 | [M01-T002](M01-T002-event-storage-contracts.md) | Event and storage contracts | M01 | T001 | done |
 | [M01-T003](M01-T003-sqlite-runtime-spine.md) | SQLite Session and Run spine | M01 | T002 | done |
-| [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | in_progress |
+| [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | done |
 | [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | pending |
 | [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | pending |
 | [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | pending |
@@ -41,3 +41,4 @@ When a task completes, add its commit id and verification result below the table
 - M01-T001: implementation `065aaa1`; Python 3.13 `pytest` 1 passed, Ruff passed, mypy passed; task review approved. TDD evidence is recorded in `.superpowers/sdd/M01-T001-report.md`.
 - M01-T002: implementation `955163b`, fixes `475d221`; Python 3.13 `pytest` 16 passed, Ruff passed, mypy passed; task review approved after re-review. TDD evidence is recorded in `.superpowers/sdd/M01-T002-report.md`.
 - M01-T003: implementation `fce50b5`, fixes `363989a` and `5ee5c97`; Python 3.13 `pytest` 47 passed, Ruff passed, mypy passed; task review approved after cancellation-safety re-review. TDD and packaging evidence is recorded in `.superpowers/sdd/M01-T003-report.md`.
+- M01-T004: implementation `9680fad`, fixes `8058c60` and `6eae6a1`; Python 3.13 `pytest` 80 passed, Ruff passed, mypy passed; task review approved after lifecycle, termination, immutability, and public-error re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T004-report.md`.
