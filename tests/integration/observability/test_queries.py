@@ -660,6 +660,80 @@ async def test_execution_tree_integrity_error_does_not_leak_event_payload(
     )
 
 
+async def _commit_cross_session_selected_noise(
+    store: InMemoryStore,
+    root: RunSnapshot,
+) -> None:
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="run.noise",
+                    session_id="ses_foreign_selected_run",
+                    run_id=root.run_id,
+                    sequence=2,
+                    payload={
+                        "secret": "must-not-leak-selected-run-ownership"
+                    },
+                ),
+            )
+        )
+    )
+
+
+class _InjectCrossSessionSelectedNoiseStore(_InjectTailCreatedStore):
+    def __init__(self, delegate: InMemoryStore, root: RunSnapshot) -> None:
+        super().__init__(
+            delegate,
+            EventEnvelope.new(
+                type="run.noise",
+                session_id="ses_foreign_selected_run",
+                run_id=root.run_id,
+                sequence=2,
+                payload={
+                    "secret": "must-not-leak-selected-run-ownership"
+                },
+            ),
+        )
+
+
+@pytest.mark.parametrize("window", ("initial", "tail"))
+@pytest.mark.asyncio
+async def test_execution_tree_rejects_cross_session_selected_run_envelope(
+    window: str,
+) -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    if window == "initial":
+        await _commit_cross_session_selected_noise(delegate, root)
+        store: object = delegate
+    else:
+        store = _InjectCrossSessionSelectedNoiseStore(delegate, root)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).execution_tree(root.run_id)  # type: ignore[arg-type]
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-selected-run-ownership" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+
+
 async def _commit_corrupt_run_snapshot(store: InMemoryStore) -> None:
     await store.commit(
         CommitBatch(
@@ -736,6 +810,53 @@ async def test_execution_tree_missing_related_child_snapshot_is_internal() -> No
         await QueryService(store).execution_tree(root.run_id)
 
     assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+class _DeleteBeforeAssemblySnapshotStore(_OneEventQueryStore):
+    def __init__(self, delegate: InMemoryStore, session_id: str) -> None:
+        super().__init__(delegate)
+        self.session_id = session_id
+        self.deleted = False
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        events = await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+        if not self.deleted:
+            self.deleted = True
+            await self.delegate.delete_session(self.session_id)
+        return events
+
+
+@pytest.mark.asyncio
+async def test_execution_tree_session_delete_before_assembly_is_not_found() -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(
+            _DeleteBeforeAssemblySnapshotStore(delegate, owner.session_id)
+        ).execution_tree(root.run_id)
+
+    assert captured.value.code is ErrorCode.NOT_FOUND
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
 

@@ -45,6 +45,11 @@ class _TreeTailStatus(Enum):
     INVALID = "invalid"
 
 
+class _TreeAssemblyFailure(Enum):
+    INVALID = "invalid"
+    MISSING_SELECTED = "missing_selected"
+
+
 class QueryService:
     def __init__(self, store: StateStore) -> None:
         self._store = store
@@ -142,7 +147,18 @@ class QueryService:
                 await self._read_through(up_to_cursor=cursor),
                 cursor,
             )
-            if isinstance(nodes, _ReadFailure):
+            if nodes is _TreeAssemblyFailure.MISSING_SELECTED:
+                current_root = await _stored_run(self._store, root_run_id)
+                if isinstance(current_root, _ReadFailure):
+                    self._internal("failed to load execution tree")
+                if current_root is None:
+                    raise AgentSDKError(
+                        ErrorCode.NOT_FOUND,
+                        "run not found",
+                        retryable=False,
+                    )
+                self._internal("failed to load execution tree")
+            if nodes is _TreeAssemblyFailure.INVALID:
                 self._internal("failed to load execution tree")
             after = await self._load_run(root_run_id)
             if root == after and await self._tree_is_stable(root, nodes, cursor):
@@ -162,11 +178,15 @@ class QueryService:
         root: RunSnapshot,
         stored_events: list[StoredEvent],
         cursor: int,
-    ) -> tuple[ExecutionTreeNode, ...] | _ReadFailure:
+    ) -> tuple[ExecutionTreeNode, ...] | _TreeAssemblyFailure:
         try:
             return await self._assemble_tree_unchecked(root, stored_events, cursor)
+        except AgentSDKError as error:
+            if error.code is ErrorCode.NOT_FOUND:
+                return _TreeAssemblyFailure.MISSING_SELECTED
+            return _TreeAssemblyFailure.INVALID
         except Exception:
-            return _ReadFailure.FAILED
+            return _TreeAssemblyFailure.INVALID
 
     async def _assemble_tree_unchecked(
         self,
@@ -214,6 +234,13 @@ class QueryService:
             if not progressed:
                 break
             pending = remaining
+        if any(
+            stored.cursor <= cursor
+            and stored.event.run_id in descendants
+            and stored.event.session_id != root.session_id
+            for stored in stored_events
+        ):
+            self._internal("failed to load execution tree")
         by_id: dict[str, ExecutionTreeNode] = {}
         for stored, initial in sorted(selected, key=lambda item: item[0].cursor):
             current = await self._load_run(initial.run_id)
@@ -481,6 +508,8 @@ def _tree_tail_status(
     try:
         for stored in stored_events:
             event = stored.event
+            if event.run_id in descendants and event.session_id != session_id:
+                return _TreeTailStatus.INVALID
             if event.type == "run.created":
                 if event.run_id in descendants:
                     return _TreeTailStatus.INVALID
