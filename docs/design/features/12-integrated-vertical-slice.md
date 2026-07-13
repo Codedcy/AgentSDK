@@ -6,6 +6,11 @@ M01 ends with one deterministic scenario that proves the implemented slices comp
 
 The slice must exercise one real path through SQLite, LiteLLM, an application Tool, an MCP Tool, a Skill, context compaction, a generated Workflow with a Child Run, observability, evaluation, analytics, restart, and Session deletion.
 
+The injectable `run_application` used by the CLI owns the active phase through
+analytics. The E2E acceptance harness invokes that exact orchestration, then owns the
+quiescent reopen and destructive Session-deletion assertions; the interactive CLI does
+not silently reopen or delete a user's Session.
+
 ## 2. Chosen approach
 
 Use a composed public-API scenario with a quiescent restart boundary:
@@ -36,7 +41,18 @@ This is preferred over a monolithic hidden scenario runner because each componen
 
 The test-only constructor still requires an injected `acompletion` callable. It does not add another model-provider abstraction; all model behavior continues through LiteLLM.
 
-### 4.2 Context façade
+### 4.2 Bounded sequential Tool steps
+
+The M01 Agent Loop accepts at most one ToolCall in a single model step, but permits
+the model to request another Tool in a later step after consuming the prior Tool
+result. The Run accumulates every ToolResult and usage record in durable order.
+
+M01 uses a fixed ceiling of eight Tool-bearing steps per Run. A ninth request fails
+before its handler runs with the existing stable Run-failure path. Multiple ToolCalls
+inside one model response remain rejected because parallel-call policy, configurable
+step budgets, and richer scheduling belong to later runtime hardening.
+
+### 4.3 Context façade
 
 `sdk.context` is a thin lifecycle-aware façade over the existing `ContextPlanner` and `ContextRetrieval`. It exposes:
 
@@ -46,7 +62,7 @@ The test-only constructor still requires an injected `acompletion` callable. It 
 
 The caller supplies the already-budgeted Tool-schema token count; M01 does not introduce a second tokenizer policy in the façade. The façade owns no second Context state and delegates all persistence and deletion semantics to the Store-backed components.
 
-### 4.3 Application-owned capabilities
+### 4.4 Application-owned capabilities
 
 `MCPManager`, `SkillRegistry`, and `PromptComposer` remain composable public components:
 
@@ -56,7 +72,7 @@ The caller supplies the already-budgeted Tool-schema token count; M01 does not i
 
 The SDK does not automatically connect MCP servers, discover arbitrary filesystem roots, or print activated content.
 
-### 4.4 Reference CLI
+### 4.5 Reference CLI
 
 The example uses only imports re-exported from `agent_sdk` and Python's standard library. `argparse` handles configuration; no CLI dependency is added to the SDK package.
 
@@ -65,8 +81,12 @@ The CLI:
 - creates a Session and starts a Run;
 - consumes `sdk.events.subscribe` and renders concise JSON-line status records;
 - races the Run result with `sdk.permissions.next_request`, asks the user, and resolves the request;
+- builds one L3 Context View and emits the coding Prompt Manifest after the main Run,
+  making clear that M01 records this composition but does not yet inject `BuiltPrompt`
+  into the Run API;
 - treats a final YAML document as a Workflow candidate, displays it, and calls `sdk.workflows.start` only after approval;
-- displays Run/Workflow state, Tool terminal facts, Child progress, token usage, Evaluation, and analytics through public records;
+- displays Run/Workflow state, Tool terminal facts, Child progress, token usage,
+  optional application-configured Evaluation, and analytics through public records;
 - performs no hidden logging, server startup, or automatic permission grant.
 
 ## 5. Deterministic E2E data flow
@@ -76,11 +96,13 @@ The acceptance test uses a scripted LiteLLM callable with model-specific turns:
 - `fake/main`: application Tool call, MCP echo Tool call, then canonical two-node Workflow YAML;
 - `fake/planner`: parent node text result;
 - `fake/worker`: Child node verification result;
-- `fake/compact`: a valid structured `ContextCapsule` citing the supplied source event ids.
+- the injected provider's structured (`stream=False`) branch, invoked with
+  `gpt-4o-mini` so local token estimation is defined: a valid `ContextCapsule`
+  citing the supplied source event ids without making a network call.
 
 The MCP fixture is a real stdio MCP server using protocol revision `2025-11-25`; it exposes one `echo` Tool. The Skill fixture contains one instruction file and one referenced resource. No network access or real model credentials are required.
 
-The test records live Session events until `workflow.completed`, acknowledges two permission requests, and asserts that the application and MCP Tool results are both durable. It then verifies one L3 Capsule, one prompt manifest, a two-node Workflow whose second node is a Child Run, a passing exact-output evaluation, success rate `1.0`, Tool failure count `0.0`, and evidence ids that resolve to durable events.
+The test records live Session events through `evaluation.completed`, acknowledges two permission requests, and asserts that the application and MCP Tool results are both durable. It then verifies one L3 Capsule, one prompt manifest, a two-node Workflow whose second node is a Child Run, a passing exact-output evaluation, success rate `1.0`, Tool failure count `0.0`, and evidence ids that resolve to durable events.
 
 After reopening the database, the test rechecks the main Run, timeline, execution tree, Workflow snapshot, Capsule sources, Evaluation event, and analytics without re-executing a Tool or model. After Session deletion it requires empty Session-filtered event results, NOT_FOUND for Session-owned snapshots exposed by public façades, `sample_count == 0` for recomputed success analytics, and the application-created workspace file to remain present.
 
@@ -90,6 +112,12 @@ After reopening the database, the test rechecks the main Run, timeline, executio
 - Invalid generated YAML is shown as a rejected candidate and never creates a Workflow snapshot or event.
 - MCP startup or protocol failure rolls back its Tool registrations and cannot partially start the Run scenario.
 - Cancelling the event-display task is settled before closing resources. No example task or MCP owner is left running.
+- Cancelling the CLI Run coordinator settles its permission-request waiter and denies
+  any request already delivered to the application. M01 has no public Run-cancel
+  command, and SDK close waits for active work rather than cancelling an in-flight
+  provider call. The coordinator therefore does not promise Run cancellation; the
+  application reaches the quiescent boundary before close, while cancellable control
+  remains M02 scope.
 - The application waits for Run/Workflow work, closes its MCP manager, settles its display task, and then closes the SDK. SDK close waits for admitted Evaluation/Context work and closes its owned SQLite adapter.
 - Ordinary provider, Store, MCP, Tool, and evaluator failures cross the example boundary only as `AgentSDKError`; the example never prints exception locals or raw third-party responses.
 
