@@ -618,6 +618,197 @@ async def test_evaluation_rejects_invalid_store_values_without_leak(mode: str) -
     )
 
 
+class _SchemaTwoTerminalStore(_OneEventPageStore):
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        page = await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+        return [
+            StoredEvent(
+                cursor=stored.cursor,
+                event=(
+                    EventEnvelope.model_validate(
+                        {
+                            **stored.event.model_dump(mode="python"),
+                            "schema_version": 2,
+                        }
+                    )
+                    if stored.event.type in {"run.completed", "run.failed"}
+                    else stored.event
+                ),
+            )
+            for stored in page
+        ]
+
+
+@pytest.mark.asyncio
+async def test_evaluation_rejects_unknown_schema_as_sole_terminal_event() -> None:
+    delegate = InMemoryStore()
+    _, terminal = await _terminal_run(delegate)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await EvaluationEngine(_SchemaTwoTerminalStore(delegate)).evaluate(
+            terminal.run_id,
+            ExactOutputEvaluator(expected="ok"),
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await delegate.read_events(after_cursor=0)
+    )
+
+
+async def _corrupt_evaluation_snapshot(
+    store: InMemoryStore,
+    *,
+    session_id: str,
+    terminal: RunSnapshot,
+    kind: str,
+) -> None:
+    entity_id = session_id if kind == "session" else terminal.run_id
+    data = await store.get_snapshot(kind, entity_id)
+    assert data is not None
+    version = int(data["version"]) + 1
+    data = {
+        **data,
+        "version": version,
+        "secret": "must-not-leak-corrupt-evaluation-snapshot",
+    }
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    kind,
+                    entity_id,
+                    session_id,
+                    version,
+                    data,
+                ),
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("kind", ("run", "session"))
+@pytest.mark.asyncio
+async def test_evaluation_corrupt_snapshot_does_not_leak_raw_data(kind: str) -> None:
+    store = InMemoryStore()
+    session_id, terminal = await _terminal_run(store)
+    await _corrupt_evaluation_snapshot(
+        store,
+        session_id=session_id,
+        terminal=terminal,
+        kind=kind,
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await EvaluationEngine(store).evaluate(
+            terminal.run_id,
+            ExactOutputEvaluator(expected="ok"),
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-corrupt-evaluation-snapshot" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await store.read_events(after_cursor=0)
+    )
+
+
+class _SecretTerminalIntegrityStore(_OneEventPageStore):
+    def __init__(self, delegate: InMemoryStore, mode: str) -> None:
+        super().__init__(delegate)
+        self.mode = mode
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        page = await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+        result = []
+        for stored in page:
+            event = stored.event
+            if event.type in {"run.completed", "run.failed"}:
+                data = event.model_dump(mode="python")
+                data["payload"] = {
+                    **event.payload,
+                    "secret": "must-not-leak-evaluation-timeline",
+                }
+                if self.mode == "cross-session":
+                    data["session_id"] = "ses_foreign_terminal"
+                else:
+                    data["schema_version"] = 2
+                event = EventEnvelope.model_validate(data)
+            result.append(StoredEvent(cursor=stored.cursor, event=event))
+        return result
+
+
+@pytest.mark.parametrize("mode", ("cross-session", "terminal-schema"))
+@pytest.mark.asyncio
+async def test_evaluation_timeline_integrity_error_does_not_leak_payload(
+    mode: str,
+) -> None:
+    delegate = InMemoryStore()
+    _, terminal = await _terminal_run(delegate)
+    store = _SecretTerminalIntegrityStore(delegate, mode)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await EvaluationEngine(store).evaluate(
+            terminal.run_id,
+            ExactOutputEvaluator(expected="ok"),
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-evaluation-timeline" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+    assert not any(
+        item.event.type == "evaluation.completed"
+        for item in await delegate.read_events(after_cursor=0)
+    )
+
+
 @pytest.mark.asyncio
 async def test_evaluation_id_collision_is_atomic_retryable_conflict(
     monkeypatch: pytest.MonkeyPatch,

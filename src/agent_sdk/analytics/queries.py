@@ -266,6 +266,9 @@ def _count_tool(
     if tool_name is not None and identity != tool_name:
         return
     counts.evidence.append(event.event_id)
+    if event.schema_version != 1:
+        counts.missing += 1
+        return
     parsed = _tool_result(event.payload)
     if parsed is _StoreFailure.FAILED:
         counts.missing += 1

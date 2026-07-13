@@ -137,6 +137,33 @@ async def test_evaluation_sequence_and_schema_are_attributable_missing() -> None
     assert len(metric.evidence_event_ids) == 3
 
 
+@pytest.mark.asyncio
+async def test_unknown_tool_event_schema_is_attributable_missing() -> None:
+    store = InMemoryStore()
+    result = ToolResult.normalized_error(
+        "call_future",
+        "shell",
+        ToolResultStatus.FAILED,
+        "future schema",
+    )
+    event = EventEnvelope.new(
+        schema_version=999,
+        type="tool.call.completed",
+        session_id="ses_future_tool",
+        run_id="run_future_tool",
+        sequence=7,
+        payload=result.model_dump(mode="json"),
+    )
+    await store.commit(CommitBatch(events=(event,)))
+
+    metric = await AnalyticsQueries(store).tool_failure_rate(tool_name="shell")
+
+    assert metric.value is None
+    assert metric.sample_count == 0
+    assert metric.missing_count == 1
+    assert metric.evidence_event_ids == (event.event_id,)
+
+
 class _OneEventAnalyticsStore:
     def __init__(self, delegate: InMemoryStore) -> None:
         self.delegate = delegate

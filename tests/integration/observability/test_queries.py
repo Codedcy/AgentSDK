@@ -418,6 +418,401 @@ async def test_execution_tree_ignores_continuous_unrelated_global_events() -> No
     assert [node.snapshot.run_id for node in tree.nodes] == [root.run_id]
 
 
+class _InjectTailCreatedStore:
+    def __init__(self, delegate: InMemoryStore, event: EventEnvelope) -> None:
+        self.delegate = delegate
+        self.event = event
+        self.latest_calls = 0
+
+    async def commit(self, batch: CommitBatch):
+        return await self.delegate.commit(batch)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ):
+        return await self.delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+
+    async def get_snapshot(self, kind: str, entity_id: str):
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+    async def latest_cursor(self) -> int:
+        self.latest_calls += 1
+        if self.latest_calls == 2:
+            await self.delegate.commit(CommitBatch(events=(self.event,)))
+        return await self.delegate.latest_cursor()
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.delegate.delete_session(session_id)
+
+
+@pytest.mark.parametrize("session", ("same", "cross"))
+@pytest.mark.asyncio
+async def test_execution_tree_rejects_selected_run_duplicate_in_tail_window(
+    session: str,
+) -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    duplicate = EventEnvelope.new(
+        type="run.created",
+        session_id=(owner.session_id if session == "same" else "ses_foreign_tail"),
+        run_id=root.run_id,
+        sequence=2,
+        payload=root.model_dump(mode="json"),
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(_InjectTailCreatedStore(delegate, duplicate)).execution_tree(
+            root.run_id
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_execution_tree_ignores_unrelated_invalid_parent_in_tail_window() -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    unrelated = EventEnvelope.new(
+        schema_version=2,
+        type="run.created",
+        session_id="ses_foreign_tail",
+        run_id="run_unrelated_tail",
+        sequence=1,
+        payload={"parent_run_id": []},
+    )
+
+    tree = await QueryService(
+        _InjectTailCreatedStore(delegate, unrelated)
+    ).execution_tree(root.run_id)
+
+    assert [node.snapshot.run_id for node in tree.nodes] == [root.run_id]
+
+
+@pytest.mark.parametrize("window", ("initial", "tail"))
+@pytest.mark.asyncio
+async def test_execution_tree_rejects_relevant_unknown_schema_created(
+    window: str,
+) -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    child = RunSnapshot(
+        run_id=f"run_schema_2_{window}",
+        session_id=owner.session_id,
+        agent_revision="child:1",
+        status=RunStatus.CREATED,
+        user_input="child",
+        parent_run_id=root.run_id,
+    )
+    created = EventEnvelope.new(
+        schema_version=2,
+        type="run.created",
+        session_id=owner.session_id,
+        run_id=child.run_id,
+        sequence=1,
+        payload=child.model_dump(mode="json"),
+    )
+    if window == "initial":
+        await delegate.commit(
+            CommitBatch(
+                events=(created,),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        child.run_id,
+                        owner.session_id,
+                        1,
+                        child.model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+        store: object = delegate
+    else:
+        store = _InjectTailCreatedStore(delegate, created)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).execution_tree(root.run_id)  # type: ignore[arg-type]
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+class _InjectSecretTailStore(_InjectTailCreatedStore):
+    def __init__(self, delegate: InMemoryStore, root: RunSnapshot) -> None:
+        super().__init__(
+            delegate,
+            EventEnvelope.new(
+                schema_version=2,
+                type="run.created",
+                session_id=root.session_id,
+                run_id="run_secret_tail",
+                sequence=1,
+                payload={
+                    "parent_run_id": root.run_id,
+                    "secret": "must-not-leak-tree-integrity",
+                },
+            ),
+        )
+
+
+async def _commit_secret_initial_created(
+    store: InMemoryStore,
+    root: RunSnapshot,
+) -> None:
+    child = RunSnapshot(
+        run_id="run_secret_initial",
+        session_id=root.session_id,
+        agent_revision="child:1",
+        status=RunStatus.CREATED,
+        user_input="must-not-leak-tree-integrity",
+        parent_run_id=root.run_id,
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    schema_version=2,
+                    type="run.created",
+                    session_id=root.session_id,
+                    run_id=child.run_id,
+                    sequence=1,
+                    payload=child.model_dump(mode="json"),
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    child.run_id,
+                    root.session_id,
+                    1,
+                    child.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize("boundary", ("assemble", "tail"))
+@pytest.mark.asyncio
+async def test_execution_tree_integrity_error_does_not_leak_event_payload(
+    boundary: str,
+) -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    if boundary == "assemble":
+        await _commit_secret_initial_created(delegate, root)
+        store: object = delegate
+    else:
+        store = _InjectSecretTailStore(delegate, root)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).execution_tree(root.run_id)  # type: ignore[arg-type]
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-tree-integrity" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+
+
+async def _commit_corrupt_run_snapshot(store: InMemoryStore) -> None:
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    "run_corrupt_snapshot",
+                    "ses_corrupt_snapshot",
+                    1,
+                    {"secret": "must-not-leak-corrupt-run-snapshot"},
+                ),
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_corrupt_run_snapshot_is_context_free_without_local_leak() -> None:
+    store = InMemoryStore()
+    await _commit_corrupt_run_snapshot(store)
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).get_run("run_corrupt_snapshot")
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    frames = []
+    traceback = captured.value.__traceback__
+    while traceback is not None:
+        frames.append(traceback.tb_frame)
+        traceback = traceback.tb_next
+    assert all(
+        "must-not-leak-corrupt-run-snapshot" not in repr(value)
+        for frame in frames
+        for value in frame.f_locals.values()
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_tree_missing_related_child_snapshot_is_internal() -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    child = RunSnapshot(
+        run_id="run_missing_child_snapshot",
+        session_id=owner.session_id,
+        agent_revision="child:1",
+        status=RunStatus.CREATED,
+        user_input="child",
+        parent_run_id=root.run_id,
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="run.created",
+                    session_id=owner.session_id,
+                    run_id=child.run_id,
+                    sequence=1,
+                    payload=child.model_dump(mode="json"),
+                ),
+            )
+        )
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        await QueryService(store).execution_tree(root.run_id)
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+class _TransitionChildAfterCapturedHStore(_OneEventQueryStore):
+    def __init__(self, delegate: InMemoryStore, child: RunSnapshot) -> None:
+        super().__init__(delegate)
+        self.child = child
+        self.latest_calls = 0
+        self.transition_cursor = 0
+
+    async def latest_cursor(self) -> int:
+        self.latest_calls += 1
+        if self.latest_calls == 1:
+            captured = await self.delegate.latest_cursor()
+            running = RunSnapshot.model_validate(
+                {
+                    **self.child.model_dump(mode="json"),
+                    "status": "running",
+                    "version": 2,
+                }
+            )
+            committed = await self.delegate.commit(
+                CommitBatch(
+                    events=(
+                        EventEnvelope.new(
+                            type="run.started",
+                            session_id=self.child.session_id,
+                            run_id=self.child.run_id,
+                            sequence=2,
+                            payload={"status": "running"},
+                        ),
+                    ),
+                    snapshots=(
+                        SnapshotWrite(
+                            "run",
+                            self.child.run_id,
+                            self.child.session_id,
+                            2,
+                            running.model_dump(mode="json"),
+                        ),
+                    ),
+                )
+            )
+            self.transition_cursor = committed.last_cursor
+            return captured
+        return await self.delegate.latest_cursor()
+
+
+@pytest.mark.asyncio
+async def test_execution_tree_retries_snapshot_transition_after_captured_h() -> None:
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    owner = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        owner.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    child = await commands.start_run(
+        owner.session_id,
+        agent_revision="child:1",
+        user_input="child",
+        parent_run_id=root.run_id,
+    )
+    store = _TransitionChildAfterCapturedHStore(delegate, child)
+
+    tree = await QueryService(store).execution_tree(root.run_id)
+
+    child_node = next(
+        node for node in tree.nodes if node.snapshot.run_id == child.run_id
+    )
+    assert child_node.snapshot.status is RunStatus.RUNNING
+    assert tree.as_of_cursor >= store.transition_cursor
+    assert store.latest_calls >= 3
+
+
 @pytest.mark.asyncio
 async def test_execution_tree_ignores_malformed_unrelated_session_run_created() -> None:
     store = InMemoryStore()

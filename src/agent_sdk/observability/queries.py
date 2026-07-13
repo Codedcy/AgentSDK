@@ -20,6 +20,15 @@ from .models import (
 
 _STABLE_READ_ATTEMPTS = 4
 _PAGE_SIZE = 100
+_RUN_SNAPSHOT_TRANSITIONS = frozenset(
+    {
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "permission.requested",
+        "permission.resolved",
+    }
+)
 
 
 class _InvalidParent(Enum):
@@ -28,6 +37,12 @@ class _InvalidParent(Enum):
 
 class _ReadFailure(Enum):
     FAILED = "failed"
+
+
+class _TreeTailStatus(Enum):
+    STABLE = "stable"
+    CHANGED = "changed"
+    INVALID = "invalid"
 
 
 class QueryService:
@@ -122,8 +137,13 @@ class QueryService:
         for _ in range(_STABLE_READ_ATTEMPTS):
             root = await self._load_run(root_run_id)
             cursor = await self._latest_cursor()
-            stored_events = await self._read_through(up_to_cursor=cursor)
-            nodes = await self._assemble_tree(root, stored_events, cursor)
+            nodes = await self._assemble_tree(
+                root,
+                await self._read_through(up_to_cursor=cursor),
+                cursor,
+            )
+            if isinstance(nodes, _ReadFailure):
+                self._internal("failed to load execution tree")
             after = await self._load_run(root_run_id)
             if root == after and await self._tree_is_stable(root, nodes, cursor):
                 return ExecutionTree(
@@ -138,6 +158,17 @@ class QueryService:
         )
 
     async def _assemble_tree(
+        self,
+        root: RunSnapshot,
+        stored_events: list[StoredEvent],
+        cursor: int,
+    ) -> tuple[ExecutionTreeNode, ...] | _ReadFailure:
+        try:
+            return await self._assemble_tree_unchecked(root, stored_events, cursor)
+        except Exception:
+            return _ReadFailure.FAILED
+
+    async def _assemble_tree_unchecked(
         self,
         root: RunSnapshot,
         stored_events: list[StoredEvent],
@@ -162,12 +193,16 @@ class QueryService:
                 if isinstance(initial, _ReadFailure):
                     self._internal("failed to load execution tree")
                 if initial.run_id in descendants:
+                    if stored.event.schema_version != 1:
+                        self._internal("failed to load execution tree")
                     if initial.run_id in selected_ids:
                         self._internal("failed to load execution tree")
                     selected_ids.add(initial.run_id)
                     selected.append((stored, initial))
                     progressed = True
                 elif initial.parent_run_id in descendants:
+                    if stored.event.schema_version != 1:
+                        self._internal("failed to load execution tree")
                     if initial.session_id != root.session_id:
                         self._internal("failed to load execution tree")
                     descendants.add(initial.run_id)
@@ -220,37 +255,32 @@ class QueryService:
     ) -> bool:
         descendants = {node.snapshot.run_id for node in nodes}
         for node in nodes:
-            try:
-                current = await self._load_run(node.snapshot.run_id)
-            except AgentSDKError as error:
-                if error.code is ErrorCode.NOT_FOUND:
-                    return False
-                raise
+            current = await _stored_run(self._store, node.snapshot.run_id)
+            if isinstance(current, _ReadFailure):
+                self._internal("failed to load execution tree")
+            if current is None:
+                return False
             if current != node.snapshot:
                 return False
         tail_cursor = await self._latest_cursor()
-        later = await self._read_through(
-            after_cursor=cursor,
-            up_to_cursor=tail_cursor,
+        tail_status = _tree_tail_status(
+            await self._read_through(
+                after_cursor=cursor,
+                up_to_cursor=tail_cursor,
+            ),
+            descendants=descendants,
+            session_id=root.session_id,
         )
-        for stored in later:
-            if stored.event.type != "run.created":
-                continue
-            parent_run_id = _parent_claim(stored.event.payload)
-            if parent_run_id is _InvalidParent.INVALID:
-                self._internal("failed to load execution tree")
-            if parent_run_id not in descendants:
-                continue
-            if stored.event.session_id != root.session_id:
-                self._internal("failed to load execution tree")
+        if tail_status is _TreeTailStatus.INVALID:
+            self._internal("failed to load execution tree")
+        if tail_status is _TreeTailStatus.CHANGED:
             return False
         for node in nodes:
-            try:
-                current = await self._load_run(node.snapshot.run_id)
-            except AgentSDKError as error:
-                if error.code is ErrorCode.NOT_FOUND:
-                    return False
-                raise
+            current = await _stored_run(self._store, node.snapshot.run_id)
+            if isinstance(current, _ReadFailure):
+                self._internal("failed to load execution tree")
+            if current is None:
+                return False
             if (
                 current != node.snapshot
                 or current.session_id != root.session_id
@@ -260,18 +290,15 @@ class QueryService:
         return True
 
     async def _load_run(self, run_id: str) -> RunSnapshot:
-        data = await _snapshot(self._store, "run", run_id)
-        if isinstance(data, _ReadFailure):
+        run = await _stored_run(self._store, run_id)
+        if isinstance(run, _ReadFailure):
             self._internal("failed to load run")
-        if data is None:
+        if run is None:
             raise AgentSDKError(
                 ErrorCode.NOT_FOUND,
                 "run not found",
                 retryable=False,
             )
-        run = _run_snapshot(data)
-        if isinstance(run, _ReadFailure):
-            self._internal("failed to load run")
         return run
 
     async def _latest_cursor(self) -> int:
@@ -367,13 +394,15 @@ def _same_creation_identity(created: RunSnapshot, current: RunSnapshot) -> bool:
     )
 
 
-async def _snapshot(
+async def _stored_run(
     store: StateStore,
-    kind: str,
-    entity_id: str,
-) -> dict[str, Any] | None | _ReadFailure:
+    run_id: str,
+) -> RunSnapshot | None | _ReadFailure:
     try:
-        return await store.get_snapshot(kind, entity_id)
+        data = await store.get_snapshot("run", run_id)
+        if data is None:
+            return None
+        return RunSnapshot.model_validate(data)
     except Exception:
         return _ReadFailure.FAILED
 
@@ -441,3 +470,35 @@ def _timeline_events(
         return tuple(selected)
     except Exception:
         return _ReadFailure.FAILED
+
+
+def _tree_tail_status(
+    stored_events: list[StoredEvent],
+    *,
+    descendants: set[str],
+    session_id: str,
+) -> _TreeTailStatus:
+    try:
+        for stored in stored_events:
+            event = stored.event
+            if event.type == "run.created":
+                if event.run_id in descendants:
+                    return _TreeTailStatus.INVALID
+                parent_run_id = _parent_claim(event.payload)
+                if parent_run_id is _InvalidParent.INVALID:
+                    continue
+                if parent_run_id not in descendants:
+                    continue
+                if event.schema_version != 1 or event.session_id != session_id:
+                    return _TreeTailStatus.INVALID
+                return _TreeTailStatus.CHANGED
+            if (
+                event.run_id in descendants
+                and event.type in _RUN_SNAPSHOT_TRANSITIONS
+            ):
+                if event.schema_version != 1 or event.session_id != session_id:
+                    return _TreeTailStatus.INVALID
+                return _TreeTailStatus.CHANGED
+        return _TreeTailStatus.STABLE
+    except Exception:
+        return _TreeTailStatus.INVALID
