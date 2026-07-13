@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_sdk import AgentSDKError, AgentSpec, ErrorCode
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
@@ -23,7 +24,12 @@ from agent_sdk.storage.base import (
 )
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.storage.memory import InMemoryStore
-from agent_sdk.workflow import WorkflowCompiler, WorkflowExecutor, WorkflowIR
+from agent_sdk.workflow import (
+    WorkflowCompiler,
+    WorkflowExecutor,
+    WorkflowHandle,
+    WorkflowIR,
+)
 from agent_sdk.workflow import WorkflowNodeStatus, WorkflowRunStatus
 
 DEFINITION = {
@@ -667,3 +673,75 @@ async def test_get_retries_when_workflow_transitions_between_aggregate_reads() -
     observed = await asyncio.wait_for(get_task, timeout=1)
 
     assert observed.status is WorkflowRunStatus.COMPLETED
+
+
+class _BusyUnrelatedEventStore:
+    def __init__(self, delegate: StateStore) -> None:
+        self.delegate = delegate
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        return await self.delegate.commit(batch)
+
+    async def read_events(
+        self, *, after_cursor: int, session_id: str | None = None
+    ) -> list[StoredEvent]:
+        del session_id
+        cursor = after_cursor + 1
+        return [
+            StoredEvent(
+                cursor,
+                EventEnvelope.new(
+                    type="noise",
+                    session_id="ses_noise",
+                    run_id=f"run_noise_{cursor}",
+                    sequence=1,
+                    payload={},
+                ),
+            )
+        ]
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+    async def delete_session(self, session_id: str) -> None:
+        await self.delegate.delete_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_events_final_drain_ends_with_busy_unrelated_store() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _chunks("done")
+
+    delegate = InMemoryStore()
+    commands = RuntimeCommands(delegate)
+    executor = WorkflowExecutor(
+        delegate,
+        commands,
+        RunEngine(delegate, LiteLLMGateway._for_test(provider)),
+        _agents(),
+    )
+    session = await commands.create_session(workspaces=[])
+    original = await executor.start(session.session_id, _ir())
+    await original.result()
+    durable = await delegate.read_events(after_cursor=0)
+    terminal_cursor = max(event.cursor for event in durable)
+    handle = WorkflowHandle(
+        original.workflow_run_id,
+        _BusyUnrelatedEventStore(delegate),
+        original._task,  # type: ignore[attr-defined]
+    )
+
+    observed = await asyncio.wait_for(
+        _collect_workflow_events(handle, cursor=terminal_cursor),
+        timeout=0.2,
+    )
+
+    assert observed == []
+
+
+async def _collect_workflow_events(
+    handle: WorkflowHandle,
+    *,
+    cursor: int,
+) -> list[StoredEvent]:
+    return [event async for event in handle.events(cursor=cursor)]

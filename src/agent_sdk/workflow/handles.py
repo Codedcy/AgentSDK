@@ -55,8 +55,6 @@ class WorkflowHandle:
                 if not completion_observed:
                     completion_observed = True
                     continue
-                if events:
-                    continue
                 snapshot = await WorkflowState(self._store).load(self.workflow_run_id)
                 if snapshot.status in {
                     WorkflowRunStatus.COMPLETED,

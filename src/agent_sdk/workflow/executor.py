@@ -7,8 +7,6 @@ from enum import Enum
 from functools import partial
 from typing import Any
 
-from pydantic import ValidationError
-
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import ModelRequest
@@ -305,7 +303,7 @@ def _validated_ir(workflow: WorkflowIR) -> WorkflowIR:
 def _validate_ir(workflow: WorkflowIR) -> WorkflowIR | _IRValidationFailure:
     try:
         return WorkflowIR.model_validate(workflow.model_dump(mode="json"))
-    except ValidationError:
+    except Exception:
         return _IRValidationFailure.INVALID
 
 
