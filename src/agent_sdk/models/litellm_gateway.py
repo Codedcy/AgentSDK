@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, TypeAlias, cast
+from typing import Any, Generic, TypeAlias, TypeVar, cast
 
 import litellm
+from pydantic import BaseModel
 
+from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.runtime.models import TokenUsage
 
 _ACompletion: TypeAlias = Callable[..., Awaitable[Any]]
@@ -18,6 +20,7 @@ class ModelRequest:
     messages: tuple[dict[str, Any], ...]
     tools: tuple[dict[str, Any], ...] = ()
     params: dict[str, Any] = field(default_factory=dict)
+    purpose: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,19 @@ class UsageReported:
 
     def to_usage(self) -> TokenUsage:
         return TokenUsage(**self.to_payload())
+
+
+_StructuredModel = TypeVar("_StructuredModel", bound=BaseModel)
+
+
+@dataclass(frozen=True)
+class StructuredCompletion(Generic[_StructuredModel]):
+    parsed: _StructuredModel
+    usage: UsageReported
+
+    @property
+    def value(self) -> _StructuredModel:
+        return self.parsed
 
 
 @dataclass(frozen=True)
@@ -79,7 +95,12 @@ def _value(container: object, name: str) -> Any:
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
-    return int(cast(int, value))
+    if isinstance(value, bool):
+        raise ValueError("usage token count must be an integer")
+    normalized = int(cast(int, value))
+    if normalized < 0:
+        raise ValueError("usage token count must be non-negative")
+    return normalized
 
 
 class LiteLLMGateway:
@@ -91,6 +112,76 @@ class LiteLLMGateway:
         gateway = cls.__new__(cls)
         gateway._acompletion = acompletion
         return gateway
+
+    async def complete_structured(
+        self,
+        request: ModelRequest,
+        schema: type[_StructuredModel],
+    ) -> StructuredCompletion[_StructuredModel]:
+        try:
+            params = deepcopy(dict(request.params))
+            params["stream"] = False
+            params["response_format"] = schema
+            response = await self._acompletion(
+                model=request.model,
+                messages=deepcopy(list(request.messages)),
+                tools=deepcopy(list(request.tools)),
+                **params,
+            )
+        except Exception as error:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "structured model call failed",
+                retryable=False,
+            ) from error
+
+        try:
+            choices = _value(response, "choices")
+            if (
+                not isinstance(choices, (list, tuple))
+                or not choices
+            ):
+                raise ValueError("choices missing")
+            message = _value(choices[0], "message")
+            if message is None:
+                raise ValueError("message missing")
+            parsed = _value(message, "parsed")
+            if isinstance(parsed, BaseModel):
+                value = schema.model_validate(parsed.model_dump(mode="python"))
+            elif isinstance(parsed, Mapping):
+                value = schema.model_validate(deepcopy(dict(parsed)))
+            elif parsed is not None:
+                raise ValueError("parsed response has unsupported type")
+            else:
+                content = _value(message, "content")
+                if not isinstance(content, str) or not content:
+                    raise ValueError("content missing")
+                value = schema.model_validate_json(content)
+            raw_usage = _value(response, "usage")
+            usage = UsageReported(
+                prompt_tokens=_optional_int(
+                    _value(raw_usage, "prompt_tokens")
+                    if raw_usage is not None
+                    else None
+                ),
+                completion_tokens=_optional_int(
+                    _value(raw_usage, "completion_tokens")
+                    if raw_usage is not None
+                    else None
+                ),
+                total_tokens=_optional_int(
+                    _value(raw_usage, "total_tokens")
+                    if raw_usage is not None
+                    else None
+                ),
+            )
+        except Exception as error:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "structured model response invalid",
+                retryable=False,
+            ) from error
+        return StructuredCompletion(parsed=value, usage=usage)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
         response = await self._acompletion(

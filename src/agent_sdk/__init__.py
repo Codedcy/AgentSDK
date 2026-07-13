@@ -1,5 +1,15 @@
 from agent_sdk.api import AgentSDK, PermissionAPI, RunAPI, SessionAPI
 from agent_sdk.config import AgentSDKConfig, CaptureLevel
+from agent_sdk.context import (
+    CompactionLevel,
+    CompactionPolicy,
+    ContextBudget,
+    ContextCapsule,
+    ContextItem,
+    ContextPlanner,
+    ContextRetrieval,
+    ContextView,
+)
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.ids import new_id
 from agent_sdk.mcp import (
@@ -9,6 +19,7 @@ from agent_sdk.mcp import (
     StreamableHTTPMCPTransport,
 )
 from agent_sdk.permissions import PermissionDecision, PermissionEffect, PermissionRequest
+from agent_sdk.prompts import BuiltPrompt, PromptComposer, PromptManifest
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.models import (
     AgentSpec,
@@ -28,6 +39,14 @@ __all__ = [
     "AgentSDKError",
     "AgentSpec",
     "CaptureLevel",
+    "CompactionLevel",
+    "CompactionPolicy",
+    "ContextBudget",
+    "ContextCapsule",
+    "ContextItem",
+    "ContextPlanner",
+    "ContextRetrieval",
+    "ContextView",
     "ErrorCode",
     "MCPManager",
     "MCPServerConfig",
@@ -35,6 +54,9 @@ __all__ = [
     "PermissionDecision",
     "PermissionEffect",
     "PermissionRequest",
+    "PromptComposer",
+    "PromptManifest",
+    "BuiltPrompt",
     "RunAPI",
     "RunHandle",
     "RunResult",

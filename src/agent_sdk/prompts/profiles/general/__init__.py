@@ -1,0 +1,1 @@
+"""General prompt profile resources."""
