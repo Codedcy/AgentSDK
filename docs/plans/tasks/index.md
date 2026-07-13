@@ -13,8 +13,8 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | done |
 | [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | done |
 | [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | done |
-| [M01-T010](M01-T010-integrated-e2e.md) | Integrated vertical-slice CLI and E2E | M01 | T009 | in_progress |
-| [M02-T001](M02-T001-session-idempotency.md) | Complete Session lifecycle and idempotency | M02 | M01 | pending |
+| [M01-T010](M01-T010-integrated-e2e.md) | Integrated vertical-slice CLI and E2E | M01 | T009 | done |
+| [M02-T001](M02-T001-session-idempotency.md) | Complete Session lifecycle and idempotency | M02 | M01 | in_progress |
 | [M02-T002](M02-T002-leases-reconciliation.md) | Leases, interruption, and reconciliation | M02 | T001 | pending |
 | [M02-T003](M02-T003-artifacts-migrations.md) | Artifact lifecycle and migrations | M02 | T001 | pending |
 | [M02-T004](M02-T004-control-sync-api.md) | Cancellation, pause/resume, sync facade | M02 | T002 | pending |
@@ -47,3 +47,4 @@ When a task completes, add its commit id and verification result below the table
 - M01-T007: implementation `b0b40e5`, fixes `c6d1340` and `29c38a6`; Python 3.13 `pytest` 246 passed, Ruff passed, mypy passed, wheel/sdist resources verified; task review approved after Session-delete atomicity, structured-usage validation, ContextView invariants, and provider traceback-local isolation re-reviews. TDD and packaging evidence is recorded in `.superpowers/sdd/M01-T007-report.md`.
 - M01-T008: implementation `24c19c7`, fixes `a5b5c3d` and `7fdd03d`; Python 3.13 `pytest` 306 passed, Ruff passed, mypy passed; task review approved after Workflow IR validation, recovery ownership, event final-drain boundedness, and child failure-isolation re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T008-report.md`.
 - M01-T009: implementation `209cc92`, fixes `5237f72`, `9513226`, `0891658`, and `0d1ca6c`; Python 3.13 `pytest` 442 passed, Ruff passed, mypy passed; task review approved after bounded cursor/page validation, evidence-event lifetime preconditions, extension traceback isolation, execution-tree temporal/ownership integrity, and analytics schema/deletion re-reviews. TDD evidence is recorded in `.superpowers/sdd/M01-T009-report.md`.
+- M01-T010: design/plan `77878e2` and `e5fcfcb`; implementation `f47f13f`, `5d84725`, `8188546`, `025eaf2`, fix `97bc98a`, and E2E `346693c`; Python 3.13 `pytest` 458 passed, independent focused gate 46 passed, Ruff passed, mypy passed, wheel/sdist build and CLI help passed; task review approved with Critical, Important, and Minor all 0. TDD evidence is recorded in `.superpowers/sdd/M01-T010-report.md`.
