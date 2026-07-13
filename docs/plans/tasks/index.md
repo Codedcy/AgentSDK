@@ -10,7 +10,7 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T004](M01-T004-litellm-agent-loop.md) | LiteLLM Agent Loop slice | M01 | T003 | done |
 | [M01-T005](M01-T005-tool-permission-slice.md) | Tool and permission slice | M01 | T004 | done |
 | [M01-T006](M01-T006-mcp-skill-slice.md) | MCP and Skill slice | M01 | T005 | done |
-| [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | pending |
+| [M01-T007](M01-T007-context-compaction-slice.md) | Context and compaction slice | M01 | T006 | in_progress |
 | [M01-T008](M01-T008-workflow-child-slice.md) | Workflow and Child slice | M01 | T007 | pending |
 | [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | pending |
 | [M01-T010](M01-T010-integrated-e2e.md) | Integrated vertical-slice CLI and E2E | M01 | T009 | pending |
