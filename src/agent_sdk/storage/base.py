@@ -80,6 +80,27 @@ class CommitBatch(NamedTuple):
     replay_preconditions: tuple[SnapshotPrecondition, ...] = ()
 
 
+class ExternalOperationWrite(NamedTuple):
+    expected: ExternalOperation | None
+    updated: ExternalOperation
+
+
+class RunCheckpointWrite(NamedTuple):
+    expected: RunCheckpoint | None
+    updated: RunCheckpoint
+
+
+class RunProgressBatch(NamedTuple):
+    lease: Lease
+    now: datetime
+    events: tuple[EventEnvelope, ...] = ()
+    snapshots: tuple[SnapshotWrite, ...] = ()
+    preconditions: tuple[SnapshotPrecondition, ...] = ()
+    event_preconditions: tuple[EventPrecondition, ...] = ()
+    operation: ExternalOperationWrite | None = None
+    checkpoint: RunCheckpointWrite | None = None
+
+
 class CommitResult(NamedTuple):
     last_cursor: int
     applied: bool = True
@@ -93,6 +114,8 @@ class StoredEvent(NamedTuple):
 
 class StateStore(Protocol):
     async def commit(self, batch: CommitBatch) -> CommitResult: ...
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult: ...
 
     async def read_events(
         self,

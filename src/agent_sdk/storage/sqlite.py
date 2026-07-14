@@ -20,7 +20,7 @@ from agent_sdk.runtime.leases import (
     LeaseLostError,
     canonical_lease_timestamp,
 )
-from agent_sdk.runtime.models import RunSnapshot
+from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
@@ -44,6 +44,7 @@ from agent_sdk.storage.base import (
     CommitResult,
     EventPreconditionConflictError,
     EventPreconditionNotFoundError,
+    RunProgressBatch,
     SnapshotPreconditionError,
     SnapshotPrecondition,
     SnapshotWrite,
@@ -647,6 +648,483 @@ class SQLiteStore:
             except BaseException:
                 await self._rollback()
                 raise
+
+    @_context_free_recovery_errors
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if not (
+            batch.events
+            or batch.snapshots
+            or batch.operation is not None
+            or batch.checkpoint is not None
+        ):
+            raise RecoveryStateConflictError
+        if batch.now.tzinfo is None or batch.now.utcoffset() is None:
+            raise RecoveryStateConflictError
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite run progress conflict")
+                run = await self._run_progress_authoritative_run(batch)
+                self._validate_run_progress_scope(batch, run)
+                self._validate_run_progress_write_shapes(batch)
+                self._validate_run_progress_internal_targets(batch)
+                await self._check_run_progress_checkpoint_operation(batch)
+                target_states = await self._run_progress_target_states(batch)
+                exact_targets = target_states.count("exact")
+                if "conflict" in target_states or (
+                    exact_targets and exact_targets != len(target_states)
+                ):
+                    raise RecoveryStateConflictError
+                if exact_targets == len(target_states):
+                    cursor = await self._last_cursor()
+                    await self._rollback()
+                    return CommitResult(last_cursor=cursor, applied=False)
+
+                await self._check_recovery_lease(
+                    batch.lease,
+                    now=batch.now,
+                    run_id=run.run_id,
+                    lease_generation=batch.lease.generation,
+                )
+                await self._check_run_progress_preconditions(batch)
+                await self._check_run_progress_event_targets(batch)
+                await self._check_run_progress_snapshot_targets(batch)
+                await self._check_run_progress_operation_target(batch)
+                await self._check_run_progress_checkpoint_target(batch)
+
+                for event in batch.events:
+                    await self._insert_event(event)
+                for snapshot in batch.snapshots:
+                    await self._upsert_newer_snapshot(snapshot)
+                await self._apply_run_progress_operation(batch)
+                await self._apply_run_progress_checkpoint(batch)
+                cursor = await self._last_cursor()
+                await self._commit_transaction()
+                return CommitResult(last_cursor=cursor)
+            except RecoveryStateConflictError:
+                await self._rollback()
+                raise
+            except (sqlite3.IntegrityError, TypeError, ValueError):
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def _run_progress_authoritative_run(
+        self, batch: RunProgressBatch
+    ) -> RunSnapshot:
+        async with self._connection.execute(
+            """
+            SELECT session_id, version, data_json FROM snapshots
+            WHERE kind = 'run' AND entity_id = ?
+            """,
+            (batch.lease.run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise RecoveryStateConflictError
+        try:
+            run = RunSnapshot.model_validate(
+                _strict_json_object(cast(str, row[2]))
+            )
+        except (TypeError, ValueError):
+            raise RecoveryStateConflictError from None
+        if (
+            run.run_id != batch.lease.run_id
+            or run.session_id != cast(str, row[0])
+            or run.version != cast(int, row[1])
+        ):
+            raise RecoveryStateConflictError
+        await self._check_recovery_run_session(run.run_id, run.session_id)
+        return run
+
+    @staticmethod
+    def _validate_run_progress_scope(
+        batch: RunProgressBatch, run: RunSnapshot
+    ) -> None:
+        for event in batch.events:
+            if event.session_id != run.session_id or event.run_id not in {
+                None,
+                run.run_id,
+            }:
+                raise RecoveryStateConflictError
+        for snapshot in batch.snapshots:
+            if snapshot.session_id != run.session_id:
+                raise RecoveryStateConflictError
+            try:
+                if snapshot.kind == "run":
+                    target_run = RunSnapshot.model_validate(snapshot.data)
+                    if (
+                        snapshot.entity_id != run.run_id
+                        or target_run.run_id != run.run_id
+                        or target_run.session_id != run.session_id
+                        or target_run.version != snapshot.version
+                    ):
+                        raise RecoveryStateConflictError
+                elif snapshot.kind == "session":
+                    target_session = SessionSnapshot.model_validate(snapshot.data)
+                    if (
+                        snapshot.entity_id != run.session_id
+                        or target_session.session_id != run.session_id
+                        or target_session.version != snapshot.version
+                    ):
+                        raise RecoveryStateConflictError
+            except ValueError:
+                raise RecoveryStateConflictError from None
+        if batch.operation is not None:
+            operation = batch.operation.updated
+            if (
+                operation.run_id != run.run_id
+                or operation.session_id != run.session_id
+                or operation.lease_generation != batch.lease.generation
+            ):
+                raise RecoveryStateConflictError
+        if batch.checkpoint is not None:
+            checkpoint = batch.checkpoint.updated
+            if (
+                checkpoint.run_id != run.run_id
+                or checkpoint.session_id != run.session_id
+            ):
+                raise RecoveryStateConflictError
+
+    @staticmethod
+    def _validate_run_progress_write_shapes(batch: RunProgressBatch) -> None:
+        if batch.operation is not None:
+            if batch.operation.expected is None:
+                legal_operation = (
+                    batch.operation.updated.status
+                    is ExternalOperationStatus.STARTED
+                )
+            else:
+                legal_operation = _valid_operation_transition(
+                    batch.operation.expected, batch.operation.updated
+                )
+            if not legal_operation:
+                raise RecoveryStateConflictError
+        if batch.checkpoint is not None and not _valid_checkpoint_replay_shape(
+            batch.checkpoint.updated, batch.checkpoint.expected
+        ):
+            raise RecoveryStateConflictError
+
+    @staticmethod
+    def _validate_run_progress_internal_targets(
+        batch: RunProgressBatch,
+    ) -> None:
+        event_ids: set[str] = set()
+        sequences: dict[tuple[str, str], int] = {}
+        for event in batch.events:
+            if event.event_id in event_ids:
+                raise RecoveryStateConflictError
+            event_ids.add(event.event_id)
+            aggregate = (
+                ("session", event.session_id)
+                if event.run_id is None
+                else ("run", event.run_id)
+            )
+            previous_sequence = sequences.get(aggregate)
+            if (
+                previous_sequence is not None
+                and event.sequence <= previous_sequence
+            ):
+                raise RecoveryStateConflictError
+            sequences[aggregate] = event.sequence
+
+        snapshot_versions: dict[tuple[str, str], int] = {}
+        for snapshot in batch.snapshots:
+            key = (snapshot.kind, snapshot.entity_id)
+            previous_version = snapshot_versions.get(key)
+            if (
+                previous_version is not None
+                and snapshot.version <= previous_version
+            ):
+                raise RecoveryStateConflictError
+            snapshot_versions[key] = snapshot.version
+
+    async def _run_progress_target_states(
+        self, batch: RunProgressBatch
+    ) -> list[str]:
+        states: list[str] = []
+        for event in batch.events:
+            current_event = await self._read_event_by_id(event.event_id)
+            states.append(
+                "absent"
+                if current_event is None
+                else "exact"
+                if current_event == event
+                else "conflict"
+            )
+        for snapshot_target in batch.snapshots:
+            async with self._connection.execute(
+                """
+                SELECT session_id, version, data_json FROM snapshots
+                WHERE kind = ? AND entity_id = ?
+                """,
+                (snapshot_target.kind, snapshot_target.entity_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or cast(int, row[1]) < snapshot_target.version:
+                states.append("absent")
+            elif (
+                cast(str, row[0]) == snapshot_target.session_id
+                and cast(int, row[1]) == snapshot_target.version
+                and cast(str, row[2]) == _canonical_json(snapshot_target.data)
+            ):
+                states.append("exact")
+            else:
+                states.append("conflict")
+        if batch.operation is not None:
+            operation_target = batch.operation.updated
+            current_operation = await self._read_external_operation(
+                operation_target.operation_id
+            )
+            if current_operation == operation_target:
+                states.append("exact")
+            elif current_operation is None or (
+                batch.operation.expected is not None
+                and current_operation == batch.operation.expected
+            ):
+                states.append("absent")
+            else:
+                states.append("conflict")
+        if batch.checkpoint is not None:
+            checkpoint_target = batch.checkpoint.updated
+            current_checkpoint = await self._read_run_checkpoint(
+                checkpoint_target.run_id
+            )
+            if current_checkpoint == checkpoint_target:
+                states.append("exact")
+            elif current_checkpoint is None or (
+                batch.checkpoint.expected is not None
+                and current_checkpoint == batch.checkpoint.expected
+            ):
+                states.append("absent")
+            else:
+                states.append("conflict")
+        return states
+
+    async def _check_run_progress_preconditions(
+        self, batch: RunProgressBatch
+    ) -> None:
+        try:
+            await self._check_event_preconditions(
+                CommitBatch(
+                    events=(), event_preconditions=batch.event_preconditions
+                )
+            )
+            await self._check_snapshot_preconditions(batch.preconditions)
+        except (EventPreconditionNotFoundError, EventPreconditionConflictError,
+                SnapshotPreconditionError):
+            raise RecoveryStateConflictError from None
+
+    async def _check_run_progress_event_targets(
+        self, batch: RunProgressBatch
+    ) -> None:
+        event_ids: set[str] = set()
+        sequences: dict[tuple[str, str], int | None] = {}
+        for event in batch.events:
+            if event.event_id in event_ids:
+                raise RecoveryStateConflictError
+            event_ids.add(event.event_id)
+            aggregate = (
+                ("session", event.session_id)
+                if event.run_id is None
+                else ("run", event.run_id)
+            )
+            if aggregate not in sequences:
+                if event.run_id is None:
+                    query = (
+                        "SELECT MAX(sequence) FROM events "
+                        "WHERE run_id IS NULL AND session_id = ?"
+                    )
+                    aggregate_id = event.session_id
+                else:
+                    query = "SELECT MAX(sequence) FROM events WHERE run_id = ?"
+                    aggregate_id = event.run_id
+                async with self._connection.execute(
+                    query, (aggregate_id,)
+                ) as cursor:
+                    row = await cursor.fetchone()
+                sequences[aggregate] = (
+                    None if row is None else cast(int | None, row[0])
+                )
+            previous = sequences[aggregate]
+            if previous is not None and event.sequence <= previous:
+                raise RecoveryStateConflictError
+            sequences[aggregate] = event.sequence
+
+    async def _check_run_progress_snapshot_targets(
+        self, batch: RunProgressBatch
+    ) -> None:
+        versions: dict[tuple[str, str], int | None] = {}
+        for snapshot in batch.snapshots:
+            key = (snapshot.kind, snapshot.entity_id)
+            if key not in versions:
+                async with self._connection.execute(
+                    """
+                    SELECT version FROM snapshots
+                    WHERE kind = ? AND entity_id = ?
+                    """,
+                    key,
+                ) as cursor:
+                    row = await cursor.fetchone()
+                versions[key] = None if row is None else cast(int, row[0])
+            previous = versions[key]
+            if previous is not None and snapshot.version <= previous:
+                raise RecoveryStateConflictError
+            versions[key] = snapshot.version
+
+    async def _check_run_progress_operation_target(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.operation is None:
+            return
+        current = await self._read_external_operation(
+            batch.operation.updated.operation_id
+        )
+        if batch.operation.expected is None:
+            if current is not None:
+                raise RecoveryStateConflictError
+        elif current != batch.operation.expected:
+            raise RecoveryStateConflictError
+
+    async def _check_run_progress_checkpoint_target(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.checkpoint is None:
+            return
+        current = await self._read_run_checkpoint(batch.checkpoint.updated.run_id)
+        if batch.checkpoint.expected is None:
+            if current is not None:
+                raise RecoveryStateConflictError
+        elif current != batch.checkpoint.expected:
+            raise RecoveryStateConflictError
+
+    async def _check_run_progress_checkpoint_operation(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.checkpoint is None:
+            return
+        checkpoint = batch.checkpoint.updated
+        if checkpoint.operation_id is None:
+            return
+        operation: ExternalOperation | None = None
+        if (
+            batch.operation is not None
+            and batch.operation.updated.operation_id == checkpoint.operation_id
+        ):
+            operation = batch.operation.updated
+        if operation is None:
+            operation = await self._read_external_operation(
+                checkpoint.operation_id
+            )
+        if checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT:
+            expected_type: type[ModelCallOperation] | type[ToolCallOperation] = (
+                ModelCallOperation
+            )
+        elif checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT:
+            expected_type = ToolCallOperation
+        else:
+            raise RecoveryStateConflictError
+        if (
+            not isinstance(operation, expected_type)
+            or operation.run_id != checkpoint.run_id
+            or operation.session_id != checkpoint.session_id
+            or operation.lease_generation != batch.lease.generation
+        ):
+            raise RecoveryStateConflictError
+
+    async def _apply_run_progress_operation(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.operation is None:
+            return
+        operation = batch.operation.updated
+        serialized = _canonical_record_json(operation)
+        if batch.operation.expected is None:
+            await self._connection.execute(
+                """
+                INSERT INTO external_operations(
+                    operation_id, operation_kind, session_id, run_id, turn,
+                    request_fingerprint, provider_identity, tool_identity,
+                    lease_generation, status, data_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation.operation_id,
+                    operation.operation_kind.value,
+                    operation.session_id,
+                    operation.run_id,
+                    operation.turn,
+                    operation.request_fingerprint,
+                    operation.provider_identity,
+                    operation.tool_identity,
+                    operation.lease_generation,
+                    operation.status.value,
+                    serialized,
+                ),
+            )
+        else:
+            result = await self._connection.execute(
+                """
+                UPDATE external_operations SET status = ?, data_json = ?
+                WHERE operation_id = ? AND data_json = ?
+                """,
+                (
+                    operation.status.value,
+                    serialized,
+                    operation.operation_id,
+                    _canonical_record_json(batch.operation.expected),
+                ),
+            )
+            if result.rowcount != 1:
+                raise RecoveryStateConflictError
+
+    async def _apply_run_progress_checkpoint(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.checkpoint is None:
+            return
+        checkpoint = batch.checkpoint.updated
+        serialized = _canonical_record_json(checkpoint)
+        if batch.checkpoint.expected is None:
+            await self._connection.execute(
+                """
+                INSERT INTO run_checkpoints(
+                    run_id, session_id, checkpoint_version, turn, phase,
+                    operation_id, data_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint.run_id,
+                    checkpoint.session_id,
+                    checkpoint.checkpoint_version,
+                    checkpoint.turn,
+                    checkpoint.phase.value,
+                    checkpoint.operation_id,
+                    serialized,
+                ),
+            )
+        else:
+            result = await self._connection.execute(
+                """
+                UPDATE run_checkpoints SET
+                    checkpoint_version = ?, turn = ?, phase = ?,
+                    operation_id = ?, data_json = ?
+                WHERE run_id = ? AND data_json = ?
+                """,
+                (
+                    checkpoint.checkpoint_version,
+                    checkpoint.turn,
+                    checkpoint.phase.value,
+                    checkpoint.operation_id,
+                    serialized,
+                    checkpoint.run_id,
+                    _canonical_record_json(batch.checkpoint.expected),
+                ),
+            )
+            if result.rowcount != 1:
+                raise RecoveryStateConflictError
 
     async def _check_snapshot_preconditions(
         self, preconditions: tuple[SnapshotPrecondition, ...]

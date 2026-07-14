@@ -59,7 +59,13 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpoint,
     _context_free_recovery_errors,
 )
-from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    RunProgressBatch,
+    StateStore,
+    StoredEvent,
+)
 from agent_sdk.storage.idempotency import IdempotencyRecord
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.registry import ToolRegistry
@@ -90,6 +96,10 @@ class _LazySQLiteStore:
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
         return await (await self._get()).commit(batch)
+
+    @_context_free_recovery_errors
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        return await (await self._get()).commit_run_progress(batch)
 
     async def read_events(
         self,
