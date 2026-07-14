@@ -423,6 +423,7 @@ class InMemoryStore:
         expected_json = _canonical_record_json(expected)
         resolved_json = _canonical_record_json(resolved)
         async with self._lock:
+            self._check_recovery_run_session(expected.run_id, expected.session_id)
             if not _valid_reconciliation_resolution(expected, resolved, event):
                 raise RecoveryStateConflictError
             current = self._reconciliation_requests.get(expected.request_id)

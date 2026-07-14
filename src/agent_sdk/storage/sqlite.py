@@ -856,6 +856,9 @@ class SQLiteStore:
             self._ensure_open()
             try:
                 await self._begin_immediate("SQLite recovery operation conflict")
+                await self._check_recovery_run_session(
+                    expected.run_id, expected.session_id
+                )
                 await self._check_recovery_lease(
                     lease,
                     now=now,
@@ -1101,6 +1104,9 @@ class SQLiteStore:
             self._ensure_open()
             try:
                 await self._begin_immediate("SQLite reconciliation conflict")
+                await self._check_recovery_run_session(
+                    expected.run_id, expected.session_id
+                )
                 if not _valid_reconciliation_resolution(expected, resolved, event):
                     raise RecoveryStateConflictError
                 current = await self._read_reconciliation_request(

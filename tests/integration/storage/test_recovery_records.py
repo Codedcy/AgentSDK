@@ -144,13 +144,16 @@ async def _put_authoritative_run_snapshot(
     *,
     run_id: str = "run_1",
     session_id: str = "ses_1",
+    status: RunStatus = RunStatus.CREATED,
+    version: int = 1,
 ) -> None:
     run = RunSnapshot(
         run_id=run_id,
         session_id=session_id,
         agent_revision="agent:1",
-        status=RunStatus.CREATED,
+        status=status,
         user_input="hello",
+        version=version,
     )
     await store.commit(
         CommitBatch(
@@ -166,6 +169,31 @@ async def _put_authoritative_run_snapshot(
             ),
         )
     )
+
+
+async def _invalidate_authoritative_run_snapshot(
+    store: Any, invalidity: str
+) -> None:
+    if invalidity == "wrong_owner":
+        await _put_authoritative_run_snapshot(
+            store,
+            session_id="ses_other",
+            status=RunStatus.RUNNING,
+            version=2,
+        )
+        return
+
+    underlying = await store._get() if isinstance(store, _LazySQLiteStore) else store
+    if isinstance(underlying, InMemoryStore):
+        async with underlying._lock:
+            underlying._snapshots.pop(("run", "run_1"))
+        return
+    assert isinstance(underlying, SQLiteStore)
+    async with underlying._lock:
+        await underlying._connection.execute(
+            "DELETE FROM snapshots WHERE kind = 'run' AND entity_id = 'run_1'"
+        )
+        await underlying._connection.commit()
 
 
 async def _put_authoritative_run_history(store: Any) -> None:
@@ -444,6 +472,49 @@ async def test_external_operation_terminal_cas_replay_and_fencing(
         )
 
 
+@pytest.mark.parametrize("recovery_store", ("sqlite", "lazy_sqlite"), indirect=True)
+@pytest.mark.parametrize("invalidity", ("missing", "wrong_owner"))
+@pytest.mark.asyncio
+async def test_sqlite_terminal_transition_requires_current_authoritative_run_owner(
+    recovery_store: Any,
+    invalidity: str,
+) -> None:
+    store = recovery_store
+    await _put_authoritative_run_snapshot(store)
+    lease = await _lease(store)
+    secret = "terminal-secret-31c7b1"
+    started = _model_operation(recovery_metadata={"credential": secret})
+    await store.create_external_operation(started, lease=lease, now=NOW)
+    completed = started.model_copy(
+        update={"status": ExternalOperationStatus.COMPLETED, "outcome": {}}
+    )
+    await _invalidate_authoritative_run_snapshot(store, invalidity)
+
+    with pytest.raises(RecoveryStateConflictError) as caught:
+        await store.transition_external_operation(
+            expected=started,
+            updated=completed,
+            lease=lease,
+            now=NOW,
+        )
+
+    assert caught.value.to_dict() == {
+        "code": "conflict",
+        "message": "recovery state conflict",
+        "retryable": True,
+    }
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    sdk_locals = _sdk_traceback_locals(caught.value)
+    assert sdk_locals
+    assert all(
+        secret not in repr(frame_locals)
+        for frame_locals in sdk_locals
+    )
+    assert await store.get_external_operation(started.operation_id) == started
+    assert await store.list_unresolved_external_operations(started.run_id) == (started,)
+
+
 @pytest.mark.asyncio
 async def test_checkpoint_full_record_cas_and_operation_identity(
     seeded_recovery_store: Any,
@@ -716,6 +787,44 @@ async def test_failed_resolution_does_not_mutate_request_or_events(
         )
 
     assert await store.get_reconciliation_request(request.request_id) == request
+    assert await store.read_events(after_cursor=0) == []
+
+
+@pytest.mark.parametrize("invalidity", ("missing", "wrong_owner"))
+@pytest.mark.asyncio
+async def test_resolution_requires_current_authoritative_run_owner(
+    seeded_recovery_store: Any,
+    invalidity: str,
+) -> None:
+    store = seeded_recovery_store
+    secret = "resolution-secret-8d93f2"
+    request = _request(details={"credential": secret})
+    await store.create_reconciliation_request(request)
+    resolved = _resolved_request(request)
+    await _invalidate_authoritative_run_snapshot(store, invalidity)
+
+    with pytest.raises(RecoveryStateConflictError) as caught:
+        await store.resolve_reconciliation_request(
+            expected=request,
+            resolved=resolved,
+            event=_resolution_event(resolved),
+        )
+
+    assert caught.value.to_dict() == {
+        "code": "conflict",
+        "message": "recovery state conflict",
+        "retryable": True,
+    }
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    sdk_locals = _sdk_traceback_locals(caught.value)
+    assert sdk_locals
+    assert all(
+        secret not in repr(frame_locals)
+        for frame_locals in sdk_locals
+    )
+    assert await store.get_reconciliation_request(request.request_id) == request
+    assert await store.list_pending_reconciliation_requests(request.run_id) == (request,)
     assert await store.read_events(after_cursor=0) == []
 
 
