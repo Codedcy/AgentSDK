@@ -2,6 +2,11 @@ import json
 from typing import Any, NamedTuple, Protocol
 
 from agent_sdk.events.models import EventEnvelope
+from agent_sdk.storage.idempotency import (
+    IdempotencyRecord,
+    IdempotencyReplay,
+    IdempotencyWrite,
+)
 
 
 def canonical_snapshot_data(value: dict[str, Any]) -> str:
@@ -60,10 +65,14 @@ class CommitBatch(NamedTuple):
     snapshots: tuple[SnapshotWrite, ...] = ()
     preconditions: tuple[SnapshotPrecondition, ...] = ()
     event_preconditions: tuple[EventPrecondition, ...] = ()
+    idempotency: IdempotencyWrite | IdempotencyReplay | None = None
+    replay_preconditions: tuple[SnapshotPrecondition, ...] = ()
 
 
 class CommitResult(NamedTuple):
     last_cursor: int
+    applied: bool = True
+    idempotency: IdempotencyRecord | None = None
 
 
 class StoredEvent(NamedTuple):
@@ -84,6 +93,10 @@ class StateStore(Protocol):
     ) -> list[StoredEvent]: ...
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None: ...
+
+    async def get_idempotency(
+        self, scope: str, key: str
+    ) -> IdempotencyRecord | None: ...
 
     async def latest_cursor(self) -> int: ...
 

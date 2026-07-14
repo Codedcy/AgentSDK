@@ -45,6 +45,7 @@ from agent_sdk.runtime.models import (
     mutable_model_params,
 )
 from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
+from agent_sdk.storage.idempotency import IdempotencyRecord
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.registry import ToolRegistry
 from agent_sdk.workflow import (
@@ -92,6 +93,9 @@ class _LazySQLiteStore:
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         return await (await self._get()).get_snapshot(kind, entity_id)
+
+    async def get_idempotency(self, scope: str, key: str) -> IdempotencyRecord | None:
+        return await (await self._get()).get_idempotency(scope, key)
 
     async def latest_cursor(self) -> int:
         return await (await self._get()).latest_cursor()

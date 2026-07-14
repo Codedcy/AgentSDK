@@ -8,6 +8,7 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_sdk.runtime.models import TokenUsage
+from agent_sdk.runtime.execution import WorkflowExecutionDescriptor
 
 
 class AgentNode(BaseModel):
@@ -216,9 +217,15 @@ class WorkflowRunSnapshot(BaseModel):
     output_text: str | None = None
     usage: TokenUsage | None = None
     error: WorkflowFailure | None = None
+    execution_compatibility: Literal["legacy_unknown", "current"] = "legacy_unknown"
+    execution_descriptor: WorkflowExecutionDescriptor | None = None
 
     @model_validator(mode="after")
     def _validate_aggregate(self) -> Self:
+        if (self.execution_compatibility == "current") != (
+            self.execution_descriptor is not None
+        ):
+            raise ValueError("workflow execution compatibility is invalid")
         if len(self.nodes) != len(self.workflow.nodes):
             raise ValueError("workflow snapshot node count does not match definition")
         for node, definition_node in zip(self.nodes, self.workflow.nodes, strict=True):

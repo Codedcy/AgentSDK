@@ -54,6 +54,13 @@ from agent_sdk.observability import (
 )
 from agent_sdk.prompts import BuiltPrompt, PromptComposer, PromptManifest
 from agent_sdk.runtime.handles import RunHandle
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+    ToolCapabilityDescriptor,
+    WorkflowAgentDescriptor,
+    WorkflowExecutionDescriptor,
+)
 from agent_sdk.runtime.models import (
     AgentSpec,
     RunFailure,
@@ -61,6 +68,7 @@ from agent_sdk.runtime.models import (
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
+    SessionStatus,
     TokenUsage,
 )
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
@@ -118,6 +126,8 @@ __all__ = [
     "ExactOutputEvaluator",
     "ExecutionTree",
     "ExecutionTreeNode",
+    "ExecutionDescriptor",
+    "ExecutionPolicyDescriptor",
     "MCPManager",
     "MCPServerConfig",
     "PermissionAPI",
@@ -140,6 +150,7 @@ __all__ = [
     "QueryService",
     "SessionAPI",
     "SessionSnapshot",
+    "SessionStatus",
     "SkillMetadata",
     "SkillRegistry",
     "ActivatedSkill",
@@ -150,6 +161,7 @@ __all__ = [
     "StreamableHTTPMCPTransport",
     "TokenUsage",
     "ToolContext",
+    "ToolCapabilityDescriptor",
     "ToolExecutor",
     "ToolRegistry",
     "ToolResult",
@@ -157,6 +169,7 @@ __all__ = [
     "ToolSpec",
     "AgentNode",
     "WorkflowAPI",
+    "WorkflowAgentDescriptor",
     "WorkflowCompiler",
     "WorkflowDefinition",
     "WorkflowEdge",
@@ -169,5 +182,6 @@ __all__ = [
     "WorkflowResult",
     "WorkflowRunSnapshot",
     "WorkflowRunStatus",
+    "WorkflowExecutionDescriptor",
     "new_id",
 ]

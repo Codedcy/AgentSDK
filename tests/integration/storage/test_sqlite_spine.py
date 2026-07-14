@@ -1,17 +1,715 @@
 import asyncio
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+import agent_sdk.storage.sqlite as sqlite_storage
 import pytest
+from aiosqlite.context import Result
 
+from agent_sdk.api import AgentSDK
+from agent_sdk.context.models import CompactionLevel, ContextCapsule, ContextView
+from agent_sdk.evaluation.models import EvaluationResult, EvaluationVerdict
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot, TokenUsage
+from agent_sdk.workflow.models import (
+    AgentNode,
+    WorkflowIR,
+    WorkflowNodeSnapshot,
+    WorkflowNodeStatus,
+    WorkflowRunSnapshot,
+    WorkflowRunStatus,
+)
+
+
+def _create_v1_database(path: Path, *, corrupt_run_status: str | None = None) -> None:
+    migration = (
+        Path(__file__).parents[3]
+        / "src"
+        / "agent_sdk"
+        / "storage"
+        / "migrations"
+        / "0001_initial.sql"
+    ).read_text(encoding="utf-8")
+    session = SessionSnapshot(session_id="ses_v1", workspaces=("workspace",)).model_dump(
+        mode="json"
+    )
+    session.pop("active_run_ids")
+    session.pop("active_workflow_run_ids")
+    created_run = RunSnapshot(
+        run_id="run_active",
+        session_id="ses_v1",
+        agent_revision="agent:1",
+        status=RunStatus.CREATED,
+        user_input="active",
+    ).model_dump(mode="json")
+    completed_run = RunSnapshot(
+        run_id="run_done",
+        session_id="ses_v1",
+        agent_revision="agent:1",
+        status=RunStatus.COMPLETED,
+        user_input="done",
+        version=3,
+        output_text="done",
+        usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+    ).model_dump(mode="json")
+    completed_run_created = RunSnapshot(
+        run_id="run_done",
+        session_id="ses_v1",
+        agent_revision="agent:1",
+        status=RunStatus.CREATED,
+        user_input="done",
+    ).model_dump(mode="json")
+    for run in (created_run, completed_run, completed_run_created):
+        run.pop("execution_compatibility")
+        run.pop("execution_descriptor")
+        run.pop("tool_results")
+    if corrupt_run_status is not None:
+        created_run["status"] = corrupt_run_status
+
+    active_ir = WorkflowIR.create(
+        name="active",
+        nodes=(AgentNode(id="one", agent_revision="agent:1", input="work"),),
+        edges=(),
+    )
+    active_node = WorkflowNodeSnapshot(
+        entity_id="wf_active:one",
+        workflow_run_id="wf_active",
+        session_id="ses_v1",
+        node_id="one",
+        status=WorkflowNodeStatus.PENDING,
+    )
+    active_workflow = WorkflowRunSnapshot(
+        workflow_run_id="wf_active",
+        session_id="ses_v1",
+        status=WorkflowRunStatus.RUNNING,
+        workflow=active_ir,
+        nodes=(active_node,),
+    ).model_dump(mode="json")
+    active_workflow.pop("execution_compatibility")
+    active_workflow.pop("execution_descriptor")
+
+    done_ir = WorkflowIR.create(
+        name="done",
+        nodes=(AgentNode(id="one", agent_revision="agent:1", input="work"),),
+        edges=(),
+    )
+    usage = TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    done_node = WorkflowNodeSnapshot(
+        entity_id="wf_done:one",
+        workflow_run_id="wf_done",
+        session_id="ses_v1",
+        node_id="one",
+        status=WorkflowNodeStatus.COMPLETED,
+        version=3,
+        run_id="run_done",
+        output_text="done",
+        usage=usage,
+    )
+    done_workflow = WorkflowRunSnapshot(
+        workflow_run_id="wf_done",
+        session_id="ses_v1",
+        status=WorkflowRunStatus.COMPLETED,
+        workflow=done_ir,
+        nodes=(done_node,),
+        version=4,
+        output_text="done",
+        usage=usage,
+    ).model_dump(mode="json")
+    done_workflow.pop("execution_compatibility")
+    done_workflow.pop("execution_descriptor")
+
+    capsule = ContextCapsule(
+        objective="continue",
+        constraints=(),
+        decisions=(),
+        facts=("fact",),
+        next_actions=("next",),
+        artifact_refs=(),
+        source_event_ids=("evt_run_active",),
+    )
+    view = ContextView(
+        view_id="ctx_v1",
+        session_id="ses_v1",
+        message_refs=("evt_run_active",),
+        capsule_id="cap_v1",
+        estimated_tokens=1,
+        recommended_level=CompactionLevel.L3,
+        applied_level=CompactionLevel.L3,
+    )
+    evaluation = EvaluationResult(
+        evaluation_id="eval_v1",
+        session_id="ses_v1",
+        subject_run_id="run_active",
+        evaluator_id="exact",
+        evaluator_version="1",
+        method="test",
+        verdict=EvaluationVerdict.PASS,
+        metrics={"score": 1.0},
+        reason="ok",
+        confidence=1.0,
+        evidence_event_ids=("evt_run_active",),
+        created_at=datetime(2025, 1, 1, tzinfo=UTC),
+        subject_cursor=2,
+    )
+
+    snapshots = (
+        ("session", "ses_v1", "ses_v1", 1, session),
+        ("run", "run_active", "ses_v1", 1, created_run),
+        ("run", "run_done", "ses_v1", 3, completed_run),
+        ("workflow", "wf_active", "ses_v1", 1, active_workflow),
+        ("workflow_node", "wf_active:one", "ses_v1", 1, active_node.model_dump(mode="json")),
+        ("workflow", "wf_done", "ses_v1", 4, done_workflow),
+        ("workflow_node", "wf_done:one", "ses_v1", 3, done_node.model_dump(mode="json")),
+        (
+            "context_capsule",
+            "cap_v1",
+            "ses_v1",
+            1,
+            {"session_id": "ses_v1", "capsule": capsule.model_dump(mode="json")},
+        ),
+        ("context_view", "ctx_v1", "ses_v1", 1, view.model_dump(mode="json")),
+        ("evaluation", "eval_v1", "ses_v1", 1, evaluation.model_dump(mode="json")),
+    )
+    events = (
+        ("evt_session", "ses_v1", None, 1, "session.created", session),
+        ("evt_run_active", "ses_v1", "run_active", 1, "run.created", created_run),
+        ("evt_run_done", "ses_v1", "run_done", 1, "run.created", completed_run_created),
+        ("evt_run_done_started", "ses_v1", "run_done", 2, "run.started", {}),
+        ("evt_run_done_completed", "ses_v1", "run_done", 3, "run.completed", {}),
+        (
+            "evt_wf_active",
+            "ses_v1",
+            "wf_active",
+            1,
+            "workflow.started",
+            {"definition_hash": active_ir.definition_hash, "name": active_ir.name},
+        ),
+        (
+            "evt_wf_done",
+            "ses_v1",
+            "wf_done",
+            1,
+            "workflow.started",
+            {"definition_hash": done_ir.definition_hash, "name": done_ir.name},
+        ),
+        (
+            "evt_wf_done_node_started",
+            "ses_v1",
+            "wf_done",
+            2,
+            "workflow.node.started",
+            {"node_id": "one", "run_id": "run_done"},
+        ),
+        (
+            "evt_wf_done_node_completed",
+            "ses_v1",
+            "wf_done",
+            3,
+            "workflow.node.completed",
+            {"node_id": "one", "run_id": "run_done"},
+        ),
+        ("evt_wf_done_completed", "ses_v1", "wf_done", 4, "workflow.completed", {}),
+        (
+            "evt_context_compacted",
+            "ses_v1",
+            "ctx_v1",
+            1,
+            "context.compaction.completed",
+            {"view_id": "ctx_v1", "capsule_id": "cap_v1"},
+        ),
+        (
+            "evt_context_view",
+            "ses_v1",
+            "ctx_v1",
+            2,
+            "context.view.created",
+            {"view_id": "ctx_v1", "capsule_id": "cap_v1"},
+        ),
+        (
+            "evt_evaluation",
+            "ses_v1",
+            "eval_v1",
+            1,
+            "evaluation.completed",
+            evaluation.model_dump(mode="json"),
+        ),
+    )
+    with sqlite3.connect(path) as connection:
+        connection.executescript(migration)
+        connection.execute("INSERT INTO schema_migrations VALUES (1, 'v1')")
+        connection.executemany(
+            "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?)",
+            [(*row[:4], json.dumps(row[4], sort_keys=True, separators=(",", ":"))) for row in snapshots],
+        )
+        connection.executemany(
+            """
+            INSERT INTO events(
+                event_id, session_id, run_id, sequence, type, schema_version,
+                occurred_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, 1, '2025-01-01T00:00:00+00:00', ?)
+            """,
+            [(*row[:5], json.dumps(row[5], sort_keys=True, separators=(",", ":"))) for row in events],
+        )
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_backfills_only_nonterminal_execution_ownership(tmp_path: Path) -> None:
+    path = tmp_path / "v1.db"
+    _create_v1_database(path)
+
+    store = await SQLiteStore.open(path)
+    try:
+        async def unused_completion(**_: object) -> dict[str, object]:
+            raise AssertionError("loading migrated snapshots must not execute a model")
+
+        sdk = AgentSDK.for_test(store=store, acompletion=unused_completion)
+        session_data = await store.get_snapshot("session", "ses_v1")
+        assert session_data is not None
+        assert session_data["version"] == 1
+        assert session_data["active_run_ids"] == ["run_active"]
+        assert session_data["active_workflow_run_ids"] == ["wf_active"]
+        for run_id in ("run_active", "run_done"):
+            run = await sdk.runs.get(run_id)
+            assert run.execution_compatibility == "legacy_unknown"
+            assert run.execution_descriptor is None
+            assert run.tool_results == ()
+        for workflow_id in ("wf_active", "wf_done"):
+            workflow = await sdk.workflows.get(workflow_id)
+            assert workflow.execution_compatibility == "legacy_unknown"
+            assert workflow.execution_descriptor is None
+        async with store._connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ) as cursor:
+            assert await cursor.fetchall() == [(1,), (2,)]
+        await sdk.close()
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_v1_unknown_run_status_rolls_back_entire_upgrade(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt-v1.db"
+    _create_v1_database(path, corrupt_run_status="interrupted")
+    with sqlite3.connect(path) as connection:
+        before = connection.execute(
+            "SELECT kind, entity_id, data_json FROM snapshots ORDER BY kind, entity_id"
+        ).fetchall()
+
+    with pytest.raises(ValueError, match="incompatible version-1"):
+        await SQLiteStore.open(path)
+
+    with sqlite3.connect(path) as connection:
+        after = connection.execute(
+            "SELECT kind, entity_id, data_json FROM snapshots ORDER BY kind, entity_id"
+        ).fetchall()
+        versions = connection.execute("SELECT version FROM schema_migrations").fetchall()
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='idempotency_records'"
+        ).fetchone()
+    assert after == before
+    assert versions == [(1,)]
+    assert table is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_v1_open_applies_migration_once(tmp_path: Path) -> None:
+    path = tmp_path / "concurrent-v1.db"
+    _create_v1_database(path)
+    first, second = await asyncio.gather(SQLiteStore.open(path), SQLiteStore.open(path))
+    try:
+        for store in (first, second):
+            async with store._connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ) as cursor:
+                assert await cursor.fetchall() == [(1,), (2,)]
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_never_uses_aiosqlite_executescript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("executescript changes transaction boundaries")
+
+    monkeypatch.setattr(aiosqlite.Connection, "executescript", forbidden)
+    store = await SQLiteStore.open(tmp_path / "empty.db")
+    await store.close()
+
+
+def _v1_state(path: Path) -> tuple[list[tuple[str, str, str]], list[tuple[int]], object, object]:
+    with sqlite3.connect(path) as connection:
+        snapshots = connection.execute(
+            "SELECT kind, entity_id, data_json FROM snapshots ORDER BY kind, entity_id"
+        ).fetchall()
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        table = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='idempotency_records'"
+        ).fetchone()
+        index = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idempotency_records_session'"
+        ).fetchone()
+    return snapshots, versions, table, index
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "migration-2-statement-1",
+        "migration-2-statement-2",
+        "migration-2-backfill-run-run_active",
+        "migration-2-backfill-run-run_done",
+        "migration-2-backfill-session-ses_v1",
+        "migration-2-backfill-workflow-wf_active",
+        "migration-2-backfill-workflow-wf_done",
+        "migration-2-version-inserted",
+        "migration-2-final-validation",
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_upgrade_faults_rollback_ddl_backfill_and_version(
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / f"fault-{stage}.db"
+    _create_v1_database(path)
+    before = _v1_state(path)
+
+    async def fail_at(checkpoint: str) -> None:
+        if checkpoint == stage:
+            raise RuntimeError("injected migration fault")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(SQLiteStore, "_migration_checkpoint", staticmethod(fail_at))
+        with pytest.raises(RuntimeError, match="injected migration fault"):
+            await SQLiteStore.open(path)
+
+    assert _v1_state(path) == before
+    reopened = await SQLiteStore.open(path)
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_commit_failure_rolls_back_exactly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "commit-fault.db"
+    _create_v1_database(path)
+    before = _v1_state(path)
+
+    async def fail_commit(_: aiosqlite.Connection) -> None:
+        raise RuntimeError("injected commit fault")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(aiosqlite.Connection, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="injected commit fault"):
+            await SQLiteStore.open(path)
+    assert _v1_state(path) == before
+
+
+@pytest.mark.asyncio
+async def test_cancel_racing_migration_commit_observes_only_complete_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "cancel-commit.db"
+    _create_v1_database(path)
+    original_commit = aiosqlite.Connection.commit
+    committed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def commit_then_wait(connection: aiosqlite.Connection) -> None:
+        await original_commit(connection)
+        committed.set()
+        await release.wait()
+
+    task: asyncio.Task[SQLiteStore] | None = None
+    with monkeypatch.context() as race:
+        race.setattr(aiosqlite.Connection, "commit", commit_then_wait)
+        task = asyncio.create_task(SQLiteStore.open(path))
+        await asyncio.wait_for(committed.wait(), timeout=2)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+    reopened = await SQLiteStore.open(path)
+    try:
+        async with reopened._connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ) as cursor:
+            assert await cursor.fetchall() == [(1,), (2,)]
+        assert (await reopened.get_snapshot("session", "ses_v1"))["active_run_ids"] == [
+            "run_active"
+        ]
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "session",
+        "run",
+        "workflow",
+        "workflow_node",
+        "context_capsule",
+        "context_view",
+        "evaluation",
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_cross_owner_row_for_every_snapshot_kind(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"cross-owner-{kind}.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE snapshots SET session_id='ses_missing' WHERE kind=?",
+            (kind,),
+        )
+    with pytest.raises(ValueError, match="incompatible version-1"):
+        await SQLiteStore.open(path)
+    assert _v1_state(path)[1:] == ([(1,)], None, None)
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_unknown_snapshot_kind(tmp_path: Path) -> None:
+    path = tmp_path / "unknown-kind.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO snapshots VALUES ('unknown', 'unknown_1', 'ses_v1', 1, '{}')"
+        )
+    with pytest.raises(ValueError, match="snapshot kind"):
+        await SQLiteStore.open(path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("DELETE FROM events WHERE event_id='evt_run_active'", "run start"),
+        ("DELETE FROM events WHERE event_id='evt_wf_active'", "workflow start"),
+        ("DELETE FROM events WHERE event_id='evt_session'", "session facts"),
+        ("DELETE FROM events WHERE event_id='evt_context_view'", "context facts"),
+        ("DELETE FROM events WHERE event_id='evt_context_compacted'", "context capsule facts"),
+        ("DELETE FROM events WHERE event_id='evt_evaluation'", "evaluation facts"),
+        ("DELETE FROM snapshots WHERE kind='run' AND entity_id='run_done'", "orphan run"),
+        (
+            "UPDATE events SET session_id='ses_missing' WHERE event_id='evt_evaluation'",
+            "event owner",
+        ),
+        (
+            "UPDATE events SET type='run.failed' WHERE event_id='evt_run_done_completed'",
+            "run terminal",
+        ),
+        (
+            "UPDATE events SET type='workflow.failed' WHERE event_id='evt_wf_done_completed'",
+            "workflow terminal",
+        ),
+        (
+            """
+            UPDATE events SET payload_json=json_set(payload_json, '$.run_id', 'run_other')
+            WHERE event_id='evt_wf_done_node_completed'
+            """,
+            "workflow node event",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_missing_or_contradictory_event_facts(
+    mutation: str,
+    expected: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bad-event-facts.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(mutation)
+    with pytest.raises(ValueError, match=expected):
+        await SQLiteStore.open(path)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        """
+        UPDATE snapshots SET data_json=json_set(data_json, '$.capsule_id', 'cap_missing')
+        WHERE kind='context_view'
+        """,
+        """
+        UPDATE snapshots SET data_json=json_set(data_json, '$.subject_run_id', 'run_missing')
+        WHERE kind='evaluation'
+        """,
+        """
+        UPDATE snapshots SET data_json=json_set(data_json, '$.evidence_event_ids', json('[\"evt_missing\"]'))
+        WHERE kind='evaluation'
+        """,
+        """
+        UPDATE snapshots SET entity_id='run_other'
+        WHERE kind='run' AND entity_id='run_active'
+        """,
+        """
+        UPDATE snapshots SET version=2
+        WHERE kind='run' AND entity_id='run_active'
+        """,
+    ],
+)
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_missing_references_and_row_identity(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bad-reference.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(mutation)
+    with pytest.raises(ValueError, match="incompatible version-1"):
+        await SQLiteStore.open(path)
+
+
+@pytest.mark.parametrize("target_sql", ["PRAGMA journal_mode=WAL", "BEGIN IMMEDIATE"])
+@pytest.mark.asyncio
+async def test_open_retries_transient_busy_for_wal_and_writer_lock(
+    target_sql: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "transient-busy.db"
+    connection = await aiosqlite.connect(path)
+    original_execute = connection.execute
+    attempts = 0
+
+    def execute_with_busy(sql: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        if sql == target_sql and attempts < 2:
+            attempts += 1
+
+            async def busy() -> Any:
+                raise sqlite3.OperationalError("database is locked")
+
+            return Result(busy())
+        return original_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(connection, "execute", execute_with_busy)
+
+    async def connect_existing(*args: Any, **kwargs: Any) -> aiosqlite.Connection:
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(aiosqlite, "connect", connect_existing)
+    store = await SQLiteStore.open(path)
+    try:
+        assert attempts == 2
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_busy_deadline_is_bounded_and_leaves_database_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "busy-deadline.db"
+    connection = await aiosqlite.connect(path)
+    original_execute = connection.execute
+
+    def always_busy(sql: str, *args: Any, **kwargs: Any) -> Any:
+        if sql == "BEGIN IMMEDIATE":
+            async def busy() -> Any:
+                raise sqlite3.OperationalError("database is locked")
+
+            return Result(busy())
+        return original_execute(sql, *args, **kwargs)
+
+    monkeypatch.setattr(connection, "execute", always_busy)
+
+    async def connect_existing(*args: Any, **kwargs: Any) -> aiosqlite.Connection:
+        del args, kwargs
+        return connection
+
+    monkeypatch.setattr(aiosqlite, "connect", connect_existing)
+    monkeypatch.setattr(sqlite_storage, "_OPEN_RETRY_SECONDS", 0.0)
+    with pytest.raises(RuntimeError, match="SQLite open conflict"):
+        await SQLiteStore.open(path)
+    with sqlite3.connect(path) as check:
+        assert check.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall() == []
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_requires_old_writer_to_be_quiesced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "old-writer.db"
+    _create_v1_database(path)
+    old_writer = sqlite3.connect(path, timeout=0)
+    old_writer.execute("BEGIN IMMEDIATE")
+    monkeypatch.setattr(sqlite_storage, "_OPEN_RETRY_SECONDS", 0.05)
+    try:
+        with pytest.raises(RuntimeError, match="open conflict"):
+            await SQLiteStore.open(path)
+    finally:
+        old_writer.rollback()
+        old_writer.close()
+
+    store = await SQLiteStore.open(path)
+    await store.close()
+
+
+@pytest.mark.parametrize("corruption", ["table_check", "partial_index"])
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_same_columns_with_unexpected_sql_shape(
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"unexpected-{corruption}.db"
+    script = (
+        Path(__file__).parents[3]
+        / "src"
+        / "agent_sdk"
+        / "storage"
+        / "migrations"
+        / "0001_initial.sql"
+    ).read_text(encoding="utf-8")
+    if corruption == "table_check":
+        script = script.replace(
+            "session_id TEXT NOT NULL,\n    run_id TEXT,",
+            "session_id TEXT NOT NULL CHECK(length(session_id) > 0),\n    run_id TEXT,",
+        )
+    else:
+        script = script.replace(
+            "CREATE INDEX snapshots_session ON snapshots(session_id);",
+            "CREATE INDEX snapshots_session ON snapshots(session_id) WHERE session_id <> '';",
+        )
+    with sqlite3.connect(path) as connection:
+        connection.executescript(script)
+        connection.execute("INSERT INTO schema_migrations VALUES (1, 'v1')")
+
+    with pytest.raises(ValueError, match="incompatible database schema"):
+        await SQLiteStore.open(path)
+    assert _v1_state(path)[1:] == ([(1,)], None, None)
 
 
 @pytest.mark.asyncio
@@ -113,7 +811,6 @@ async def test_sqlite_delete_leaves_global_cursor_hole(tmp_path: Path) -> None:
 async def test_sqlite_rejects_incompatible_existing_database(tmp_path: Path) -> None:
     path = tmp_path / "state.db"
     with sqlite3.connect(path) as connection:
-        initial_journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         connection.executescript(
             """
             CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -149,7 +846,9 @@ async def test_sqlite_rejects_incompatible_existing_database(tmp_path: Path) -> 
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
         ).fetchone()
     assert migration == (1, "existing")
-    assert final_journal_mode == initial_journal_mode
+    # Open arbitration establishes WAL before schema discovery, even when the
+    # later exact-schema validation fails closed.
+    assert final_journal_mode == ("wal",)
     assert events_sql is not None
     assert "AUTOINCREMENT" not in events_sql[0]
 

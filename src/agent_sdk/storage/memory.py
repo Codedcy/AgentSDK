@@ -10,8 +10,19 @@ from agent_sdk.storage.base import (
     EventPreconditionConflictError,
     EventPreconditionNotFoundError,
     SnapshotPreconditionError,
+    SnapshotPrecondition,
     SnapshotWrite,
     StoredEvent,
+)
+from agent_sdk.storage.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyRecord,
+    IdempotencyReplay,
+    IdempotencyReplayMissError,
+    IdempotencyValidationError,
+    detached_record,
+    record_from_write,
+    validate_replay,
 )
 
 _AggregateKey: TypeAlias = tuple[str, str]
@@ -29,10 +40,37 @@ class InMemoryStore:
         self._lock = asyncio.Lock()
         self._events: list[StoredEvent] = []
         self._snapshots: dict[_SnapshotKey, SnapshotWrite] = {}
+        self._idempotency: dict[tuple[str, str], IdempotencyRecord] = {}
         self._last_cursor = 0
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
+        if batch.replay_preconditions and batch.idempotency is None:
+            raise IdempotencyValidationError(
+                "replay preconditions require an idempotency request"
+            )
+        request = batch.idempotency
+        incoming: IdempotencyRecord | None = None
+        if isinstance(request, IdempotencyReplay):
+            validate_replay(request)
+        elif request is not None:
+            incoming = record_from_write(request)
         async with self._lock:
+            if request is not None:
+                key = (request.scope, request.key)
+                existing = self._idempotency.get(key)
+                if existing is not None:
+                    self._check_snapshot_preconditions(batch.replay_preconditions)
+                    if existing.request_fingerprint != request.request_fingerprint:
+                        raise IdempotencyConflictError("idempotency key was reused")
+                    return CommitResult(
+                        self._last_cursor,
+                        applied=False,
+                        idempotency=detached_record(existing),
+                    )
+                if isinstance(request, IdempotencyReplay):
+                    raise IdempotencyReplayMissError(
+                        "idempotency replay record no longer exists"
+                    )
             if batch.event_preconditions:
                 events_by_id = {
                     stored.event.event_id: stored for stored in self._events
@@ -54,26 +92,10 @@ class InMemoryStore:
                         raise EventPreconditionConflictError(
                             "event precondition failed"
                         )
-            for snapshot_precondition in batch.preconditions:
-                snapshot = self._snapshots.get(
-                    (snapshot_precondition.kind, snapshot_precondition.entity_id)
-                )
-                if snapshot is None or (
-                    snapshot_precondition.version is not None
-                    and snapshot.version != snapshot_precondition.version
-                ) or (
-                    snapshot_precondition.session_id is not None
-                    and snapshot.session_id != snapshot_precondition.session_id
-                ) or (
-                    snapshot_precondition.data is not None
-                    and canonical_snapshot_data(snapshot.data)
-                    != canonical_snapshot_data(snapshot_precondition.data)
-                ):
-                    raise SnapshotPreconditionError(
-                        "snapshot precondition failed"
-                    )
+            self._check_snapshot_preconditions(batch.preconditions)
             events = self._events.copy()
             snapshots = self._snapshots.copy()
+            idempotency = self._idempotency.copy()
             last_cursor = self._last_cursor
             sequences = self._latest_sequences(events)
             event_ids = {stored.event.event_id for stored in events}
@@ -100,10 +122,34 @@ class InMemoryStore:
                     raise ValueError("snapshot version must be strictly increasing")
                 snapshots[key] = deepcopy(snapshot)
 
+            if isinstance(incoming, IdempotencyRecord):
+                idempotency[(incoming.scope, incoming.key)] = detached_record(incoming)
+
             self._events = events
             self._snapshots = snapshots
+            self._idempotency = idempotency
             self._last_cursor = last_cursor
-            return CommitResult(last_cursor)
+            return CommitResult(last_cursor, idempotency=incoming)
+
+    def _check_snapshot_preconditions(
+        self, preconditions: tuple[SnapshotPrecondition, ...]
+    ) -> None:
+        for snapshot_precondition in preconditions:
+            snapshot = self._snapshots.get(
+                (snapshot_precondition.kind, snapshot_precondition.entity_id)
+            )
+            if snapshot is None or (
+                snapshot_precondition.version is not None
+                and snapshot.version != snapshot_precondition.version
+            ) or (
+                snapshot_precondition.session_id is not None
+                and snapshot.session_id != snapshot_precondition.session_id
+            ) or (
+                snapshot_precondition.data is not None
+                and canonical_snapshot_data(snapshot.data)
+                != canonical_snapshot_data(snapshot_precondition.data)
+            ):
+                raise SnapshotPreconditionError("snapshot precondition failed")
 
     async def read_events(
         self,
@@ -142,6 +188,11 @@ class InMemoryStore:
         async with self._lock:
             return self._last_cursor
 
+    async def get_idempotency(self, scope: str, key: str) -> IdempotencyRecord | None:
+        async with self._lock:
+            record = self._idempotency.get((scope, key))
+            return None if record is None else detached_record(record)
+
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
             events = [
@@ -154,6 +205,11 @@ class InMemoryStore:
             }
             self._events = events
             self._snapshots = snapshots
+            self._idempotency = {
+                key: record
+                for key, record in self._idempotency.items()
+                if record.session_id != session_id
+            }
 
     @staticmethod
     def _latest_sequences(events: list[StoredEvent]) -> dict[_AggregateKey, int]:

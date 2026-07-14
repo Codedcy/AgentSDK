@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
+from enum import Enum
 from importlib import resources
 from pathlib import Path
-from typing import Any, cast
+from time import monotonic
+from typing import Any, NamedTuple, cast
 
 import aiosqlite
 
@@ -18,11 +21,27 @@ from agent_sdk.storage.base import (
     EventPreconditionConflictError,
     EventPreconditionNotFoundError,
     SnapshotPreconditionError,
+    SnapshotPrecondition,
     SnapshotWrite,
     StoredEvent,
 )
+from agent_sdk.storage.idempotency import (
+    IdempotencyConflictError,
+    IdempotencyRecord,
+    IdempotencyReplay,
+    IdempotencyReplayMissError,
+    IdempotencyValidationError,
+    canonical_result_json,
+    detached_record,
+    record_from_stored_json,
+    record_from_write,
+    validate_replay,
+)
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"
+_OPEN_BUSY_TIMEOUT_MS = 50
+_OPEN_RETRY_SECONDS = 2.0
 _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
     "schema_migrations": (
         ("version", "INTEGER", False, 1),
@@ -46,16 +65,81 @@ _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
         ("version", "INTEGER", True, 0),
         ("data_json", "TEXT", True, 0),
     ),
+    "idempotency_records": (
+        ("scope", "TEXT", True, 1),
+        ("key", "TEXT", True, 2),
+        ("request_fingerprint", "TEXT", True, 0),
+        ("session_id", "TEXT", True, 0),
+        ("result_json", "TEXT", True, 0),
+    ),
 }
 _EXPECTED_INDEXES = {
     "events_session_cursor": (False, ("session_id", "cursor")),
     "events_aggregate_sequence": (True, (None, "sequence")),
     "snapshots_session": (False, ("session_id",)),
+    "idempotency_records_session": (False, ("session_id",)),
 }
 _AGGREGATE_INDEX_SQL = (
     "create unique index events_aggregate_sequence "
     "on events(coalesce(run_id, session_id), sequence)"
 )
+_EXPECTED_TABLE_SQL = {
+    "schema_migrations": """
+        CREATE TABLE schema_migrations(
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        )
+    """,
+    "events": """
+        CREATE TABLE events(
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT UNIQUE NOT NULL,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            sequence INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            occurred_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+    """,
+    "snapshots": """
+        CREATE TABLE snapshots(
+            kind TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            data_json TEXT NOT NULL,
+            PRIMARY KEY(kind, entity_id)
+        )
+    """,
+    "idempotency_records": """
+        CREATE TABLE idempotency_records(
+            scope TEXT NOT NULL,
+            key TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            PRIMARY KEY(scope, key)
+        )
+    """,
+}
+_EXPECTED_INDEX_SQL = {
+    "events_session_cursor": (
+        "CREATE INDEX events_session_cursor ON events(session_id, cursor)"
+    ),
+    "events_aggregate_sequence": _AGGREGATE_INDEX_SQL,
+    "snapshots_session": "CREATE INDEX snapshots_session ON snapshots(session_id)",
+    "idempotency_records_session": (
+        "CREATE INDEX idempotency_records_session ON idempotency_records(session_id)"
+    ),
+}
+
+
+class _SchemaState(Enum):
+    EMPTY = "empty"
+    V1 = "v1"
+    V2 = "v2"
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
@@ -73,6 +157,58 @@ def _normalized_sql(value: str) -> str:
     return "".join(value.casefold().split())
 
 
+def _complete_sql_statements(script: str) -> tuple[str, ...]:
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines(keepends=True):
+        pending += line
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            if statement:
+                statements.append(statement)
+            pending = ""
+    if pending.strip():
+        raise ValueError("incomplete packaged SQLite migration")
+    return tuple(statements)
+
+
+def _is_busy(error: sqlite3.Error) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return True
+    message = str(error).casefold()
+    return "database is locked" in message or "database table is locked" in message
+
+
+async def _with_busy_retry(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    deadline: float,
+    message: str,
+) -> Any:
+    while True:
+        try:
+            return await operation()
+        except sqlite3.OperationalError as error:
+            if not _is_busy(error) or monotonic() >= deadline:
+                if _is_busy(error):
+                    raise RuntimeError(message) from error
+                raise
+            await asyncio.sleep(0)
+
+
+async def _execute_script_statements(
+    connection: aiosqlite.Connection,
+    script: str,
+    *,
+    after_statement: Callable[[int], Awaitable[None]] | None = None,
+) -> None:
+    for index, statement in enumerate(_complete_sql_statements(script), start=1):
+        await connection.execute(statement)
+        if after_statement is not None:
+            await after_statement(index)
+
+
 class SQLiteStore:
     def __init__(self, connection: aiosqlite.Connection) -> None:
         self._connection = connection
@@ -85,10 +221,11 @@ class SQLiteStore:
         database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = await aiosqlite.connect(database_path)
         try:
-            await cls._migrate(connection)
             await cls._configure_connection(connection)
+            await cls._migrate(connection)
         except BaseException:
-            await connection.close()
+            close_task = asyncio.create_task(connection.close())
+            await cls._await_cleanup(close_task)
             raise
         return cls(connection)
 
@@ -104,25 +241,59 @@ class SQLiteStore:
                     self._closed = True
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
+        if batch.replay_preconditions and batch.idempotency is None:
+            raise IdempotencyValidationError(
+                "replay preconditions require an idempotency request"
+            )
+        request = batch.idempotency
+        incoming: IdempotencyRecord | None = None
+        if isinstance(request, IdempotencyReplay):
+            validate_replay(request)
+        elif request is not None:
+            incoming = record_from_write(request)
         async with self._lock:
             self._ensure_open()
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
+                if request is not None:
+                    existing = await self._read_idempotency(request.scope, request.key)
+                    if existing is not None:
+                        await self._check_snapshot_preconditions(
+                            batch.replay_preconditions
+                        )
+                        if existing.request_fingerprint != request.request_fingerprint:
+                            raise IdempotencyConflictError(
+                                "idempotency key was reused"
+                            )
+                        await self._rollback()
+                        return CommitResult(
+                            await self._last_cursor(),
+                            applied=False,
+                            idempotency=detached_record(existing),
+                        )
+                    if isinstance(request, IdempotencyReplay):
+                        raise IdempotencyReplayMissError(
+                            "idempotency replay record no longer exists"
+                        )
                 await self._check_event_preconditions(batch)
-                await self._check_snapshot_preconditions(batch)
+                await self._check_snapshot_preconditions(batch.preconditions)
                 for event in batch.events:
                     await self._insert_event(event)
                 for snapshot in batch.snapshots:
                     await self._upsert_newer_snapshot(snapshot)
+                if isinstance(incoming, IdempotencyRecord):
+                    await self._insert_idempotency(incoming)
                 cursor = await self._last_cursor()
                 await self._connection.commit()
-                return CommitResult(last_cursor=cursor)
+                return CommitResult(last_cursor=cursor, idempotency=incoming)
             except BaseException:
                 await self._rollback()
                 raise
 
-    async def _check_snapshot_preconditions(self, batch: CommitBatch) -> None:
-        for precondition in batch.preconditions:
+    async def _check_snapshot_preconditions(
+        self, preconditions: tuple[SnapshotPrecondition, ...]
+    ) -> None:
+        for precondition in preconditions:
             async with self._connection.execute(
                 """
                 SELECT version, session_id, data_json
@@ -219,6 +390,12 @@ class SQLiteStore:
                 return None
             return _json_object(cast(str, row[0]))
 
+    async def get_idempotency(self, scope: str, key: str) -> IdempotencyRecord | None:
+        async with self._lock:
+            self._ensure_open()
+            record = await self._read_idempotency(scope, key)
+            return None if record is None else detached_record(record)
+
     async def latest_cursor(self) -> int:
         async with self._lock:
             self._ensure_open()
@@ -235,6 +412,10 @@ class SQLiteStore:
                 )
                 await self._connection.execute(
                     "DELETE FROM snapshots WHERE session_id = ?",
+                    (session_id,),
+                )
+                await self._connection.execute(
+                    "DELETE FROM idempotency_records WHERE session_id = ?",
                     (session_id,),
                 )
                 await self._connection.commit()
@@ -343,6 +524,43 @@ class SQLiteStore:
             ),
         )
 
+    async def _read_idempotency(
+        self, scope: str, key: str
+    ) -> IdempotencyRecord | None:
+        async with self._connection.execute(
+            """
+            SELECT scope, key, request_fingerprint, session_id, result_json
+            FROM idempotency_records WHERE scope = ? AND key = ?
+            """,
+            (scope, key),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return record_from_stored_json(
+            scope=row[0],
+            key=row[1],
+            request_fingerprint=row[2],
+            session_id=row[3],
+            result_json=row[4],
+        )
+
+    async def _insert_idempotency(self, record: IdempotencyRecord) -> None:
+        await self._connection.execute(
+            """
+            INSERT INTO idempotency_records(
+                scope, key, request_fingerprint, session_id, result_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                record.scope,
+                record.key,
+                record.request_fingerprint,
+                record.session_id,
+                canonical_result_json(record),
+            ),
+        )
+
     async def _last_cursor(self) -> int:
         async with self._connection.execute(
             "SELECT seq FROM sqlite_sequence WHERE name = 'events'"
@@ -370,41 +588,77 @@ class SQLiteStore:
 
     @classmethod
     async def _migrate(cls, connection: aiosqlite.Connection) -> None:
-        async with connection.execute(
-            """
-            SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            """
-        ) as cursor:
-            rows = await cursor.fetchall()
-        table_names = {cast(str, row[0]) for row in rows}
+        deadline = monotonic() + _OPEN_RETRY_SECONDS
 
-        if "schema_migrations" not in table_names:
-            if table_names:
-                raise ValueError("incompatible database schema")
-            migration = resources.files("agent_sdk.storage").joinpath(
-                "migrations",
-                "0001_initial.sql",
-            )
-            await connection.executescript(migration.read_text(encoding="utf-8"))
-            await connection.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (_SCHEMA_VERSION, datetime.now(UTC).isoformat()),
-            )
-            await connection.commit()
-        else:
-            async with connection.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            ) as cursor:
-                version_rows = await cursor.fetchall()
-            versions = tuple(cast(int, row[0]) for row in version_rows)
-            if versions != (_SCHEMA_VERSION,):
-                raise ValueError("incompatible database schema version")
+        async def begin() -> None:
+            await connection.execute("BEGIN IMMEDIATE")
 
-        await cls._validate_schema(connection)
+        await _with_busy_retry(
+            begin,
+            deadline=deadline,
+            message="SQLite open conflict",
+        )
+        try:
+            state = await cls._discover_schema_state(connection)
+            upgraded = state is not _SchemaState.V2
+            empty_database = state is _SchemaState.EMPTY
+            if empty_database:
+                migration_one = resources.files("agent_sdk.storage").joinpath(
+                    "migrations", "0001_initial.sql"
+                )
+                await _execute_script_statements(
+                    connection, migration_one.read_text(encoding="utf-8")
+                )
+                await connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (1, datetime.now(UTC).isoformat()),
+                )
+                state = _SchemaState.V1
+
+            if state is _SchemaState.V1:
+                await cls._validate_schema(connection, expected_version=1)
+                migration_two = resources.files("agent_sdk.storage").joinpath(
+                    "migrations", "0002_idempotency.sql"
+                )
+
+                async def after_migration_statement(index: int) -> None:
+                    await cls._migration_checkpoint(f"migration-2-statement-{index}")
+
+                await _execute_script_statements(
+                    connection,
+                    migration_two.read_text(encoding="utf-8"),
+                    after_statement=after_migration_statement,
+                )
+                if not empty_database:
+                    await cls._validate_and_backfill_v1_projections(connection)
+                await connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (2, datetime.now(UTC).isoformat()),
+                )
+                await cls._migration_checkpoint("migration-2-version-inserted")
+
+            await cls._validate_schema(connection, expected_version=2)
+            if upgraded:
+                await cls._validate_v2_projections(connection)
+            await cls._migration_checkpoint("migration-2-final-validation")
+            commit_task = asyncio.create_task(connection.commit())
+            await cls._await_cleanup(commit_task)
+        except BaseException:
+            rollback_task = asyncio.create_task(connection.rollback())
+            await cls._await_cleanup(rollback_task)
+            raise
+
+    @staticmethod
+    async def _migration_checkpoint(stage: str) -> None:
+        del stage
 
     @staticmethod
     async def _configure_connection(connection: aiosqlite.Connection) -> None:
+        try:
+            await connection.execute(f"PRAGMA busy_timeout={_OPEN_BUSY_TIMEOUT_MS}")
+        except sqlite3.Error as error:
+            raise RuntimeError("failed to configure SQLite busy_timeout") from error
+
         try:
             await connection.execute("PRAGMA foreign_keys=ON")
             async with connection.execute("PRAGMA foreign_keys") as cursor:
@@ -414,17 +668,68 @@ class SQLiteStore:
         if foreign_keys != (1,):
             raise RuntimeError("failed to enable SQLite foreign_keys")
 
-        try:
+        async def enable_wal() -> tuple[Any, ...] | None:
             async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
-                journal_mode = await cursor.fetchone()
+                return cast(tuple[Any, ...] | None, await cursor.fetchone())
+
+        try:
+            journal_mode = await _with_busy_retry(
+                enable_wal,
+                deadline=monotonic() + _OPEN_RETRY_SECONDS,
+                message="SQLite journal_mode open conflict",
+            )
         except sqlite3.Error as error:
             raise RuntimeError("failed to enable SQLite journal_mode=WAL") from error
         if journal_mode is None or cast(str, journal_mode[0]).lower() != "wal":
             raise RuntimeError("failed to enable SQLite journal_mode=WAL")
 
     @classmethod
-    async def _validate_schema(cls, connection: aiosqlite.Connection) -> None:
-        for table_name, expected_info in _EXPECTED_TABLE_INFO.items():
+    async def _discover_schema_state(
+        cls, connection: aiosqlite.Connection
+    ) -> _SchemaState:
+        try:
+            async with connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            ) as cursor:
+                rows = await cursor.fetchall()
+            table_names = {cast(str, row[0]) for row in rows}
+            if not table_names:
+                return _SchemaState.EMPTY
+            v1_tables = {"schema_migrations", "events", "snapshots"}
+            v2_tables = {*v1_tables, "idempotency_records"}
+            frozen_table_names = frozenset(table_names)
+            if frozen_table_names not in {frozenset(v1_tables), frozenset(v2_tables)}:
+                raise ValueError("incompatible database schema")
+            async with connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ) as cursor:
+                version_rows = await cursor.fetchall()
+            versions = tuple(row[0] for row in version_rows)
+            if table_names == v1_tables and versions == (1,):
+                return _SchemaState.V1
+            if table_names == v2_tables and versions == (1, 2):
+                return _SchemaState.V2
+            raise ValueError("incompatible database schema version")
+        except sqlite3.Error as error:
+            raise ValueError("incompatible database schema") from error
+
+    @classmethod
+    async def _validate_schema(
+        cls,
+        connection: aiosqlite.Connection,
+        *,
+        expected_version: int,
+    ) -> None:
+        table_names = (
+            ("schema_migrations", "events", "snapshots")
+            if expected_version == 1
+            else tuple(_EXPECTED_TABLE_INFO)
+        )
+        for table_name in table_names:
+            expected_info = _EXPECTED_TABLE_INFO[table_name]
             async with connection.execute(f"PRAGMA table_info({table_name})") as cursor:
                 rows = await cursor.fetchall()
             table_info = tuple(
@@ -438,6 +743,15 @@ class SQLiteStore:
             )
             if table_info != expected_info:
                 raise ValueError("incompatible database schema")
+            async with connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ) as cursor:
+                table_sql = await cursor.fetchone()
+            if table_sql is None or _normalized_sql(cast(str, table_sql[0])) != (
+                _normalized_sql(_EXPECTED_TABLE_SQL[table_name])
+            ):
+                raise ValueError("incompatible database schema")
 
         async with connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'events'"
@@ -446,22 +760,44 @@ class SQLiteStore:
         if events_row is None or "AUTOINCREMENT" not in cast(str, events_row[0]).upper():
             raise ValueError("incompatible database schema")
 
+        expected_indexes = {
+            name: value
+            for name, value in _EXPECTED_INDEXES.items()
+            if expected_version == 2 or name != "idempotency_records_session"
+        }
         indexes: dict[str, tuple[bool, tuple[str | None, ...]]] = {}
-        for table_name in ("events", "snapshots"):
+        for table_name in (
+            ("events", "snapshots")
+            if expected_version == 1
+            else ("events", "snapshots", "idempotency_records")
+        ):
             async with connection.execute(f"PRAGMA index_list({table_name})") as cursor:
                 index_rows = await cursor.fetchall()
             for index_row in index_rows:
                 index_name = cast(str, index_row[1])
-                if index_name not in _EXPECTED_INDEXES:
+                if index_name.startswith("sqlite_autoindex_"):
                     continue
+                if index_name not in expected_indexes:
+                    raise ValueError("incompatible database schema")
                 async with connection.execute(f"PRAGMA index_info({index_name})") as cursor:
                     column_rows = await cursor.fetchall()
                 indexes[index_name] = (
                     bool(index_row[2]),
                     tuple(cast(str | None, column_row[2]) for column_row in column_rows),
                 )
-        if indexes != _EXPECTED_INDEXES:
+        if indexes != expected_indexes:
             raise ValueError("incompatible database schema")
+
+        for index_name in expected_indexes:
+            async with connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ) as cursor:
+                index_sql = await cursor.fetchone()
+            if index_sql is None or _normalized_sql(cast(str, index_sql[0])) != (
+                _normalized_sql(_EXPECTED_INDEX_SQL[index_name])
+            ):
+                raise ValueError("incompatible database schema")
 
         async with connection.execute(
             "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
@@ -487,3 +823,768 @@ class SQLiteStore:
             event_id_unique = await cursor.fetchone()
         if event_id_unique is None:
             raise ValueError("incompatible database schema")
+
+        async with connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ) as cursor:
+            versions = tuple(row[0] for row in await cursor.fetchall())
+        expected_versions = (1,) if expected_version == 1 else (1, 2)
+        if versions != expected_versions:
+            raise ValueError("incompatible database schema version")
+
+    @classmethod
+    async def _validate_and_backfill_v1_projections(
+        cls, connection: aiosqlite.Connection
+    ) -> None:
+        transformed = await _validated_v1_projection_transforms(connection)
+        for kind, entity_id, data in transformed:
+            result = await connection.execute(
+                "UPDATE snapshots SET data_json = ? WHERE kind = ? AND entity_id = ?",
+                (_canonical_json(data), kind, entity_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("incompatible version-1 projection")
+            await cls._migration_checkpoint(f"migration-2-backfill-{kind}-{entity_id}")
+
+    @staticmethod
+    async def _validate_v2_projections(connection: aiosqlite.Connection) -> None:
+        await _validate_current_projection_rows(connection)
+
+
+class _SnapshotRow(NamedTuple):
+    kind: str
+    entity_id: str
+    session_id: str
+    version: int
+    data_json: str
+
+
+class _EventRow(NamedTuple):
+    cursor: int
+    event_id: str
+    session_id: str
+    run_id: str | None
+    sequence: int
+    type: str
+    schema_version: int
+    occurred_at: str
+    payload_json: str
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _strict_json_object(value: str) -> dict[str, Any]:
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("stored JSON contains a duplicate key")
+            result[key] = item
+        return result
+
+    decoded = json.loads(
+        value,
+        object_pairs_hook=object_pairs,
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(decoded, dict):
+        raise ValueError("stored JSON must be an object")
+    return cast(dict[str, Any], decoded)
+
+
+async def _snapshot_rows(connection: aiosqlite.Connection) -> tuple[_SnapshotRow, ...]:
+    async with connection.execute(
+        """
+        SELECT kind, entity_id, session_id, version, data_json
+        FROM snapshots ORDER BY kind, entity_id
+        """
+    ) as cursor:
+        rows = await cursor.fetchall()
+    result: list[_SnapshotRow] = []
+    for row in rows:
+        if (
+            not isinstance(row[0], str)
+            or not isinstance(row[1], str)
+            or not isinstance(row[2], str)
+            or not isinstance(row[3], int)
+            or not isinstance(row[4], str)
+            or row[3] <= 0
+        ):
+            raise ValueError("incompatible projection row")
+        result.append(_SnapshotRow(*row))
+    return tuple(result)
+
+
+async def _event_rows(connection: aiosqlite.Connection) -> tuple[_EventRow, ...]:
+    async with connection.execute(
+        """
+        SELECT cursor, event_id, session_id, run_id, sequence, type,
+               schema_version, occurred_at, payload_json
+        FROM events ORDER BY cursor
+        """
+    ) as cursor:
+        rows = await cursor.fetchall()
+    result: list[_EventRow] = []
+    for row in rows:
+        if (
+            not isinstance(row[0], int)
+            or not isinstance(row[1], str)
+            or not isinstance(row[2], str)
+            or (row[3] is not None and not isinstance(row[3], str))
+            or not isinstance(row[4], int)
+            or not isinstance(row[5], str)
+            or not isinstance(row[6], int)
+            or not isinstance(row[7], str)
+            or not isinstance(row[8], str)
+            or row[0] <= 0
+            or row[4] <= 0
+        ):
+            raise ValueError("incompatible event row")
+        result.append(_EventRow(*row))
+    return tuple(result)
+
+
+_V1_SESSION_FIELDS = {"session_id", "status", "workspaces", "version"}
+_V1_RUN_FIELDS = {
+    "run_id",
+    "session_id",
+    "agent_revision",
+    "status",
+    "user_input",
+    "version",
+    "output_text",
+    "usage",
+    "parent_run_id",
+    "workflow_run_id",
+    "workflow_node_id",
+    "task_envelope",
+    "error",
+}
+_V1_WORKFLOW_FIELDS = {
+    "workflow_run_id",
+    "session_id",
+    "status",
+    "workflow",
+    "nodes",
+    "version",
+    "output_text",
+    "usage",
+    "error",
+}
+
+
+async def _validated_v1_projection_transforms(
+    connection: aiosqlite.Connection,
+) -> tuple[tuple[str, str, dict[str, Any]], ...]:
+    from agent_sdk.context.models import ContextCapsule, ContextView
+    from agent_sdk.evaluation.models import EvaluationResult
+    from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot, SessionStatus
+    from agent_sdk.workflow.models import (
+        WorkflowNodeSnapshot,
+        WorkflowRunSnapshot,
+        WorkflowRunStatus,
+    )
+
+    try:
+        rows = await _snapshot_rows(connection)
+        decoded = {row: _strict_json_object(row.data_json) for row in rows}
+        session_rows = {row.entity_id: row for row in rows if row.kind == "session"}
+        sessions: dict[str, SessionSnapshot] = {}
+        for session_id, row in session_rows.items():
+            data = decoded[row]
+            if set(data) != _V1_SESSION_FIELDS or data.get("status") != "active":
+                raise ValueError("incompatible version-1 session projection")
+            session = SessionSnapshot.model_validate(data)
+            if (
+                session.status is not SessionStatus.ACTIVE
+                or session.session_id != session_id
+                or row.session_id != session_id
+                or row.version != session.version
+            ):
+                raise ValueError("incompatible version-1 session identity")
+            sessions[session_id] = session
+
+        runs: dict[str, RunSnapshot] = {}
+        workflows: dict[str, WorkflowRunSnapshot] = {}
+        nodes: dict[str, WorkflowNodeSnapshot] = {}
+        capsules: dict[str, tuple[str, ContextCapsule]] = {}
+        views: dict[str, ContextView] = {}
+        evaluations: dict[str, EvaluationResult] = {}
+        transformed: dict[tuple[str, str], dict[str, Any]] = {}
+
+        for row in rows:
+            if row.session_id not in sessions:
+                raise ValueError("incompatible version-1 orphan projection")
+            data = decoded[row]
+            if row.kind == "session":
+                continue
+            if row.kind == "run":
+                if set(data) != _V1_RUN_FIELDS:
+                    raise ValueError("incompatible version-1 run projection")
+                current = {
+                    **data,
+                    "execution_compatibility": "legacy_unknown",
+                    "execution_descriptor": None,
+                    "tool_results": [],
+                }
+                run = RunSnapshot.model_validate(current)
+                if (
+                    run.run_id != row.entity_id
+                    or run.session_id != row.session_id
+                    or run.version != row.version
+                ):
+                    raise ValueError("incompatible version-1 run identity")
+                runs[run.run_id] = run
+                transformed[(row.kind, row.entity_id)] = current
+            elif row.kind == "workflow":
+                if set(data) != _V1_WORKFLOW_FIELDS:
+                    raise ValueError("incompatible version-1 workflow projection")
+                current = {
+                    **data,
+                    "execution_compatibility": "legacy_unknown",
+                    "execution_descriptor": None,
+                }
+                workflow = WorkflowRunSnapshot.model_validate(current)
+                if (
+                    workflow.workflow_run_id != row.entity_id
+                    or workflow.session_id != row.session_id
+                    or workflow.version != row.version
+                ):
+                    raise ValueError("incompatible version-1 workflow identity")
+                workflows[workflow.workflow_run_id] = workflow
+                transformed[(row.kind, row.entity_id)] = current
+            elif row.kind == "workflow_node":
+                node = WorkflowNodeSnapshot.model_validate(data)
+                if (
+                    node.entity_id != row.entity_id
+                    or node.session_id != row.session_id
+                    or node.version != row.version
+                ):
+                    raise ValueError("incompatible version-1 workflow node identity")
+                nodes[node.entity_id] = node
+            elif row.kind == "context_capsule":
+                if set(data) != {"session_id", "capsule"} or data["session_id"] != row.session_id:
+                    raise ValueError("incompatible version-1 context capsule")
+                capsule = ContextCapsule.model_validate(data["capsule"])
+                if row.version != 1:
+                    raise ValueError("incompatible version-1 context capsule version")
+                capsules[row.entity_id] = (row.session_id, capsule)
+            elif row.kind == "context_view":
+                view = ContextView.model_validate(data)
+                if (
+                    view.view_id != row.entity_id
+                    or view.session_id != row.session_id
+                    or row.version != 1
+                ):
+                    raise ValueError("incompatible version-1 context view identity")
+                views[view.view_id] = view
+            elif row.kind == "evaluation":
+                evaluation = EvaluationResult.model_validate(data)
+                if (
+                    evaluation.evaluation_id != row.entity_id
+                    or evaluation.session_id != row.session_id
+                    or evaluation.record_version != row.version
+                ):
+                    raise ValueError("incompatible version-1 evaluation identity")
+                evaluations[evaluation.evaluation_id] = evaluation
+            else:
+                raise ValueError("incompatible version-1 snapshot kind")
+
+        for node in nodes.values():
+            owner_workflow = workflows.get(node.workflow_run_id)
+            if owner_workflow is None or owner_workflow.session_id != node.session_id:
+                raise ValueError("incompatible version-1 workflow node owner")
+            nested = next(
+                (item for item in owner_workflow.nodes if item.entity_id == node.entity_id),
+                None,
+            )
+            if nested != node:
+                raise ValueError("incompatible version-1 workflow node projection")
+        for workflow in workflows.values():
+            for nested in workflow.nodes:
+                if nodes.get(nested.entity_id) != nested:
+                    raise ValueError("incompatible version-1 workflow node projection")
+
+        for view in views.values():
+            if view.capsule_id is not None:
+                capsule_ref = capsules.get(view.capsule_id)
+                if capsule_ref is None or capsule_ref[0] != view.session_id:
+                    raise ValueError("incompatible version-1 context reference")
+        for evaluation in evaluations.values():
+            subject_run = runs.get(evaluation.subject_run_id)
+            if subject_run is None or subject_run.session_id != evaluation.session_id:
+                raise ValueError("incompatible version-1 evaluation subject")
+
+        events = await _event_rows(connection)
+        await _validate_v1_events(
+            events=events,
+            sessions=sessions,
+            runs=runs,
+            workflows=workflows,
+            nodes=nodes,
+            capsules=capsules,
+            views=views,
+            evaluations=evaluations,
+        )
+
+        active_runs: dict[str, list[str]] = {session_id: [] for session_id in sessions}
+        active_workflows: dict[str, list[str]] = {
+            session_id: [] for session_id in sessions
+        }
+        for run in runs.values():
+            if run.status in {
+                RunStatus.CREATED,
+                RunStatus.RUNNING,
+                RunStatus.WAITING_PERMISSION,
+            }:
+                active_runs[run.session_id].append(run.run_id)
+        for workflow in workflows.values():
+            if workflow.status is WorkflowRunStatus.RUNNING:
+                active_workflows[workflow.session_id].append(workflow.workflow_run_id)
+        for session_id, session in sessions.items():
+            data = decoded[session_rows[session_id]]
+            transformed[("session", session_id)] = {
+                **data,
+                "active_run_ids": sorted(active_runs[session_id]),
+                "active_workflow_run_ids": sorted(active_workflows[session_id]),
+            }
+
+        return tuple(
+            (kind, entity_id, transformed[(kind, entity_id)])
+            for kind, entity_id in sorted(transformed)
+        )
+    except ValueError as error:
+        if str(error).startswith("incompatible version-1"):
+            raise
+        raise ValueError("incompatible version-1 projection") from error
+    except Exception as error:
+        raise ValueError("incompatible version-1 projection") from error
+
+
+async def _validate_v1_events(
+    *,
+    events: tuple[_EventRow, ...],
+    sessions: Mapping[str, Any],
+    runs: Mapping[str, Any],
+    workflows: Mapping[str, Any],
+    nodes: Mapping[str, Any],
+    capsules: Mapping[str, tuple[str, Any]],
+    views: Mapping[str, Any],
+    evaluations: Mapping[str, Any],
+) -> None:
+    from agent_sdk.events.models import EventEnvelope
+    from agent_sdk.runtime.models import RunSnapshot, RunStatus
+    from agent_sdk.workflow.models import WorkflowNodeStatus, WorkflowRunStatus
+
+    payloads: dict[str, dict[str, Any]] = {}
+    event_ids: set[str] = set()
+    events_by_id: dict[str, _EventRow] = {}
+    by_run: dict[str, list[_EventRow]] = {}
+    for row in events:
+        payload = _strict_json_object(row.payload_json)
+        EventEnvelope.model_validate(
+            {
+                "event_id": row.event_id,
+                "schema_version": row.schema_version,
+                "type": row.type,
+                "session_id": row.session_id,
+                "run_id": row.run_id,
+                "sequence": row.sequence,
+                "payload": payload,
+                "occurred_at": row.occurred_at,
+            }
+        )
+        if row.event_id in event_ids or row.session_id not in sessions:
+            raise ValueError("incompatible version-1 event owner")
+        event_ids.add(row.event_id)
+        events_by_id[row.event_id] = row
+        payloads[row.event_id] = payload
+        if row.run_id is not None:
+            by_run.setdefault(row.run_id, []).append(row)
+
+    session_created: dict[str, list[_EventRow]] = {}
+    for row in events:
+        if row.type == "session.created":
+            if row.run_id is not None or row.sequence != 1:
+                raise ValueError("incompatible version-1 session event")
+            payload = payloads[row.event_id]
+            if (
+                set(payload) != _V1_SESSION_FIELDS
+                or payload.get("session_id") != row.session_id
+                or payload.get("status") != "active"
+            ):
+                raise ValueError("incompatible version-1 session event payload")
+            session_created.setdefault(row.session_id, []).append(row)
+    if any(len(session_created.get(session_id, ())) != 1 for session_id in sessions):
+        raise ValueError("incompatible version-1 session facts")
+
+    for run_id, run in runs.items():
+        aggregate = sorted(by_run.get(run_id, ()), key=lambda item: item.sequence)
+        created = [item for item in aggregate if item.type == "run.created"]
+        terminals = [
+            item for item in aggregate if item.type in {"run.completed", "run.failed"}
+        ]
+        if len(created) != 1 or created[0].sequence != 1:
+            raise ValueError("incompatible version-1 run start fact")
+        created_payload = payloads[created[0].event_id]
+        if set(created_payload) != _V1_RUN_FIELDS:
+            raise ValueError("incompatible version-1 run start payload")
+        migrated_payload = {
+            **created_payload,
+            "execution_compatibility": "legacy_unknown",
+            "execution_descriptor": None,
+            "tool_results": [],
+        }
+        created_run = RunSnapshot.model_validate(migrated_payload)
+        if (
+            created_run.status is not RunStatus.CREATED
+            or created_run.run_id != run_id
+            or created_run.session_id != run.session_id
+            or created[0].session_id != run.session_id
+        ):
+            raise ValueError("incompatible version-1 run start payload")
+        if run.status is RunStatus.COMPLETED:
+            expected_terminal = "run.completed"
+        elif run.status is RunStatus.FAILED:
+            expected_terminal = "run.failed"
+        else:
+            expected_terminal = None
+        if expected_terminal is None:
+            if terminals:
+                raise ValueError("incompatible version-1 run terminal fact")
+        elif (
+            len(terminals) != 1
+            or terminals[0].type != expected_terminal
+            or terminals[0].sequence != run.version
+            or terminals[0].session_id != run.session_id
+        ):
+            raise ValueError("incompatible version-1 run terminal fact")
+
+    for row in events:
+        if row.type == "run.created" and (row.run_id is None or row.run_id not in runs):
+            raise ValueError("incompatible version-1 orphan run event")
+
+    for workflow_id, workflow in workflows.items():
+        aggregate = sorted(by_run.get(workflow_id, ()), key=lambda item: item.sequence)
+        started = [item for item in aggregate if item.type == "workflow.started"]
+        terminals = [
+            item
+            for item in aggregate
+            if item.type in {"workflow.completed", "workflow.failed"}
+        ]
+        if (
+            len(started) != 1
+            or started[0].sequence != 1
+            or started[0].session_id != workflow.session_id
+        ):
+            raise ValueError("incompatible version-1 workflow start fact")
+        start_payload = payloads[started[0].event_id]
+        if set(start_payload) != {"definition_hash", "name"} or (
+            start_payload.get("definition_hash") != workflow.workflow.definition_hash
+            or start_payload.get("name") != workflow.workflow.name
+        ):
+            raise ValueError("incompatible version-1 workflow start payload")
+
+        state: dict[str, dict[str, object]] = {
+            node.node_id: {
+                "status": WorkflowNodeStatus.PENDING,
+                "version": 1,
+                "run_id": None,
+            }
+            for node in workflow.nodes
+        }
+        aggregate_version = 1
+        for event in aggregate:
+            if event.type not in {
+                "workflow.node.started",
+                "workflow.node.completed",
+                "workflow.node.failed",
+            }:
+                continue
+            payload = payloads[event.event_id]
+            node_id = payload.get("node_id")
+            if not isinstance(node_id, str) or node_id not in state:
+                raise ValueError("incompatible version-1 workflow node event")
+            current = state[node_id]
+            aggregate_version += 1
+            if event.sequence != aggregate_version:
+                raise ValueError("incompatible version-1 workflow event sequence")
+            if event.type == "workflow.node.started":
+                node_run_id = payload.get("run_id")
+                if (
+                    current["status"] is not WorkflowNodeStatus.PENDING
+                    or not isinstance(node_run_id, str)
+                ):
+                    raise ValueError("incompatible version-1 workflow node event")
+                current.update(
+                    status=WorkflowNodeStatus.RUNNING,
+                    version=2,
+                    run_id=node_run_id,
+                )
+            else:
+                if (
+                    current["status"] is not WorkflowNodeStatus.RUNNING
+                    or payload.get("run_id") != current["run_id"]
+                ):
+                    raise ValueError("incompatible version-1 workflow node event")
+                current.update(
+                    status=(
+                        WorkflowNodeStatus.COMPLETED
+                        if event.type == "workflow.node.completed"
+                        else WorkflowNodeStatus.FAILED
+                    ),
+                    version=3,
+                )
+        for node in workflow.nodes:
+            reduced = state[node.node_id]
+            if (
+                node.status is not reduced["status"]
+                or node.version != reduced["version"]
+                or node.run_id != reduced["run_id"]
+                or nodes.get(node.entity_id) != node
+            ):
+                raise ValueError("incompatible version-1 workflow node facts")
+        if workflow.status is WorkflowRunStatus.COMPLETED:
+            expected_terminal = "workflow.completed"
+        elif workflow.status is WorkflowRunStatus.FAILED:
+            expected_terminal = "workflow.failed"
+        else:
+            expected_terminal = None
+        if expected_terminal is None:
+            if terminals or aggregate_version != workflow.version:
+                raise ValueError("incompatible version-1 workflow terminal fact")
+        else:
+            aggregate_version += 1
+            if (
+                len(terminals) != 1
+                or terminals[0].type != expected_terminal
+                or terminals[0].sequence != aggregate_version
+                or terminals[0].sequence != workflow.version
+            ):
+                raise ValueError("incompatible version-1 workflow terminal fact")
+
+    for row in events:
+        if row.type == "workflow.started" and (
+            row.run_id is None or row.run_id not in workflows
+        ):
+            raise ValueError("incompatible version-1 orphan workflow event")
+
+    view_events: dict[str, _EventRow] = {}
+    capsule_events: set[str] = set()
+    evaluation_events: dict[str, _EventRow] = {}
+    for row in events:
+        payload = payloads[row.event_id]
+        if row.type == "context.view.created":
+            view_id = payload.get("view_id")
+            if not isinstance(view_id, str) or view_id in view_events:
+                raise ValueError("incompatible version-1 context event")
+            view_events[view_id] = row
+        elif row.type == "context.compaction.completed":
+            capsule_id = payload.get("capsule_id")
+            if isinstance(capsule_id, str):
+                capsule_events.add(capsule_id)
+        elif row.type == "evaluation.completed":
+            evaluation_id = payload.get("evaluation_id")
+            if not isinstance(evaluation_id, str) or evaluation_id in evaluation_events:
+                raise ValueError("incompatible version-1 evaluation event")
+            evaluation_events[evaluation_id] = row
+    for view_id, event in view_events.items():
+        view = views.get(view_id)
+        payload = payloads[event.event_id]
+        if (
+            view is None
+            or event.session_id != view.session_id
+            or event.run_id != view_id
+            or payload.get("capsule_id") != view.capsule_id
+        ):
+            raise ValueError("incompatible version-1 context event")
+    for capsule_id in capsule_events:
+        capsule = capsules.get(capsule_id)
+        if capsule is None or not any(
+            row.session_id == capsule[0]
+            and payloads[row.event_id].get("capsule_id") == capsule_id
+            for row in events
+        ):
+            raise ValueError("incompatible version-1 context capsule event")
+    for evaluation_id, event in evaluation_events.items():
+        evaluation = evaluations.get(evaluation_id)
+        if (
+            evaluation is None
+            or event.session_id != evaluation.session_id
+            or event.run_id != evaluation_id
+            or payloads[event.event_id] != evaluation.model_dump(mode="json")
+        ):
+            raise ValueError("incompatible version-1 evaluation event")
+    for _, (session_id, capsule) in capsules.items():
+        if any(
+            source_id not in events_by_id
+            or events_by_id[source_id].session_id != session_id
+            for source_id in capsule.source_event_ids
+        ):
+            raise ValueError("incompatible version-1 context source reference")
+    for view in views.values():
+        if any(
+            reference not in events_by_id
+            or events_by_id[reference].session_id != view.session_id
+            for reference in view.message_refs
+        ):
+            raise ValueError("incompatible version-1 context message reference")
+    for evaluation in evaluations.values():
+        if any(
+            evidence_id not in events_by_id
+            or events_by_id[evidence_id].session_id != evaluation.session_id
+            for evidence_id in evaluation.evidence_event_ids
+        ):
+            raise ValueError("incompatible version-1 evaluation evidence")
+    for view_id, view in views.items():
+        view_event = view_events.get(view_id)
+        if (
+            view_event is None
+            or view_event.session_id != view.session_id
+            or view_event.run_id != view_id
+        ):
+            raise ValueError("incompatible version-1 context facts")
+    for capsule_id, (session_id, _) in capsules.items():
+        if capsule_id not in capsule_events:
+            raise ValueError("incompatible version-1 context capsule facts")
+        if not any(
+            row.session_id == session_id
+            and payloads[row.event_id].get("capsule_id") == capsule_id
+            for row in events
+        ):
+            raise ValueError("incompatible version-1 context capsule owner")
+    for evaluation_id, evaluation in evaluations.items():
+        evaluation_event = evaluation_events.get(evaluation_id)
+        if (
+            evaluation_event is None
+            or evaluation_event.session_id != evaluation.session_id
+            or evaluation_event.run_id != evaluation_id
+        ):
+            raise ValueError("incompatible version-1 evaluation facts")
+
+
+async def _validate_current_projection_rows(connection: aiosqlite.Connection) -> None:
+    from agent_sdk.context.models import ContextCapsule, ContextView
+    from agent_sdk.evaluation.models import EvaluationResult
+    from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
+    from agent_sdk.workflow.models import WorkflowNodeSnapshot, WorkflowRunSnapshot
+
+    try:
+        rows = await _snapshot_rows(connection)
+        decoded = {row: _strict_json_object(row.data_json) for row in rows}
+        sessions: dict[str, SessionSnapshot] = {}
+        runs: dict[str, RunSnapshot] = {}
+        workflows: dict[str, WorkflowRunSnapshot] = {}
+        nodes: dict[str, WorkflowNodeSnapshot] = {}
+        capsules: dict[str, tuple[str, ContextCapsule]] = {}
+        views: dict[str, ContextView] = {}
+        evaluations: dict[str, EvaluationResult] = {}
+        for row in rows:
+            if row.kind != "session":
+                continue
+            session = SessionSnapshot.model_validate(decoded[row])
+            if (
+                session.session_id != row.entity_id
+                or row.session_id != session.session_id
+                or row.version != session.version
+            ):
+                raise ValueError("current session identity is invalid")
+            sessions[session.session_id] = session
+        for row in rows:
+            if row.session_id not in sessions:
+                raise ValueError("current projection owner is missing")
+            data = decoded[row]
+            if row.kind == "session":
+                continue
+            if row.kind == "run":
+                run_value = RunSnapshot.model_validate(data)
+                if (
+                    run_value.run_id != row.entity_id
+                    or run_value.session_id != row.session_id
+                    or run_value.version != row.version
+                ):
+                    raise ValueError("current run identity is invalid")
+                runs[run_value.run_id] = run_value
+            elif row.kind == "workflow":
+                workflow_value = WorkflowRunSnapshot.model_validate(data)
+                if (
+                    workflow_value.workflow_run_id != row.entity_id
+                    or workflow_value.session_id != row.session_id
+                    or workflow_value.version != row.version
+                ):
+                    raise ValueError("current workflow identity is invalid")
+                workflows[workflow_value.workflow_run_id] = workflow_value
+            elif row.kind == "workflow_node":
+                node_value = WorkflowNodeSnapshot.model_validate(data)
+                if (
+                    node_value.entity_id != row.entity_id
+                    or node_value.session_id != row.session_id
+                    or node_value.version != row.version
+                ):
+                    raise ValueError("current workflow node identity is invalid")
+                nodes[node_value.entity_id] = node_value
+            elif row.kind == "context_capsule":
+                if set(data) != {"session_id", "capsule"} or data["session_id"] != row.session_id:
+                    raise ValueError("current context capsule is invalid")
+                capsule_value = ContextCapsule.model_validate(data["capsule"])
+                if row.version != 1:
+                    raise ValueError("current context capsule version is invalid")
+                capsules[row.entity_id] = (row.session_id, capsule_value)
+            elif row.kind == "context_view":
+                view_value = ContextView.model_validate(data)
+                if (
+                    view_value.view_id != row.entity_id
+                    or view_value.session_id != row.session_id
+                    or row.version != 1
+                ):
+                    raise ValueError("current context view identity is invalid")
+                views[view_value.view_id] = view_value
+            elif row.kind == "evaluation":
+                evaluation_value = EvaluationResult.model_validate(data)
+                if (
+                    evaluation_value.evaluation_id != row.entity_id
+                    or evaluation_value.session_id != row.session_id
+                    or evaluation_value.record_version != row.version
+                ):
+                    raise ValueError("current evaluation identity is invalid")
+                evaluations[evaluation_value.evaluation_id] = evaluation_value
+            else:
+                raise ValueError("current snapshot kind is invalid")
+        for workflow in workflows.values():
+            for node in workflow.nodes:
+                if nodes.get(node.entity_id) != node:
+                    raise ValueError("current workflow node projection is invalid")
+        for node in nodes.values():
+            owner_workflow = workflows.get(node.workflow_run_id)
+            if owner_workflow is None or owner_workflow.session_id != node.session_id:
+                raise ValueError("current workflow node owner is invalid")
+        for view in views.values():
+            if view.capsule_id is not None:
+                capsule = capsules.get(view.capsule_id)
+                if capsule is None or capsule[0] != view.session_id:
+                    raise ValueError("current context reference is invalid")
+        for evaluation in evaluations.values():
+            run = runs.get(evaluation.subject_run_id)
+            if run is None or run.session_id != evaluation.session_id:
+                raise ValueError("current evaluation subject is invalid")
+        async with connection.execute(
+            """
+            SELECT scope, key, request_fingerprint, session_id, result_json
+            FROM idempotency_records ORDER BY scope, key
+            """
+        ) as cursor:
+            records = await cursor.fetchall()
+        for record_row in records:
+            record = record_from_stored_json(
+                scope=record_row[0],
+                key=record_row[1],
+                request_fingerprint=record_row[2],
+                session_id=record_row[3],
+                result_json=record_row[4],
+            )
+            if record.session_id not in sessions:
+                raise ValueError("current idempotency owner is invalid")
+    except Exception as error:
+        raise ValueError("incompatible current projections") from error

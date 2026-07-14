@@ -63,8 +63,12 @@ class ToolSpec(BaseModel):
     name: str = Field(min_length=1)
     description: str
     input_schema: Mapping[str, Any]
-    version: str = "1"
-    source: str = "application"
+    version: str = Field(
+        default="1",
+        min_length=1,
+        description="Application-maintained handler/capability version.",
+    )
+    source: str = Field(default="application", min_length=1)
     effects: tuple[str, ...] = ()
     timeout_seconds: float | None = Field(default=None, gt=0)
 

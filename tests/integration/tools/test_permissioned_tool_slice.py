@@ -273,7 +273,7 @@ async def test_gateway_assembles_real_litellm_attribute_tool_fragments() -> None
 
 
 @pytest.mark.asyncio
-async def test_text_only_run_keeps_snapshot_and_terminal_payload_unchanged() -> None:
+async def test_text_only_run_persists_empty_ordered_tool_results() -> None:
     store = InMemoryStore()
 
     async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
@@ -304,7 +304,7 @@ async def test_text_only_run_keeps_snapshot_and_terminal_payload_unchanged() -> 
         )
 
         assert result.tool_results == ()
-        assert "tool_results" not in snapshot.model_dump(mode="json")
+        assert snapshot.model_dump(mode="json")["tool_results"] == []
         assert terminal.payload == {
             "output_text": "plain",
             "usage": TokenUsage().model_dump(),
