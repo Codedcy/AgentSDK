@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,26 @@ from agent_sdk.storage.memory import InMemoryStore
 
 async def _unused_acompletion(**_: object) -> AsyncIterator[dict[str, Any]]:
     raise AssertionError("session lifecycle must not call the model provider")
+
+
+def _assert_context_free_sanitizer(
+    error: AgentSDKError,
+    *,
+    secret: str,
+    original: BaseException | None = None,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    current = error.__traceback__
+    while current is not None:
+        local_values = current.tb_frame.f_locals
+        if original is not None:
+            assert all(value is not original for value in local_values.values())
+        assert secret not in repr(local_values)
+        current = current.tb_next
 
 
 @pytest.fixture
@@ -148,42 +169,96 @@ async def test_session_with_active_work_closes_to_closing_and_remains_busy() -> 
         await instance.close()
 
 
+class _AbsentIdempotencyBarrierStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.absent_hints = 0
+        self.both_absent = asyncio.Event()
+        self.release_commits = asyncio.Event()
+        self.create_commit_attempts = 0
+        self.create_applied: list[bool] = []
+
+    async def get_idempotency(self, scope: str, key: str):
+        record = await super().get_idempotency(scope, key)
+        if scope == "session.create" and record is None:
+            self.absent_hints += 1
+            if self.absent_hints == 2:
+                self.both_absent.set()
+            await asyncio.wait_for(self.release_commits.wait(), timeout=1)
+        return record
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        if batch.idempotency is not None and batch.idempotency.scope == "session.create":
+            self.create_commit_attempts += 1
+        result = await super().commit(batch)
+        if batch.idempotency is not None and batch.idempotency.scope == "session.create":
+            self.create_applied.append(result.applied)
+        return result
+
+
 async def test_matching_concurrent_create_returns_one_durable_session() -> None:
-    store = InMemoryStore()
+    store = _AbsentIdempotencyBarrierStore()
     first_instance = await _sdk_with_store(store)
     second_instance = await _sdk_with_store(store)
+    tasks: list[asyncio.Task[SessionSnapshot]] = []
     try:
-        first, second = await asyncio.gather(
-            first_instance.sessions.create(
+        tasks = [
+            asyncio.create_task(first_instance.sessions.create(
                 workspaces=[Path("one"), "two"], idempotency_key="key"
-            ),
-            second_instance.sessions.create(
+            )),
+            asyncio.create_task(second_instance.sessions.create(
                 workspaces=[Path("one"), "two"], idempotency_key="key"
-            ),
+            )),
+        ]
+        await asyncio.wait_for(store.both_absent.wait(), timeout=1)
+        assert store.absent_hints == 2
+        store.release_commits.set()
+        first, second = await asyncio.wait_for(
+            asyncio.gather(*tasks),
+            timeout=1,
         )
 
         assert first == second
         assert first.workspaces == ("one", "two")
+        assert store.create_commit_attempts == 2
+        assert sorted(store.create_applied) == [False, True]
         events = await store.read_events(after_cursor=0)
         assert [stored.event.type for stored in events] == ["session.created"]
     finally:
+        store.release_commits.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await first_instance.close()
         await second_instance.close()
 
 
 async def test_same_create_key_with_different_workspace_order_conflicts() -> None:
-    store = InMemoryStore()
+    store = _AbsentIdempotencyBarrierStore()
     first_instance = await _sdk_with_store(store)
     second_instance = await _sdk_with_store(store)
+    tasks: list[asyncio.Task[SessionSnapshot]] = []
     try:
-        outcomes = await asyncio.gather(
-            first_instance.sessions.create(
-                workspaces=["one", "two"], idempotency_key="same"
+        tasks = [
+            asyncio.create_task(
+                first_instance.sessions.create(
+                    workspaces=["private-one", "two"], idempotency_key="same"
+                )
             ),
-            second_instance.sessions.create(
-                workspaces=["two", "one"], idempotency_key="same"
+            asyncio.create_task(
+                second_instance.sessions.create(
+                    workspaces=["two", "private-two"], idempotency_key="same"
+                )
             ),
-            return_exceptions=True,
+        ]
+        await asyncio.wait_for(store.both_absent.wait(), timeout=1)
+        assert store.absent_hints == 2
+        store.release_commits.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=1,
         )
 
         snapshots = [value for value in outcomes if isinstance(value, SessionSnapshot)]
@@ -193,8 +268,25 @@ async def test_same_create_key_with_different_workspace_order_conflicts() -> Non
         assert errors[0].code is ErrorCode.CONFLICT
         assert errors[0].message == "idempotency key conflicts with another request"
         assert errors[0].retryable is False
+        assert errors[0].__cause__ is None
+        assert errors[0].__context__ is None
+        formatted = "".join(
+            traceback.format_exception(
+                type(errors[0]), errors[0], errors[0].__traceback__
+            )
+        )
+        assert "private-one" not in formatted
+        assert "private-two" not in formatted
+        assert store.create_commit_attempts == 2
+        assert store.create_applied == [True]
         assert len(await store.read_events(after_cursor=0)) == 1
     finally:
+        store.release_commits.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await first_instance.close()
         await second_instance.close()
 
@@ -210,6 +302,8 @@ async def test_create_rejects_invalid_idempotency_key(key: str) -> None:
         assert raised.value.code is ErrorCode.INVALID_STATE
         assert raised.value.message == "idempotency key is invalid"
         assert raised.value.retryable is False
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
         assert await store.read_events(after_cursor=0) == []
     finally:
         await instance.close()
@@ -267,8 +361,10 @@ async def test_malformed_stored_create_result_is_sanitized(tmp_path: Path) -> No
 
         assert raised.value.code is ErrorCode.INTERNAL
         assert raised.value.retryable is False
-        assert "must-not-leak" not in str(raised.value)
-        assert "must-not-leak" not in repr(raised.value)
+        _assert_context_free_sanitizer(
+            raised.value,
+            secret="must-not-leak",
+        )
     finally:
         await second_sdk.close()
 
@@ -416,6 +512,27 @@ class _FailingCommandStore(InMemoryStore):
         await super().delete_session(session_id)
 
 
+class _MalformedSessionSnapshotStore(InMemoryStore):
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        del kind, entity_id
+        return {"private": "must-not-leak-malformed-session"}
+
+
+async def test_malformed_session_snapshot_is_context_free() -> None:
+    instance = await _sdk_with_store(_MalformedSessionSnapshotStore())
+    try:
+        with pytest.raises(AgentSDKError) as raised:
+            await instance.sessions.get("ses_malformed")
+
+        assert raised.value.code is ErrorCode.INTERNAL
+        _assert_context_free_sanitizer(
+            raised.value,
+            secret="must-not-leak-malformed-session",
+        )
+    finally:
+        await instance.close()
+
+
 @pytest.mark.parametrize(
     "operation",
     ["create", "get", "close", "delete"],
@@ -452,8 +569,11 @@ async def test_custom_store_failures_are_sanitized(operation: str) -> None:
 
         assert raised.value.code is ErrorCode.INTERNAL
         assert raised.value.retryable is False
-        assert "must-not-leak-custom-store-failure" not in str(raised.value)
-        assert "must-not-leak-custom-store-failure" not in repr(raised.value)
+        _assert_context_free_sanitizer(
+            raised.value,
+            secret="must-not-leak-custom-store-failure",
+            original=store.error,
+        )
     finally:
         await instance.close()
 

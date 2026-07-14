@@ -12,28 +12,39 @@ from agent_sdk.storage.idempotency import IdempotencyReplay, IdempotencyWrite
 
 
 async def load_session(store: StateStore, session_id: str) -> SessionSnapshot:
+    data: dict[str, object] | None = None
+    store_failed = False
     try:
         data = await store.get_snapshot("session", session_id)
     except Exception:
+        store_failed = True
+    if store_failed:
         raise AgentSDKError(
             ErrorCode.INTERNAL,
             "failed to load session",
             retryable=False,
-        ) from None
+        )
     if data is None:
         raise AgentSDKError(
             ErrorCode.NOT_FOUND,
             "session not found",
             retryable=False,
         )
+    snapshot: SessionSnapshot | None = None
+    validation_failed = False
     try:
-        return SessionSnapshot.model_validate(data)
+        snapshot = SessionSnapshot.model_validate(data)
     except Exception:
+        validation_failed = True
+    if validation_failed:
+        data = None
         raise AgentSDKError(
             ErrorCode.INTERNAL,
             "failed to load session",
             retryable=False,
-        ) from None
+        )
+    assert snapshot is not None
+    return snapshot
 
 
 def session_write(snapshot: SessionSnapshot) -> SnapshotWrite:
