@@ -244,12 +244,14 @@ async def test_same_create_key_with_different_workspace_order_conflicts() -> Non
         tasks = [
             asyncio.create_task(
                 first_instance.sessions.create(
-                    workspaces=["private-one", "two"], idempotency_key="same"
+                    workspaces=["private-one", "private-two"],
+                    idempotency_key="same",
                 )
             ),
             asyncio.create_task(
                 second_instance.sessions.create(
-                    workspaces=["two", "private-two"], idempotency_key="same"
+                    workspaces=["private-two", "private-one"],
+                    idempotency_key="same",
                 )
             ),
         ]
