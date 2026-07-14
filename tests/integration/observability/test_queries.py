@@ -54,10 +54,11 @@ async def test_queries_are_cursor_qualified_and_high_water_survives_deletion(
     assert tuple(item.event.type for item in queried.events) == ("run.created",)
     assert queried.next_cursor == queried.as_of_cursor
 
-    high_water = await store.latest_cursor()
+    await commands.close_session(first_session.session_id)
+    before_delete = await store.latest_cursor()
     await commands.delete_session(first_session.session_id)
 
-    assert await store.latest_cursor() == high_water
+    assert await store.latest_cursor() == before_delete + 1
 
 
 @pytest.mark.asyncio
@@ -329,6 +330,7 @@ async def test_query_cursor_advances_over_unrelated_and_deleted_events(
     commands = RuntimeCommands(store)
     removed = await commands.create_session(workspaces=[])
     hole_cursor = await store.latest_cursor()
+    await commands.close_session(removed.session_id)
     await commands.delete_session(removed.session_id)
     retained = await commands.create_session(workspaces=[])
     run = await commands.start_run(

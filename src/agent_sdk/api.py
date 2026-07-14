@@ -189,9 +189,33 @@ class SessionAPI:
         self._commands = commands
         self._lifecycle = lifecycle
 
-    async def create(self, *, workspaces: Iterable[str | Path]) -> SessionSnapshot:
+    async def create(
+        self,
+        *,
+        workspaces: Iterable[str | Path],
+        idempotency_key: str | None = None,
+    ) -> SessionSnapshot:
         async with self._lifecycle.admit():
-            return await self._commands.create_session(workspaces=workspaces)
+            return await self._commands.create_session(
+                workspaces=workspaces,
+                idempotency_key=idempotency_key,
+            )
+
+    async def get(self, session_id: str) -> SessionSnapshot:
+        async with self._lifecycle.admit():
+            return await self._commands.get_session(session_id)
+
+    async def close(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> SessionSnapshot:
+        async with self._lifecycle.admit():
+            return await self._commands.close_session(
+                session_id,
+                idempotency_key=idempotency_key,
+            )
 
     async def delete(self, session_id: str) -> None:
         async with self._lifecycle.admit():

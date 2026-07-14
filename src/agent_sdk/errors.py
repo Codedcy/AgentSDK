@@ -16,3 +16,12 @@ class AgentSDKError(Exception):
 
     def to_dict(self) -> dict[str, Any]:
         return {"code": self.code.value, "message": self.message, "retryable": self.retryable}
+
+
+class SessionBusyError(AgentSDKError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CONFLICT,
+            "session has active work",
+            retryable=False,
+        )

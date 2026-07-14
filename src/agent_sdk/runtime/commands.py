@@ -1,28 +1,86 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Any
 
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.ids import new_id
-from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
+from agent_sdk.runtime.idempotency import _idempotency_public_error
+from agent_sdk.runtime.models import (
+    RunSnapshot,
+    RunStatus,
+    SessionSnapshot,
+    SessionStatus,
+)
+from agent_sdk.runtime.session_lifecycle import (
+    close_session_transition,
+    exact_session_precondition,
+    load_session,
+    session_transition_batch,
+    session_write,
+    transition_session,
+)
 from agent_sdk.storage.base import (
     CommitBatch,
+    CommitResult,
     SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
 )
+from agent_sdk.storage.idempotency import (
+    IdempotencyError,
+    IdempotencyRecord,
+    IdempotencyReplay,
+    IdempotencyReplayMissError,
+    IdempotencyWrite,
+    fingerprint_command,
+)
 from agent_sdk.subagents.models import TaskEnvelope
+
+_MAX_SESSION_COMMIT_ATTEMPTS = 8
+
+
+def session_result_idempotency(
+    snapshot: SessionSnapshot,
+    key: str,
+) -> IdempotencyWrite:
+    return IdempotencyWrite(
+        scope=f"session/{snapshot.session_id}/close",
+        key=key,
+        request_fingerprint=fingerprint_command(
+            "session.close", {"session_id": snapshot.session_id}
+        ),
+        session_id=snapshot.session_id,
+        result=snapshot.model_dump(mode="json"),
+    )
+
+
+def validate_session_result(result: Mapping[str, Any]) -> SessionSnapshot:
+    try:
+        return SessionSnapshot.model_validate(dict(result))
+    except Exception:
+        raise AgentSDKError(
+            ErrorCode.INTERNAL,
+            "session command result is invalid",
+            retryable=False,
+        ) from None
 
 
 class RuntimeCommands:
     def __init__(self, store: StateStore) -> None:
         self._store = store
 
-    async def create_session(self, *, workspaces: Iterable[str | Path]) -> SessionSnapshot:
+    async def create_session(
+        self,
+        *,
+        workspaces: Iterable[str | Path],
+        idempotency_key: str | None = None,
+    ) -> SessionSnapshot:
+        normalized_workspaces = tuple(str(workspace) for workspace in workspaces)
         snapshot = SessionSnapshot(
             session_id=new_id("ses"),
-            workspaces=tuple(str(workspace) for workspace in workspaces),
+            workspaces=normalized_workspaces,
         )
         data = snapshot.model_dump(mode="json")
         event = EventEnvelope.new(
@@ -32,33 +90,243 @@ class RuntimeCommands:
             sequence=1,
             payload=data,
         )
-        await self._store.commit(
-            CommitBatch(
-                events=(event,),
-                snapshots=(
-                    SnapshotWrite(
-                        "session",
-                        snapshot.session_id,
-                        snapshot.session_id,
-                        snapshot.version,
-                        data,
-                    ),
+        candidate = None
+        if idempotency_key is not None:
+            candidate = IdempotencyWrite(
+                scope="session.create",
+                key=idempotency_key,
+                request_fingerprint=fingerprint_command(
+                    "session.create", {"workspaces": list(normalized_workspaces)}
                 ),
+                session_id=snapshot.session_id,
+                result=data,
             )
+        batch = CommitBatch(
+            events=(event,),
+            snapshots=(session_write(snapshot),),
         )
-        return snapshot
+
+        for _ in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+            try:
+                if candidate is None:
+                    await self._commit_session_batch(
+                        batch,
+                        failure_message="failed to create session",
+                    )
+                    return snapshot
+                hint = await self._get_idempotency(
+                    candidate.scope,
+                    candidate.key,
+                    failure_message="failed to create session",
+                )
+                request: IdempotencyWrite | IdempotencyReplay = candidate
+                if hint is not None:
+                    request = IdempotencyReplay(
+                        candidate.scope,
+                        candidate.key,
+                        candidate.request_fingerprint,
+                    )
+                result = await self._commit_session_batch(
+                    batch._replace(idempotency=request),
+                    failure_message="failed to create session",
+                )
+                record = self._required_session_result(result)
+                return validate_session_result(record.result)
+            except IdempotencyReplayMissError:
+                continue
+            except IdempotencyError as error:
+                raise _idempotency_public_error(error) from None
+        raise _idempotency_public_error(
+            IdempotencyReplayMissError("idempotency replay retry exhausted")
+        ) from None
+
+    async def get_session(self, session_id: str) -> SessionSnapshot:
+        current = await load_session(self._store, session_id)
+        if current.status is SessionStatus.DELETING:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "session is deleting",
+                retryable=False,
+            )
+        return current
+
+    async def close_session(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> SessionSnapshot:
+        for _ in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+            current = await load_session(self._store, session_id)
+            if current.status is SessionStatus.DELETING:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "session is deleting",
+                    retryable=False,
+                )
+            try:
+                if current.status in {SessionStatus.CLOSING, SessionStatus.CLOSED}:
+                    return await self._record_session_result(
+                        current,
+                        idempotency_key,
+                    )
+                target = (
+                    SessionStatus.CLOSED
+                    if not current.active_run_ids
+                    and not current.active_workflow_run_ids
+                    else SessionStatus.CLOSING
+                )
+                updated = close_session_transition(current, target)
+                request: IdempotencyWrite | IdempotencyReplay | None = None
+                if idempotency_key is not None:
+                    candidate = session_result_idempotency(updated, idempotency_key)
+                    hint = await self._get_idempotency(
+                        candidate.scope,
+                        candidate.key,
+                        failure_message="failed to close session",
+                    )
+                    request = candidate
+                    if hint is not None:
+                        request = IdempotencyReplay(
+                            candidate.scope,
+                            candidate.key,
+                            candidate.request_fingerprint,
+                        )
+                result = await self._commit_session_batch(
+                    session_transition_batch(
+                        current,
+                        updated,
+                        "session.closed"
+                        if target is SessionStatus.CLOSED
+                        else "session.closing",
+                        idempotency=request,
+                    ),
+                    failure_message="failed to close session",
+                )
+                if request is None:
+                    return updated
+                record = self._required_session_result(result)
+                return validate_session_result(record.result)
+            except (SnapshotPreconditionError, IdempotencyReplayMissError):
+                continue
+            except IdempotencyError as error:
+                raise _idempotency_public_error(error) from None
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session changed concurrently",
+            retryable=True,
+        )
 
     async def delete_session(self, session_id: str) -> None:
+        for _ in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+            current = await load_session(self._store, session_id)
+            if current.status in {SessionStatus.ACTIVE, SessionStatus.CLOSING}:
+                raise SessionBusyError()
+            if current.status is SessionStatus.CLOSED:
+                deleting = transition_session(current, SessionStatus.DELETING)
+                try:
+                    await self._commit_session_batch(
+                        session_transition_batch(
+                            current,
+                            deleting,
+                            "session.deleting",
+                        ),
+                        failure_message="failed to delete session",
+                    )
+                except SnapshotPreconditionError:
+                    continue
+            try:
+                await self._store.delete_session(session_id)
+            except Exception:
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "failed to delete session",
+                    retryable=False,
+                ) from None
+            return
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session changed concurrently",
+            retryable=True,
+        )
+
+    async def _record_session_result(
+        self,
+        current: SessionSnapshot,
+        key: str | None,
+    ) -> SessionSnapshot:
+        if key is None:
+            return current
+        candidate = session_result_idempotency(current, key)
+        hint = await self._get_idempotency(
+            candidate.scope,
+            key,
+            failure_message="failed to close session",
+        )
+        request: IdempotencyWrite | IdempotencyReplay = candidate
+        if hint is not None:
+            request = IdempotencyReplay(
+                candidate.scope,
+                key,
+                candidate.request_fingerprint,
+            )
+        precondition = exact_session_precondition(current)
+        result = await self._commit_session_batch(
+            CommitBatch(
+                events=(),
+                preconditions=(precondition,),
+                idempotency=request,
+                replay_preconditions=(precondition,),
+            ),
+            failure_message="failed to close session",
+        )
+        record = self._required_session_result(result)
+        return validate_session_result(record.result)
+
+    async def _get_idempotency(
+        self,
+        scope: str,
+        key: str,
+        *,
+        failure_message: str,
+    ) -> IdempotencyRecord | None:
         try:
-            await self._store.delete_session(session_id)
-        except AgentSDKError:
+            return await self._store.get_idempotency(scope, key)
+        except IdempotencyError:
             raise
         except Exception:
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
-                "failed to delete session",
+                failure_message,
                 retryable=False,
             ) from None
+
+    async def _commit_session_batch(
+        self,
+        batch: CommitBatch,
+        *,
+        failure_message: str,
+    ) -> CommitResult:
+        try:
+            return await self._store.commit(batch)
+        except (IdempotencyError, SnapshotPreconditionError):
+            raise
+        except Exception:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                failure_message,
+                retryable=False,
+            ) from None
+
+    @staticmethod
+    def _required_session_result(result: CommitResult) -> IdempotencyRecord:
+        if result.idempotency is None:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "session command result is missing",
+                retryable=False,
+            )
+        return result.idempotency
 
     async def start_run(
         self,

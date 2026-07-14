@@ -365,6 +365,7 @@ async def test_complete_vertical_slice_survives_reopen_and_delete(
         assert reopen_calls == 0
         assert (workspace / "result.txt").stat().st_mtime_ns == workspace_mtime
 
+        await reopened.sessions.close(session.session_id)
         await reopened.sessions.delete(session.session_id)
         deleted_events = await reopened.queries.query_events(
             EventFilter(session_id=session.session_id)

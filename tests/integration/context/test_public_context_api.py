@@ -91,6 +91,7 @@ async def test_context_facade_builds_retrieves_and_deletes_session_capsule() -> 
     )
     assert all(isinstance(item, ObservedEvent) for item in sources)
 
+    await sdk.sessions.close(session.session_id)
     await sdk.sessions.delete(session.session_id)
     with pytest.raises(AgentSDKError) as missing:
         await sdk.context.get_capsule(

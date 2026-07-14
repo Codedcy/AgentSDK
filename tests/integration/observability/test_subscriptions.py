@@ -84,6 +84,7 @@ async def test_subscription_waits_for_later_commit_and_crosses_deleted_cursor_ho
     commands = RuntimeCommands(store)
     deleted = await commands.create_session(workspaces=[])
     deleted_cursor = await store.latest_cursor()
+    await commands.close_session(deleted.session_id)
     await commands.delete_session(deleted.session_id)
     service = SubscriptionService(store, poll_interval=0.001)
     stream = service.subscribe(cursor=deleted_cursor)

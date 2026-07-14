@@ -23,7 +23,7 @@ from agent_sdk.context import (
     ContextRetrieval,
     ContextView,
 )
-from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.evaluation import (
     EvaluationDecision,
     EvaluationEngine,
@@ -149,6 +149,7 @@ __all__ = [
     "QueryAPI",
     "QueryService",
     "SessionAPI",
+    "SessionBusyError",
     "SessionSnapshot",
     "SessionStatus",
     "SkillMetadata",
