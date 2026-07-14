@@ -13,6 +13,11 @@ from agent_sdk.storage.idempotency import (
 
 if TYPE_CHECKING:
     from agent_sdk.runtime.leases import Lease
+    from agent_sdk.runtime.reconciliation import (
+        ExternalOperation,
+        ReconciliationRequest,
+        RunCheckpoint,
+    )
 
 
 def canonical_snapshot_data(value: dict[str, Any]) -> str:
@@ -119,3 +124,55 @@ class StateStore(Protocol):
     async def release_lease(self, lease: Lease) -> None: ...
 
     async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None: ...
+
+    async def create_external_operation(
+        self, operation: ExternalOperation, *, lease: Lease, now: datetime
+    ) -> ExternalOperation: ...
+
+    async def get_external_operation(
+        self, operation_id: str
+    ) -> ExternalOperation | None: ...
+
+    async def list_unresolved_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]: ...
+
+    async def transition_external_operation(
+        self,
+        *,
+        expected: ExternalOperation,
+        updated: ExternalOperation,
+        lease: Lease,
+        now: datetime,
+    ) -> ExternalOperation: ...
+
+    async def put_run_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        expected: RunCheckpoint | None,
+        lease: Lease,
+        now: datetime,
+    ) -> RunCheckpoint: ...
+
+    async def get_run_checkpoint(self, run_id: str) -> RunCheckpoint | None: ...
+
+    async def create_reconciliation_request(
+        self, request: ReconciliationRequest
+    ) -> ReconciliationRequest: ...
+
+    async def get_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None: ...
+
+    async def list_pending_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]: ...
+
+    async def resolve_reconciliation_request(
+        self,
+        *,
+        expected: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        event: EventEnvelope,
+    ) -> ReconciliationRequest: ...

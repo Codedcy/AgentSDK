@@ -20,6 +20,22 @@ from agent_sdk.runtime.leases import (
     LeaseLostError,
     canonical_lease_timestamp,
 )
+from agent_sdk.runtime.reconciliation import (
+    ExternalOperation,
+    ExternalOperationStatus,
+    ModelCallOperation,
+    ReconciliationRequest,
+    ReconciliationStatus,
+    RecoveryStateConflictError,
+    RunCheckpoint,
+    RunCheckpointPhase,
+    ToolCallOperation,
+    _canonical_record_json,
+    _checkpoint_from_json,
+    _context_free_recovery_errors,
+    _external_operation_from_json,
+    _reconciliation_request_from_json,
+)
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
@@ -43,6 +59,7 @@ from agent_sdk.storage.idempotency import (
     record_from_write,
     validate_replay,
 )
+from agent_sdk.tools.models import thaw_json
 
 _SCHEMA_VERSION = 3
 _MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"
@@ -454,6 +471,66 @@ def _lease_identity_matches(current: Lease | None, expected: Lease) -> bool:
     )
 
 
+def _valid_operation_transition(
+    expected: ExternalOperation, updated: ExternalOperation
+) -> bool:
+    if (
+        expected.status is not ExternalOperationStatus.STARTED
+        or updated.status is ExternalOperationStatus.STARTED
+        or type(expected) is not type(updated)
+    ):
+        return False
+    immutable_fields = (
+        "operation_id",
+        "operation_kind",
+        "session_id",
+        "run_id",
+        "turn",
+        "request_fingerprint",
+        "lease_generation",
+        "provider_identity",
+        "tool_identity",
+        "recovery_metadata",
+    )
+    return all(
+        getattr(expected, field) == getattr(updated, field)
+        for field in immutable_fields
+    )
+
+
+def _valid_reconciliation_resolution(
+    expected: ReconciliationRequest,
+    resolved: ReconciliationRequest,
+    event: EventEnvelope,
+) -> bool:
+    resolution = resolved.resolution
+    if (
+        expected.status is not ReconciliationStatus.PENDING
+        or resolved.status is not ReconciliationStatus.RESOLVED
+        or resolution is None
+        or resolved.request_id != expected.request_id
+        or resolved.session_id != expected.session_id
+        or resolved.run_id != expected.run_id
+        or resolved.operation_id != expected.operation_id
+        or resolved.reason != expected.reason
+        or resolved.details != expected.details
+        or event.event_id != resolution.event_id
+        or event.occurred_at != resolution.decided_at
+        or event.type != "reconciliation.resolved"
+        or event.session_id != resolved.session_id
+        or event.run_id != resolved.run_id
+    ):
+        return False
+    expected_payload = {
+        "request_id": resolved.request_id,
+        "operation_id": resolved.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    return event.payload == expected_payload
+
+
 class _StoredLease(NamedTuple):
     lease: Lease
     released: bool
@@ -674,6 +751,396 @@ class SQLiteStore:
             self._ensure_open()
             record = await self._read_idempotency(scope, key)
             return None if record is None else detached_record(record)
+
+    @_context_free_recovery_errors
+    async def create_external_operation(
+        self, operation: ExternalOperation, *, lease: Lease, now: datetime
+    ) -> ExternalOperation:
+        serialized = _canonical_record_json(operation)
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite recovery operation conflict")
+                await self._check_recovery_run_session(
+                    operation.run_id, operation.session_id
+                )
+                await self._check_recovery_lease(
+                    lease,
+                    now=now,
+                    run_id=operation.run_id,
+                    lease_generation=operation.lease_generation,
+                )
+                if operation.status is not ExternalOperationStatus.STARTED:
+                    raise RecoveryStateConflictError
+                existing = await self._read_external_operation(
+                    operation.operation_id
+                )
+                if existing is not None:
+                    if _canonical_record_json(existing) != serialized:
+                        raise RecoveryStateConflictError
+                    await self._commit_transaction()
+                    return _external_operation_from_json(serialized)
+                await self._connection.execute(
+                    """
+                    INSERT INTO external_operations(
+                        operation_id, operation_kind, session_id, run_id, turn,
+                        request_fingerprint, provider_identity, tool_identity,
+                        lease_generation, status, data_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        operation.operation_id,
+                        operation.operation_kind.value,
+                        operation.session_id,
+                        operation.run_id,
+                        operation.turn,
+                        operation.request_fingerprint,
+                        operation.provider_identity,
+                        operation.tool_identity,
+                        operation.lease_generation,
+                        operation.status.value,
+                        serialized,
+                    ),
+                )
+                await self._commit_transaction()
+                return _external_operation_from_json(serialized)
+            except sqlite3.IntegrityError:
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def get_external_operation(
+        self, operation_id: str
+    ) -> ExternalOperation | None:
+        async with self._lock:
+            self._ensure_open()
+            operation = await self._read_external_operation(operation_id)
+            if operation is None:
+                return None
+            return _external_operation_from_json(_canonical_record_json(operation))
+
+    async def list_unresolved_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        async with self._lock:
+            self._ensure_open()
+            async with self._connection.execute(
+                """
+                SELECT data_json FROM external_operations
+                WHERE run_id = ? AND status = 'started'
+                ORDER BY turn, operation_kind, operation_id
+                """,
+                (run_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(
+                _external_operation_from_json(cast(str, row[0])) for row in rows
+            )
+
+    @_context_free_recovery_errors
+    async def transition_external_operation(
+        self,
+        *,
+        expected: ExternalOperation,
+        updated: ExternalOperation,
+        lease: Lease,
+        now: datetime,
+    ) -> ExternalOperation:
+        expected_json = _canonical_record_json(expected)
+        updated_json = _canonical_record_json(updated)
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite recovery operation conflict")
+                await self._check_recovery_lease(
+                    lease,
+                    now=now,
+                    run_id=expected.run_id,
+                    lease_generation=expected.lease_generation,
+                )
+                if not _valid_operation_transition(expected, updated):
+                    raise RecoveryStateConflictError
+                existing = await self._read_external_operation(
+                    expected.operation_id
+                )
+                if existing is None:
+                    raise RecoveryStateConflictError
+                existing_json = _canonical_record_json(existing)
+                if existing_json == updated_json:
+                    await self._commit_transaction()
+                    return _external_operation_from_json(updated_json)
+                if existing_json != expected_json:
+                    raise RecoveryStateConflictError
+                result = await self._connection.execute(
+                    """
+                    UPDATE external_operations SET status = ?, data_json = ?
+                    WHERE operation_id = ? AND status = 'started' AND data_json = ?
+                    """,
+                    (
+                        updated.status.value,
+                        updated_json,
+                        expected.operation_id,
+                        expected_json,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise RecoveryStateConflictError
+                await self._commit_transaction()
+                return _external_operation_from_json(updated_json)
+            except sqlite3.IntegrityError:
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
+
+    @_context_free_recovery_errors
+    async def put_run_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        expected: RunCheckpoint | None,
+        lease: Lease,
+        now: datetime,
+    ) -> RunCheckpoint:
+        checkpoint_json = _canonical_record_json(checkpoint)
+        expected_json = (
+            None if expected is None else _canonical_record_json(expected)
+        )
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite recovery checkpoint conflict")
+                await self._check_recovery_run_session(
+                    checkpoint.run_id, checkpoint.session_id
+                )
+                await self._check_recovery_lease(
+                    lease,
+                    now=now,
+                    run_id=checkpoint.run_id,
+                    lease_generation=lease.generation,
+                )
+                existing = await self._read_run_checkpoint(checkpoint.run_id)
+                existing_json = (
+                    None
+                    if existing is None
+                    else _canonical_record_json(existing)
+                )
+                if existing_json == checkpoint_json:
+                    await self._check_checkpoint_operation(checkpoint, lease)
+                    await self._commit_transaction()
+                    return _checkpoint_from_json(checkpoint_json)
+                if expected is None:
+                    if existing is not None or checkpoint.checkpoint_version != 1:
+                        raise RecoveryStateConflictError
+                    await self._check_checkpoint_operation(checkpoint, lease)
+                    await self._connection.execute(
+                        """
+                        INSERT INTO run_checkpoints(
+                            run_id, session_id, checkpoint_version, turn, phase,
+                            operation_id, data_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            checkpoint.run_id,
+                            checkpoint.session_id,
+                            checkpoint.checkpoint_version,
+                            checkpoint.turn,
+                            checkpoint.phase.value,
+                            checkpoint.operation_id,
+                            checkpoint_json,
+                        ),
+                    )
+                else:
+                    if (
+                        existing_json != expected_json
+                        or checkpoint.run_id != expected.run_id
+                        or checkpoint.session_id != expected.session_id
+                        or checkpoint.checkpoint_version
+                        != expected.checkpoint_version + 1
+                    ):
+                        raise RecoveryStateConflictError
+                    await self._check_checkpoint_operation(checkpoint, lease)
+                    result = await self._connection.execute(
+                        """
+                        UPDATE run_checkpoints SET
+                            checkpoint_version = ?, turn = ?, phase = ?,
+                            operation_id = ?, data_json = ?
+                        WHERE run_id = ? AND data_json = ?
+                        """,
+                        (
+                            checkpoint.checkpoint_version,
+                            checkpoint.turn,
+                            checkpoint.phase.value,
+                            checkpoint.operation_id,
+                            checkpoint_json,
+                            checkpoint.run_id,
+                            expected_json,
+                        ),
+                    )
+                    if result.rowcount != 1:
+                        raise RecoveryStateConflictError
+                await self._commit_transaction()
+                return _checkpoint_from_json(checkpoint_json)
+            except sqlite3.IntegrityError:
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def get_run_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        async with self._lock:
+            self._ensure_open()
+            checkpoint = await self._read_run_checkpoint(run_id)
+            if checkpoint is None:
+                return None
+            return _checkpoint_from_json(_canonical_record_json(checkpoint))
+
+    @_context_free_recovery_errors
+    async def create_reconciliation_request(
+        self, request: ReconciliationRequest
+    ) -> ReconciliationRequest:
+        serialized = _canonical_record_json(request)
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite reconciliation conflict")
+                await self._check_recovery_run_session(
+                    request.run_id, request.session_id
+                )
+                if request.status is not ReconciliationStatus.PENDING:
+                    raise RecoveryStateConflictError
+                if request.operation_id is not None:
+                    operation = await self._read_external_operation(
+                        request.operation_id
+                    )
+                    if operation is None or (
+                        operation.run_id != request.run_id
+                        or operation.session_id != request.session_id
+                    ):
+                        raise RecoveryStateConflictError
+                existing = await self._read_reconciliation_request(
+                    request.request_id
+                )
+                if existing is not None:
+                    if _canonical_record_json(existing) != serialized:
+                        raise RecoveryStateConflictError
+                    await self._commit_transaction()
+                    return _reconciliation_request_from_json(serialized)
+                await self._connection.execute(
+                    """
+                    INSERT INTO reconciliation_requests(
+                        request_id, session_id, run_id, operation_id, status, data_json
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        request.request_id,
+                        request.session_id,
+                        request.run_id,
+                        request.operation_id,
+                        request.status.value,
+                        serialized,
+                    ),
+                )
+                await self._commit_transaction()
+                return _reconciliation_request_from_json(serialized)
+            except sqlite3.IntegrityError:
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def get_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None:
+        async with self._lock:
+            self._ensure_open()
+            request = await self._read_reconciliation_request(request_id)
+            if request is None:
+                return None
+            return _reconciliation_request_from_json(_canonical_record_json(request))
+
+    async def list_pending_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]:
+        async with self._lock:
+            self._ensure_open()
+            async with self._connection.execute(
+                """
+                SELECT data_json FROM reconciliation_requests
+                WHERE run_id = ? AND status = 'pending'
+                ORDER BY request_id
+                """,
+                (run_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(
+                _reconciliation_request_from_json(cast(str, row[0]))
+                for row in rows
+            )
+
+    @_context_free_recovery_errors
+    async def resolve_reconciliation_request(
+        self,
+        *,
+        expected: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        event: EventEnvelope,
+    ) -> ReconciliationRequest:
+        expected_json = _canonical_record_json(expected)
+        resolved_json = _canonical_record_json(resolved)
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite reconciliation conflict")
+                if not _valid_reconciliation_resolution(expected, resolved, event):
+                    raise RecoveryStateConflictError
+                current = await self._read_reconciliation_request(
+                    expected.request_id
+                )
+                if current is None:
+                    raise RecoveryStateConflictError
+                current_json = _canonical_record_json(current)
+                if current_json == resolved_json:
+                    stored_event = await self._read_event_by_id(event.event_id)
+                    if stored_event != event:
+                        raise RecoveryStateConflictError
+                    await self._commit_transaction()
+                    return _reconciliation_request_from_json(resolved_json)
+                if current_json != expected_json:
+                    raise RecoveryStateConflictError
+                if event.sequence <= 0:
+                    raise RecoveryStateConflictError
+                try:
+                    await self._insert_event(event)
+                except ValueError:
+                    raise RecoveryStateConflictError from None
+                result = await self._connection.execute(
+                    """
+                    UPDATE reconciliation_requests SET status = ?, data_json = ?
+                    WHERE request_id = ? AND status = 'pending' AND data_json = ?
+                    """,
+                    (
+                        resolved.status.value,
+                        resolved_json,
+                        expected.request_id,
+                        expected_json,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise RecoveryStateConflictError
+                await self._commit_transaction()
+                return _reconciliation_request_from_json(resolved_json)
+            except sqlite3.IntegrityError:
+                await self._rollback()
+                raise RecoveryStateConflictError from None
+            except BaseException:
+                await self._rollback()
+                raise
 
     async def latest_cursor(self) -> int:
         async with self._lock:
@@ -1008,6 +1475,114 @@ class SQLiteStore:
         ) as cursor:
             row = await cursor.fetchone()
         return None if row is None else _StoredLease(_lease_from_row(row), bool(row[6]))
+
+    async def _check_recovery_lease(
+        self,
+        lease: Lease,
+        *,
+        now: datetime,
+        run_id: str,
+        lease_generation: int,
+    ) -> None:
+        current = await self._read_lease(run_id)
+        if (
+            current is None
+            or current.released
+            or current.lease.owner != lease.owner
+            or current.lease.generation != lease.generation
+            or current.lease.expires_at <= now
+            or lease.run_id != run_id
+            or lease_generation != lease.generation
+        ):
+            raise RecoveryStateConflictError
+
+    async def _check_recovery_run_session(
+        self, run_id: str, session_id: str
+    ) -> None:
+        async with self._connection.execute(
+            """
+            SELECT session_id FROM external_operations WHERE run_id = ?
+            UNION ALL
+            SELECT session_id FROM run_checkpoints WHERE run_id = ?
+            UNION ALL
+            SELECT session_id FROM reconciliation_requests WHERE run_id = ?
+            """,
+            (run_id, run_id, run_id),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if any(cast(str, row[0]) != session_id for row in rows):
+            raise RecoveryStateConflictError
+
+    async def _read_external_operation(
+        self, operation_id: str
+    ) -> ExternalOperation | None:
+        async with self._connection.execute(
+            "SELECT data_json FROM external_operations WHERE operation_id = ?",
+            (operation_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _external_operation_from_json(cast(str, row[0]))
+
+    async def _read_run_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        async with self._connection.execute(
+            "SELECT data_json FROM run_checkpoints WHERE run_id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _checkpoint_from_json(cast(str, row[0]))
+
+    async def _read_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None:
+        async with self._connection.execute(
+            "SELECT data_json FROM reconciliation_requests WHERE request_id = ?",
+            (request_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return _reconciliation_request_from_json(cast(str, row[0]))
+
+    async def _read_event_by_id(self, event_id: str) -> EventEnvelope | None:
+        async with self._connection.execute(
+            """
+            SELECT cursor, event_id, schema_version, type, session_id, run_id,
+                   sequence, payload_json, occurred_at
+            FROM events WHERE event_id = ?
+            """,
+            (event_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return self._stored_event(row).event
+
+    async def _check_checkpoint_operation(
+        self, checkpoint: RunCheckpoint, lease: Lease
+    ) -> None:
+        if checkpoint.operation_id is None:
+            return
+        operation = await self._read_external_operation(checkpoint.operation_id)
+        if operation is None:
+            raise RecoveryStateConflictError
+        expected_type: type[ModelCallOperation] | type[ToolCallOperation]
+        if checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT:
+            expected_type = ModelCallOperation
+        elif checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT:
+            expected_type = ToolCallOperation
+        else:
+            raise RecoveryStateConflictError
+        if (
+            not isinstance(operation, expected_type)
+            or operation.run_id != checkpoint.run_id
+            or operation.session_id != checkpoint.session_id
+            or operation.lease_generation != lease.generation
+        ):
+            raise RecoveryStateConflictError
 
     async def _insert_idempotency(self, record: IdempotencyRecord) -> None:
         await self._connection.execute(
@@ -1456,6 +2031,95 @@ class SQLiteStore:
             foreign_key_errors = await cursor.fetchall()
         if foreign_key_errors:
             raise ValueError("incompatible v3 foreign key rows")
+
+        async with connection.execute(
+            "SELECT operation_id, data_json FROM external_operations"
+        ) as cursor:
+            operation_rows = await cursor.fetchall()
+        operations: dict[str, ExternalOperation] = {}
+        recovery_run_sessions: dict[str, str] = {}
+        for operation_id, data_json in operation_rows:
+            try:
+                operation = _external_operation_from_json(cast(str, data_json))
+            except (TypeError, ValueError):
+                raise ValueError("incompatible external operation row") from None
+            if operation.operation_id != operation_id:
+                raise ValueError("incompatible external operation row")
+            owner_session = recovery_run_sessions.setdefault(
+                operation.run_id, operation.session_id
+            )
+            if owner_session != operation.session_id:
+                raise ValueError("incompatible recovery run ownership")
+            operations[operation.operation_id] = operation
+
+        async with connection.execute(
+            "SELECT run_id, data_json FROM run_checkpoints"
+        ) as cursor:
+            checkpoint_rows = await cursor.fetchall()
+        for run_id, data_json in checkpoint_rows:
+            try:
+                checkpoint = _checkpoint_from_json(cast(str, data_json))
+            except (TypeError, ValueError):
+                raise ValueError("incompatible run checkpoint row") from None
+            if checkpoint.run_id != run_id:
+                raise ValueError("incompatible run checkpoint row")
+            owner_session = recovery_run_sessions.setdefault(
+                checkpoint.run_id, checkpoint.session_id
+            )
+            if owner_session != checkpoint.session_id:
+                raise ValueError("incompatible recovery run ownership")
+            if checkpoint.operation_id is not None:
+                checkpoint_operation = operations.get(checkpoint.operation_id)
+                if checkpoint_operation is None or (
+                    checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT
+                    and not isinstance(checkpoint_operation, ModelCallOperation)
+                ) or (
+                    checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT
+                    and not isinstance(checkpoint_operation, ToolCallOperation)
+                ):
+                    raise ValueError("incompatible checkpoint operation row")
+
+        async with connection.execute(
+            "SELECT request_id, data_json FROM reconciliation_requests"
+        ) as cursor:
+            reconciliation_rows = await cursor.fetchall()
+        for request_id, data_json in reconciliation_rows:
+            try:
+                request = _reconciliation_request_from_json(cast(str, data_json))
+            except (TypeError, ValueError):
+                raise ValueError("incompatible reconciliation request row") from None
+            if request.request_id != request_id:
+                raise ValueError("incompatible reconciliation request row")
+            owner_session = recovery_run_sessions.setdefault(
+                request.run_id, request.session_id
+            )
+            if owner_session != request.session_id:
+                raise ValueError("incompatible recovery run ownership")
+            if request.status is ReconciliationStatus.RESOLVED:
+                assert request.resolution is not None
+                async with connection.execute(
+                    """
+                    SELECT cursor, event_id, schema_version, type, session_id, run_id,
+                           sequence, payload_json, occurred_at
+                    FROM events WHERE event_id = ?
+                    """,
+                    (request.resolution.event_id,),
+                ) as cursor:
+                    event_row = await cursor.fetchone()
+                if event_row is None:
+                    raise ValueError("incompatible reconciliation audit event")
+                try:
+                    event = SQLiteStore._stored_event(event_row).event
+                    pending = request.model_copy(
+                        update={
+                            "status": ReconciliationStatus.PENDING,
+                            "resolution": None,
+                        }
+                    )
+                except (TypeError, ValueError):
+                    raise ValueError("incompatible reconciliation audit event") from None
+                if not _valid_reconciliation_resolution(pending, request, event):
+                    raise ValueError("incompatible reconciliation audit event")
 
 
 class _SnapshotRow(NamedTuple):

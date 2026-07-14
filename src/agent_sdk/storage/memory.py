@@ -5,6 +5,22 @@ from typing import Any, TypeAlias
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError
+from agent_sdk.runtime.reconciliation import (
+    ExternalOperation,
+    ExternalOperationStatus,
+    ModelCallOperation,
+    ReconciliationRequest,
+    ReconciliationStatus,
+    RecoveryStateConflictError,
+    RunCheckpoint,
+    RunCheckpointPhase,
+    ToolCallOperation,
+    _canonical_record_json,
+    _checkpoint_from_json,
+    _context_free_recovery_errors,
+    _external_operation_from_json,
+    _reconciliation_request_from_json,
+)
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
@@ -26,6 +42,7 @@ from agent_sdk.storage.idempotency import (
     record_from_write,
     validate_replay,
 )
+from agent_sdk.tools.models import thaw_json
 
 _AggregateKey: TypeAlias = tuple[str, str]
 _SnapshotKey: TypeAlias = tuple[str, str]
@@ -45,6 +62,9 @@ class InMemoryStore:
         self._idempotency: dict[tuple[str, str], IdempotencyRecord] = {}
         self._leases: dict[str, Lease] = {}
         self._lease_generations: dict[str, int] = {}
+        self._external_operations: dict[str, str] = {}
+        self._run_checkpoints: dict[str, str] = {}
+        self._reconciliation_requests: dict[str, str] = {}
         self._last_cursor = 0
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
@@ -197,6 +217,245 @@ class InMemoryStore:
             record = self._idempotency.get((scope, key))
             return None if record is None else detached_record(record)
 
+    @_context_free_recovery_errors
+    async def create_external_operation(
+        self, operation: ExternalOperation, *, lease: Lease, now: datetime
+    ) -> ExternalOperation:
+        serialized = _canonical_record_json(operation)
+        async with self._lock:
+            self._check_recovery_run_session(operation.run_id, operation.session_id)
+            self._check_recovery_lease(
+                lease,
+                now=now,
+                run_id=operation.run_id,
+                lease_generation=operation.lease_generation,
+            )
+            if operation.status is not ExternalOperationStatus.STARTED:
+                raise RecoveryStateConflictError
+            existing = self._external_operations.get(operation.operation_id)
+            if existing is not None:
+                if existing != serialized:
+                    raise RecoveryStateConflictError
+                return _external_operation_from_json(existing)
+            self._external_operations[operation.operation_id] = serialized
+            return _external_operation_from_json(serialized)
+
+    async def get_external_operation(
+        self, operation_id: str
+    ) -> ExternalOperation | None:
+        async with self._lock:
+            serialized = self._external_operations.get(operation_id)
+            return (
+                None
+                if serialized is None
+                else _external_operation_from_json(serialized)
+            )
+
+    async def list_unresolved_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        async with self._lock:
+            operations = tuple(
+                _external_operation_from_json(serialized)
+                for serialized in self._external_operations.values()
+            )
+            return tuple(
+                sorted(
+                    (
+                        operation
+                        for operation in operations
+                        if operation.run_id == run_id
+                        and operation.status is ExternalOperationStatus.STARTED
+                    ),
+                    key=lambda operation: (
+                        operation.turn,
+                        operation.operation_kind.value,
+                        operation.operation_id,
+                    ),
+                )
+            )
+
+    @_context_free_recovery_errors
+    async def transition_external_operation(
+        self,
+        *,
+        expected: ExternalOperation,
+        updated: ExternalOperation,
+        lease: Lease,
+        now: datetime,
+    ) -> ExternalOperation:
+        expected_json = _canonical_record_json(expected)
+        updated_json = _canonical_record_json(updated)
+        async with self._lock:
+            self._check_recovery_run_session(expected.run_id, expected.session_id)
+            self._check_recovery_lease(
+                lease,
+                now=now,
+                run_id=expected.run_id,
+                lease_generation=expected.lease_generation,
+            )
+            if not _valid_operation_transition(expected, updated):
+                raise RecoveryStateConflictError
+            existing = self._external_operations.get(expected.operation_id)
+            if existing == updated_json:
+                return _external_operation_from_json(existing)
+            if existing != expected_json:
+                raise RecoveryStateConflictError
+            self._external_operations[expected.operation_id] = updated_json
+            return _external_operation_from_json(updated_json)
+
+    @_context_free_recovery_errors
+    async def put_run_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        expected: RunCheckpoint | None,
+        lease: Lease,
+        now: datetime,
+    ) -> RunCheckpoint:
+        checkpoint_json = _canonical_record_json(checkpoint)
+        expected_json = (
+            None if expected is None else _canonical_record_json(expected)
+        )
+        async with self._lock:
+            self._check_recovery_run_session(
+                checkpoint.run_id, checkpoint.session_id
+            )
+            self._check_recovery_lease(
+                lease,
+                now=now,
+                run_id=checkpoint.run_id,
+                lease_generation=lease.generation,
+            )
+            existing = self._run_checkpoints.get(checkpoint.run_id)
+            if existing == checkpoint_json:
+                self._check_checkpoint_operation(checkpoint, lease)
+                return _checkpoint_from_json(existing)
+            if expected is None:
+                if existing is not None or checkpoint.checkpoint_version != 1:
+                    raise RecoveryStateConflictError
+            elif (
+                existing != expected_json
+                or checkpoint.run_id != expected.run_id
+                or checkpoint.session_id != expected.session_id
+                or checkpoint.checkpoint_version != expected.checkpoint_version + 1
+            ):
+                raise RecoveryStateConflictError
+            self._check_checkpoint_operation(checkpoint, lease)
+            self._run_checkpoints[checkpoint.run_id] = checkpoint_json
+            return _checkpoint_from_json(checkpoint_json)
+
+    async def get_run_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        async with self._lock:
+            serialized = self._run_checkpoints.get(run_id)
+            return None if serialized is None else _checkpoint_from_json(serialized)
+
+    @_context_free_recovery_errors
+    async def create_reconciliation_request(
+        self, request: ReconciliationRequest
+    ) -> ReconciliationRequest:
+        serialized = _canonical_record_json(request)
+        async with self._lock:
+            self._check_recovery_run_session(request.run_id, request.session_id)
+            if request.status is not ReconciliationStatus.PENDING:
+                raise RecoveryStateConflictError
+            if request.operation_id is not None:
+                operation_json = self._external_operations.get(request.operation_id)
+                if operation_json is None:
+                    raise RecoveryStateConflictError
+                operation = _external_operation_from_json(operation_json)
+                if (
+                    operation.run_id != request.run_id
+                    or operation.session_id != request.session_id
+                ):
+                    raise RecoveryStateConflictError
+            existing = self._reconciliation_requests.get(request.request_id)
+            if existing is not None:
+                if existing != serialized:
+                    raise RecoveryStateConflictError
+                return _reconciliation_request_from_json(existing)
+            self._reconciliation_requests[request.request_id] = serialized
+            return _reconciliation_request_from_json(serialized)
+
+    async def get_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None:
+        async with self._lock:
+            serialized = self._reconciliation_requests.get(request_id)
+            return (
+                None
+                if serialized is None
+                else _reconciliation_request_from_json(serialized)
+            )
+
+    async def list_pending_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]:
+        async with self._lock:
+            requests = (
+                _reconciliation_request_from_json(serialized)
+                for serialized in self._reconciliation_requests.values()
+            )
+            return tuple(
+                sorted(
+                    (
+                        request
+                        for request in requests
+                        if request.run_id == run_id
+                        and request.status is ReconciliationStatus.PENDING
+                    ),
+                    key=lambda request: request.request_id,
+                )
+            )
+
+    @_context_free_recovery_errors
+    async def resolve_reconciliation_request(
+        self,
+        *,
+        expected: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        event: EventEnvelope,
+    ) -> ReconciliationRequest:
+        expected_json = _canonical_record_json(expected)
+        resolved_json = _canonical_record_json(resolved)
+        async with self._lock:
+            if not _valid_reconciliation_resolution(expected, resolved, event):
+                raise RecoveryStateConflictError
+            current = self._reconciliation_requests.get(expected.request_id)
+            if current == resolved_json:
+                stored_event = next(
+                    (
+                        stored.event
+                        for stored in self._events
+                        if stored.event.event_id == event.event_id
+                    ),
+                    None,
+                )
+                if stored_event != event:
+                    raise RecoveryStateConflictError
+                return _reconciliation_request_from_json(current)
+            if current != expected_json:
+                raise RecoveryStateConflictError
+            if any(stored.event.event_id == event.event_id for stored in self._events):
+                raise RecoveryStateConflictError
+            aggregate = _aggregate_key(event)
+            previous_sequence = self._latest_sequences(self._events).get(aggregate)
+            if event.sequence <= 0 or (
+                previous_sequence is not None and event.sequence <= previous_sequence
+            ):
+                raise RecoveryStateConflictError
+
+            detached_event = EventEnvelope.model_validate_json(event.model_dump_json())
+            events = self._events.copy()
+            last_cursor = self._last_cursor + 1
+            events.append(StoredEvent(last_cursor, detached_event))
+            requests = self._reconciliation_requests.copy()
+            requests[expected.request_id] = resolved_json
+            self._events = events
+            self._reconciliation_requests = requests
+            self._last_cursor = last_cursor
+            return _reconciliation_request_from_json(resolved_json)
+
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
             run_ids = {
@@ -228,6 +487,21 @@ class InMemoryStore:
                 run_id: generation
                 for run_id, generation in self._lease_generations.items()
                 if run_id not in run_ids
+            }
+            self._external_operations = {
+                operation_id: serialized
+                for operation_id, serialized in self._external_operations.items()
+                if _external_operation_from_json(serialized).session_id != session_id
+            }
+            self._run_checkpoints = {
+                run_id: serialized
+                for run_id, serialized in self._run_checkpoints.items()
+                if _checkpoint_from_json(serialized).session_id != session_id
+            }
+            self._reconciliation_requests = {
+                request_id: serialized
+                for request_id, serialized in self._reconciliation_requests.items()
+                if _reconciliation_request_from_json(serialized).session_id != session_id
             }
 
     async def acquire_lease(
@@ -294,6 +568,75 @@ class InMemoryStore:
             ):
                 raise LeaseLostError
 
+    def _check_recovery_lease(
+        self,
+        lease: Lease,
+        *,
+        now: datetime,
+        run_id: str,
+        lease_generation: int,
+    ) -> None:
+        current = self._leases.get(run_id)
+        if (
+            current is None
+            or current.owner != lease.owner
+            or current.generation != lease.generation
+            or current.expires_at <= now
+            or lease.run_id != run_id
+            or lease_generation != lease.generation
+        ):
+            raise RecoveryStateConflictError
+
+    def _check_recovery_run_session(self, run_id: str, session_id: str) -> None:
+        operation_sessions = (
+            _external_operation_from_json(serialized).session_id
+            for serialized in self._external_operations.values()
+            if _external_operation_from_json(serialized).run_id == run_id
+        )
+        checkpoint_sessions = (
+            _checkpoint_from_json(serialized).session_id
+            for serialized in self._run_checkpoints.values()
+            if _checkpoint_from_json(serialized).run_id == run_id
+        )
+        request_sessions = (
+            _reconciliation_request_from_json(serialized).session_id
+            for serialized in self._reconciliation_requests.values()
+            if _reconciliation_request_from_json(serialized).run_id == run_id
+        )
+        if any(
+            owner_session != session_id
+            for owner_session in (
+                *operation_sessions,
+                *checkpoint_sessions,
+                *request_sessions,
+            )
+        ):
+            raise RecoveryStateConflictError
+
+    def _check_checkpoint_operation(
+        self, checkpoint: RunCheckpoint, lease: Lease
+    ) -> None:
+        if checkpoint.operation_id is None:
+            return
+        operation_json = self._external_operations.get(checkpoint.operation_id)
+        if operation_json is None:
+            raise RecoveryStateConflictError
+        operation = _external_operation_from_json(operation_json)
+        expected_type: type[ModelCallOperation] | type[ToolCallOperation]
+        if checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT:
+            expected_type = ModelCallOperation
+        elif checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT:
+            expected_type = ToolCallOperation
+        else:
+            raise RecoveryStateConflictError
+        if (
+            not isinstance(operation, expected_type)
+            or operation.run_id != checkpoint.run_id
+            or operation.session_id != checkpoint.session_id
+            or operation.lease_generation != lease.generation
+        ):
+            raise RecoveryStateConflictError
+
     @staticmethod
     def _latest_sequences(events: list[StoredEvent]) -> dict[_AggregateKey, int]:
         sequences: dict[_AggregateKey, int] = {}
@@ -308,3 +651,63 @@ def _lease_matches(current: Lease | None, expected: Lease) -> bool:
         and current.owner == expected.owner
         and current.generation == expected.generation
     )
+
+
+def _valid_operation_transition(
+    expected: ExternalOperation, updated: ExternalOperation
+) -> bool:
+    if (
+        expected.status is not ExternalOperationStatus.STARTED
+        or updated.status is ExternalOperationStatus.STARTED
+        or type(expected) is not type(updated)
+    ):
+        return False
+    immutable_fields = (
+        "operation_id",
+        "operation_kind",
+        "session_id",
+        "run_id",
+        "turn",
+        "request_fingerprint",
+        "lease_generation",
+        "provider_identity",
+        "tool_identity",
+        "recovery_metadata",
+    )
+    return all(
+        getattr(expected, field) == getattr(updated, field)
+        for field in immutable_fields
+    )
+
+
+def _valid_reconciliation_resolution(
+    expected: ReconciliationRequest,
+    resolved: ReconciliationRequest,
+    event: EventEnvelope,
+) -> bool:
+    resolution = resolved.resolution
+    if (
+        expected.status is not ReconciliationStatus.PENDING
+        or resolved.status is not ReconciliationStatus.RESOLVED
+        or resolution is None
+        or resolved.request_id != expected.request_id
+        or resolved.session_id != expected.session_id
+        or resolved.run_id != expected.run_id
+        or resolved.operation_id != expected.operation_id
+        or resolved.reason != expected.reason
+        or resolved.details != expected.details
+        or event.event_id != resolution.event_id
+        or event.occurred_at != resolution.decided_at
+        or event.type != "reconciliation.resolved"
+        or event.session_id != resolved.session_id
+        or event.run_id != resolved.run_id
+    ):
+        return False
+    expected_payload = {
+        "request_id": resolved.request_id,
+        "operation_id": resolved.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    return event.payload == expected_payload

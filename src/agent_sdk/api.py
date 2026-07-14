@@ -21,6 +21,7 @@ from agent_sdk.context import (
 )
 from agent_sdk.evaluation import EvaluationEngine, EvaluationResult, Evaluator
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
@@ -51,6 +52,12 @@ from agent_sdk.runtime.models import (
     RunSnapshot,
     SessionSnapshot,
     mutable_model_params,
+)
+from agent_sdk.runtime.reconciliation import (
+    ExternalOperation,
+    ReconciliationRequest,
+    RunCheckpoint,
+    _context_free_recovery_errors,
 )
 from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore, StoredEvent
 from agent_sdk.storage.idempotency import IdempotencyRecord
@@ -135,6 +142,89 @@ class _LazySQLiteStore:
 
     async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None:
         await (await self._get()).assert_current_lease(lease, now=now)
+
+    @_context_free_recovery_errors
+    async def create_external_operation(
+        self, operation: ExternalOperation, *, lease: Lease, now: datetime
+    ) -> ExternalOperation:
+        return await (await self._get()).create_external_operation(
+            operation, lease=lease, now=now
+        )
+
+    async def get_external_operation(
+        self, operation_id: str
+    ) -> ExternalOperation | None:
+        return await (await self._get()).get_external_operation(operation_id)
+
+    async def list_unresolved_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        return await (await self._get()).list_unresolved_external_operations(run_id)
+
+    @_context_free_recovery_errors
+    async def transition_external_operation(
+        self,
+        *,
+        expected: ExternalOperation,
+        updated: ExternalOperation,
+        lease: Lease,
+        now: datetime,
+    ) -> ExternalOperation:
+        return await (await self._get()).transition_external_operation(
+            expected=expected,
+            updated=updated,
+            lease=lease,
+            now=now,
+        )
+
+    @_context_free_recovery_errors
+    async def put_run_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+        *,
+        expected: RunCheckpoint | None,
+        lease: Lease,
+        now: datetime,
+    ) -> RunCheckpoint:
+        return await (await self._get()).put_run_checkpoint(
+            checkpoint,
+            expected=expected,
+            lease=lease,
+            now=now,
+        )
+
+    async def get_run_checkpoint(self, run_id: str) -> RunCheckpoint | None:
+        return await (await self._get()).get_run_checkpoint(run_id)
+
+    @_context_free_recovery_errors
+    async def create_reconciliation_request(
+        self, request: ReconciliationRequest
+    ) -> ReconciliationRequest:
+        return await (await self._get()).create_reconciliation_request(request)
+
+    async def get_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None:
+        return await (await self._get()).get_reconciliation_request(request_id)
+
+    async def list_pending_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]:
+        return await (await self._get()).list_pending_reconciliation_requests(run_id)
+
+    @_context_free_recovery_errors
+    async def resolve_reconciliation_request(
+        self,
+        *,
+        expected: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        event: EventEnvelope,
+    ) -> ReconciliationRequest:
+        return await (await self._get()).resolve_reconciliation_request(
+            expected=expected,
+            resolved=resolved,
+            event=event,
+        )
 
     async def close(self) -> None:
         async with self._lock:
