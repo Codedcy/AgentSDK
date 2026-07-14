@@ -99,6 +99,70 @@ async def test_memory_renew_preserves_generation_and_returns_detached_copy() -> 
 
 
 @pytest.mark.asyncio
+async def test_memory_release_reacquire_preserves_generation_high_water() -> None:
+    manager = LeaseManager(InMemoryStore(), ttl=timedelta(seconds=30))
+    now = datetime(2026, 7, 14, tzinfo=UTC)
+    first = await manager.acquire("run_1", "coordinator_1", now=now)
+
+    await manager.release(first)
+    second = await manager.acquire("run_1", "coordinator_2", now=now)
+
+    assert second.generation == first.generation + 1
+    with pytest.raises(LeaseLostError):
+        await manager.assert_current(first, now=now)
+
+
+async def _assert_reverse_renew_order_is_fenced(manager: LeaseManager) -> None:
+    now = datetime(2026, 7, 14, tzinfo=UTC)
+    acquired = await manager.acquire("run_renew", "coordinator_1", now=now)
+    barrier = asyncio.Event()
+    ready = 0
+    ready_lock = asyncio.Lock()
+    newer_done = asyncio.Event()
+
+    async def rendezvous() -> None:
+        nonlocal ready
+        async with ready_lock:
+            ready += 1
+            if ready == 2:
+                barrier.set()
+        await asyncio.wait_for(barrier.wait(), timeout=1)
+
+    async def newer() -> Lease:
+        await rendezvous()
+        try:
+            return await manager.renew(acquired, now=now + timedelta(seconds=10))
+        finally:
+            newer_done.set()
+
+    async def older() -> BaseException | Lease:
+        await rendezvous()
+        await asyncio.wait_for(newer_done.wait(), timeout=1)
+        try:
+            return await manager.renew(acquired, now=now + timedelta(seconds=5))
+        except BaseException as error:
+            return error
+
+    renewed, stale = await asyncio.wait_for(
+        asyncio.gather(newer(), older()), timeout=3
+    )
+    assert isinstance(renewed, Lease)
+    assert isinstance(stale, LeaseLostError)
+    assert renewed.expires_at == now + timedelta(seconds=40)
+    with pytest.raises(LeaseHeldError):
+        await manager.acquire(
+            "run_renew", "coordinator_2", now=now + timedelta(seconds=36)
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_reverse_order_renew_keeps_maximum_expiry() -> None:
+    await _assert_reverse_renew_order_is_fenced(
+        LeaseManager(InMemoryStore(), ttl=timedelta(seconds=30))
+    )
+
+
+@pytest.mark.asyncio
 async def test_memory_concurrent_acquire_has_one_winner() -> None:
     manager = LeaseManager(InMemoryStore(), ttl=timedelta(seconds=30))
     now = datetime(2026, 7, 14, tzinfo=UTC)
@@ -160,6 +224,40 @@ async def test_sqlite_expiry_stale_operations_and_renewal(tmp_path: Path) -> Non
             await manager.renew(first, now=renewed.renewed_at)
         with pytest.raises(LeaseLostError):
             await manager.release(first)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_release_reacquire_preserves_durable_generation_high_water(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "release-reacquire.db"
+    now = datetime(2026, 7, 14, tzinfo=UTC)
+    store = await SQLiteStore.open(path)
+    first_manager = LeaseManager(store, ttl=timedelta(seconds=30))
+    first = await first_manager.acquire("run_1", "coordinator_1", now=now)
+    await first_manager.release(first)
+    await store.close()
+
+    reopened = await SQLiteStore.open(path)
+    second_manager = LeaseManager(reopened, ttl=timedelta(seconds=30))
+    try:
+        second = await second_manager.acquire("run_1", "coordinator_2", now=now)
+        assert second.generation == first.generation + 1
+        with pytest.raises(LeaseLostError):
+            await second_manager.assert_current(first, now=now)
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_reverse_order_renew_keeps_maximum_expiry(tmp_path: Path) -> None:
+    store = await SQLiteStore.open(tmp_path / "reverse-renew.db")
+    try:
+        await _assert_reverse_renew_order_is_fenced(
+            LeaseManager(store, ttl=timedelta(seconds=30))
+        )
     finally:
         await store.close()
 

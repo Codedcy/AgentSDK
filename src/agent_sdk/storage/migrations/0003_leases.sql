@@ -8,7 +8,8 @@ CREATE TABLE leases(
         length(expires_at) > 0
         AND renewed_at >= acquired_at
         AND expires_at > renewed_at
-    )
+    ),
+    released INTEGER NOT NULL DEFAULT 0 CHECK(released IN (0, 1))
 );
 CREATE INDEX leases_expires_at ON leases(expires_at);
 
@@ -38,7 +39,42 @@ CREATE TABLE external_operations(
             AND provider_identity IS NULL
             AND tool_identity IS NOT NULL
             AND length(trim(tool_identity)) > 0)
-    )
+    ),
+    CHECK(coalesce(
+        json_type(data_json, '$.operation_id') = 'text'
+        AND json_extract(data_json, '$.operation_id') = operation_id
+        AND json_type(data_json, '$.operation_kind') = 'text'
+        AND json_extract(data_json, '$.operation_kind') = operation_kind
+        AND json_type(data_json, '$.session_id') = 'text'
+        AND json_extract(data_json, '$.session_id') = session_id
+        AND json_type(data_json, '$.run_id') = 'text'
+        AND json_extract(data_json, '$.run_id') = run_id
+        AND json_type(data_json, '$.turn') = 'integer'
+        AND json_extract(data_json, '$.turn') = turn
+        AND json_type(data_json, '$.request_fingerprint') = 'text'
+        AND json_extract(data_json, '$.request_fingerprint') = request_fingerprint
+        AND (
+            (provider_identity IS NULL
+                AND json_type(data_json, '$.provider_identity') = 'null')
+            OR
+            (provider_identity IS NOT NULL
+                AND json_type(data_json, '$.provider_identity') = 'text'
+                AND json_extract(data_json, '$.provider_identity') = provider_identity)
+        )
+        AND (
+            (tool_identity IS NULL
+                AND json_type(data_json, '$.tool_identity') = 'null')
+            OR
+            (tool_identity IS NOT NULL
+                AND json_type(data_json, '$.tool_identity') = 'text'
+                AND json_extract(data_json, '$.tool_identity') = tool_identity)
+        )
+        AND json_type(data_json, '$.lease_generation') = 'integer'
+        AND json_extract(data_json, '$.lease_generation') = lease_generation
+        AND json_type(data_json, '$.status') = 'text'
+        AND json_extract(data_json, '$.status') = status,
+        0
+    ))
 );
 CREATE INDEX external_operations_session ON external_operations(session_id);
 CREATE INDEX external_operations_run_status ON external_operations(run_id, status);
@@ -63,7 +99,27 @@ CREATE TABLE run_checkpoints(
         (phase IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NOT NULL)
         OR
         (phase NOT IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NULL)
-    )
+    ),
+    CHECK(coalesce(
+        json_type(data_json, '$.run_id') = 'text'
+        AND json_extract(data_json, '$.run_id') = run_id
+        AND json_type(data_json, '$.session_id') = 'text'
+        AND json_extract(data_json, '$.session_id') = session_id
+        AND json_type(data_json, '$.checkpoint_version') = 'integer'
+        AND json_extract(data_json, '$.checkpoint_version') = checkpoint_version
+        AND json_type(data_json, '$.turn') = 'integer'
+        AND json_extract(data_json, '$.turn') = turn
+        AND json_type(data_json, '$.phase') = 'text'
+        AND json_extract(data_json, '$.phase') = phase
+        AND (
+            (operation_id IS NULL AND json_type(data_json, '$.operation_id') = 'null')
+            OR
+            (operation_id IS NOT NULL
+                AND json_type(data_json, '$.operation_id') = 'text'
+                AND json_extract(data_json, '$.operation_id') = operation_id)
+        ),
+        0
+    ))
 );
 CREATE INDEX run_checkpoints_session ON run_checkpoints(session_id);
 CREATE INDEX run_checkpoints_phase ON run_checkpoints(phase);
@@ -80,7 +136,25 @@ CREATE TABLE reconciliation_requests(
     ),
     FOREIGN KEY(operation_id, run_id, session_id)
         REFERENCES external_operations(operation_id, run_id, session_id)
-        ON DELETE RESTRICT
+        ON DELETE RESTRICT,
+    CHECK(coalesce(
+        json_type(data_json, '$.request_id') = 'text'
+        AND json_extract(data_json, '$.request_id') = request_id
+        AND json_type(data_json, '$.session_id') = 'text'
+        AND json_extract(data_json, '$.session_id') = session_id
+        AND json_type(data_json, '$.run_id') = 'text'
+        AND json_extract(data_json, '$.run_id') = run_id
+        AND (
+            (operation_id IS NULL AND json_type(data_json, '$.operation_id') = 'null')
+            OR
+            (operation_id IS NOT NULL
+                AND json_type(data_json, '$.operation_id') = 'text'
+                AND json_extract(data_json, '$.operation_id') = operation_id)
+        )
+        AND json_type(data_json, '$.status') = 'text'
+        AND json_extract(data_json, '$.status') = status,
+        0
+    ))
 );
 CREATE INDEX reconciliation_requests_session ON reconciliation_requests(session_id);
 CREATE INDEX reconciliation_requests_run_status

@@ -101,3 +101,12 @@ def _utc_now(value: datetime | None) -> datetime:
     if candidate.tzinfo is None or candidate.utcoffset() is None:
         raise ValueError("lease timestamps must be timezone-aware")
     return candidate.astimezone(UTC)
+
+
+def canonical_lease_timestamp(value: datetime) -> str:
+    normalized = _utc_now(value)
+    return (
+        f"{normalized.year:04d}-{normalized.month:02d}-{normalized.day:02d}"
+        f"T{normalized.hour:02d}:{normalized.minute:02d}:{normalized.second:02d}."
+        f"{normalized.microsecond:06d}Z"
+    )

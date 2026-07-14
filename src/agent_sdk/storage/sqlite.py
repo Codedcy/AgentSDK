@@ -14,7 +14,12 @@ from typing import Any, NamedTuple, cast
 import aiosqlite
 
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError
+from agent_sdk.runtime.leases import (
+    Lease,
+    LeaseHeldError,
+    LeaseLostError,
+    canonical_lease_timestamp,
+)
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
@@ -80,6 +85,7 @@ _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
         ("acquired_at", "TEXT", True, 0),
         ("renewed_at", "TEXT", True, 0),
         ("expires_at", "TEXT", True, 0),
+        ("released", "INTEGER", True, 0),
     ),
     "external_operations": (
         ("operation_id", "TEXT", True, 1),
@@ -182,7 +188,8 @@ _EXPECTED_TABLE_SQL = {
                 length(expires_at) > 0
                 AND renewed_at >= acquired_at
                 AND expires_at > renewed_at
-            )
+            ),
+            released INTEGER NOT NULL DEFAULT 0 CHECK(released IN (0, 1))
         )
     """,
     "external_operations": """
@@ -212,7 +219,42 @@ _EXPECTED_TABLE_SQL = {
                     AND provider_identity IS NULL
                     AND tool_identity IS NOT NULL
                     AND length(trim(tool_identity)) > 0)
-            )
+            ),
+            CHECK(coalesce(
+                json_type(data_json, '$.operation_id') = 'text'
+                AND json_extract(data_json, '$.operation_id') = operation_id
+                AND json_type(data_json, '$.operation_kind') = 'text'
+                AND json_extract(data_json, '$.operation_kind') = operation_kind
+                AND json_type(data_json, '$.session_id') = 'text'
+                AND json_extract(data_json, '$.session_id') = session_id
+                AND json_type(data_json, '$.run_id') = 'text'
+                AND json_extract(data_json, '$.run_id') = run_id
+                AND json_type(data_json, '$.turn') = 'integer'
+                AND json_extract(data_json, '$.turn') = turn
+                AND json_type(data_json, '$.request_fingerprint') = 'text'
+                AND json_extract(data_json, '$.request_fingerprint') = request_fingerprint
+                AND (
+                    (provider_identity IS NULL
+                        AND json_type(data_json, '$.provider_identity') = 'null')
+                    OR
+                    (provider_identity IS NOT NULL
+                        AND json_type(data_json, '$.provider_identity') = 'text'
+                        AND json_extract(data_json, '$.provider_identity') = provider_identity)
+                )
+                AND (
+                    (tool_identity IS NULL
+                        AND json_type(data_json, '$.tool_identity') = 'null')
+                    OR
+                    (tool_identity IS NOT NULL
+                        AND json_type(data_json, '$.tool_identity') = 'text'
+                        AND json_extract(data_json, '$.tool_identity') = tool_identity)
+                )
+                AND json_type(data_json, '$.lease_generation') = 'integer'
+                AND json_extract(data_json, '$.lease_generation') = lease_generation
+                AND json_type(data_json, '$.status') = 'text'
+                AND json_extract(data_json, '$.status') = status,
+                0
+            ))
         )
     """,
     "run_checkpoints": """
@@ -236,7 +278,28 @@ _EXPECTED_TABLE_SQL = {
                 (phase IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NOT NULL)
                 OR
                 (phase NOT IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NULL)
-            )
+            ),
+            CHECK(coalesce(
+                json_type(data_json, '$.run_id') = 'text'
+                AND json_extract(data_json, '$.run_id') = run_id
+                AND json_type(data_json, '$.session_id') = 'text'
+                AND json_extract(data_json, '$.session_id') = session_id
+                AND json_type(data_json, '$.checkpoint_version') = 'integer'
+                AND json_extract(data_json, '$.checkpoint_version') = checkpoint_version
+                AND json_type(data_json, '$.turn') = 'integer'
+                AND json_extract(data_json, '$.turn') = turn
+                AND json_type(data_json, '$.phase') = 'text'
+                AND json_extract(data_json, '$.phase') = phase
+                AND (
+                    (operation_id IS NULL
+                        AND json_type(data_json, '$.operation_id') = 'null')
+                    OR
+                    (operation_id IS NOT NULL
+                        AND json_type(data_json, '$.operation_id') = 'text'
+                        AND json_extract(data_json, '$.operation_id') = operation_id)
+                ),
+                0
+            ))
         )
     """,
     "reconciliation_requests": """
@@ -251,7 +314,26 @@ _EXPECTED_TABLE_SQL = {
             ),
             FOREIGN KEY(operation_id, run_id, session_id)
                 REFERENCES external_operations(operation_id, run_id, session_id)
-                ON DELETE RESTRICT
+                ON DELETE RESTRICT,
+            CHECK(coalesce(
+                json_type(data_json, '$.request_id') = 'text'
+                AND json_extract(data_json, '$.request_id') = request_id
+                AND json_type(data_json, '$.session_id') = 'text'
+                AND json_extract(data_json, '$.session_id') = session_id
+                AND json_type(data_json, '$.run_id') = 'text'
+                AND json_extract(data_json, '$.run_id') = run_id
+                AND (
+                    (operation_id IS NULL
+                        AND json_type(data_json, '$.operation_id') = 'null')
+                    OR
+                    (operation_id IS NOT NULL
+                        AND json_type(data_json, '$.operation_id') = 'text'
+                        AND json_extract(data_json, '$.operation_id') = operation_id)
+                )
+                AND json_type(data_json, '$.status') = 'text'
+                AND json_extract(data_json, '$.status') = status,
+                0
+            ))
         )
     """,
 }
@@ -358,9 +440,9 @@ def _lease_values(lease: Lease) -> tuple[str, str, int, str, str, str]:
         lease.run_id,
         lease.owner,
         lease.generation,
-        lease.acquired_at.isoformat(),
-        lease.renewed_at.isoformat(),
-        lease.expires_at.isoformat(),
+        canonical_lease_timestamp(lease.acquired_at),
+        canonical_lease_timestamp(lease.renewed_at),
+        canonical_lease_timestamp(lease.expires_at),
     )
 
 
@@ -370,6 +452,11 @@ def _lease_identity_matches(current: Lease | None, expected: Lease) -> bool:
         and current.owner == expected.owner
         and current.generation == expected.generation
     )
+
+
+class _StoredLease(NamedTuple):
+    lease: Lease
+    released: bool
 
 
 async def _with_busy_retry(
@@ -609,21 +696,27 @@ class SQLiteStore:
             try:
                 await self._begin_immediate("SQLite lease acquisition conflict")
                 current = await self._read_lease(proposed.run_id)
-                if current is not None and current.expires_at > proposed.acquired_at:
+                if (
+                    current is not None
+                    and not current.released
+                    and current.lease.expires_at > proposed.acquired_at
+                ):
                     raise LeaseHeldError
-                generation = 1 if current is None else current.generation + 1
+                generation = 1 if current is None else current.lease.generation + 1
                 acquired = proposed.model_copy(update={"generation": generation})
                 await self._connection.execute(
                     """
                     INSERT INTO leases(
-                        run_id, owner, generation, acquired_at, renewed_at, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        run_id, owner, generation, acquired_at, renewed_at, expires_at,
+                        released
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(run_id) DO UPDATE SET
                         owner = excluded.owner,
                         generation = excluded.generation,
                         acquired_at = excluded.acquired_at,
                         renewed_at = excluded.renewed_at,
-                        expires_at = excluded.expires_at
+                        expires_at = excluded.expires_at,
+                        released = 0
                     """,
                     _lease_values(acquired),
                 )
@@ -643,16 +736,19 @@ class SQLiteStore:
                 current = await self._read_lease(lease.run_id)
                 if (
                     current is None
-                    or current.owner != lease.owner
-                    or current.generation != lease.generation
-                    or current.expires_at <= now
+                    or current.released
+                    or current.lease.owner != lease.owner
+                    or current.lease.generation != lease.generation
+                    or current.lease.expires_at <= now
+                    or now < current.lease.renewed_at
+                    or expires_at < current.lease.expires_at
                 ):
                     raise LeaseLostError
                 renewed = Lease(
-                    run_id=current.run_id,
-                    owner=current.owner,
-                    generation=current.generation,
-                    acquired_at=current.acquired_at,
+                    run_id=current.lease.run_id,
+                    owner=current.lease.owner,
+                    generation=current.lease.generation,
+                    acquired_at=current.lease.acquired_at,
                     renewed_at=now,
                     expires_at=expires_at,
                 )
@@ -662,8 +758,8 @@ class SQLiteStore:
                     WHERE run_id = ? AND owner = ? AND generation = ?
                     """,
                     (
-                        renewed.renewed_at.isoformat(),
-                        renewed.expires_at.isoformat(),
+                        canonical_lease_timestamp(renewed.renewed_at),
+                        canonical_lease_timestamp(renewed.expires_at),
                         renewed.run_id,
                         renewed.owner,
                         renewed.generation,
@@ -683,10 +779,17 @@ class SQLiteStore:
             try:
                 await self._begin_immediate("SQLite lease release conflict")
                 current = await self._read_lease(lease.run_id)
-                if not _lease_identity_matches(current, lease):
+                if (
+                    current is None
+                    or current.released
+                    or not _lease_identity_matches(current.lease, lease)
+                ):
                     raise LeaseLostError
                 result = await self._connection.execute(
-                    "DELETE FROM leases WHERE run_id = ? AND owner = ? AND generation = ?",
+                    """
+                    UPDATE leases SET released = 1
+                    WHERE run_id = ? AND owner = ? AND generation = ? AND released = 0
+                    """,
                     (lease.run_id, lease.owner, lease.generation),
                 )
                 if result.rowcount != 1:
@@ -704,9 +807,10 @@ class SQLiteStore:
                 current = await self._read_lease(lease.run_id)
                 if (
                     current is None
-                    or current.owner != lease.owner
-                    or current.generation != lease.generation
-                    or current.expires_at <= now
+                    or current.released
+                    or current.lease.owner != lease.owner
+                    or current.lease.generation != lease.generation
+                    or current.lease.expires_at <= now
                 ):
                     raise LeaseLostError
                 await self._commit_transaction()
@@ -893,16 +997,17 @@ class SQLiteStore:
             result_json=row[4],
         )
 
-    async def _read_lease(self, run_id: str) -> Lease | None:
+    async def _read_lease(self, run_id: str) -> _StoredLease | None:
         async with self._connection.execute(
             """
-            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at
+            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at,
+                   released
             FROM leases WHERE run_id = ?
             """,
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
-        return None if row is None else _lease_from_row(row)
+        return None if row is None else _StoredLease(_lease_from_row(row), bool(row[6]))
 
     async def _insert_idempotency(self, record: IdempotencyRecord) -> None:
         await self._connection.execute(
@@ -1284,14 +1389,15 @@ class SQLiteStore:
     async def _validate_v3_rows(connection: aiosqlite.Connection) -> None:
         async with connection.execute(
             """
-            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at
+            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at,
+                   released
             FROM leases
             """
         ) as cursor:
             lease_rows = await cursor.fetchall()
         for row in lease_rows:
             try:
-                Lease.model_validate(
+                lease = Lease.model_validate(
                     {
                         "run_id": row[0],
                         "owner": row[1],
@@ -1301,6 +1407,15 @@ class SQLiteStore:
                         "expires_at": row[5],
                     }
                 )
+                if row[6] not in (0, 1):
+                    raise ValueError("lease released state is invalid")
+                canonical_timestamps = (
+                    canonical_lease_timestamp(lease.acquired_at),
+                    canonical_lease_timestamp(lease.renewed_at),
+                    canonical_lease_timestamp(lease.expires_at),
+                )
+                if tuple(row[3:6]) != canonical_timestamps:
+                    raise ValueError("lease timestamps are not canonical UTC")
             except ValueError as error:
                 raise ValueError("incompatible lease row") from error
 
@@ -1401,7 +1516,9 @@ async def _validate_json_identity_rows(
         except (TypeError, ValueError) as error:
             raise ValueError(f"incompatible {table} JSON") from error
         if any(
-            column not in data or data[column] != row[index]
+            column not in data
+            or type(data[column]) is not type(row[index])
+            or data[column] != row[index]
             for index, column in enumerate(columns)
         ):
             raise ValueError(f"incompatible {table} row identity")
