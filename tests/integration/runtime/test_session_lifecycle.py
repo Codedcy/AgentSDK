@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import traceback
 from collections.abc import AsyncIterator
@@ -369,6 +370,64 @@ async def test_malformed_stored_create_result_is_sanitized(tmp_path: Path) -> No
         )
     finally:
         await second_sdk.close()
+
+
+async def test_create_rejects_valid_foreign_result_with_different_workspaces(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "valid-foreign-session-result.db"
+    first_sdk = AgentSDK.for_test(
+        database_path=database,
+        acompletion=_unused_acompletion,
+    )
+    try:
+        expected = await first_sdk.sessions.create(
+            workspaces=["workspace-a", "workspace-b"],
+            idempotency_key="expected-session",
+        )
+        await first_sdk.sessions.create(
+            workspaces=["workspace-b", "must-not-leak-foreign-workspace"],
+            idempotency_key="foreign-session",
+        )
+    finally:
+        await first_sdk.close()
+
+    with sqlite3.connect(database) as connection:
+        foreign_row = connection.execute(
+            "SELECT result_json FROM idempotency_records "
+            "WHERE scope = 'session.create' AND key = 'foreign-session'"
+        ).fetchone()
+        assert foreign_row is not None
+        foreign_result = json.loads(foreign_row[0])
+        assert foreign_result["session_id"] != expected.session_id
+        assert foreign_result["workspaces"] != list(expected.workspaces)
+        connection.execute(
+            "UPDATE idempotency_records SET result_json = ? "
+            "WHERE scope = 'session.create' AND key = 'expected-session'",
+            (json.dumps(foreign_result),),
+        )
+        connection.commit()
+    foreign_result.clear()
+    foreign_row = None
+
+    reopened = AgentSDK.for_test(
+        database_path=database,
+        acompletion=_unused_acompletion,
+    )
+    try:
+        with pytest.raises(AgentSDKError) as substituted:
+            await reopened.sessions.create(
+                workspaces=["workspace-a", "workspace-b"],
+                idempotency_key="expected-session",
+            )
+        assert substituted.value.code is ErrorCode.INTERNAL
+        assert substituted.value.retryable is False
+        _assert_context_free_sanitizer(
+            substituted.value,
+            secret="must-not-leak-foreign-workspace",
+        )
+    finally:
+        await reopened.close()
 
 
 class _RetainDeletingStore(InMemoryStore):

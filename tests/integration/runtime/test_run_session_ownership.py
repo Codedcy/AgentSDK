@@ -325,6 +325,77 @@ async def test_completed_replay_is_detached_and_uses_durable_result() -> None:
         await sdk.close()
 
 
+@pytest.mark.parametrize("idempotency_key", ["", "x" * 257])
+async def test_invalid_run_key_precedes_missing_session_and_execution(
+    idempotency_key: str,
+) -> None:
+    completion = CountingCompletion("unexpected")
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(store=store, acompletion=completion)
+    try:
+        with pytest.raises(AgentSDKError) as invalid:
+            await sdk.runs.start(
+                "ses_missing",
+                AGENT,
+                "must not start",
+                idempotency_key=idempotency_key,
+            )
+        assert invalid.value.code is ErrorCode.INVALID_STATE
+        assert invalid.value.message == "idempotency key is invalid"
+        assert invalid.value.retryable is False
+        _assert_context_free_sanitizer(
+            invalid.value,
+            secret=idempotency_key or "idempotency text",
+        )
+        assert completion.call_count == 0
+        assert await store.read_events(after_cursor=0) == []
+    finally:
+        await sdk.close()
+
+
+class _InvalidRunKeyAccessTrap(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.access_count = 0
+
+    def _trap(self) -> None:
+        self.access_count += 1
+        raise AssertionError("invalid Run key reached Store")
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        del kind, entity_id
+        self._trap()
+
+    async def get_idempotency(self, scope: str, key: str):
+        del scope, key
+        self._trap()
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        del batch
+        self._trap()
+
+
+@pytest.mark.parametrize("idempotency_key", ["", "x" * 257])
+async def test_invalid_run_key_is_rejected_before_any_store_access(
+    idempotency_key: str,
+) -> None:
+    store = _InvalidRunKeyAccessTrap()
+    sdk = AgentSDK.for_test(store=store, acompletion=CountingCompletion("unexpected"))
+    try:
+        with pytest.raises(AgentSDKError) as invalid:
+            await sdk.runs.start(
+                "ses_missing",
+                AGENT,
+                "must not start",
+                idempotency_key=idempotency_key,
+            )
+        assert invalid.value.code is ErrorCode.INVALID_STATE
+        assert invalid.value.message == "idempotency key is invalid"
+        assert store.access_count == 0
+    finally:
+        await sdk.close()
+
+
 async def test_completed_short_runs_do_not_accumulate_in_run_registry() -> None:
     completion = CountingCompletion()
     sdk = AgentSDK.for_test(store=InMemoryStore(), acompletion=completion)
@@ -1050,6 +1121,75 @@ async def test_corrupted_sqlite_run_replay_is_context_free_and_does_not_execute(
         assert provider_calls == 0
     finally:
         await reopened.close()
+
+
+async def test_run_start_rejects_valid_foreign_current_result(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "valid-foreign-run-result.db"
+    completion = CountingCompletion()
+    first_sdk = AgentSDK.for_test(database_path=database, acompletion=completion)
+    try:
+        session = await first_sdk.sessions.create(workspaces=[])
+        expected = await first_sdk.runs.start(
+            session.session_id,
+            AGENT,
+            "expected input",
+            idempotency_key="expected-run",
+        )
+        await expected.result()
+        foreign = await first_sdk.runs.start(
+            session.session_id,
+            AgentSpec(
+                name="test",
+                model="fake/model",
+                revision="1",
+                model_params={"private": "must-not-leak-foreign-run"},
+            ),
+            "foreign input",
+            idempotency_key="foreign-run",
+        )
+        await foreign.result()
+    finally:
+        await first_sdk.close()
+
+    with sqlite3.connect(database) as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        connection.execute(
+            "UPDATE idempotency_records "
+            "SET result_json = ("
+            "SELECT result_json FROM idempotency_records WHERE key = 'foreign-run'"
+            ") WHERE key = 'expected-run'"
+        )
+        connection.commit()
+
+    replay_completion = CountingCompletion("unexpected")
+    reopened = AgentSDK.for_test(
+        database_path=database,
+        acompletion=replay_completion,
+    )
+    try:
+        with pytest.raises(AgentSDKError) as substituted:
+            await reopened.runs.start(
+                session.session_id,
+                AGENT,
+                "expected input",
+                idempotency_key="expected-run",
+            )
+        assert substituted.value.code is ErrorCode.INTERNAL
+        assert substituted.value.retryable is False
+        _assert_context_free_sanitizer(
+            substituted.value,
+            secret="must-not-leak-foreign-run",
+        )
+        assert replay_completion.call_count == 0
+    finally:
+        await reopened.close()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == (
+            before_events
+        )
 
 
 class _DetachedFailingStore(InMemoryStore):

@@ -338,37 +338,40 @@ class RunAPI:
         *,
         idempotency_key: str | None = None,
     ) -> RunHandle:
-        async with self._lifecycle.admit():
-            messages = ({"role": "user", "content": user_input},)
-            config = self._policy.execution_config()
-            descriptor = ExecutionDescriptor.create(
-                agent=agent,
-                messages=messages,
-                tools=tuple(
-                    ToolCapabilityDescriptor.from_spec(spec)
-                    for spec in self._tools.list()
-                ),
-                policy=ExecutionPolicyDescriptor.create(
-                    permission_default=config["permission_default"]
-                ),
-            )
-            request = ModelRequest(
-                model=agent.model,
-                messages=messages,
-                tools=self._tools.schemas(),
-                params=mutable_model_params(agent.model_params),
-            )
-            coordinator = asyncio.create_task(
-                self._coordinate_start(
-                    session_id=session_id,
-                    agent_revision=f"{agent.name}:{agent.revision}",
-                    user_input=user_input,
-                    execution_descriptor=descriptor,
-                    request=request,
-                    idempotency_key=idempotency_key,
+        try:
+            async with self._lifecycle.admit():
+                messages = ({"role": "user", "content": user_input},)
+                config = self._policy.execution_config()
+                descriptor = ExecutionDescriptor.create(
+                    agent=agent,
+                    messages=messages,
+                    tools=tuple(
+                        ToolCapabilityDescriptor.from_spec(spec)
+                        for spec in self._tools.list()
+                    ),
+                    policy=ExecutionPolicyDescriptor.create(
+                        permission_default=config["permission_default"]
+                    ),
                 )
-            )
-            return await self._await_start_coordinator(coordinator)
+                request = ModelRequest(
+                    model=agent.model,
+                    messages=messages,
+                    tools=self._tools.schemas(),
+                    params=mutable_model_params(agent.model_params),
+                )
+                coordinator = asyncio.create_task(
+                    self._coordinate_start(
+                        session_id=session_id,
+                        agent_revision=f"{agent.name}:{agent.revision}",
+                        user_input=user_input,
+                        execution_descriptor=descriptor,
+                        request=request,
+                        idempotency_key=idempotency_key,
+                    )
+                )
+                return await self._await_start_coordinator(coordinator)
+        finally:
+            del idempotency_key
 
     async def _coordinate_start(
         self,
@@ -380,26 +383,29 @@ class RunAPI:
         request: ModelRequest,
         idempotency_key: str | None,
     ) -> RunHandle:
-        async with self._start_lock:
-            outcome = await self._commands.start_run(
-                session_id,
-                agent_revision=agent_revision,
-                user_input=user_input,
-                execution_descriptor=execution_descriptor,
-                idempotency_key=idempotency_key,
-            )
-            snapshot = outcome.value
-            task = self._tasks.get(snapshot.run_id)
-            if not outcome.replayed:
-                task = asyncio.create_task(
-                    self._engine.execute(snapshot.run_id, request)
+        try:
+            async with self._start_lock:
+                outcome = await self._commands.start_run(
+                    session_id,
+                    agent_revision=agent_revision,
+                    user_input=user_input,
+                    execution_descriptor=execution_descriptor,
+                    idempotency_key=idempotency_key,
                 )
-                self._tasks[snapshot.run_id] = task
-                task.add_done_callback(
-                    partial(self._release_task, snapshot.run_id)
-                )
-                self._track_task(task)
-            return RunHandle(snapshot.run_id, self._store, task)
+                snapshot = outcome.value
+                task = self._tasks.get(snapshot.run_id)
+                if not outcome.replayed:
+                    task = asyncio.create_task(
+                        self._engine.execute(snapshot.run_id, request)
+                    )
+                    self._tasks[snapshot.run_id] = task
+                    task.add_done_callback(
+                        partial(self._release_task, snapshot.run_id)
+                    )
+                    self._track_task(task)
+                return RunHandle(snapshot.run_id, self._store, task)
+        finally:
+            del idempotency_key
 
     def _release_task(
         self,

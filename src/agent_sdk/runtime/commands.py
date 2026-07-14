@@ -37,6 +37,7 @@ from agent_sdk.storage.idempotency import (
     IdempotencyReplayMissError,
     IdempotencyWrite,
     fingerprint_command,
+    validate_replay,
 )
 from agent_sdk.subagents.models import TaskEnvelope
 
@@ -153,7 +154,8 @@ class RuntimeCommands:
                     await self._commit_session_batch(
                         batch._replace(idempotency=request),
                         failure_message="failed to create session",
-                    )
+                    ),
+                    expected_workspaces=normalized_workspaces,
                 )
             except IdempotencyReplayMissError:
                 continue
@@ -370,7 +372,11 @@ class RuntimeCommands:
         return result
 
     @staticmethod
-    def _validated_session_result(result: CommitResult) -> SessionSnapshot:
+    def _validated_session_result(
+        result: CommitResult,
+        *,
+        expected_workspaces: tuple[str, ...] | None = None,
+    ) -> SessionSnapshot:
         record = result.idempotency
         if record is None:
             raise AgentSDKError(
@@ -381,10 +387,22 @@ class RuntimeCommands:
         payload = dict(record.result)
         del result
         del record
+        snapshot: SessionSnapshot | None = None
         try:
-            return validate_session_result(payload)
+            snapshot = validate_session_result(payload)
         finally:
             payload.clear()
+        if (
+            expected_workspaces is not None
+            and snapshot.workspaces != expected_workspaces
+        ):
+            snapshot = None
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "session command result is invalid",
+                retryable=False,
+            ) from None
+        return snapshot
 
     async def start_run(
         self,
@@ -406,12 +424,24 @@ class RuntimeCommands:
                 "legacy run cannot use idempotency",
                 retryable=False,
             ) from None
+        scope = f"session/{session_id}/run.start"
+        invalid_key: AgentSDKError | None = None
+        if idempotency_key is not None:
+            try:
+                validate_replay(
+                    IdempotencyReplay(scope, idempotency_key, "0" * 64)
+                )
+            except IdempotencyError as error:
+                invalid_key = _idempotency_public_error(error)
+        if invalid_key is not None:
+            idempotency_key = None
+            raise invalid_key from None
+
         selected_run_id = run_id or new_id("run")
         compatibility: Literal["legacy_unknown", "current"] = (
             "current" if execution_descriptor is not None else "legacy_unknown"
         )
         fingerprint: str | None = None
-        scope = f"session/{session_id}/run.start"
         if idempotency_key is not None:
             fingerprint = fingerprint_command(
                 "run.start",
@@ -568,6 +598,13 @@ class RuntimeCommands:
             stored, validation_error = self._validated_run_result(
                 result,
                 session_id=session_id,
+                agent_revision=agent_revision,
+                user_input=user_input,
+                parent_run_id=parent_run_id,
+                workflow_run_id=workflow_run_id,
+                workflow_node_id=workflow_node_id,
+                task_envelope=task_envelope,
+                execution_descriptor=execution_descriptor,
             )
             result = None
             if validation_error is not None:
@@ -586,6 +623,13 @@ class RuntimeCommands:
         result: CommitResult,
         *,
         session_id: str,
+        agent_revision: str,
+        user_input: str,
+        parent_run_id: str | None,
+        workflow_run_id: str | None,
+        workflow_node_id: str | None,
+        task_envelope: TaskEnvelope | None,
+        execution_descriptor: ExecutionDescriptor | None,
     ) -> tuple[RunSnapshot | None, AgentSDKError | None]:
         record = result.idempotency
         if record is None:
@@ -608,8 +652,22 @@ class RuntimeCommands:
             validation_failed = True
         finally:
             payload.clear()
-        if validation_failed or snapshot is None or snapshot.session_id != session_id:
+        if (
+            validation_failed
+            or snapshot is None
+            or snapshot.session_id != session_id
+            or snapshot.agent_revision != agent_revision
+            or snapshot.user_input != user_input
+            or snapshot.parent_run_id != parent_run_id
+            or snapshot.workflow_run_id != workflow_run_id
+            or snapshot.workflow_node_id != workflow_node_id
+            or snapshot.task_envelope != task_envelope
+            or snapshot.execution_compatibility != "current"
+            or snapshot.execution_descriptor != execution_descriptor
+        ):
             snapshot = None
+            del task_envelope
+            del execution_descriptor
             return (
                 None,
                 AgentSDKError(
