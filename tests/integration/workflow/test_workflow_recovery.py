@@ -74,6 +74,9 @@ class _CommitThenCancelStore:
         self.event_type = event_type
         self.triggered = False
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
     async def commit(self, batch: CommitBatch) -> CommitResult:
         result = await self.delegate.commit(batch)
         if not self.triggered and any(event.type == self.event_type for event in batch.events):
@@ -84,9 +87,7 @@ class _CommitThenCancelStore:
     async def read_events(
         self, *, after_cursor: int, session_id: str | None = None
     ) -> list[StoredEvent]:
-        return await self.delegate.read_events(
-            after_cursor=after_cursor, session_id=session_id
-        )
+        return await self.delegate.read_events(after_cursor=after_cursor, session_id=session_id)
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         return await self.delegate.get_snapshot(kind, entity_id)
@@ -169,9 +170,7 @@ async def test_sqlite_resume_skips_commit_then_cancelled_completed_node(
         different_data["name"] = "different"
         import yaml
 
-        different = WorkflowCompiler().compile_yaml(
-            yaml.safe_dump(different_data, sort_keys=False)
-        )
+        different = WorkflowCompiler().compile_yaml(yaml.safe_dump(different_data, sort_keys=False))
         with pytest.raises(AgentSDKError) as mismatch:
             await resumed.resume(handle.workflow_run_id, expected_workflow=different)
         assert mismatch.value.code is ErrorCode.CONFLICT
@@ -256,9 +255,10 @@ async def test_session_delete_removes_workflow_node_and_related_run_data(
     await store.delete_session(session.session_id)
 
     assert await store.get_snapshot("workflow", handle.workflow_run_id) is None
-    assert [
-        await store.get_snapshot("workflow_node", item) for item in node_entity_ids
-    ] == [None, None]
+    assert [await store.get_snapshot("workflow_node", item) for item in node_entity_ids] == [
+        None,
+        None,
+    ]
     assert [await store.get_snapshot("run", item or "") for item in run_ids] == [
         None,
         None,
@@ -326,6 +326,9 @@ class _BlockingBeforeWorkflowCommitStore:
         self.blocked = asyncio.Event()
         self.release = asyncio.Event()
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
     async def commit(self, batch: CommitBatch) -> CommitResult:
         if any(event.type == "workflow.node.completed" for event in batch.events):
             self.blocked.set()
@@ -335,9 +338,7 @@ class _BlockingBeforeWorkflowCommitStore:
     async def read_events(
         self, *, after_cursor: int, session_id: str | None = None
     ) -> list[StoredEvent]:
-        return await self.delegate.read_events(
-            after_cursor=after_cursor, session_id=session_id
-        )
+        return await self.delegate.read_events(after_cursor=after_cursor, session_id=session_id)
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         return await self.delegate.get_snapshot(kind, entity_id)
@@ -373,8 +374,7 @@ async def test_delete_racing_workflow_transition_cannot_resurrect_any_state() ->
     assert raised.value.code is ErrorCode.NOT_FOUND
     assert await store.get_snapshot("workflow", handle.workflow_run_id) is None
     assert [
-        await store.get_snapshot("workflow_node", node.entity_id)
-        for node in before_delete.nodes
+        await store.get_snapshot("workflow_node", node.entity_id) for node in before_delete.nodes
     ] == [None, None]
     assert await store.get_snapshot("run", run_id or "") is None
     assert await store.read_events(after_cursor=0) == []
@@ -456,8 +456,7 @@ async def test_store_failure_is_sanitized_before_workflow_exposure() -> None:
         for value in frame.f_locals.values()
     )
     assert not any(
-        event.event.type == "workflow.started"
-        for event in await store.read_events(after_cursor=0)
+        event.event.type == "workflow.started" for event in await store.read_events(after_cursor=0)
     )
 
 
@@ -504,9 +503,7 @@ async def test_resume_rejects_cross_session_selected_run_without_model_or_projec
         user_input="make a plan",
     )
     if foreign_status == "completed":
-        await RunEngine(
-            interrupted, LiteLLMGateway._for_test(provider)
-        ).execute(
+        await RunEngine(interrupted, LiteLLMGateway._for_test(provider)).execute(
             foreign.run_id,
             ModelRequest(
                 model="fake/planner",
@@ -630,15 +627,16 @@ class _BlockingNodeReadStore:
         self.node_read_blocked = asyncio.Event()
         self.release_node_read = asyncio.Event()
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
     async def commit(self, batch: CommitBatch) -> CommitResult:
         return await self.delegate.commit(batch)
 
     async def read_events(
         self, *, after_cursor: int, session_id: str | None = None
     ) -> list[StoredEvent]:
-        return await self.delegate.read_events(
-            after_cursor=after_cursor, session_id=session_id
-        )
+        return await self.delegate.read_events(after_cursor=after_cursor, session_id=session_id)
 
     async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
         if kind == "workflow_node" and self.block_next_node_read:

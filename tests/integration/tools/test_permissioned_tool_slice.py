@@ -35,7 +35,7 @@ from agent_sdk.models.litellm_gateway import (
 )
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.policy import PolicyEngine
-from agent_sdk.storage.base import CommitBatch, CommitResult
+from agent_sdk.storage.base import CommitResult, RunProgressBatch
 from agent_sdk.storage.memory import InMemoryStore
 
 
@@ -105,15 +105,15 @@ class _TwoStepModel:
 class _FailOncePermissionResolvedStore(InMemoryStore):
     def __init__(self) -> None:
         super().__init__()
-        self.failed = False
+        self.failed_attempts = 0
 
-    async def commit(self, batch: CommitBatch) -> CommitResult:
-        if not self.failed and any(
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if self.failed_attempts < 2 and any(
             event.type == "permission.resolved" for event in batch.events
         ):
-            self.failed = True
+            self.failed_attempts += 1
             raise RuntimeError("raw permission resolved storage secret")
-        return await super().commit(batch)
+        return await super().commit_run_progress(batch)
 
 
 async def _add(_: ToolContext, a: int, b: int) -> int:
@@ -279,11 +279,7 @@ async def test_text_only_run_persists_empty_ordered_tool_results() -> None:
 
     async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
         async def chunks() -> AsyncIterator[dict[str, object]]:
-            yield {
-                "choices": [
-                    {"delta": {"content": "plain"}, "finish_reason": "stop"}
-                ]
-            }
+            yield {"choices": [{"delta": {"content": "plain"}, "finish_reason": "stop"}]}
 
         return chunks()
 
@@ -300,8 +296,7 @@ async def test_text_only_run_persists_empty_ordered_tool_results() -> None:
         terminal = next(
             stored.event
             for stored in await store.read_events(after_cursor=0)
-            if stored.event.run_id == run.run_id
-            and stored.event.type == "run.completed"
+            if stored.event.run_id == run.run_id and stored.event.type == "run.completed"
         )
 
         assert result.tool_results == ()
@@ -367,9 +362,7 @@ async def test_tool_waits_for_permission_then_runs_second_model_step() -> None:
                 }
             else:
                 yield {
-                    "choices": [
-                        {"delta": {"content": "5"}, "finish_reason": "stop"}
-                    ],
+                    "choices": [{"delta": {"content": "5"}, "finish_reason": "stop"}],
                     "usage": {
                         "prompt_tokens": 2,
                         "completion_tokens": 1,
@@ -801,14 +794,10 @@ async def test_in_flight_permission_resolutions_remain_duplicate_conflicts() -> 
             arguments={},
         )
         waiting.append(asyncio.create_task(bridge.wait(request)))
-        assert (
-            await bridge.next_request("run_in_flight")
-        ).request_id == request_id
+        assert (await bridge.next_request("run_in_flight")).request_id == request_id
 
     resolving = [
-        asyncio.create_task(
-            bridge.resolve(request_id, PermissionDecision.allow_once())
-        )
+        asyncio.create_task(bridge.resolve(request_id, PermissionDecision.allow_once()))
         for request_id in request_ids
     ]
     try:
@@ -839,10 +828,7 @@ async def test_in_flight_permission_resolutions_remain_duplicate_conflicts() -> 
 async def test_permission_resolution_history_is_bounded_without_re_resolve() -> None:
     bridge = InProcessPermissionBridge()
     history_limit = 64
-    request_ids = [
-        f"prm_history_{index}"
-        for index in range(history_limit + 1)
-    ]
+    request_ids = [f"prm_history_{index}" for index in range(history_limit + 1)]
 
     for request_id in request_ids:
         request = PermissionRequest(
@@ -854,9 +840,7 @@ async def test_permission_resolution_history_is_bounded_without_re_resolve() -> 
         )
         waiting = asyncio.create_task(bridge.wait(request))
         assert (await bridge.next_request("run_history")).request_id == request_id
-        resolving = asyncio.create_task(
-            bridge.resolve(request_id, PermissionDecision.allow_once())
-        )
+        resolving = asyncio.create_task(bridge.resolve(request_id, PermissionDecision.allow_once()))
         assert (await waiting).allowed
         await bridge.mark_committed(request_id)
         await resolving
@@ -880,8 +864,7 @@ async def test_permission_resolution_history_is_bounded_without_re_resolve() -> 
 async def test_permission_request_queues_do_not_grow_for_unknown_waiters() -> None:
     bridge = InProcessPermissionBridge()
     unknown_waiters = [
-        asyncio.create_task(bridge.next_request(f"run_unknown_{index}"))
-        for index in range(100)
+        asyncio.create_task(bridge.next_request(f"run_unknown_{index}")) for index in range(100)
     ]
     await asyncio.sleep(0)
     for waiter in unknown_waiters:
@@ -899,9 +882,7 @@ async def test_permission_request_queues_do_not_grow_for_unknown_waiters() -> No
     )
     waiting = asyncio.create_task(bridge.wait(request))
     try:
-        assert (
-            await bridge.next_request("run_queue_cleanup")
-        ).request_id == request.request_id
+        assert (await bridge.next_request("run_queue_cleanup")).request_id == request.request_id
         assert "run_queue_cleanup" not in bridge._queues  # type: ignore[attr-defined]
     finally:
         await bridge.cancel(request.request_id)
@@ -1058,8 +1039,7 @@ async def test_permission_reason_and_tool_error_are_utf8_byte_bounded() -> None:
         resolved = next(
             stored.event
             for stored in await store.read_events(after_cursor=0)
-            if stored.event.run_id == run.run_id
-            and stored.event.type == "permission.resolved"
+            if stored.event.run_id == run.run_id and stored.event.type == "permission.resolved"
         )
         persisted_reason = resolved.payload["decision"]["reason"]
         assert isinstance(persisted_reason, str)
@@ -1192,8 +1172,7 @@ async def test_timeout_ignores_handler_late_success_after_cancel() -> None:
         completed = [
             stored.event.payload
             for stored in await store.read_events(after_cursor=0)
-            if stored.event.run_id == run.run_id
-            and stored.event.type == "tool.call.completed"
+            if stored.event.run_id == run.run_id and stored.event.type == "tool.call.completed"
         ]
 
         assert result.tool_results[0].status is ToolResultStatus.TIMED_OUT
@@ -1383,9 +1362,7 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
                 }
             else:
                 yield {
-                    "choices": [
-                        {"delta": {"content": "ten"}, "finish_reason": "stop"}
-                    ],
+                    "choices": [{"delta": {"content": "ten"}, "finish_reason": "stop"}],
                     "usage": {
                         "prompt_tokens": 3,
                         "completion_tokens": 1,
@@ -1405,6 +1382,7 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
         permission_default="allow",
     )
     try:
+
         async def handler(_: ToolContext, a: int, b: int) -> int:
             nonlocal handler_calls
             handler_calls += 1

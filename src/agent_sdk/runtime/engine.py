@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from typing import Any
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
+from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import (
     LiteLLMGateway,
     ModelCompleted,
@@ -18,6 +23,11 @@ from agent_sdk.models.litellm_gateway import (
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.runtime.leases import Lease, LeaseLostError, LeaseManager
+from agent_sdk.runtime.execution import (
+    ExecutionPolicyDescriptor,
+    ToolCapabilityDescriptor,
+)
 from agent_sdk.runtime.models import (
     RunFailure,
     RunResult,
@@ -33,27 +43,71 @@ from agent_sdk.runtime.session_lifecycle import (
     load_session,
     session_write,
 )
+from agent_sdk.runtime.reconciliation import (
+    ExternalOperationStatus,
+    ModelCallOperation,
+    RunCheckpoint,
+    RunCheckpointPhase,
+    RecoveryStateConflictError,
+    ToolCallOperation,
+)
 from agent_sdk.storage.base import (
-    CommitBatch,
+    CommitResult,
+    ExternalOperationWrite,
+    RunCheckpointWrite,
+    RunProgressBatch,
     SnapshotPrecondition,
-    SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
 )
 from agent_sdk.tools.executor import ToolExecutor
-from agent_sdk.tools.models import ToolContext, ToolResult
-from agent_sdk.tools.registry import ToolRegistry
+from agent_sdk.tools.models import ToolContext, ToolResult, ToolResultStatus
+from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
 
 _DELTA_FLUSH_SECONDS = 0.05
 _DELTA_FLUSH_BYTES = 4 * 1024
 _MAX_TOOL_STEPS = 8
 _MAX_SESSION_COMMIT_ATTEMPTS = 8
+_RUN_LEASE_TTL = timedelta(seconds=30)
+
+
+class _RunProgressError(AgentSDKError):
+    """Private control-flow error for sanitized fenced progress failures."""
+
+
+class _RunProgressConflictError(_RunProgressError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.CONFLICT,
+            "run lease is no longer current",
+            retryable=False,
+        )
+
+
+class _RunProgressStorageError(_RunProgressError):
+    def __init__(self) -> None:
+        super().__init__(
+            ErrorCode.INTERNAL,
+            "failed to persist run",
+            retryable=False,
+        )
 
 
 class _RunEmitter:
-    def __init__(self, store: StateStore, run: RunSnapshot) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        run: RunSnapshot,
+        lease: Lease,
+        clock: Callable[[], datetime],
+        lease_error: Callable[[], BaseException | None],
+    ) -> None:
         self._store = store
         self._run = run
+        self._lease = lease
+        self._clock = clock
+        self._lease_error = lease_error
+        self._checkpoint: RunCheckpoint | None = None
         self._sequence = 2
         self._lock = asyncio.Lock()
         self._delta_parts: list[str] = []
@@ -65,6 +119,394 @@ class _RunEmitter:
     def current_snapshot(self) -> RunSnapshot:
         return self._run
 
+    async def initialize(self, messages: tuple[dict[str, Any], ...]) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            snapshot = self._run.model_copy(
+                update={
+                    "status": RunStatus.RUNNING,
+                    "version": self._run.version + 1,
+                }
+            )
+            checkpoint = RunCheckpoint(
+                run_id=self._run.run_id,
+                session_id=self._run.session_id,
+                checkpoint_version=1,
+                turn=0,
+                phase=RunCheckpointPhase.READY_FOR_MODEL,
+                messages=messages,
+            )
+            event = self._new_event("run.started", {"status": RunStatus.RUNNING.value})
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    snapshots=(self._run_write(snapshot),),
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    checkpoint=RunCheckpointWrite(None, checkpoint),
+                ),
+            )
+            self._run = snapshot
+            self._checkpoint = checkpoint
+            self._sequence += 1
+
+    async def start_model(self, request: ModelRequest) -> ModelCallOperation:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            operation = ModelCallOperation(
+                operation_id=new_id("op_model"),
+                session_id=self._run.session_id,
+                run_id=self._run.run_id,
+                turn=self._checkpoint.turn,
+                request_fingerprint=_model_request_fingerprint(request),
+                lease_generation=self._lease.generation,
+                status=ExternalOperationStatus.STARTED,
+                provider_identity=request.model,
+                recovery_metadata={
+                    "authoritative_status": False,
+                    "same_operation_id_resend": False,
+                },
+            )
+            checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.MODEL_IN_FLIGHT,
+                    "operation_id": operation.operation_id,
+                }
+            )
+            events = (
+                self._new_event("step.started", {}),
+                self._new_event("model.call.started", {"model": request.model}, offset=1),
+            )
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=events,
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    operation=ExternalOperationWrite(None, operation),
+                    checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),
+                ),
+            )
+            self._checkpoint = checkpoint
+            self._sequence += len(events)
+            return operation
+
+    async def complete_model(
+        self,
+        operation: ModelCallOperation,
+        *,
+        finish_reason: str | None,
+        text: str,
+        calls: list[ToolCallCompleted],
+        operation_usage: TokenUsage,
+        usage: TokenUsage,
+        usage_payload: dict[str, int | None] | None,
+        output_parts: list[str],
+    ) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            assistant: dict[str, Any] = {"role": "assistant", "content": text or None}
+            if calls:
+                assistant["tool_calls"] = [
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments_json,
+                        },
+                    }
+                    for call in calls
+                ]
+            completed = operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.COMPLETED,
+                    "outcome": {
+                        "finish_reason": finish_reason,
+                        "text": text,
+                        "tool_calls": [
+                            {
+                                "index": call.index,
+                                "call_id": call.call_id,
+                                "name": call.name,
+                                "arguments_json": call.arguments_json,
+                            }
+                            for call in calls
+                        ],
+                        "usage": operation_usage.model_dump(mode="json"),
+                    },
+                }
+            )
+            checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "phase": (
+                        RunCheckpointPhase.READY_FOR_TOOL
+                        if calls
+                        else RunCheckpointPhase.READY_FOR_MODEL
+                    ),
+                    "operation_id": None,
+                    "messages": (*self._checkpoint.messages, assistant),
+                    "output_parts": tuple(output_parts),
+                    "usage": usage,
+                }
+            )
+            event_specs: list[tuple[str, dict[str, Any]]] = []
+            if usage_payload is not None:
+                event_specs.append(("model.usage.reported", usage_payload))
+            event_specs.append(("model.call.completed", {"finish_reason": finish_reason}))
+            events = tuple(
+                self._new_event(event_type, payload, offset=index)
+                for index, (event_type, payload) in enumerate(event_specs)
+            )
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=events,
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    operation=ExternalOperationWrite(operation, completed),
+                    checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),
+                ),
+            )
+            self._checkpoint = checkpoint
+            self._sequence += len(events)
+
+    async def fail_model(
+        self,
+        operation: ModelCallOperation,
+        failure: AgentSDKError,
+        *,
+        output_parts: list[str],
+        usage: TokenUsage,
+        tool_results: list[ToolResult],
+    ) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            payload = {"error": failure.to_dict()}
+            failed_operation = operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.FAILED,
+                    "outcome": {
+                        "error": {
+                            "code": failure.code.value,
+                            "message": "model call failed",
+                        }
+                    },
+                }
+            )
+            terminal_checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.TERMINAL,
+                    "operation_id": None,
+                    "output_parts": tuple(output_parts),
+                    "usage": usage,
+                    "tool_results": tuple(tool_results),
+                }
+            )
+            snapshot = self._run.model_copy(
+                update={
+                    "status": RunStatus.FAILED,
+                    "version": self._run.version + 1,
+                    "output_text": "".join(output_parts),
+                    "usage": usage,
+                    "tool_results": tuple(tool_results),
+                    "error": RunFailure(
+                        code=failure.code.value,
+                        message=failure.message,
+                        retryable=failure.retryable,
+                    ),
+                }
+            )
+            run_events = (
+                self._new_event("model.call.failed", payload),
+                self._new_event("step.failed", payload, offset=1),
+                self._new_event("run.failed", payload, offset=2),
+            )
+            for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+                session = await load_session(self._store, self._run.session_id)
+                updated_session, session_event_type = detach_run_transition(
+                    session, self._run.run_id
+                )
+                session_event = EventEnvelope.new(
+                    type=session_event_type,
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=updated_session.version,
+                    payload={
+                        "run_id": self._run.run_id,
+                        "status": updated_session.status.value,
+                    },
+                )
+                try:
+                    await _commit_progress(
+                        self._store,
+                        RunProgressBatch(
+                            lease=self._lease,
+                            now=self._clock(),
+                            events=(*run_events, session_event),
+                            snapshots=(
+                                self._run_write(snapshot),
+                                session_write(updated_session),
+                            ),
+                            preconditions=(
+                                exact_run_precondition(self._run),
+                                exact_session_precondition(session),
+                            ),
+                            operation=ExternalOperationWrite(operation, failed_operation),
+                            checkpoint=RunCheckpointWrite(self._checkpoint, terminal_checkpoint),
+                        ),
+                    )
+                except _RunProgressConflictError:
+                    try:
+                        await self._store.assert_current_lease(self._lease, now=self._clock())
+                    except Exception:
+                        raise _RunProgressConflictError from None
+                    current = await self._load_run_snapshot()
+                    if current != self._run:
+                        raise AgentSDKError(
+                            ErrorCode.CONFLICT,
+                            "run state changed concurrently",
+                            retryable=True,
+                        ) from None
+                    if attempt + 1 < _MAX_SESSION_COMMIT_ATTEMPTS:
+                        await asyncio.sleep(0)
+                    continue
+                self._run = snapshot
+                self._checkpoint = terminal_checkpoint
+                self._sequence += len(run_events)
+                return
+            raise AgentSDKError(
+                ErrorCode.CONFLICT,
+                "session state changed concurrently",
+                retryable=True,
+            )
+
+    async def start_tool(
+        self,
+        call: ToolCallCompleted,
+        registered: RegisteredTool,
+        arguments: Mapping[str, Any],
+    ) -> ToolCallOperation:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+            operation = ToolCallOperation(
+                operation_id=new_id("op_tool"),
+                session_id=self._run.session_id,
+                run_id=self._run.run_id,
+                turn=self._checkpoint.turn,
+                request_fingerprint=_tool_request_fingerprint(call, capability, arguments),
+                lease_generation=self._lease.generation,
+                status=ExternalOperationStatus.STARTED,
+                tool_identity=capability.capability_hash,
+                recovery_metadata={"safe_retry": False, "retry_class": "unsafe"},
+            )
+            checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.TOOL_IN_FLIGHT,
+                    "operation_id": operation.operation_id,
+                }
+            )
+            event = self._new_event(
+                "tool.call.started",
+                {"call_id": call.call_id, "tool_name": call.name},
+            )
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    operation=ExternalOperationWrite(None, operation),
+                    checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),
+                ),
+            )
+            self._checkpoint = checkpoint
+            self._sequence += 1
+            return operation
+
+    async def complete_tool(
+        self,
+        call: ToolCallCompleted,
+        result: ToolResult,
+        operation: ToolCallOperation | None,
+    ) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            operation_write: ExternalOperationWrite | None = None
+            if operation is not None:
+                operation_status = (
+                    ExternalOperationStatus.COMPLETED
+                    if result.status is ToolResultStatus.SUCCEEDED
+                    else ExternalOperationStatus.FAILED
+                )
+                finished_operation = operation.model_copy(
+                    update={
+                        "status": operation_status,
+                        "outcome": result.model_dump(mode="json"),
+                    }
+                )
+                operation_write = ExternalOperationWrite(operation, finished_operation)
+            tool_message = {
+                "role": "tool",
+                "tool_call_id": call.call_id,
+                "name": call.name,
+                "content": result.content,
+            }
+            checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "turn": self._checkpoint.turn + 1,
+                    "phase": RunCheckpointPhase.READY_FOR_MODEL,
+                    "operation_id": None,
+                    "messages": (*self._checkpoint.messages, tool_message),
+                    "tool_results": (*self._checkpoint.tool_results, result),
+                }
+            )
+            event = self._new_event("tool.call.completed", result.model_dump(mode="json"))
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    operation=operation_write,
+                    checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),
+                ),
+            )
+            self._checkpoint = checkpoint
+            self._sequence += 1
+
     async def emit(
         self,
         event_type: str,
@@ -73,6 +515,7 @@ class _RunEmitter:
         snapshot: RunSnapshot | None = None,
     ) -> None:
         async with self._lock:
+            self._ensure_lease_current()
             self._raise_timer_error()
             await self._emit_locked(event_type, payload or {}, snapshot=snapshot)
 
@@ -85,6 +528,7 @@ class _RunEmitter:
         update: dict[str, Any] | None = None,
     ) -> RunSnapshot:
         async with self._lock:
+            self._ensure_lease_current()
             self._raise_timer_error()
             values: dict[str, Any] = {
                 "status": status,
@@ -96,9 +540,52 @@ class _RunEmitter:
             await self._emit_locked(event_type, payload, snapshot=snapshot)
             return snapshot
 
+    async def permission_transition(
+        self,
+        event_type: str,
+        status: RunStatus,
+        payload: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            snapshot = self._run.model_copy(
+                update={"status": status, "version": self._run.version + 1}
+            )
+            checkpoint = self._checkpoint.model_copy(
+                update={
+                    "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                    "phase": (
+                        RunCheckpointPhase.WAITING
+                        if status is RunStatus.WAITING_PERMISSION
+                        else RunCheckpointPhase.READY_FOR_TOOL
+                    ),
+                    "operation_id": None,
+                }
+            )
+            event = self._new_event(event_type, payload)
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    snapshots=(self._run_write(snapshot),),
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),
+                ),
+            )
+            self._run = snapshot
+            self._checkpoint = checkpoint
+            self._sequence += 1
+
     async def add_delta(self, text: str) -> None:
         cancelled_timer: asyncio.Task[None] | None = None
         async with self._lock:
+            self._ensure_lease_current()
             self._raise_timer_error()
             self._delta_parts.append(text)
             self._delta_bytes += len(text.encode("utf-8"))
@@ -113,6 +600,7 @@ class _RunEmitter:
     async def flush_delta(self) -> None:
         cancelled_timer: asyncio.Task[None] | None = None
         async with self._lock:
+            self._ensure_lease_current()
             self._raise_timer_error()
             cancelled_timer = self._detach_timer_locked()
             await self._flush_delta_locked()
@@ -124,6 +612,7 @@ class _RunEmitter:
     async def _flush_after_delay(self) -> None:
         await asyncio.sleep(_DELTA_FLUSH_SECONDS)
         async with self._lock:
+            self._ensure_lease_current()
             if self._timer is asyncio.current_task():
                 self._timer = None
             await self._flush_delta_locked()
@@ -140,6 +629,10 @@ class _RunEmitter:
             error = self._timer_error
             self._timer_error = None
             raise error
+
+    def _ensure_lease_current(self) -> None:
+        if self._lease_error() is not None:
+            raise LeaseLostError from None
 
     def _detach_timer_locked(self) -> asyncio.Task[None] | None:
         timer = self._timer
@@ -171,13 +664,8 @@ class _RunEmitter:
         *,
         snapshot: RunSnapshot | None = None,
     ) -> None:
-        event = EventEnvelope.new(
-            type=event_type,
-            session_id=self._run.session_id,
-            run_id=self._run.run_id,
-            sequence=self._sequence,
-            payload=payload,
-        )
+        self._ensure_lease_current()
+        event = self._new_event(event_type, payload)
         if snapshot is not None and snapshot.status in RUN_LIFECYCLE_FINAL_STATUSES:
             await self._commit_terminal(event, snapshot)
             return
@@ -194,22 +682,21 @@ class _RunEmitter:
             )
         store_failed = False
         try:
-            await self._store.commit(
-                CommitBatch(
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
                     events=(event,),
                     snapshots=snapshots,
                     preconditions=(
                         SnapshotPrecondition("session", self._run.session_id),
                         SnapshotPrecondition("run", self._run.run_id, self._run.version),
                     ),
-                )
+                ),
             )
-        except SnapshotPreconditionError:
-            raise AgentSDKError(
-                ErrorCode.NOT_FOUND,
-                "run session no longer exists",
-                retryable=False,
-            ) from None
+        except _RunProgressError:
+            raise
         except Exception:
             store_failed = True
         if store_failed:
@@ -222,11 +709,45 @@ class _RunEmitter:
             self._run = snapshot
         self._sequence += 1
 
+    def _new_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        offset: int = 0,
+    ) -> EventEnvelope:
+        return EventEnvelope.new(
+            type=event_type,
+            session_id=self._run.session_id,
+            run_id=self._run.run_id,
+            sequence=self._sequence + offset,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _run_write(snapshot: RunSnapshot) -> SnapshotWrite:
+        return SnapshotWrite(
+            "run",
+            snapshot.run_id,
+            snapshot.session_id,
+            snapshot.version,
+            snapshot.model_dump(mode="json"),
+        )
+
     async def _commit_terminal(
         self,
         run_event: EventEnvelope,
         snapshot: RunSnapshot,
     ) -> None:
+        self._ensure_lease_current()
+        assert self._checkpoint is not None
+        terminal_checkpoint = self._checkpoint.model_copy(
+            update={
+                "checkpoint_version": self._checkpoint.checkpoint_version + 1,
+                "phase": RunCheckpointPhase.TERMINAL,
+                "operation_id": None,
+            }
+        )
         for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
             session = await load_session(self._store, self._run.session_id)
             updated_session, session_event_type = detach_run_transition(
@@ -245,8 +766,11 @@ class _RunEmitter:
             )
             store_failed = False
             try:
-                await self._store.commit(
-                    CommitBatch(
+                await _commit_progress(
+                    self._store,
+                    RunProgressBatch(
+                        lease=self._lease,
+                        now=self._clock(),
                         events=(run_event, session_event),
                         snapshots=(
                             SnapshotWrite(
@@ -262,9 +786,14 @@ class _RunEmitter:
                             exact_run_precondition(self._run),
                             exact_session_precondition(session),
                         ),
-                    )
+                        checkpoint=RunCheckpointWrite(self._checkpoint, terminal_checkpoint),
+                    ),
                 )
-            except SnapshotPreconditionError:
+            except _RunProgressConflictError:
+                try:
+                    await self._store.assert_current_lease(self._lease, now=self._clock())
+                except Exception:
+                    raise _RunProgressConflictError from None
                 current = await self._load_run_snapshot()
                 if current != self._run:
                     raise AgentSDKError(
@@ -284,6 +813,7 @@ class _RunEmitter:
                     retryable=False,
                 ) from None
             self._run = snapshot
+            self._checkpoint = terminal_checkpoint
             self._sequence += 1
             return
         raise AgentSDKError(
@@ -336,21 +866,138 @@ class RunEngine:
         tools: ToolRegistry | None = None,
         policy: PolicyEngine | None = None,
         permission_bridge: InProcessPermissionBridge | None = None,
+        *,
+        lease_manager: LeaseManager | None = None,
+        _clock: Callable[[], datetime] | None = None,
+        _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        _heartbeat_interval: float = _RUN_LEASE_TTL.total_seconds() / 3,
     ) -> None:
         self._store = store
         self._models = models
         self._tools = tools or ToolRegistry()
         self._policy = policy or PolicyEngine()
         self._permission_bridge = permission_bridge
+        self._leases = lease_manager or LeaseManager(store, ttl=_RUN_LEASE_TTL)
+        self._clock = _clock or (lambda: datetime.now(UTC))
+        self._sleep = _sleep
+        self._heartbeat_interval = _heartbeat_interval
 
     async def execute(self, run_id: str, request: ModelRequest) -> RunResult:
+        public_error: tuple[ErrorCode, str, bool] | None = None
+        try:
+            return await self._execute_private(run_id, request)
+        except AgentSDKError as error:
+            public_error = (error.code, error.message, error.retryable)
+        del self, run_id, request
+        assert public_error is not None
+        raise AgentSDKError(
+            public_error[0],
+            public_error[1],
+            retryable=public_error[2],
+        ) from None
+
+    async def _execute_private(self, run_id: str, request: ModelRequest) -> RunResult:
         created = await self._load_created_run(run_id)
-        emitter = _RunEmitter(self._store, created)
-        await emitter.transition(
-            "run.started",
-            RunStatus.RUNNING,
-            {"status": RunStatus.RUNNING.value},
+        self._validate_live_execution(created, request)
+        lease = await self._leases.acquire(run_id, new_id("coord"), now=self._clock())
+        owner = asyncio.current_task()
+        assert owner is not None
+        heartbeat_error: BaseException | None = None
+        heartbeat = asyncio.create_task(self._heartbeat(lease))
+
+        def heartbeat_finished(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception()
+            if heartbeat_error is not None and not owner.done():
+                owner.cancel()
+
+        heartbeat.add_done_callback(heartbeat_finished)
+        try:
+            try:
+                return await self._execute_owned(
+                    created,
+                    request,
+                    lease,
+                    lambda: heartbeat_error,
+                )
+            except _RunProgressConflictError:
+                session = await self._store.get_snapshot("session", created.session_id)
+                if session is None:
+                    raise AgentSDKError(
+                        ErrorCode.NOT_FOUND,
+                        "run session no longer exists",
+                        retryable=False,
+                    ) from None
+                raise
+        except asyncio.CancelledError:
+            if heartbeat_error is not None:
+                raise LeaseLostError from None
+            raise
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+            with suppress(Exception):
+                await asyncio.shield(self._leases.release(lease))
+
+    async def _heartbeat(self, lease: Lease) -> None:
+        while True:
+            await self._sleep(self._heartbeat_interval)
+            lease = await self._leases.renew(lease, now=self._clock())
+
+    def _validate_live_execution(
+        self,
+        created: RunSnapshot,
+        request: ModelRequest,
+    ) -> None:
+        descriptor = created.execution_descriptor
+        if descriptor is None:
+            return
+        policy_config = self._policy.execution_config()
+        live_policy = ExecutionPolicyDescriptor.create(
+            permission_default=policy_config["permission_default"]
         )
+        live_tools = tuple(ToolCapabilityDescriptor.from_spec(spec) for spec in self._tools.list())
+        request_messages = tuple(deepcopy(message) for message in request.messages)
+        descriptor_messages = tuple(dict(message) for message in descriptor.messages)
+        descriptor_params = descriptor.agent.model_dump(mode="json")["model_params"]
+        mismatched = (
+            descriptor.agent.model != request.model
+            or descriptor_messages != request_messages
+            or descriptor_params != request.params
+            or descriptor.tools != live_tools
+            or request.tools != self._tools.schemas()
+            or descriptor.policy != live_policy
+        )
+        if mismatched:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run execution descriptor mismatch",
+                retryable=False,
+            ) from None
+
+    async def _execute_owned(
+        self,
+        created: RunSnapshot,
+        request: ModelRequest,
+        lease: Lease,
+        lease_error: Callable[[], BaseException | None],
+    ) -> RunResult:
+        run_id = created.run_id
+        emitter = _RunEmitter(
+            self._store,
+            created,
+            lease,
+            self._clock,
+            lease_error,
+        )
+        initial_messages = request.messages
+        if created.execution_descriptor is not None:
+            initial_messages = tuple(
+                dict(message) for message in created.execution_descriptor.messages
+            )
+        await emitter.initialize(initial_messages)
         chunks: list[str] = []
         usage = TokenUsage()
         tool_results: list[ToolResult] = []
@@ -362,9 +1009,8 @@ class RunEngine:
         )
         try:
             while True:
-                await emitter.emit("step.started")
-                await emitter.emit("model.call.started", {"model": request.model})
                 step_chunks: list[str] = []
+                step_usage = TokenUsage()
                 calls: list[ToolCallCompleted] = []
                 model_request = ModelRequest(
                     model=request.model,
@@ -372,6 +1018,9 @@ class RunEngine:
                     tools=request.tools,
                     params=dict(request.params),
                 )
+                operation = await emitter.start_model(model_request)
+                model_completed: ModelCompleted | None = None
+                usage_payload: dict[str, int | None] | None = None
                 try:
                     async for event in self._models.stream(model_request):
                         if isinstance(event, TextDelta):
@@ -382,18 +1031,16 @@ class RunEngine:
                             calls.append(event)
                         elif isinstance(event, UsageReported):
                             await emitter.flush_delta()
-                            usage = _add_usage(usage, event.to_usage())
-                            await emitter.emit(
-                                "model.usage.reported",
-                                event.to_payload(),
-                            )
+                            reported_usage = event.to_usage()
+                            step_usage = _add_usage(step_usage, reported_usage)
+                            usage = _add_usage(usage, reported_usage)
+                            usage_payload = event.to_payload()
                         elif isinstance(event, ModelCompleted):
                             await emitter.flush_delta()
-                            await emitter.emit(
-                                "model.call.completed",
-                                event.to_payload(),
-                            )
+                            model_completed = event
                 except asyncio.CancelledError:
+                    raise
+                except (LeaseLostError, _RunProgressError):
                     raise
                 except Exception as cause:
                     failure = AgentSDKError(
@@ -402,6 +1049,23 @@ class RunEngine:
                         retryable=False,
                     )
                     await emitter.flush_delta()
+                    await emitter.fail_model(
+                        operation,
+                        failure,
+                        output_parts=chunks,
+                        usage=usage,
+                        tool_results=tool_results,
+                    )
+                    await emitter.close()
+                    del cause
+                    raise failure from None
+
+                if model_completed is None:
+                    failure = AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "model call failed",
+                        retryable=False,
+                    )
                     await self._fail_run(
                         emitter,
                         failure,
@@ -410,8 +1074,17 @@ class RunEngine:
                         tool_results,
                         model_call_failed=True,
                     )
-                    await emitter.close()
-                    raise failure from cause
+                    raise failure
+                await emitter.complete_model(
+                    operation,
+                    finish_reason=model_completed.finish_reason,
+                    text="".join(step_chunks),
+                    calls=calls,
+                    operation_usage=step_usage,
+                    usage=usage,
+                    usage_payload=usage_payload,
+                    output_parts=chunks,
+                )
 
                 if len(calls) > 1:
                     failure = AgentSDKError(
@@ -454,6 +1127,22 @@ class RunEngine:
                     "tool.call.proposed",
                     {"call_id": call.call_id, "tool_name": call.name},
                 )
+                tool_operation: ToolCallOperation | None = None
+
+                async def before_handler(
+                    hook_call: ToolCallCompleted,
+                    registered: RegisteredTool,
+                    arguments: Mapping[str, Any],
+                ) -> None:
+                    nonlocal tool_operation
+                    tool_operation = await emitter.start_tool(hook_call, registered, arguments)
+
+                async def call_completed(
+                    hook_call: ToolCallCompleted,
+                    result: ToolResult,
+                ) -> None:
+                    await emitter.complete_tool(hook_call, result, tool_operation)
+
                 try:
                     tool_result = await executor.execute(
                         call,
@@ -480,8 +1169,12 @@ class RunEngine:
                                 decision,
                             )
                         ),
+                        on_before_handler=before_handler,
+                        on_call_completed=call_completed,
                     )
                 except asyncio.CancelledError:
+                    raise
+                except (LeaseLostError, _RunProgressError):
                     raise
                 except Exception as cause:
                     failure = (
@@ -556,8 +1249,7 @@ class RunEngine:
         }
         if tool_results:
             terminal_payload["tool_results"] = [
-                tool_result.model_dump(mode="json")
-                for tool_result in tool_results
+                tool_result.model_dump(mode="json") for tool_result in tool_results
             ]
         await emitter.transition(
             "run.completed",
@@ -585,7 +1277,7 @@ class RunEngine:
         }
         if decision is not None:
             payload["decision"] = decision.model_dump(mode="json")
-        await emitter.transition(event_type, status, payload)
+        await emitter.permission_transition(event_type, status, payload)
 
     @staticmethod
     async def _fail_run(
@@ -635,6 +1327,47 @@ class RunEngine:
         return run
 
 
+async def _commit_progress(
+    store: StateStore,
+    batch: RunProgressBatch,
+) -> CommitResult:
+    task = asyncio.create_task(store.commit_run_progress(batch))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        await _settle_commit_task(task)
+        if task.done() and not task.cancelled() and task.exception() is not None:
+            replay = asyncio.create_task(store.commit_run_progress(batch))
+            await _settle_commit_task(replay)
+        raise cancellation from None
+    except Exception as first_error:
+        del first_error
+
+    replay = asyncio.create_task(store.commit_run_progress(batch))
+    try:
+        return await asyncio.shield(replay)
+    except RecoveryStateConflictError:
+        raise _RunProgressConflictError from None
+    except asyncio.CancelledError as cancellation:
+        await _settle_commit_task(replay)
+        raise cancellation from None
+    except Exception as replay_error:
+        del replay_error
+    raise _RunProgressStorageError from None
+
+
+async def _settle_commit_task(task: asyncio.Task[CommitResult]) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    if task.done() and not task.cancelled():
+        task.exception()
+
+
 def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
     def add(first: int | None, second: int | None) -> int | None:
         if first is None:
@@ -648,3 +1381,40 @@ def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
         completion_tokens=add(left.completion_tokens, right.completion_tokens),
         total_tokens=add(left.total_tokens, right.total_tokens),
     )
+
+
+def _model_request_fingerprint(request: ModelRequest) -> str:
+    encoded = json.dumps(
+        {
+            "model": request.model,
+            "messages": request.messages,
+            "tools": request.tools,
+            "params": request.params,
+            "purpose": request.purpose,
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _tool_request_fingerprint(
+    call: ToolCallCompleted,
+    capability: ToolCapabilityDescriptor,
+    arguments: Mapping[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {
+            "call_id": call.call_id,
+            "tool_name": call.name,
+            "arguments": arguments,
+            "capability": capability.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()

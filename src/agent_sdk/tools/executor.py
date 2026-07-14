@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 from jsonschema import Draft202012Validator
@@ -21,12 +21,12 @@ from agent_sdk.tools.models import (
     ToolResultStatus,
     thaw_json,
 )
-from agent_sdk.tools.registry import ToolRegistry
+from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
 
 _Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
-_PermissionTransition = Callable[
-    [PermissionRequest, PermissionDecision | None], Awaitable[None]
-]
+_PermissionTransition = Callable[[PermissionRequest, PermissionDecision | None], Awaitable[None]]
+_BeforeHandler = Callable[[ToolCallCompleted, RegisteredTool, Mapping[str, Any]], Awaitable[None]]
+_CompleteCall = Callable[[ToolCallCompleted, ToolResult], Awaitable[None]]
 
 
 class ToolExecutor:
@@ -47,6 +47,8 @@ class ToolExecutor:
         emit: _Emit,
         on_permission_requested: _PermissionTransition,
         on_permission_resolved: _PermissionTransition,
+        on_before_handler: _BeforeHandler | None = None,
+        on_call_completed: _CompleteCall | None = None,
     ) -> ToolResult:
         try:
             registered = self._registry.get(call.name)
@@ -56,6 +58,7 @@ class ToolExecutor:
                 ToolResultStatus.FAILED,
                 "tool not found",
                 emit,
+                on_call_completed,
             )
 
         try:
@@ -66,9 +69,7 @@ class ToolExecutor:
             if not isinstance(decoded, dict):
                 raise ValueError("tool arguments must be an object")
             arguments = cast(dict[str, Any], decoded)
-            Draft202012Validator(
-                thaw_json(registered.spec.input_schema)
-            ).validate(arguments)
+            Draft202012Validator(thaw_json(registered.spec.input_schema)).validate(arguments)
             request = PermissionRequest(
                 request_id=new_id("prm"),
                 run_id=context.run_id,
@@ -88,6 +89,7 @@ class ToolExecutor:
                 ToolResultStatus.INVALID_ARGUMENTS,
                 "invalid tool arguments",
                 emit,
+                on_call_completed,
             )
 
         decision = await self._permissions.authorize(
@@ -101,16 +103,20 @@ class ToolExecutor:
                 ToolResultStatus.DENIED,
                 decision.reason or "permission denied",
                 emit,
+                on_call_completed,
             )
 
         await emit(
             "tool.call.authorized",
             {"call_id": call.call_id, "tool_name": call.name},
         )
-        await emit(
-            "tool.call.started",
-            {"call_id": call.call_id, "tool_name": call.name},
-        )
+        if on_before_handler is None:
+            await emit(
+                "tool.call.started",
+                {"call_id": call.call_id, "tool_name": call.name},
+            )
+        else:
+            await on_before_handler(call, registered, arguments)
         try:
             invocation = registered.handler(
                 context,
@@ -160,7 +166,10 @@ class ToolExecutor:
                 "tool handler failed",
             )
 
-        await emit("tool.call.completed", self._result_payload(result))
+        if on_call_completed is None:
+            await emit("tool.call.completed", self._result_payload(result))
+        else:
+            await on_call_completed(call, result)
         return result
 
     @staticmethod
@@ -169,6 +178,7 @@ class ToolExecutor:
         status: ToolResultStatus,
         message: str,
         emit: _Emit,
+        on_call_completed: _CompleteCall | None = None,
     ) -> ToolResult:
         result = ToolResult.normalized_error(
             call.call_id,
@@ -176,7 +186,10 @@ class ToolExecutor:
             status,
             message,
         )
-        await emit("tool.call.completed", ToolExecutor._result_payload(result))
+        if on_call_completed is None:
+            await emit("tool.call.completed", ToolExecutor._result_payload(result))
+        else:
+            await on_call_completed(call, result)
         return result
 
     @staticmethod

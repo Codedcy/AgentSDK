@@ -506,6 +506,9 @@ class _OneEventPageStore:
     def __init__(self, delegate: InMemoryStore) -> None:
         self.delegate = delegate
 
+    def __getattr__(self, name: str):
+        return getattr(self.delegate, name)
+
     async def commit(self, batch: CommitBatch):
         return await self.delegate.commit(batch)
 

@@ -31,7 +31,12 @@ from agent_sdk.models.litellm_gateway import (
 )
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
-from agent_sdk.storage.base import CommitBatch, CommitResult, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    RunProgressBatch,
+    StoredEvent,
+)
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -169,9 +174,7 @@ def test_agent_spec_model_copy_update_detaches_nested_model_params() -> None:
 
 def test_agent_spec_model_copy_update_returns_frozen_nested_values() -> None:
     original = AgentSpec(name="test", model="fake/model")
-    copied = original.model_copy(
-        update={"model_params": {"metadata": {"labels": ["copied"]}}}
-    )
+    copied = original.model_copy(update={"model_params": {"metadata": {"labels": ["copied"]}}})
 
     with pytest.raises(TypeError):
         copied.model_params["metadata"]["labels"][0] = "mutation"  # type: ignore[index]
@@ -729,34 +732,17 @@ async def test_events_normalizes_store_failure_after_task_done() -> None:
     _assert_context_free_sanitizer(raised.value, secret="raw store failure")
 
 
-class _BlockingTerminalStore:
+class _BlockingTerminalStore(InMemoryStore):
     def __init__(self) -> None:
-        self._store = InMemoryStore()
+        super().__init__()
         self.terminal_commit_started = asyncio.Event()
         self.release_terminal_commit = asyncio.Event()
 
-    async def commit(self, batch: CommitBatch) -> CommitResult:
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
         if any(event.type == "run.completed" for event in batch.events):
             self.terminal_commit_started.set()
             await self.release_terminal_commit.wait()
-        return await self._store.commit(batch)
-
-    async def read_events(
-        self,
-        *,
-        after_cursor: int,
-        session_id: str | None = None,
-    ) -> list[StoredEvent]:
-        return await self._store.read_events(
-            after_cursor=after_cursor,
-            session_id=session_id,
-        )
-
-    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
-        return await self._store.get_snapshot(kind, entity_id)
-
-    async def delete_session(self, session_id: str) -> None:
-        await self._store.delete_session(session_id)
+        return await super().commit_run_progress(batch)
 
 
 @pytest.mark.asyncio
@@ -784,33 +770,13 @@ async def test_result_waits_for_atomic_terminal_event_and_snapshot() -> None:
         await sdk.close()
 
 
-class _CloseTrackingStore:
+class _CloseTrackingStore(InMemoryStore):
     def __init__(self) -> None:
-        self._store = InMemoryStore()
+        super().__init__()
         self.close_calls = 0
 
     async def close(self) -> None:
         self.close_calls += 1
-
-    async def commit(self, batch: CommitBatch) -> CommitResult:
-        return await self._store.commit(batch)
-
-    async def read_events(
-        self,
-        *,
-        after_cursor: int,
-        session_id: str | None = None,
-    ) -> list[StoredEvent]:
-        return await self._store.read_events(
-            after_cursor=after_cursor,
-            session_id=session_id,
-        )
-
-    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
-        return await self._store.get_snapshot(kind, entity_id)
-
-    async def delete_session(self, session_id: str) -> None:
-        await self._store.delete_session(session_id)
 
 
 @pytest.mark.asyncio
@@ -842,9 +808,9 @@ async def test_run_start_is_rejected_once_close_begins(store: InMemoryStore) -> 
     assert raised.value.message == "SDK is closing"
 
 
-class _BlockingRunCreatedStore:
+class _BlockingRunCreatedStore(InMemoryStore):
     def __init__(self) -> None:
-        self._store = InMemoryStore()
+        super().__init__()
         self.run_created_commit_started = asyncio.Event()
         self.release_run_created_commit = asyncio.Event()
 
@@ -852,24 +818,7 @@ class _BlockingRunCreatedStore:
         if any(event.type == "run.created" for event in batch.events):
             self.run_created_commit_started.set()
             await self.release_run_created_commit.wait()
-        return await self._store.commit(batch)
-
-    async def read_events(
-        self,
-        *,
-        after_cursor: int,
-        session_id: str | None = None,
-    ) -> list[StoredEvent]:
-        return await self._store.read_events(
-            after_cursor=after_cursor,
-            session_id=session_id,
-        )
-
-    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
-        return await self._store.get_snapshot(kind, entity_id)
-
-    async def delete_session(self, session_id: str) -> None:
-        await self._store.delete_session(session_id)
+        return await super().commit(batch)
 
 
 @pytest.mark.asyncio
@@ -1064,9 +1013,7 @@ async def test_cancelled_only_close_waiter_leaves_no_unretrieved_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    close_started, release_close, close_failed = _install_failing_sqlite_close(
-        monkeypatch
-    )
+    close_started, release_close, close_failed = _install_failing_sqlite_close(monkeypatch)
     loop = asyncio.get_running_loop()
     previous_handler = loop.get_exception_handler()
     diagnostics: list[dict[str, Any]] = []
@@ -1110,9 +1057,7 @@ async def test_second_close_replays_failure_after_only_waiter_is_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    close_started, release_close, close_failed = _install_failing_sqlite_close(
-        monkeypatch
-    )
+    close_started, release_close, close_failed = _install_failing_sqlite_close(monkeypatch)
     sdk = AgentSDK(AgentSDKConfig(database_path=tmp_path / "state.db"))
     await sdk.sessions.create(workspaces=[])
     close_waiter = asyncio.create_task(sdk.close())

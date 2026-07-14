@@ -28,11 +28,12 @@ from agent_sdk.runtime.session_lifecycle import (
     exact_session_precondition,
     session_write,
 )
+from agent_sdk.runtime.reconciliation import RecoveryStateConflictError
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
-    SnapshotPreconditionError,
+    RunProgressBatch,
 )
 from agent_sdk.tools.models import ToolContext, ToolSpec
 from agent_sdk.storage.memory import InMemoryStore
@@ -55,9 +56,7 @@ class BlockingCompletion:
 
         async def chunks() -> AsyncIterator[dict[str, object]]:
             yield {
-                "choices": [
-                    {"delta": {"content": "done"}, "finish_reason": "stop"}
-                ],
+                "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
                 "usage": {
                     "prompt_tokens": 1,
                     "completion_tokens": 1,
@@ -209,9 +208,12 @@ async def test_concurrent_duplicate_run_start_executes_once(
 
     assert len({handle.run_id for handle in handles}) == 1
     assert all(handle.attached for handle in handles)
-    assert len(
-        {id(handle._task) for handle in handles}  # type: ignore[attr-defined]
-    ) == 1
+    assert (
+        len(
+            {id(handle._task) for handle in handles}  # type: ignore[attr-defined]
+        )
+        == 1
+    )
     completion.finish()
     await asyncio.gather(*(handle.result() for handle in handles))
     assert completion.call_count == 1
@@ -757,9 +759,7 @@ async def test_close_start_race_linearizes_without_orphaned_run(winner: str) -> 
     handle = None
     try:
         session = await starting_sdk.sessions.create(workspaces=[])
-        start_task = asyncio.create_task(
-            starting_sdk.runs.start(session.session_id, AGENT, "race")
-        )
+        start_task = asyncio.create_task(starting_sdk.runs.start(session.session_id, AGENT, "race"))
         await asyncio.wait_for(store.run_ready.wait(), timeout=1)
         close_task = asyncio.create_task(closing_sdk.sessions.close(session.session_id))
         await asyncio.wait_for(store.close_ready.wait(), timeout=1)
@@ -805,17 +805,19 @@ class _TerminalRaceStore(InMemoryStore):
         super().__init__()
         self.failures = failures
         self.terminal_attempts = 0
+        self._rejected_batches: dict[int, RunProgressBatch] = {}
 
-    async def commit(self, batch: CommitBatch) -> CommitResult:
-        if any(
-            event.type in {"run.completed", "run.failed"}
-            for event in batch.events
-        ):
-            self.terminal_attempts += 1
-            if self.failures:
-                self.failures -= 1
-                raise SnapshotPreconditionError("synthetic terminal race")
-        return await super().commit(batch)
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if any(event.type in {"run.completed", "run.failed"} for event in batch.events):
+            batch_id = id(batch)
+            if batch_id not in self._rejected_batches:
+                self.terminal_attempts += 1
+                if self.failures:
+                    self.failures -= 1
+                    self._rejected_batches[batch_id] = batch
+            if batch_id in self._rejected_batches:
+                raise RecoveryStateConflictError
+        return await super().commit_run_progress(batch)
 
 
 async def test_terminal_session_race_retries_once_and_writes_one_terminal_event() -> None:
@@ -879,13 +881,10 @@ class _FailingTerminalStore(InMemoryStore):
         super().__init__()
         self.error = RuntimeError("must-not-leak-terminal-store-secret")
 
-    async def commit(self, batch: CommitBatch) -> CommitResult:
-        if any(
-            event.type in {"run.completed", "run.failed"}
-            for event in batch.events
-        ):
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if any(event.type in {"run.completed", "run.failed"} for event in batch.events):
             raise self.error
-        return await super().commit(batch)
+        return await super().commit_run_progress(batch)
 
 
 async def test_terminal_commit_failure_rolls_back_both_aggregates_and_is_sanitized() -> None:
@@ -1010,6 +1009,7 @@ async def test_cancelled_start_finishes_registration_before_reraising(
     try:
         session = await sdk.sessions.create(workspaces=[])
         if phase == "post-command":
+
             async def blocked_start(*args: Any, **kwargs: Any):
                 outcome = await original_start(*args, **kwargs)
                 store.reached.set()
@@ -1084,9 +1084,7 @@ async def test_corrupted_sqlite_run_replay_is_context_free_and_does_not_execute(
         assert row is not None
         result = json.loads(row[0])
         if corruption == "descriptor":
-            result["execution_descriptor"]["private_secret"] = (
-                "must-not-leak-corrupt-replay"
-            )
+            result["execution_descriptor"]["private_secret"] = "must-not-leak-corrupt-replay"
         else:
             result["output_text"] = None
             result["private_secret"] = "must-not-leak-corrupt-replay"
@@ -1187,9 +1185,7 @@ async def test_run_start_rejects_valid_foreign_current_result(
         await reopened.close()
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == (
-            before_events
-        )
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == (before_events)
 
 
 class _DetachedFailingStore(InMemoryStore):
@@ -1223,9 +1219,7 @@ class _CorruptHintStore(InMemoryStore):
     def __init__(self) -> None:
         super().__init__()
         self.enabled = False
-        self.error = IdempotencyCorruptionError(
-            "must-not-leak-corrupt-idempotency-hint"
-        )
+        self.error = IdempotencyCorruptionError("must-not-leak-corrupt-idempotency-hint")
 
     async def get_idempotency(self, scope: str, key: str):
         if self.enabled:
