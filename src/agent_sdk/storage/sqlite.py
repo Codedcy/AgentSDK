@@ -49,6 +49,7 @@ from agent_sdk.storage.base import (
     SnapshotPrecondition,
     SnapshotWrite,
     StoredEvent,
+    _valid_run_progress_int64_fields,
 )
 from agent_sdk.storage.idempotency import (
     IdempotencyConflictError,
@@ -660,6 +661,8 @@ class SQLiteStore:
             raise RecoveryStateConflictError
         if batch.now.tzinfo is None or batch.now.utcoffset() is None:
             raise RecoveryStateConflictError
+        if not _valid_run_progress_int64_fields(batch):
+            raise RecoveryStateConflictError
         async with self._lock:
             self._ensure_open()
             try:
@@ -830,16 +833,12 @@ class SQLiteStore:
                 raise RecoveryStateConflictError
             sequences[aggregate] = event.sequence
 
-        snapshot_versions: dict[tuple[str, str], int] = {}
+        snapshot_keys: set[tuple[str, str]] = set()
         for snapshot in batch.snapshots:
             key = (snapshot.kind, snapshot.entity_id)
-            previous_version = snapshot_versions.get(key)
-            if (
-                previous_version is not None
-                and snapshot.version <= previous_version
-            ):
+            if key in snapshot_keys:
                 raise RecoveryStateConflictError
-            snapshot_versions[key] = snapshot.version
+            snapshot_keys.add(key)
 
     async def _run_progress_target_states(
         self, batch: RunProgressBatch

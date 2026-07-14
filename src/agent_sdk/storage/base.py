@@ -101,6 +101,56 @@ class RunProgressBatch(NamedTuple):
     checkpoint: RunCheckpointWrite | None = None
 
 
+_SIGNED_INT64_MIN = -(1 << 63)
+_SIGNED_INT64_MAX = (1 << 63) - 1
+
+
+def _valid_run_progress_int64_fields(batch: RunProgressBatch) -> bool:
+    def valid(value: object) -> bool:
+        return (
+            type(value) is int
+            and _SIGNED_INT64_MIN <= value <= _SIGNED_INT64_MAX
+        )
+
+    if not valid(batch.lease.generation):
+        return False
+    for event in batch.events:
+        if not valid(event.schema_version) or not valid(event.sequence):
+            return False
+    for snapshot in batch.snapshots:
+        if not valid(snapshot.version):
+            return False
+    for snapshot_precondition in batch.preconditions:
+        if snapshot_precondition.version is not None and not valid(
+            snapshot_precondition.version
+        ):
+            return False
+    for event_precondition in batch.event_preconditions:
+        if not valid(event_precondition.cursor) or not valid(
+            event_precondition.sequence
+        ):
+            return False
+    if batch.operation is not None:
+        operations = [batch.operation.updated]
+        if batch.operation.expected is not None:
+            operations.append(batch.operation.expected)
+        for operation in operations:
+            if not valid(operation.turn) or not valid(
+                operation.lease_generation
+            ):
+                return False
+    if batch.checkpoint is not None:
+        checkpoints = [batch.checkpoint.updated]
+        if batch.checkpoint.expected is not None:
+            checkpoints.append(batch.checkpoint.expected)
+        for checkpoint in checkpoints:
+            if not valid(checkpoint.checkpoint_version) or not valid(
+                checkpoint.turn
+            ):
+                return False
+    return True
+
+
 class CommitResult(NamedTuple):
     last_cursor: int
     applied: bool = True

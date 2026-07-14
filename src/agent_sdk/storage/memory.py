@@ -35,6 +35,7 @@ from agent_sdk.storage.base import (
     SnapshotPrecondition,
     SnapshotWrite,
     StoredEvent,
+    _valid_run_progress_int64_fields,
 )
 from agent_sdk.storage.idempotency import (
     IdempotencyConflictError,
@@ -161,6 +162,8 @@ class InMemoryStore:
 
     @_context_free_recovery_errors
     async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if not _valid_run_progress_int64_fields(batch):
+            raise RecoveryStateConflictError
         try:
             return await self._commit_run_progress(batch)
         except (TypeError, ValueError):
@@ -431,16 +434,12 @@ class InMemoryStore:
                 raise RecoveryStateConflictError
             sequences[aggregate] = event.sequence
 
-        snapshot_versions: dict[_SnapshotKey, int] = {}
+        snapshot_keys: set[_SnapshotKey] = set()
         for snapshot in batch.snapshots:
             key = (snapshot.kind, snapshot.entity_id)
-            previous_version = snapshot_versions.get(key)
-            if (
-                previous_version is not None
-                and snapshot.version <= previous_version
-            ):
+            if key in snapshot_keys:
                 raise RecoveryStateConflictError
-            snapshot_versions[key] = snapshot.version
+            snapshot_keys.add(key)
 
     def _run_progress_target_states(
         self, batch: RunProgressBatch

@@ -128,21 +128,56 @@ behavior GREEN.
     - GREEN: `2 passed, 82 deselected` after pre-replay internal id/sequence/version
       validation.
 
-Fresh final Phase 3A focused result: `84 passed in 5.50s`.
+## Review remediation
+
+The first independent review returned `C0/I2/M0`, not approved. Both Important
+findings were repaired under strict TDD without changing the schema or expanding
+Phase 3A scope.
+
+1. Multiple snapshot targets with one identity
+   - Finding: a batch could contain the same `(kind, entity_id)` twice when the
+     versions increased. First application published only the last snapshot, so
+     the original multi-target invocation could never be exactly replayed.
+   - RED: `2 failed, 4 passed, 84 deselected`; active Memory and SQLite batches
+     accepted Run snapshot versions 3 then 4 for the same identity.
+   - GREEN: `6 passed, 84 deselected`.
+   - Fix: both pre-replay internal validators now treat the second occurrence of
+     any snapshot identity as an illegal invocation, before replay, lease checks,
+     or mutation. Shared tests cover active commit, released invocation, durable
+     state, replay rejection, and zero mutation.
+2. Unified signed-64-bit batch integers
+   - Finding: oversized integers were accepted by Memory, leaked SQLite
+     `OverflowError` at binding, or bypassed validation on exact replay.
+   - RED: `23 failed, 4 passed, 90 deselected`. The failures included Memory
+     publication, raw SQLite/lazy overflow, and accepted oversized replay lease or
+     precondition values.
+   - GREEN: `27 passed, 90 deselected`.
+   - Fix: one pure storage-base validator enforces exact Python `int` values in
+     the inclusive signed-64-bit range for lease generation, event schema version
+     and sequence, snapshot version, snapshot-precondition version,
+     event-precondition cursor and sequence, operation expected/updated turn and
+     lease generation, and checkpoint expected/updated version and turn. Memory
+     and SQLite call it before replay, lease validation, and SQLite transaction
+     creation; lazy SQLite inherits the same decision and sanitizes its own frame.
+   - Every parameter asserts constant `RecoveryStateConflictError`, empty cause
+     and context, nonempty SDK traceback frames without the secret, and exact zero
+     mutation of cursor, events, snapshots, operations, and checkpoints.
+
+Fresh final Phase 3A focused result: `117 passed in 6.58s`.
 
 ## Required gates on final code
 
 - Phase 3A focused:
-  `84 passed in 5.50s`.
+  `117 passed in 6.58s`.
 - Phase 2 focused (`test_reconciliation_models.py`, `test_recovery_records.py`,
   `test_sqlite_recovery_validation.py`):
-  `136 passed in 8.03s`.
+  `136 passed in 8.55s`.
 - Phase 1 + M02-T001 regression (`test_leases.py`,
   `test_sqlite_v3_migration.py`, `test_idempotency_store_contract.py`,
   `test_execution_descriptors.py`, `test_sqlite_spine.py`):
-  `188 passed in 13.04s`.
+  `188 passed in 14.15s`.
 - Final full Python 3.13 pytest:
-  `994 passed in 33.87s`.
+  `1027 passed in 34.69s`.
 - Ruff (`ruff check src tests`):
   `All checks passed!`.
 - mypy (`mypy src/agent_sdk`):

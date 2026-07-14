@@ -36,6 +36,10 @@ from agent_sdk.storage.sqlite import SQLiteStore
 
 
 NOW = datetime(2026, 7, 14, 8, tzinfo=UTC)
+INT64_MAX = (1 << 63) - 1
+INT64_MIN = -(1 << 63)
+INT64_TOO_LARGE = INT64_MAX + 1
+INT64_TOO_SMALL = INT64_MIN - 1
 
 
 def _running_run(**updates: object) -> RunSnapshot:
@@ -1162,3 +1166,261 @@ async def test_exact_replay_rejects_duplicate_event_target_in_invocation(
                 events=(event, event),
             )
         )
+
+
+@pytest.mark.parametrize("lease_state", ("active", "released"))
+@pytest.mark.asyncio
+async def test_run_progress_rejects_multiple_snapshots_for_same_identity(
+    progress_store: Any,
+    lease_state: str,
+) -> None:
+    store, lease, run = await _seed_store(progress_store)
+    version_3 = _run_write(run.model_copy(update={"version": 3}))
+    version_4 = _run_write(run.model_copy(update={"version": 4}))
+    if lease_state == "released":
+        await store.release_lease(lease)
+
+    with pytest.raises(RecoveryStateConflictError):
+        await store.commit_run_progress(
+            RunProgressBatch(
+                lease=lease,
+                now=NOW,
+                snapshots=(version_3, version_4),
+            )
+        )
+
+    assert await store.latest_cursor() == 0
+    assert await store.get_snapshot("run", run.run_id) == run.model_dump(
+        mode="json"
+    )
+    assert await store.get_external_operation("op_model") is None
+    assert await store.get_run_checkpoint(run.run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_run_progress_never_replays_multiple_snapshot_target_shape(
+    progress_store: Any,
+) -> None:
+    store, lease, run = await _seed_store(progress_store)
+    version_3 = _run_write(run.model_copy(update={"version": 3}))
+    version_4 = _run_write(run.model_copy(update={"version": 4}))
+    await store.commit(
+        CommitBatch(events=(), snapshots=(version_3, version_4))
+    )
+    await store.release_lease(lease)
+
+    with pytest.raises(RecoveryStateConflictError):
+        await store.commit_run_progress(
+            RunProgressBatch(
+                lease=lease,
+                now=lease.expires_at,
+                snapshots=(version_3, version_4),
+            )
+        )
+
+    assert await store.get_snapshot("run", run.run_id) == version_4.data
+
+
+_INT64_FIELD_CASES = (
+    "event_schema_version",
+    "event_sequence_high",
+    "event_sequence_low",
+    "snapshot_version_high",
+    "snapshot_version_low",
+    "snapshot_precondition_version",
+    "event_precondition_cursor",
+    "event_precondition_sequence",
+    "operation_turn",
+    "operation_lease_generation",
+    "checkpoint_version",
+    "checkpoint_turn",
+    "lease_generation",
+)
+
+
+async def _batch_with_oversized_integer(
+    store: Any,
+    lease: Lease,
+    run: RunSnapshot,
+    field: str,
+    secret: str,
+) -> RunProgressBatch:
+    replay_fields = {
+        "snapshot_precondition_version",
+        "event_precondition_cursor",
+        "event_precondition_sequence",
+        "lease_generation",
+    }
+    if field in replay_fields:
+        event = _event("evt_exact_numeric_target", 1).model_copy(
+            update={"payload": {"secret": secret}}
+        )
+        await store.commit_run_progress(
+            RunProgressBatch(lease=lease, now=NOW, events=(event,))
+        )
+        await store.release_lease(lease)
+        batch_lease = lease
+        preconditions: tuple[SnapshotPrecondition, ...] = ()
+        event_preconditions: tuple[EventPrecondition, ...] = ()
+        if field == "snapshot_precondition_version":
+            preconditions = (
+                SnapshotPrecondition(
+                    "run", run.run_id, version=INT64_TOO_LARGE
+                ),
+            )
+        elif field == "event_precondition_cursor":
+            event_preconditions = (
+                EventPrecondition(
+                    event.event_id,
+                    INT64_TOO_LARGE,
+                    event.session_id,
+                    event.run_id,
+                    event.type,
+                    event.sequence,
+                ),
+            )
+        elif field == "event_precondition_sequence":
+            event_preconditions = (
+                EventPrecondition(
+                    event.event_id,
+                    1,
+                    event.session_id,
+                    event.run_id,
+                    event.type,
+                    INT64_TOO_LARGE,
+                ),
+            )
+        else:
+            batch_lease = lease.model_copy(
+                update={"generation": INT64_TOO_LARGE}
+            )
+        return RunProgressBatch(
+            lease=batch_lease,
+            now=lease.expires_at,
+            events=(event,),
+            preconditions=preconditions,
+            event_preconditions=event_preconditions,
+        )
+
+    event = _event("evt_oversized_numeric", 1).model_copy(
+        update={"payload": {"secret": secret}}
+    )
+    snapshot = _run_write(run.model_copy(update={"version": 3}))
+    operation = _model_operation(recovery_metadata={"secret": secret})
+    checkpoint = _checkpoint(
+        phase=RunCheckpointPhase.MODEL_IN_FLIGHT,
+        operation_id=operation.operation_id,
+    )
+    if field == "event_schema_version":
+        event = event.model_copy(update={"schema_version": INT64_TOO_LARGE})
+    elif field == "event_sequence_high":
+        event = event.model_copy(update={"sequence": INT64_TOO_LARGE})
+    elif field == "event_sequence_low":
+        event = event.model_copy(update={"sequence": INT64_TOO_SMALL})
+    elif field == "snapshot_version_high":
+        oversized_run = run.model_copy(update={"version": INT64_TOO_LARGE})
+        snapshot = _run_write(oversized_run)
+    elif field == "snapshot_version_low":
+        snapshot = SnapshotWrite(
+            "custom",
+            "custom_oversized",
+            run.session_id,
+            INT64_TOO_SMALL,
+            {"secret": secret},
+        )
+    elif field == "operation_turn":
+        operation = _model_operation(
+            turn=INT64_TOO_LARGE,
+            recovery_metadata={"secret": secret},
+        )
+        checkpoint = checkpoint.model_copy(
+            update={"operation_id": operation.operation_id}
+        )
+    elif field == "operation_lease_generation":
+        operation = _model_operation(
+            lease_generation=INT64_TOO_LARGE,
+            recovery_metadata={"secret": secret},
+        )
+        checkpoint = checkpoint.model_copy(
+            update={"operation_id": operation.operation_id}
+        )
+    elif field == "checkpoint_version":
+        checkpoint = checkpoint.model_copy(
+            update={"checkpoint_version": INT64_TOO_LARGE}
+        )
+    elif field == "checkpoint_turn":
+        checkpoint = checkpoint.model_copy(update={"turn": INT64_TOO_LARGE})
+    else:
+        raise AssertionError(f"unhandled int64 field: {field}")
+    return RunProgressBatch(
+        lease=lease,
+        now=NOW,
+        events=(event,),
+        snapshots=(snapshot,),
+        operation=ExternalOperationWrite(None, operation),
+        checkpoint=RunCheckpointWrite(None, checkpoint),
+    )
+
+
+@pytest.mark.parametrize("numeric_field", _INT64_FIELD_CASES)
+@pytest.mark.asyncio
+async def test_run_progress_rejects_out_of_int64_numeric_fields_safely(
+    progress_store: Any,
+    numeric_field: str,
+) -> None:
+    store, lease, run = await _seed_store(progress_store)
+    secret = f"int64-secret-{numeric_field}-80f75d"
+    batch = await _batch_with_oversized_integer(
+        store, lease, run, numeric_field, secret
+    )
+    before_cursor = await store.latest_cursor()
+    before_events = await store.read_events(after_cursor=0)
+    before_run = await store.get_snapshot("run", run.run_id)
+
+    with pytest.raises(RecoveryStateConflictError) as caught:
+        await store.commit_run_progress(batch)
+
+    assert caught.value.to_dict() == {
+        "code": "conflict",
+        "message": "recovery state conflict",
+        "retryable": True,
+    }
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    sdk_locals = _sdk_traceback_locals(caught.value)
+    assert sdk_locals
+    assert all(secret not in repr(frame_locals) for frame_locals in sdk_locals)
+    assert await store.latest_cursor() == before_cursor
+    assert await store.read_events(after_cursor=0) == before_events
+    assert await store.get_snapshot("run", run.run_id) == before_run
+    assert await store.get_external_operation("op_model") is None
+    assert await store.get_run_checkpoint(run.run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_lazy_run_progress_rejects_out_of_int64_with_sanitized_traceback(
+    tmp_path: Path,
+) -> None:
+    store = _LazySQLiteStore(tmp_path / "lazy-int64.db")
+    try:
+        _, lease, run = await _seed_store(store)
+        secret = "lazy-int64-secret-6f12d8"
+        batch = await _batch_with_oversized_integer(
+            store, lease, run, "event_sequence_high", secret
+        )
+
+        with pytest.raises(RecoveryStateConflictError) as caught:
+            await store.commit_run_progress(batch)
+
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+        sdk_locals = _sdk_traceback_locals(caught.value)
+        assert sdk_locals
+        assert all(
+            secret not in repr(frame_locals) for frame_locals in sdk_locals
+        )
+        assert await store.latest_cursor() == 0
+        assert await store.get_external_operation("op_model") is None
+        assert await store.get_run_checkpoint(run.run_id) is None
+    finally:
+        await store.close()
