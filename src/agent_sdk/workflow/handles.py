@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.storage.base import StateStore, StoredEvent
-from agent_sdk.workflow.models import WorkflowResult, WorkflowRunStatus
+from agent_sdk.workflow.models import WorkflowResult, WorkflowRunSnapshot, WorkflowRunStatus
 from agent_sdk.workflow.state import WorkflowState
 
 _TERMINAL_EVENTS = {"workflow.completed", "workflow.failed"}
@@ -16,13 +16,20 @@ class WorkflowHandle:
         self,
         workflow_run_id: str,
         store: StateStore,
-        task: asyncio.Task[WorkflowResult],
+        task: asyncio.Task[WorkflowResult] | None,
     ) -> None:
         self.workflow_run_id = workflow_run_id
         self._store = store
         self._task = task
 
+    @property
+    def attached(self) -> bool:
+        return self._task is not None
+
     async def result(self) -> WorkflowResult:
+        if self._task is None:
+            snapshot = await WorkflowState(self._store).load(self.workflow_run_id)
+            return _durable_result(snapshot)
         result = await asyncio.shield(self._task)
         snapshot = await WorkflowState(self._store).load(self.workflow_run_id)
         if snapshot.status is not WorkflowRunStatus.COMPLETED:
@@ -51,6 +58,8 @@ class WorkflowHandle:
                 yield stored
                 if stored.event.type in _TERMINAL_EVENTS:
                     return
+            if self._task is None:
+                return
             if self._task.done():
                 if not completion_observed:
                     completion_observed = True
@@ -88,3 +97,42 @@ async def _read_events(
         return await store.read_events(after_cursor=cursor)
     except Exception:
         return None
+
+
+def _durable_result(snapshot: WorkflowRunSnapshot) -> WorkflowResult:
+    if snapshot.status is WorkflowRunStatus.COMPLETED:
+        if snapshot.output_text is None or snapshot.usage is None:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "terminal workflow result is invalid",
+                retryable=False,
+            ) from None
+        return WorkflowResult(
+            workflow_run_id=snapshot.workflow_run_id,
+            status=snapshot.status,
+            nodes=snapshot.nodes,
+            output_text=snapshot.output_text,
+            usage=snapshot.usage,
+        )
+    if snapshot.status is WorkflowRunStatus.FAILED:
+        failure = snapshot.error
+        if failure is None:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "terminal workflow result is invalid",
+                retryable=False,
+            ) from None
+        try:
+            code = ErrorCode(failure.code)
+        except ValueError:
+            code = ErrorCode.INTERNAL
+        raise AgentSDKError(
+            code,
+            failure.message,
+            retryable=failure.retryable,
+        ) from None
+    raise AgentSDKError(
+        ErrorCode.CONFLICT,
+        "recovery required",
+        retryable=True,
+    ) from None

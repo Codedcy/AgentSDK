@@ -1,17 +1,34 @@
 from __future__ import annotations
 
+import asyncio
 from enum import Enum
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
-from agent_sdk.runtime.models import RunResult, TokenUsage
+from agent_sdk.runtime.commands import CommandOutcome
+from agent_sdk.runtime.execution import WorkflowExecutionDescriptor
+from agent_sdk.runtime.models import RunResult, SessionStatus, TokenUsage
+from agent_sdk.runtime.session_lifecycle import (
+    detach_workflow_transition,
+    exact_session_precondition,
+    load_session,
+    session_write,
+)
 from agent_sdk.storage.base import (
     CommitBatch,
+    CommitResult,
     SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
+)
+from agent_sdk.storage.idempotency import (
+    IdempotencyError,
+    IdempotencyReplay,
+    IdempotencyReplayMissError,
+    IdempotencyWrite,
+    fingerprint_command,
 )
 from agent_sdk.workflow.models import (
     WorkflowFailure,
@@ -39,7 +56,20 @@ class WorkflowState:
     def __init__(self, store: StateStore) -> None:
         self._store = store
 
-    async def create(self, session_id: str, workflow: WorkflowIR) -> WorkflowRunSnapshot:
+    async def create(
+        self,
+        session_id: str,
+        workflow: WorkflowIR,
+        *,
+        execution_descriptor: WorkflowExecutionDescriptor | None = None,
+        idempotency_key: str | None = None,
+    ) -> CommandOutcome[WorkflowRunSnapshot]:
+        if execution_descriptor is None and idempotency_key is not None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "legacy workflow cannot use idempotency",
+                retryable=False,
+            ) from None
         workflow_run_id = new_id("wfr")
         nodes = tuple(
             WorkflowNodeSnapshot(
@@ -57,8 +87,28 @@ class WorkflowState:
             status=WorkflowRunStatus.RUNNING,
             workflow=workflow,
             nodes=nodes,
+            execution_compatibility=(
+                "current" if execution_descriptor is not None else "legacy_unknown"
+            ),
+            execution_descriptor=execution_descriptor,
         )
-        event = EventEnvelope.new(
+        snapshot_data = snapshot.model_dump(mode="json")
+        scope = f"session/{session_id}/workflow.start"
+        fingerprint: str | None = None
+        if idempotency_key is not None:
+            fingerprint = fingerprint_command(
+                "workflow.start",
+                {
+                    "session_id": session_id,
+                    "workflow": workflow.model_dump(mode="json"),
+                    "execution_descriptor": (
+                        None
+                        if execution_descriptor is None
+                        else execution_descriptor.model_dump(mode="json")
+                    ),
+                },
+            )
+        workflow_event = EventEnvelope.new(
             type="workflow.started",
             session_id=session_id,
             run_id=workflow_run_id,
@@ -68,20 +118,116 @@ class WorkflowState:
                 "name": workflow.name,
             },
         )
-        writes = (
-            _workflow_write(snapshot),
-            *(_node_write(node) for node in nodes),
+        for attempt in range(8):
+            session = await load_session(self._store, session_id)
+            if session.status is SessionStatus.DELETING:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "session is deleting",
+                    retryable=False,
+                )
+            has_hint = False
+            if idempotency_key is not None:
+                hint = await _get_idempotency(
+                    self._store,
+                    scope,
+                    idempotency_key,
+                )
+                has_hint = hint is not None
+                hint = None
+
+            request: IdempotencyWrite | IdempotencyReplay | None
+            if has_hint:
+                assert idempotency_key is not None
+                assert fingerprint is not None
+                request = IdempotencyReplay(scope, idempotency_key, fingerprint)
+                batch = CommitBatch(
+                    events=(),
+                    idempotency=request,
+                    replay_preconditions=(exact_session_precondition(session),),
+                )
+            elif session.status is not SessionStatus.ACTIVE:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "session is not active",
+                    retryable=False,
+                )
+            else:
+                updated_session = session.model_copy(
+                    update={
+                        "active_workflow_run_ids": tuple(
+                            sorted((*session.active_workflow_run_ids, workflow_run_id))
+                        ),
+                        "version": session.version + 1,
+                    }
+                )
+                session_event = EventEnvelope.new(
+                    type="session.workflow.attached",
+                    session_id=session_id,
+                    run_id=None,
+                    sequence=updated_session.version,
+                    payload={"workflow_run_id": workflow_run_id},
+                )
+                request = None
+                if idempotency_key is not None:
+                    assert fingerprint is not None
+                    request = IdempotencyWrite(
+                        scope=scope,
+                        key=idempotency_key,
+                        request_fingerprint=fingerprint,
+                        session_id=session_id,
+                        result=snapshot_data,
+                    )
+                session_precondition = exact_session_precondition(session)
+                batch = CommitBatch(
+                    events=(session_event, workflow_event),
+                    snapshots=(
+                        session_write(updated_session),
+                        _workflow_write(snapshot),
+                        *(_node_write(node) for node in nodes),
+                    ),
+                    preconditions=(session_precondition,),
+                    idempotency=request,
+                    replay_preconditions=(
+                        (session_precondition,) if request is not None else ()
+                    ),
+                )
+            result: CommitResult | None = None
+            store_failed = False
+            try:
+                result = await self._store.commit(batch)
+            except (SnapshotPreconditionError, IdempotencyReplayMissError):
+                if attempt + 1 < 8:
+                    await asyncio.sleep(0)
+                continue
+            except IdempotencyError:
+                raise
+            except Exception:
+                store_failed = True
+            if store_failed:
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "failed to persist workflow state",
+                    retryable=False,
+                ) from None
+            assert result is not None
+            if request is None:
+                return CommandOutcome(snapshot, replayed=False)
+            replayed = not result.applied
+            stored, validation_error = _validated_workflow_result(
+                result,
+                session_id=session_id,
+            )
+            result = None
+            if validation_error is not None:
+                raise validation_error from None
+            assert stored is not None
+            return CommandOutcome(stored, replayed=replayed)
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session state changed concurrently",
+            retryable=True,
         )
-        await self._commit(
-            CommitBatch(
-                events=(event,),
-                snapshots=writes,
-                preconditions=(SnapshotPrecondition("session", session_id),),
-            ),
-            session_id,
-            conflict_message="workflow already exists",
-        )
-        return snapshot
 
     async def load(self, workflow_run_id: str) -> WorkflowRunSnapshot:
         result = await _load_workflow(self._store, workflow_run_id)
@@ -272,26 +418,65 @@ class WorkflowState:
         event_type: str,
         payload: dict[str, object],
     ) -> None:
-        event = EventEnvelope.new(
+        workflow_event = EventEnvelope.new(
             type=event_type,
             session_id=previous.session_id,
             run_id=previous.workflow_run_id,
             sequence=updated.version,
             payload=payload,
         )
-        await self._commit(
-            CommitBatch(
-                events=(event,),
-                snapshots=(_workflow_write(updated),),
-                preconditions=(
-                    SnapshotPrecondition("session", previous.session_id),
-                    SnapshotPrecondition(
-                        "workflow", previous.workflow_run_id, previous.version
+        for attempt in range(8):
+            session = await load_session(self._store, previous.session_id)
+            updated_session, session_event_type = detach_workflow_transition(
+                session,
+                previous.workflow_run_id,
+            )
+            session_event = EventEnvelope.new(
+                type=session_event_type,
+                session_id=previous.session_id,
+                run_id=None,
+                sequence=updated_session.version,
+                payload={
+                    "workflow_run_id": previous.workflow_run_id,
+                    "status": updated_session.status.value,
+                },
+            )
+            result = await _commit_batch(
+                self._store,
+                CommitBatch(
+                    events=(workflow_event, session_event),
+                    snapshots=(
+                        _workflow_write(updated),
+                        session_write(updated_session),
+                    ),
+                    preconditions=(
+                        _exact_workflow_precondition(previous),
+                        exact_session_precondition(session),
                     ),
                 ),
-            ),
-            previous.session_id,
-            conflict_message="workflow state changed concurrently",
+            )
+            if result is None:
+                return
+            if result is _CommitFailure.PRECONDITION:
+                current = await self.load(previous.workflow_run_id)
+                if current != previous:
+                    raise AgentSDKError(
+                        ErrorCode.CONFLICT,
+                        "workflow state changed concurrently",
+                        retryable=True,
+                    ) from None
+                if attempt + 1 < 8:
+                    await asyncio.sleep(0)
+                continue
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to persist workflow state",
+                retryable=False,
+            )
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session state changed concurrently",
+            retryable=True,
         )
 
     async def _commit(
@@ -378,6 +563,8 @@ async def _commit_batch(
     try:
         await store.commit(batch)
         return None
+    except IdempotencyError:
+        raise
     except SnapshotPreconditionError:
         return _CommitFailure.PRECONDITION
     except Exception:
@@ -391,6 +578,67 @@ async def _session_exists(store: StateStore, session_id: str) -> bool | None:
         return None
 
 
+async def _get_idempotency(
+    store: StateStore,
+    scope: str,
+    key: str,
+) -> object | None:
+    result: object | None = None
+    store_failed = False
+    try:
+        result = await store.get_idempotency(scope, key)
+    except IdempotencyError:
+        raise
+    except Exception:
+        store_failed = True
+    if store_failed:
+        raise AgentSDKError(
+            ErrorCode.INTERNAL,
+            "failed to persist workflow state",
+            retryable=False,
+        ) from None
+    return result
+
+
+def _validated_workflow_result(
+    result: CommitResult,
+    *,
+    session_id: str,
+) -> tuple[WorkflowRunSnapshot | None, AgentSDKError | None]:
+    record = result.idempotency
+    if record is None:
+        return (
+            None,
+            AgentSDKError(
+                ErrorCode.INTERNAL,
+                "workflow command result is missing",
+                retryable=False,
+            ),
+        )
+    payload = dict(record.result)
+    record = None
+    del result
+    snapshot: WorkflowRunSnapshot | None = None
+    validation_failed = False
+    try:
+        snapshot = WorkflowRunSnapshot.model_validate(payload)
+    except Exception:
+        validation_failed = True
+    finally:
+        payload.clear()
+    if validation_failed or snapshot is None or snapshot.session_id != session_id:
+        snapshot = None
+        return (
+            None,
+            AgentSDKError(
+                ErrorCode.INTERNAL,
+                "workflow command result is invalid",
+                retryable=False,
+            ),
+        )
+    return snapshot, None
+
+
 def _node_entity_id(workflow_run_id: str, node_id: str) -> str:
     return f"{workflow_run_id}:{node_id}"
 
@@ -401,6 +649,18 @@ def _workflow_write(snapshot: WorkflowRunSnapshot) -> SnapshotWrite:
         snapshot.workflow_run_id,
         snapshot.session_id,
         snapshot.version,
+        snapshot.model_dump(mode="json"),
+    )
+
+
+def _exact_workflow_precondition(
+    snapshot: WorkflowRunSnapshot,
+) -> SnapshotPrecondition:
+    return SnapshotPrecondition(
+        "workflow",
+        snapshot.workflow_run_id,
+        snapshot.version,
+        snapshot.session_id,
         snapshot.model_dump(mode="json"),
     )
 

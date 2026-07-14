@@ -112,6 +112,36 @@ def detach_run_transition(
     return updated, "session.closed" if close_now else "session.run.detached"
 
 
+def detach_workflow_transition(
+    session: SessionSnapshot,
+    workflow_run_id: str,
+) -> tuple[SessionSnapshot, str]:
+    if workflow_run_id not in session.active_workflow_run_ids:
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "workflow is not owned by session",
+            retryable=False,
+        )
+    remaining = tuple(
+        active_workflow_run_id
+        for active_workflow_run_id in session.active_workflow_run_ids
+        if active_workflow_run_id != workflow_run_id
+    )
+    close_now = (
+        session.status is SessionStatus.CLOSING
+        and not session.active_run_ids
+        and not remaining
+    )
+    updated = session.model_copy(
+        update={
+            "active_workflow_run_ids": remaining,
+            "status": SessionStatus.CLOSED if close_now else session.status,
+            "version": session.version + 1,
+        }
+    )
+    return updated, "session.closed" if close_now else "session.workflow.detached"
+
+
 def transition_session(
     previous: SessionSnapshot,
     target: SessionStatus,

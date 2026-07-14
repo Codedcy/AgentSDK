@@ -145,13 +145,12 @@ async def test_sqlite_resume_skips_commit_then_cancelled_completed_node(
             RunEngine(reopened, LiteLLMGateway._for_test(provider)),
             _agents(),
         )
-        recovered = await resumed.resume(handle.workflow_run_id)
-        assert (await recovered.result()).output_text == "verified"
-        assert calls == {"fake/planner": 1, "fake/worker": 1}
-
-        completed = await resumed.resume(handle.workflow_run_id)
-        assert (await completed.result()).output_text == "verified"
-        assert calls == {"fake/planner": 1, "fake/worker": 1}
+        with pytest.raises(AgentSDKError) as recovery:
+            await resumed.resume(handle.workflow_run_id)
+        assert recovery.value.code is ErrorCode.CONFLICT
+        assert recovery.value.message == "recovery required"
+        assert recovery.value.retryable is True
+        assert calls == {"fake/planner": 1, "fake/worker": 0}
 
         read_only = WorkflowExecutor(
             reopened,
@@ -159,10 +158,12 @@ async def test_sqlite_resume_skips_commit_then_cancelled_completed_node(
             RunEngine(reopened, LiteLLMGateway._for_test(provider)),
             AgentRegistry(),
         )
-        assert (
-            await (await read_only.resume(handle.workflow_run_id)).result()
-        ).output_text == "verified"
-        assert calls == {"fake/planner": 1, "fake/worker": 1}
+        with pytest.raises(AgentSDKError) as read_only_recovery:
+            await read_only.resume(handle.workflow_run_id)
+        assert read_only_recovery.value.code is ErrorCode.CONFLICT
+        assert read_only_recovery.value.message == "recovery required"
+        assert read_only_recovery.value.retryable is True
+        assert calls == {"fake/planner": 1, "fake/worker": 0}
 
         different_data = dict(DEFINITION)
         different_data["name"] = "different"
@@ -219,11 +220,16 @@ async def test_resume_reconciles_terminal_related_run_without_reexecution(
     )
     assert calls == 1
 
-    resumed = WorkflowExecutor(sqlite, RuntimeCommands(sqlite), engine, _agents())
-    result = await (await resumed.resume(handle.workflow_run_id)).result()
-    assert result.output_text == "already done"
-    assert calls == 2  # reconciled plan plus one child, never a second planner call
-    await sqlite.close()
+    try:
+        resumed = WorkflowExecutor(sqlite, RuntimeCommands(sqlite), engine, _agents())
+        with pytest.raises(AgentSDKError) as recovery:
+            await resumed.resume(handle.workflow_run_id)
+        assert recovery.value.code is ErrorCode.CONFLICT
+        assert recovery.value.message == "recovery required"
+        assert recovery.value.retryable is True
+        assert calls == 1
+    finally:
+        await sqlite.close()
 
 
 @pytest.mark.asyncio
@@ -306,8 +312,10 @@ async def test_resume_fails_closed_for_inflight_run_without_replay(
         _agents(),
     )
     with pytest.raises(AgentSDKError) as raised:
-        await (await resumed.resume(handle.workflow_run_id)).result()
-    assert raised.value.code is ErrorCode.INVALID_STATE
+        await resumed.resume(handle.workflow_run_id)
+    assert raised.value.code is ErrorCode.CONFLICT
+    assert raised.value.message == "recovery required"
+    assert raised.value.retryable is True
     assert calls == 1
     await store.close()
 
@@ -543,10 +551,11 @@ async def test_resume_rejects_cross_session_selected_run_without_model_or_projec
     events_before = await delegate.read_events(after_cursor=0)
 
     with pytest.raises(AgentSDKError) as raised:
-        await (await resumed.resume(workflow.workflow_run_id)).result()
+        await resumed.resume(workflow.workflow_run_id)
 
-    assert raised.value.code is ErrorCode.INVALID_STATE
-    assert raised.value.message == "related run does not match workflow node"
+    assert raised.value.code is ErrorCode.CONFLICT
+    assert raised.value.message == "recovery required"
+    assert raised.value.retryable is True
     assert "FOREIGN_SESSION_SECRET" not in str(raised.value)
     assert calls == 0
     assert await resumed.get(workflow.workflow_run_id) == injected

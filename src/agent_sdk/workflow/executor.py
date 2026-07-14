@@ -18,7 +18,10 @@ from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
     ToolCapabilityDescriptor,
+    WorkflowAgentDescriptor,
+    WorkflowExecutionDescriptor,
 )
+from agent_sdk.runtime.idempotency import _idempotency_public_error
 from agent_sdk.runtime.models import (
     AgentSpec,
     RunResult,
@@ -28,6 +31,7 @@ from agent_sdk.runtime.models import (
     mutable_model_params,
 )
 from agent_sdk.storage.base import StateStore
+from agent_sdk.storage.idempotency import IdempotencyError
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.subagents.service import SubagentService, render_task_envelope
 from agent_sdk.tools.models import ToolSpec
@@ -93,12 +97,95 @@ class WorkflowExecutor:
         )
         self._track_workflow_task = track_workflow_task
         self._active: dict[str, asyncio.Task[WorkflowResult]] = {}
+        self._start_lock = asyncio.Lock()
 
-    async def start(self, session_id: str, workflow: WorkflowIR) -> WorkflowHandle:
+    async def start(
+        self,
+        session_id: str,
+        workflow: WorkflowIR,
+        *,
+        idempotency_key: str | None = None,
+    ) -> WorkflowHandle:
         validated = _validated_ir(workflow)
-        self._validate_agents(validated)
-        snapshot = await self._state.create(session_id, validated)
-        return self._start_task(snapshot.workflow_run_id)
+        descriptor = self._workflow_execution_descriptor(validated)
+        coordinator = asyncio.create_task(
+            self._coordinate_start(
+                session_id,
+                validated,
+                descriptor,
+                idempotency_key=idempotency_key,
+            )
+        )
+        try:
+            return await self._await_start_coordinator(coordinator)
+        finally:
+            del idempotency_key
+            del validated
+            del descriptor
+            del coordinator
+
+    async def _coordinate_start(
+        self,
+        session_id: str,
+        workflow: WorkflowIR,
+        execution_descriptor: WorkflowExecutionDescriptor,
+        *,
+        idempotency_key: str | None,
+    ) -> WorkflowHandle:
+        try:
+            async with self._start_lock:
+                public_error: AgentSDKError | None = None
+                try:
+                    outcome = await self._state.create(
+                        session_id,
+                        workflow,
+                        execution_descriptor=execution_descriptor,
+                        idempotency_key=idempotency_key,
+                    )
+                except IdempotencyError as error:
+                    public_error = _idempotency_public_error(error)
+                if public_error is not None:
+                    raise public_error from None
+                if outcome.replayed:
+                    active = self._active.get(outcome.value.workflow_run_id)
+                    if active is not None and not active.done():
+                        return WorkflowHandle(
+                            outcome.value.workflow_run_id,
+                            self._store,
+                            active,
+                        )
+                    return WorkflowHandle(
+                        outcome.value.workflow_run_id,
+                        self._store,
+                        None,
+                    )
+                return self._start_task(outcome.value.workflow_run_id)
+        finally:
+            del idempotency_key
+            del execution_descriptor
+            del workflow
+
+    @staticmethod
+    async def _await_start_coordinator(
+        coordinator: asyncio.Task[WorkflowHandle],
+    ) -> WorkflowHandle:
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            return await asyncio.shield(coordinator)
+        except asyncio.CancelledError as error:
+            cancellation = error
+
+        while not coordinator.done():
+            try:
+                await asyncio.shield(coordinator)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if coordinator.done() and not coordinator.cancelled():
+            coordinator.exception()
+        assert cancellation is not None
+        raise cancellation from None
 
     async def resume(
         self,
@@ -122,12 +209,19 @@ class WorkflowExecutor:
                     "workflow definition does not match persisted run",
                     retryable=False,
                 )
-        if snapshot.status is WorkflowRunStatus.RUNNING:
-            self._validate_agents(snapshot.workflow)
         active = self._active.get(workflow_run_id)
         if active is not None and not active.done():
             return WorkflowHandle(workflow_run_id, self._store, active)
-        return self._start_task(workflow_run_id)
+        if snapshot.status in {
+            WorkflowRunStatus.COMPLETED,
+            WorkflowRunStatus.FAILED,
+        }:
+            return WorkflowHandle(workflow_run_id, self._store, None)
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "recovery required",
+            retryable=True,
+        ) from None
 
     async def get(self, workflow_run_id: str) -> WorkflowRunSnapshot:
         return await self._state.load(workflow_run_id)
@@ -153,6 +247,41 @@ class WorkflowExecutor:
     def _validate_agents(self, workflow: WorkflowIR) -> None:
         for node in workflow.nodes:
             self._agents.resolve(node.agent_revision)
+
+    def _workflow_execution_descriptor(
+        self,
+        workflow: WorkflowIR,
+    ) -> WorkflowExecutionDescriptor:
+        tools = tuple(
+            ToolCapabilityDescriptor.from_spec(spec)
+            for spec in self._tool_specs()
+        )
+        config = self._policy.execution_config()
+        policy = ExecutionPolicyDescriptor.create(
+            permission_default=config["permission_default"]
+        )
+        agents: list[WorkflowAgentDescriptor] = []
+        seen: set[str] = set()
+        for node in workflow.nodes:
+            if node.agent_revision in seen:
+                continue
+            seen.add(node.agent_revision)
+            agent = self._agents.resolve(node.agent_revision)
+            execution = ExecutionDescriptor.create(
+                agent=agent,
+                messages=({"role": "user", "content": node.input},),
+                tools=tools,
+                policy=policy,
+            )
+            agents.append(
+                WorkflowAgentDescriptor.create(node.agent_revision, execution)
+            )
+        return WorkflowExecutionDescriptor.create(
+            workflow=workflow,
+            agents=tuple(agents),
+            tools=tools,
+            policy=policy,
+        )
 
     async def _drive(self, workflow_run_id: str) -> WorkflowResult:
         while True:

@@ -251,10 +251,20 @@ class WorkflowAPI:
         self,
         session_id: str,
         definition: WorkflowIR | WorkflowDefinition | str,
+        *,
+        idempotency_key: str | None = None,
     ) -> WorkflowHandle:
         async with self._lifecycle.admit():
             workflow = self._compile(definition)
-            return await self._executor.start(session_id, workflow)
+            try:
+                return await self._executor.start(
+                    session_id,
+                    workflow,
+                    idempotency_key=idempotency_key,
+                )
+            finally:
+                del idempotency_key
+                del workflow
 
     async def resume(
         self,
