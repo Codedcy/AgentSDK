@@ -30,11 +30,12 @@ from agent_sdk.storage.base import (
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.idempotency import (
     IdempotencyCorruptionError,
+    IdempotencyRecord,
     IdempotencyReplay,
 )
 from agent_sdk.workflow.handles import WorkflowHandle
 from agent_sdk.workflow.compiler import WorkflowCompiler
-from agent_sdk.workflow.state import WorkflowState
+from agent_sdk.workflow.state import WorkflowState, _validated_workflow_result
 
 
 WORKFLOW = WorkflowDefinition.model_validate(
@@ -1604,6 +1605,180 @@ async def test_valid_foreign_workflow_replay_result_is_rejected_and_sanitized(
         assert connection.execute(
             "SELECT COUNT(*) FROM snapshots WHERE kind = 'run'"
         ).fetchone()[0] == before_runs
+
+
+@pytest.mark.asyncio
+async def test_same_ir_model_params_descriptor_substitution_is_rejected(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "same-ir-descriptor-substitution.db"
+    secret = "private-same-ir-model-params-b-secret"
+    tool_calls = 0
+    tool_spec = ToolSpec(
+        name="unused",
+        description="must remain unused",
+        input_schema={"type": "object"},
+    )
+
+    async def tool_handler(_: ToolContext, **values: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        return values
+
+    async def setup_provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        return _chunks(f"done:{params['model']}")
+
+    agent_a = AgentSpec(
+        name="worker",
+        revision="1",
+        model="fake/worker",
+        model_params={"temperature": 0.1},
+    )
+    agent_b = AgentSpec(
+        name="worker",
+        revision="1",
+        model="fake/worker",
+        model_params={"temperature": 0.2, "private": secret},
+    )
+
+    first = AgentSDK.for_test(database_path=database, acompletion=setup_provider)
+    first.agents.define(agent_a)
+    first.tools.register(tool_spec, tool_handler)
+    try:
+        session = await first.sessions.create(workspaces=[])
+        handle_a = await first.workflows.start(
+            session.session_id,
+            WORKFLOW,
+            idempotency_key="same-ir-a",
+        )
+        await handle_a.result()
+        snapshot_a = await first.workflows.get(handle_a.workflow_run_id)
+    finally:
+        await first.close()
+
+    second = AgentSDK.for_test(database_path=database, acompletion=setup_provider)
+    second.agents.define(agent_b)
+    second.tools.register(tool_spec, tool_handler)
+    try:
+        handle_b = await second.workflows.start(
+            session.session_id,
+            WORKFLOW,
+            idempotency_key="same-ir-b",
+        )
+        await handle_b.result()
+        snapshot_b = await second.workflows.get(handle_b.workflow_run_id)
+    finally:
+        await second.close()
+
+    assert snapshot_a.session_id == snapshot_b.session_id
+    assert snapshot_a.workflow == snapshot_b.workflow
+    assert snapshot_a.execution_compatibility == "current"
+    assert snapshot_b.execution_compatibility == "current"
+    descriptor_a = snapshot_a.execution_descriptor
+    descriptor_b = snapshot_b.execution_descriptor
+    assert descriptor_a is not None
+    assert descriptor_b is not None
+    assert descriptor_a.workflow == descriptor_b.workflow
+    assert descriptor_a.tools == descriptor_b.tools
+    assert descriptor_a.policy == descriptor_b.policy
+    assert descriptor_a.agents[0].revision == descriptor_b.agents[0].revision
+    agent_data_a = descriptor_a.agents[0].execution.agent.model_dump(mode="json")
+    agent_data_b = descriptor_b.agents[0].execution.agent.model_dump(mode="json")
+    model_params_a = agent_data_a.pop("model_params")
+    model_params_b = agent_data_b.pop("model_params")
+    assert agent_data_a == agent_data_b
+    assert model_params_a != model_params_b
+
+    with sqlite3.connect(database) as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        before_runs = connection.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE kind = 'run'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE idempotency_records SET result_json = ? WHERE key = ?",
+            (
+                json.dumps(snapshot_b.model_dump(mode="json")),
+                "same-ir-a",
+            ),
+        )
+        connection.commit()
+
+    replay_provider_calls = 0
+
+    async def replay_provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal replay_provider_calls
+        del params
+        replay_provider_calls += 1
+        return _chunks("unexpected")
+
+    replaying = AgentSDK.for_test(database_path=database, acompletion=replay_provider)
+    replaying.agents.define(agent_a)
+    replaying.tools.register(tool_spec, tool_handler)
+    try:
+        with pytest.raises(AgentSDKError) as substituted:
+            await replaying.workflows.start(
+                session.session_id,
+                WORKFLOW,
+                idempotency_key="same-ir-a",
+            )
+        assert substituted.value.code is ErrorCode.INTERNAL
+        assert substituted.value.retryable is False
+        _assert_context_free_sanitizer(substituted.value, secret=secret)
+        assert replay_provider_calls == 0
+        assert tool_calls == 0
+        assert replaying.workflows._executor._active == {}  # type: ignore[attr-defined]
+    finally:
+        await replaying.close()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before_events
+        assert connection.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE kind = 'run'"
+        ).fetchone()[0] == before_runs
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_legacy_unknown_result_by_compatibility_marker() -> None:
+    """Isolate the marker invariant; this is not a public keyed legacy scenario."""
+
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        del params
+        return _chunks("done")
+
+    sdk = _sdk(provider)
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handle = await sdk.workflows.start(session.session_id, WORKFLOW)
+        await handle.result()
+        current = await sdk.workflows.get(handle.workflow_run_id)
+    finally:
+        await sdk.close()
+
+    legacy = current.model_copy(
+        update={
+            "execution_compatibility": "legacy_unknown",
+            "execution_descriptor": None,
+        }
+    )
+    assert type(current).model_validate(legacy.model_dump(mode="json")) == legacy
+    record = IdempotencyRecord(
+        scope=f"session/{session.session_id}/workflow.start",
+        key="legacy-result",
+        request_fingerprint="0" * 64,
+        session_id=session.session_id,
+        result=legacy.model_dump(mode="json"),
+    )
+    stored, validation_error = _validated_workflow_result(
+        CommitResult(last_cursor=0, applied=False, idempotency=record),
+        session_id=session.session_id,
+        expected_workflow=current.workflow,
+        expected_execution_descriptor=None,
+    )
+
+    assert stored is None
+    assert validation_error is not None
+    assert validation_error.code is ErrorCode.INTERNAL
+    assert validation_error.message == "workflow command result is invalid"
 
 
 @pytest.mark.asyncio
