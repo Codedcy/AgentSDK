@@ -85,17 +85,19 @@ Expected: missing Artifact/Migration types.
 
 - [ ] **Step 3: Implement atomic FileArtifactStore**
 
-Use a durable per-digest, generation-fenced two-phase state machine. SQLite
-transactions only reserve/CAS metadata; all temp-file fsync, `os.replace`,
-`unlink`, and directory scanning occur outside transactions. Artifact states are
-`publishing`, `ready`, `delete_pending`, and `deleting`; operation claims carry
-generation, claim token, and expiry. Readers expose only `ready` content.
+Use a durable per-digest, generation-fenced two-phase state machine. Every
+publish generation has a globally unique, immutable physical path such as
+`objects/<digest>/<generation>`; a physical path is never reused by a later
+generation. SQLite transactions only reserve/CAS metadata; all temp-file fsync,
+`os.replace`, `unlink`, and directory scanning occur outside transactions.
+Artifact states are `publishing`, `ready`, `delete_pending`, and `deleting`;
+operation claims carry generation, its exact physical path, claim token, and
+expiry. Readers expose only the `ready` generation's recorded physical path.
 
 ```python
 async def put(self, session_id: str, content: bytes, mime_type: str) -> ArtifactMetadata:
     digest = sha256(content).hexdigest()
-    target = self._root / digest
-    staged = await asyncio.to_thread(write_staged_bytes, target, content)
+    staged = await asyncio.to_thread(write_staged_bytes, self._staging_root, content)
     try:
         reservation = await self._metadata.reserve_publish(
             session_id, digest, len(content), mime_type
@@ -103,6 +105,7 @@ async def put(self, session_id: str, content: bytes, mime_type: str) -> Artifact
         if reservation.ready:
             return reservation.metadata
         if reservation.publisher:
+            target = self._generation_path(digest, reservation.generation)
             await asyncio.to_thread(os.replace, staged, target)
             return await self._metadata.finish_publish(reservation)
         return await self._help_or_wait_publish(reservation)
@@ -111,13 +114,15 @@ async def put(self, session_id: str, content: bytes, mime_type: str) -> Artifact
 ```
 
 `reserve_publish` atomically records a pending owner and one publishing
-generation/claim, or adds the owner to an already-ready digest. Concurrent puts
-for identical bytes join that generation; only its publisher performs replace.
-`finish_publish` is a short CAS transaction from the same generation/claim to
-`ready` and activates all pending owners. A stale publisher cannot finalize a
-newer generation. Replace failure records a retryable failed/releasable claim;
-crash leaves durable `publishing` state that a helper/startup recovery worker can
-reclaim after expiry. `read` either returns verified `ready` content or a stable
+generation/claim with a fresh never-reused physical path, or adds the owner to
+an already-ready digest. Concurrent puts for identical bytes join that
+generation; only its publisher performs replace. `finish_publish` is a short
+CAS transaction from the same generation/path/claim to `ready` and activates
+all pending owners. A stale publisher can write only its own old generation
+path and cannot finalize or overwrite a newer generation. Replace failure
+records a retryable failed/releasable claim; crash leaves durable `publishing`
+state that a helper/startup recovery worker can reclaim after expiry. `read`
+either returns verified `ready` content from the metadata-bound path or a stable
 retryable pending error/helps the durable operation; it never exposes a target
 whose metadata is not ready.
 
@@ -172,7 +177,8 @@ bootstrapped checksums or Artifact tables remain.
 
 Delete Artifact ownership/contributions and create anonymous `delete_pending`
 cleanup jobs in the same SQLite transaction. A cleanup job contains only its
-stable job id, digest/path, generation, and state—not the deleted Session id.
+stable job id, digest, exact generation-owned physical path, generation, and
+state—not the deleted Session id.
 After commit, a retryable two-phase worker performs unlink outside SQLite. Do
 not emit Session-linked durable events after deletion.
 
@@ -180,22 +186,24 @@ not emit Session-linked durable events after deletion.
 async def delete_session_artifacts(self, session_id: str) -> None:
     async with self._metadata.immediate_transaction() as transaction:
         orphan_hashes = await transaction.remove_owner_and_list_orphans(session_id)
-        for digest in orphan_hashes:
+        for digest, generation, physical_path in orphan_hashes:
             await transaction.enqueue_cleanup_once(
-                f"artifact:{digest}", self._root / digest
+                f"artifact:{digest}:{generation}", digest, generation, physical_path
             )
     await self._cleanup.run_pending()
 ```
 
 The cleanup worker uses a short transaction to CAS `delete_pending -> deleting`
-with generation/claim/expiry, commits, unlinks outside the transaction (missing
-is success), then uses a second short CAS transaction to complete/remove the
-same generation. A stale cleanup claimant cannot complete a newer state. A put
-that sees unclaimed `delete_pending` may atomically cancel it and restore ready
-ownership if the verified target remains. A put that sees claimed `deleting`
-waits/helps it finish, then reserves a newer publish generation; it never
-publishes a target that an older cleanup claimant may still unlink. Expired
-claims are reclaimable and every command has bounded retry/pending behavior.
+with generation/path/claim/expiry, commits, unlinks only that immutable physical
+path outside the transaction (missing is success), then uses a second short CAS
+transaction to complete/remove the same generation. A stale cleanup claimant
+can neither complete nor unlink a newer generation because the paths are
+different and never reused. A put that sees unclaimed `delete_pending` may
+atomically cancel it and restore ready ownership if the verified generation path
+remains. A put that sees claimed `deleting` may immediately reserve a newer
+publish generation at a different physical path; it never publishes onto the
+path held by an older cleanup claimant. Expired claims are reclaimable and
+every command has bounded retry/pending behavior.
 
 Because SQLite and the filesystem cannot share one atomic commit, startup/
 maintenance recovery first queries pending/expired metadata claims, performs
@@ -205,7 +213,10 @@ candidate to recheck metadata and enqueue anonymous cleanup for truly
 unreferenced files. It never scans, fsyncs, replaces, or unlinks while a
 transaction is open. Fault-inject every publish/delete boundary and prove
 reopen+sweep converges without deleting a ready owner or leaking an
-unrecoverable file.
+unrecoverable file. Include the exact fencing race: pause cleaner A before
+unlink, let its claim expire, let cleaner B finish deletion, publish a newer
+generation to `ready`, then resume A. A may unlink only its recorded old path;
+the new generation must remain readable and its metadata/path unchanged.
 
 - [ ] **Step 6: Verify**
 
