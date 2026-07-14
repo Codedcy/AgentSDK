@@ -92,8 +92,11 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
     }
     provider_started = asyncio.Event()
     release_provider = asyncio.Event()
+    tool_calls = 0
 
     async def tool_handler(_: ToolContext, **values: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
         return values
 
     async def script(**params: Any) -> object:
@@ -145,6 +148,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
             idempotency_key="start-workflow",
         )
         assert (await workflow_handle.result()).output_text == "done"
+        assert tool_calls == 0
         view = await first.context.build(
             session.session_id,
             model="fake/context",
@@ -174,6 +178,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
             "fake/worker": 1,
             "fake/context": 1,
         }
+        assert tool_calls == 0
         evaluation = await first.evaluations.evaluate(
             run_handles[0].run_id,
             ExactOutputEvaluator(expected="done"),
@@ -218,6 +223,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
         )
         assert replayed_workflow.workflow_run_id == workflow_handle.workflow_run_id
         assert (await replayed_workflow.result()).output_text == "done"
+        assert tool_calls == 0
 
         run_snapshot = await reopened.runs.get(replayed.run_id)
         run_descriptor = run_snapshot.execution_descriptor
@@ -270,6 +276,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
         changed.agents.define(worker)
         changed.tools.register(TOOL.model_copy(update={"version": "2"}), tool_handler)
         try:
+            assert tool_calls == 0
             with pytest.raises(AgentSDKError) as conflict:
                 await changed.workflows.start(
                     session.session_id,
@@ -278,6 +285,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
                 )
             assert conflict.value.code is ErrorCode.CONFLICT
             assert conflict_calls == 0
+            assert tool_calls == 0
         finally:
             await changed.close()
 
