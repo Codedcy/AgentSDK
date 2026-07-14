@@ -870,7 +870,12 @@ async def test_session_and_run_survive_reopen(tmp_path: Path) -> None:
     reopened = await SQLiteStore.open(path)
     assert (await reopened.get_snapshot("session", session.session_id))["status"] == "active"
     assert (await reopened.get_snapshot("run", run.run_id))["status"] == "created"
-    assert len(await reopened.read_events(after_cursor=0, session_id=session.session_id)) == 2
+    events = await reopened.read_events(after_cursor=0, session_id=session.session_id)
+    assert [stored.event.type for stored in events] == [
+        "session.created",
+        "session.run.attached",
+        "run.created",
+    ]
     await reopened.close()
 
 

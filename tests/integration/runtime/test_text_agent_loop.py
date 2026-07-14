@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import traceback
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -62,6 +63,20 @@ async def _scripted_success(**_: object) -> AsyncIterator[dict[str, object]]:
 
 def _run_events(events: list[StoredEvent], run_id: str) -> list[StoredEvent]:
     return [stored for stored in events if stored.event.run_id == run_id]
+
+
+def _assert_context_free_sanitizer(error: AgentSDKError, *, secret: str) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert secret not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    current = error.__traceback__
+    while current is not None:
+        filename = current.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/src/agent_sdk/" in filename:
+            assert secret not in repr(current.tb_frame.f_locals)
+        current = current.tb_next
 
 
 async def _event_of_type(handle: Any, event_type: str) -> StoredEvent:
@@ -401,7 +416,10 @@ async def test_provider_failure_is_durable_before_stable_error(store: InMemorySt
         assert raised.value.code is ErrorCode.INTERNAL
         assert raised.value.message == "model call failed"
         assert raised.value.retryable is False
-        assert isinstance(raised.value.__cause__, RuntimeError)
+        _assert_context_free_sanitizer(
+            raised.value,
+            secret="provider-specific secret details",
+        )
         snapshot = await sdk.runs.get(handle.run_id)
         events = _run_events(await store.read_events(after_cursor=0), handle.run_id)
         assert snapshot.status is RunStatus.FAILED
@@ -504,7 +522,10 @@ async def test_events_terminates_and_normalizes_failed_task_without_terminal(
 
     assert raised.value.code is ErrorCode.INTERNAL
     assert raised.value.message == "run execution failed"
-    assert isinstance(raised.value.__cause__, RuntimeError)
+    _assert_context_free_sanitizer(
+        raised.value,
+        secret="raw provider startup failure",
+    )
 
 
 @pytest.mark.asyncio
@@ -521,7 +542,10 @@ async def test_result_normalizes_raw_startup_failure(store: InMemoryStore) -> No
 
     assert raised.value.code is ErrorCode.INTERNAL
     assert raised.value.message == "run execution failed"
-    assert isinstance(raised.value.__cause__, RuntimeError)
+    _assert_context_free_sanitizer(
+        raised.value,
+        secret="raw provider startup failure",
+    )
 
 
 @pytest.mark.asyncio
@@ -544,7 +568,12 @@ async def test_events_preserves_agent_sdk_error_without_terminal(
             timeout=0.1,
         )
 
-    assert raised.value is expected
+    assert raised.value is not expected
+    assert raised.value.code is expected.code
+    assert raised.value.message == expected.message
+    assert raised.value.retryable is expected.retryable
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -611,7 +640,7 @@ async def test_run_get_normalizes_store_failure() -> None:
         assert raised.value.message == "failed to load run"
         assert raised.value.retryable is False
         assert "raw store failure" not in str(raised.value)
-        assert isinstance(raised.value.__cause__, RuntimeError)
+        _assert_context_free_sanitizer(raised.value, secret="raw store failure")
     finally:
         await sdk.close()
 
@@ -636,7 +665,7 @@ async def test_run_get_normalizes_invalid_snapshot() -> None:
         assert raised.value.message == "failed to load run"
         assert raised.value.retryable is False
         assert "corrupt" not in str(raised.value)
-        assert isinstance(raised.value.__cause__, ValidationError)
+        _assert_context_free_sanitizer(raised.value, secret="corrupt")
     finally:
         await sdk.close()
 
@@ -697,7 +726,7 @@ async def test_events_normalizes_store_failure_after_task_done() -> None:
 
     assert raised.value.code is ErrorCode.INTERNAL
     assert raised.value.message == "run execution failed"
-    assert isinstance(raised.value.__cause__, RuntimeError)
+    _assert_context_free_sanitizer(raised.value, secret="raw store failure")
 
 
 class _BlockingTerminalStore:

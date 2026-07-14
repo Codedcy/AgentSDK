@@ -18,6 +18,7 @@ from agent_sdk.storage.base import CommitBatch, CommitResult, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.subagents import SubagentService, TaskEnvelope
+from agent_sdk.subagents.service import render_task_envelope
 
 
 def _response(text: str) -> AsyncIterator[dict[str, object]]:
@@ -99,6 +100,16 @@ async def test_child_is_isolated_related_normal_run_and_reopens_from_sqlite(
     assert child_events[0] == "run.created"
     assert child_events[-1] == "run.completed"
     await store.close()
+
+    assert persisted.execution_compatibility == "current"
+    assert persisted.execution_descriptor is not None
+    assert persisted.execution_descriptor.agent.name == "worker"
+    assert persisted.execution_descriptor.agent.model == "fake/worker"
+    assert persisted.execution_descriptor.messages == (
+        {"role": "user", "content": render_task_envelope(envelope)},
+    )
+    assert persisted.execution_descriptor.tools == ()
+    assert persisted.execution_descriptor.policy.permission_default == "ask"
 
     reopened = await SQLiteStore.open(database)
     try:

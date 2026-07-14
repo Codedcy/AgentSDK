@@ -25,6 +25,14 @@ from agent_sdk.runtime.models import (
     RunStatus,
     TokenUsage,
 )
+from agent_sdk.runtime.session_lifecycle import (
+    RUN_LIFECYCLE_FINAL_STATUSES,
+    detach_run_transition,
+    exact_run_precondition,
+    exact_session_precondition,
+    load_session,
+    session_write,
+)
 from agent_sdk.storage.base import (
     CommitBatch,
     SnapshotPrecondition,
@@ -39,6 +47,7 @@ from agent_sdk.tools.registry import ToolRegistry
 _DELTA_FLUSH_SECONDS = 0.05
 _DELTA_FLUSH_BYTES = 4 * 1024
 _MAX_TOOL_STEPS = 8
+_MAX_SESSION_COMMIT_ATTEMPTS = 8
 
 
 class _RunEmitter:
@@ -169,6 +178,9 @@ class _RunEmitter:
             sequence=self._sequence,
             payload=payload,
         )
+        if snapshot is not None and snapshot.status in RUN_LIFECYCLE_FINAL_STATUSES:
+            await self._commit_terminal(event, snapshot)
+            return
         snapshots: tuple[SnapshotWrite, ...] = ()
         if snapshot is not None:
             snapshots = (
@@ -180,6 +192,7 @@ class _RunEmitter:
                     snapshot.model_dump(mode="json"),
                 ),
             )
+        store_failed = False
         try:
             await self._store.commit(
                 CommitBatch(
@@ -197,9 +210,122 @@ class _RunEmitter:
                 "run session no longer exists",
                 retryable=False,
             ) from None
+        except Exception:
+            store_failed = True
+        if store_failed:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to persist run",
+                retryable=False,
+            ) from None
         if snapshot is not None:
             self._run = snapshot
         self._sequence += 1
+
+    async def _commit_terminal(
+        self,
+        run_event: EventEnvelope,
+        snapshot: RunSnapshot,
+    ) -> None:
+        for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+            session = await load_session(self._store, self._run.session_id)
+            updated_session, session_event_type = detach_run_transition(
+                session,
+                self._run.run_id,
+            )
+            session_event = EventEnvelope.new(
+                type=session_event_type,
+                session_id=session.session_id,
+                run_id=None,
+                sequence=updated_session.version,
+                payload={
+                    "run_id": self._run.run_id,
+                    "status": updated_session.status.value,
+                },
+            )
+            store_failed = False
+            try:
+                await self._store.commit(
+                    CommitBatch(
+                        events=(run_event, session_event),
+                        snapshots=(
+                            SnapshotWrite(
+                                "run",
+                                snapshot.run_id,
+                                snapshot.session_id,
+                                snapshot.version,
+                                snapshot.model_dump(mode="json"),
+                            ),
+                            session_write(updated_session),
+                        ),
+                        preconditions=(
+                            exact_run_precondition(self._run),
+                            exact_session_precondition(session),
+                        ),
+                    )
+                )
+            except SnapshotPreconditionError:
+                current = await self._load_run_snapshot()
+                if current != self._run:
+                    raise AgentSDKError(
+                        ErrorCode.CONFLICT,
+                        "run state changed concurrently",
+                        retryable=True,
+                    ) from None
+                if attempt + 1 < _MAX_SESSION_COMMIT_ATTEMPTS:
+                    await asyncio.sleep(0)
+                continue
+            except Exception:
+                store_failed = True
+            if store_failed:
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "failed to persist run",
+                    retryable=False,
+                ) from None
+            self._run = snapshot
+            self._sequence += 1
+            return
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session state changed concurrently",
+            retryable=True,
+        )
+
+    async def _load_run_snapshot(self) -> RunSnapshot:
+        data: dict[str, Any] | None = None
+        store_failed = False
+        try:
+            data = await self._store.get_snapshot("run", self._run.run_id)
+        except Exception:
+            store_failed = True
+        if store_failed:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to load run",
+                retryable=False,
+            ) from None
+        if data is None:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "run not found",
+                retryable=False,
+            )
+        snapshot: RunSnapshot | None = None
+        validation_failed = False
+        try:
+            snapshot = RunSnapshot.model_validate(data)
+        except Exception:
+            validation_failed = True
+        data = None
+        if validation_failed:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to load run",
+                retryable=False,
+            ) from None
+        assert snapshot is not None
+        return snapshot
 
 
 class RunEngine:

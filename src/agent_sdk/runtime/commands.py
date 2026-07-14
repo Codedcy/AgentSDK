@@ -1,11 +1,14 @@
+import asyncio
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Generic, Literal, TypeVar
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.ids import new_id
 from agent_sdk.runtime.idempotency import _idempotency_public_error
+from agent_sdk.runtime.execution import ExecutionDescriptor
 from agent_sdk.runtime.models import (
     RunSnapshot,
     RunStatus,
@@ -23,7 +26,6 @@ from agent_sdk.runtime.session_lifecycle import (
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
-    SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
@@ -39,6 +41,17 @@ from agent_sdk.storage.idempotency import (
 from agent_sdk.subagents.models import TaskEnvelope
 
 _MAX_SESSION_COMMIT_ATTEMPTS = 8
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class CommandOutcome(Generic[T]):
+    value: T
+    replayed: bool
+
+    def __getattr__(self, name: str) -> Any:
+        """Keep M01 internal snapshot reads source-compatible during migration."""
+        return getattr(self.value, name)
 
 
 def session_result_idempotency(
@@ -384,46 +397,219 @@ class RuntimeCommands:
         workflow_run_id: str | None = None,
         workflow_node_id: str | None = None,
         task_envelope: TaskEnvelope | None = None,
-    ) -> RunSnapshot:
-        snapshot = RunSnapshot(
-            run_id=run_id or new_id("run"),
-            session_id=session_id,
-            agent_revision=agent_revision,
-            status=RunStatus.CREATED,
-            user_input=user_input,
-            parent_run_id=parent_run_id,
-            workflow_run_id=workflow_run_id,
-            workflow_node_id=workflow_node_id,
-            task_envelope=task_envelope,
+        execution_descriptor: ExecutionDescriptor | None = None,
+        idempotency_key: str | None = None,
+    ) -> CommandOutcome[RunSnapshot]:
+        selected_run_id = run_id or new_id("run")
+        compatibility: Literal["legacy_unknown", "current"] = (
+            "current" if execution_descriptor is not None else "legacy_unknown"
         )
-        data = snapshot.model_dump(mode="json")
-        event = EventEnvelope.new(
-            type="run.created",
-            session_id=session_id,
-            run_id=snapshot.run_id,
-            sequence=1,
-            payload=data,
-        )
-        try:
-            await self._store.commit(
-                CommitBatch(
-                    events=(event,),
+        fingerprint: str | None = None
+        scope = f"session/{session_id}/run.start"
+        if idempotency_key is not None:
+            fingerprint = fingerprint_command(
+                "run.start",
+                {
+                    "session_id": session_id,
+                    "execution_descriptor": (
+                        None
+                        if execution_descriptor is None
+                        else execution_descriptor.model_dump(mode="json")
+                    ),
+                    "user_input": user_input,
+                    "parent_run_id": parent_run_id,
+                    "workflow_run_id": workflow_run_id,
+                    "workflow_node_id": workflow_node_id,
+                    "task_envelope": (
+                        None
+                        if task_envelope is None
+                        else task_envelope.model_dump(mode="json")
+                    ),
+                },
+            )
+
+        for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
+            public_error: AgentSDKError | None = None
+            current = await load_session(self._store, session_id)
+            if current.status is SessionStatus.DELETING:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "session is deleting",
+                    retryable=False,
+                )
+
+            has_hint = False
+            if idempotency_key is not None:
+                hint_error: AgentSDKError | None = None
+                try:
+                    hint = await self._get_idempotency(
+                        scope,
+                        idempotency_key,
+                        failure_message="failed to start run",
+                    )
+                except IdempotencyError as error:
+                    hint_error = _idempotency_public_error(error)
+                if hint_error is not None:
+                    raise hint_error from None
+                has_hint = hint is not None
+                hint = None
+
+            request: IdempotencyWrite | IdempotencyReplay | None
+            if has_hint:
+                assert idempotency_key is not None
+                assert fingerprint is not None
+                request = IdempotencyReplay(scope, idempotency_key, fingerprint)
+                precondition = exact_session_precondition(current)
+                batch = CommitBatch(
+                    events=(),
+                    idempotency=request,
+                    replay_preconditions=(precondition,),
+                )
+                snapshot = None
+            else:
+                if current.status is not SessionStatus.ACTIVE:
+                    raise AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "session is not active",
+                        retryable=False,
+                    )
+                snapshot = RunSnapshot(
+                    run_id=selected_run_id,
+                    session_id=session_id,
+                    agent_revision=agent_revision,
+                    status=RunStatus.CREATED,
+                    user_input=user_input,
+                    parent_run_id=parent_run_id,
+                    workflow_run_id=workflow_run_id,
+                    workflow_node_id=workflow_node_id,
+                    task_envelope=task_envelope,
+                    execution_compatibility=compatibility,
+                    execution_descriptor=execution_descriptor,
+                )
+                run_data = snapshot.model_dump(mode="json")
+                active_run_ids = tuple(
+                    sorted((*current.active_run_ids, snapshot.run_id))
+                )
+                updated_session = current.model_copy(
+                    update={
+                        "active_run_ids": active_run_ids,
+                        "version": current.version + 1,
+                    }
+                )
+                session_event = EventEnvelope.new(
+                    type="session.run.attached",
+                    session_id=session_id,
+                    run_id=None,
+                    sequence=updated_session.version,
+                    payload={"run_id": snapshot.run_id},
+                )
+                run_event = EventEnvelope.new(
+                    type="run.created",
+                    session_id=session_id,
+                    run_id=snapshot.run_id,
+                    sequence=1,
+                    payload=run_data,
+                )
+                request = None
+                if idempotency_key is not None:
+                    assert fingerprint is not None
+                    request = IdempotencyWrite(
+                        scope=scope,
+                        key=idempotency_key,
+                        request_fingerprint=fingerprint,
+                        session_id=session_id,
+                        result=run_data,
+                    )
+                session_precondition = exact_session_precondition(current)
+                batch = CommitBatch(
+                    events=(session_event, run_event),
                     snapshots=(
+                        session_write(updated_session),
                         SnapshotWrite(
                             "run",
                             snapshot.run_id,
                             session_id,
                             snapshot.version,
-                            data,
+                            run_data,
                         ),
                     ),
-                    preconditions=(SnapshotPrecondition("session", session_id),),
+                    preconditions=(session_precondition,),
+                    idempotency=request,
+                    replay_preconditions=(
+                        (session_precondition,) if request is not None else ()
+                    ),
                 )
+
+            try:
+                result: CommitResult | None = await self._commit_session_batch(
+                    batch,
+                    failure_message="failed to start run",
+                )
+            except (SnapshotPreconditionError, IdempotencyReplayMissError):
+                if attempt + 1 < _MAX_SESSION_COMMIT_ATTEMPTS:
+                    await asyncio.sleep(0)
+                continue
+            except IdempotencyError as error:
+                public_error = _idempotency_public_error(error)
+            if public_error is not None:
+                raise public_error from None
+
+            assert result is not None
+            if request is None:
+                assert snapshot is not None
+                return CommandOutcome(snapshot, replayed=False)
+            replayed = not result.applied
+            stored, validation_error = self._validated_run_result(
+                result,
+                session_id=session_id,
             )
-        except SnapshotPreconditionError:
-            raise AgentSDKError(
-                ErrorCode.NOT_FOUND,
-                "session not found",
-                retryable=False,
-            ) from None
-        return snapshot
+            result = None
+            if validation_error is not None:
+                raise validation_error from None
+            assert stored is not None
+            return CommandOutcome(stored, replayed=replayed)
+
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "session state changed concurrently",
+            retryable=True,
+        )
+
+    @staticmethod
+    def _validated_run_result(
+        result: CommitResult,
+        *,
+        session_id: str,
+    ) -> tuple[RunSnapshot | None, AgentSDKError | None]:
+        record = result.idempotency
+        if record is None:
+            return (
+                None,
+                AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "run command result is missing",
+                    retryable=False,
+                ),
+            )
+        payload = dict(record.result)
+        record = None
+        del result
+        snapshot: RunSnapshot | None = None
+        validation_failed = False
+        try:
+            snapshot = RunSnapshot.model_validate(payload)
+        except Exception:
+            validation_failed = True
+        finally:
+            payload.clear()
+        if validation_failed or snapshot is None or snapshot.session_id != session_id:
+            snapshot = None
+            return (
+                None,
+                AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "run command result is invalid",
+                    retryable=False,
+                ),
+            )
+        return snapshot, None

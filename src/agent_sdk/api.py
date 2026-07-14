@@ -34,6 +34,11 @@ from agent_sdk.observability import (
     SubscriptionService,
 )
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+    ToolCapabilityDescriptor,
+)
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.handles import RunHandle
@@ -302,6 +307,7 @@ class RunAPI:
         track_task: Callable[[asyncio.Task[RunResult]], None],
         lifecycle: _SDKLifecycle,
         tools: ToolRegistry,
+        policy: PolicyEngine,
     ) -> None:
         self._store = store
         self._commands = commands
@@ -309,53 +315,137 @@ class RunAPI:
         self._track_task = track_task
         self._lifecycle = lifecycle
         self._tools = tools
+        self._policy = policy
+        self._start_lock = asyncio.Lock()
+        self._tasks: dict[str, asyncio.Task[RunResult]] = {}
 
     async def start(
         self,
         session_id: str,
         agent: AgentSpec,
         user_input: str,
+        *,
+        idempotency_key: str | None = None,
     ) -> RunHandle:
         async with self._lifecycle.admit():
-            if await self._store.get_snapshot("session", session_id) is None:
-                raise AgentSDKError(
-                    ErrorCode.NOT_FOUND,
-                    "session not found",
-                    retryable=False,
-                )
-            created = await self._commands.start_run(
-                session_id,
-                agent_revision=agent.revision,
-                user_input=user_input,
+            messages = ({"role": "user", "content": user_input},)
+            config = self._policy.execution_config()
+            descriptor = ExecutionDescriptor.create(
+                agent=agent,
+                messages=messages,
+                tools=tuple(
+                    ToolCapabilityDescriptor.from_spec(spec)
+                    for spec in self._tools.list()
+                ),
+                policy=ExecutionPolicyDescriptor.create(
+                    permission_default=config["permission_default"]
+                ),
             )
             request = ModelRequest(
                 model=agent.model,
-                messages=({"role": "user", "content": user_input},),
+                messages=messages,
                 tools=self._tools.schemas(),
                 params=mutable_model_params(agent.model_params),
             )
-            task = asyncio.create_task(self._engine.execute(created.run_id, request))
-            self._track_task(task)
-            return RunHandle(created.run_id, self._store, task)
+            coordinator = asyncio.create_task(
+                self._coordinate_start(
+                    session_id=session_id,
+                    agent_revision=f"{agent.name}:{agent.revision}",
+                    user_input=user_input,
+                    execution_descriptor=descriptor,
+                    request=request,
+                    idempotency_key=idempotency_key,
+                )
+            )
+            return await self._await_start_coordinator(coordinator)
+
+    async def _coordinate_start(
+        self,
+        *,
+        session_id: str,
+        agent_revision: str,
+        user_input: str,
+        execution_descriptor: ExecutionDescriptor,
+        request: ModelRequest,
+        idempotency_key: str | None,
+    ) -> RunHandle:
+        async with self._start_lock:
+            outcome = await self._commands.start_run(
+                session_id,
+                agent_revision=agent_revision,
+                user_input=user_input,
+                execution_descriptor=execution_descriptor,
+                idempotency_key=idempotency_key,
+            )
+            snapshot = outcome.value
+            task = self._tasks.get(snapshot.run_id)
+            if not outcome.replayed:
+                task = asyncio.create_task(
+                    self._engine.execute(snapshot.run_id, request)
+                )
+                self._tasks[snapshot.run_id] = task
+                self._track_task(task)
+            return RunHandle(snapshot.run_id, self._store, task)
+
+    @staticmethod
+    async def _await_start_coordinator(
+        coordinator: asyncio.Task[RunHandle],
+    ) -> RunHandle:
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            return await asyncio.shield(coordinator)
+        except asyncio.CancelledError as error:
+            cancellation = error
+
+        while not coordinator.done():
+            try:
+                await asyncio.shield(coordinator)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if coordinator.done() and not coordinator.cancelled():
+            coordinator.exception()
+        assert cancellation is not None
+        raise cancellation from None
 
     async def get(self, run_id: str) -> RunSnapshot:
+        data: dict[str, Any] | None = None
+        store_failed = False
         try:
             data = await self._store.get_snapshot("run", run_id)
-            if data is None:
-                raise AgentSDKError(
-                    ErrorCode.NOT_FOUND,
-                    "run not found",
-                    retryable=False,
-                )
-            return RunSnapshot.model_validate(data)
         except AgentSDKError:
             raise
-        except Exception as error:
+        except Exception:
+            store_failed = True
+        if store_failed:
+            data = None
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
                 "failed to load run",
                 retryable=False,
-            ) from error
+            ) from None
+        if data is None:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "run not found",
+                retryable=False,
+            )
+        snapshot: RunSnapshot | None = None
+        validation_failed = False
+        try:
+            snapshot = RunSnapshot.model_validate(data)
+        except Exception:
+            validation_failed = True
+        data = None
+        if validation_failed:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to load run",
+                retryable=False,
+            ) from None
+        assert snapshot is not None
+        return snapshot
 
 
 class ContextAPI:
@@ -621,11 +711,12 @@ class AgentSDK:
         self._lifecycle = _SDKLifecycle()
         commands = RuntimeCommands(store)
         tools = ToolRegistry()
+        policy = PolicyEngine(permission_default)
         engine = RunEngine(
             store,
             models,
             tools,
-            PolicyEngine(permission_default),
+            policy,
             permission_bridge,
         )
         agents = AgentRegistry()
@@ -635,6 +726,8 @@ class AgentSDK:
             engine,
             agents,
             tool_schemas=tools.schemas,
+            tool_specs=tools.list,
+            policy=policy,
             track_run_task=self._track_task,
             track_workflow_task=self._track_task,
         )
@@ -649,6 +742,7 @@ class AgentSDK:
             self._track_task,
             self._lifecycle,
             tools,
+            policy,
         )
         self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)

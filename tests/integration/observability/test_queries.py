@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,9 @@ import pytest
 from agent_sdk import AgentSDKError, ErrorCode
 from agent_sdk.observability import EventFilter, QueryService
 from agent_sdk.events.models import EventEnvelope
+from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.models import RunSnapshot, RunStatus
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite, StateStore, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
@@ -49,10 +52,28 @@ async def test_queries_are_cursor_qualified_and_high_water_survives_deletion(
         after_cursor=0,
     )
 
-    assert observed.snapshot == run
+    assert observed.snapshot == run.value
     assert observed.as_of_cursor >= 2
     assert tuple(item.event.type for item in queried.events) == ("run.created",)
     assert queried.next_cursor == queried.as_of_cursor
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "done"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    await RunEngine(store, LiteLLMGateway._for_test(completion)).execute(
+        run.run_id,
+        ModelRequest(
+            model="fake/model",
+            messages=({"role": "user", "content": "observe me"},),
+        ),
+    )
 
     await commands.close_session(first_session.session_id)
     before_delete = await store.latest_cursor()

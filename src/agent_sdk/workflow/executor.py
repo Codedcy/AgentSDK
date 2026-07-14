@@ -10,9 +10,15 @@ from typing import Any
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import ModelRequest
+from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+    ToolCapabilityDescriptor,
+)
 from agent_sdk.runtime.models import (
     AgentSpec,
     RunResult,
@@ -24,6 +30,7 @@ from agent_sdk.runtime.models import (
 from agent_sdk.storage.base import StateStore
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.subagents.service import SubagentService, render_task_envelope
+from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.handles import WorkflowHandle
 from agent_sdk.workflow.models import (
     AgentNode,
@@ -61,6 +68,8 @@ class WorkflowExecutor:
         agents: AgentRegistry,
         *,
         tool_schemas: Callable[[], tuple[dict[str, Any], ...]] | None = None,
+        tool_specs: Callable[[], tuple[ToolSpec, ...]] | None = None,
+        policy: PolicyEngine | None = None,
         track_run_task: Callable[[asyncio.Task[RunResult]], None] | None = None,
         track_workflow_task: Callable[[asyncio.Task[WorkflowResult]], None] | None = None,
     ) -> None:
@@ -70,12 +79,16 @@ class WorkflowExecutor:
         self._agents = agents
         self._state = WorkflowState(store)
         self._tool_schemas = tool_schemas or (lambda: ())
+        self._tool_specs = tool_specs or (lambda: ())
+        self._policy = policy or PolicyEngine()
         self._subagents = SubagentService(
             store,
             commands,
             engine,
             agents,
             tool_schemas=self._tool_schemas,
+            tool_specs=self._tool_specs,
+            policy=self._policy,
             track_task=track_run_task,
         )
         self._track_workflow_task = track_workflow_task
@@ -253,10 +266,29 @@ class WorkflowExecutor:
             user_input=node.input,
             workflow_run_id=snapshot.workflow_run_id,
             workflow_node_id=node.id,
+            execution_descriptor=self._execution_descriptor(agent, node.input),
         )
         if isinstance(created, _RunFailure):
             return created
         return await self._execute_created(node, created, agent=agent)
+
+    def _execution_descriptor(
+        self,
+        agent: AgentSpec,
+        user_input: str,
+    ) -> ExecutionDescriptor:
+        config = self._policy.execution_config()
+        return ExecutionDescriptor.create(
+            agent=agent,
+            messages=({"role": "user", "content": user_input},),
+            tools=tuple(
+                ToolCapabilityDescriptor.from_spec(spec)
+                for spec in self._tool_specs()
+            ),
+            policy=ExecutionPolicyDescriptor.create(
+                permission_default=config["permission_default"]
+            ),
+        )
 
     async def _execute_created(
         self,
@@ -338,7 +370,7 @@ async def _create_run(
     **values: Any,
 ) -> RunSnapshot | _RunFailure:
     try:
-        return await commands.start_run(**values)
+        return (await commands.start_run(**values)).value
     except AgentSDKError as failure:
         return _RunFailure(failure.code, failure.message)
     except Exception:

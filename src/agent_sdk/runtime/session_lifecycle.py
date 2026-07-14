@@ -1,6 +1,6 @@
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import SessionSnapshot, SessionStatus
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot, SessionStatus
 from agent_sdk.runtime.state_machine import SessionStateMachine
 from agent_sdk.storage.base import (
     CommitBatch,
@@ -9,6 +9,11 @@ from agent_sdk.storage.base import (
     StateStore,
 )
 from agent_sdk.storage.idempotency import IdempotencyReplay, IdempotencyWrite
+
+
+RUN_LIFECYCLE_FINAL_STATUSES = frozenset(
+    {RunStatus.COMPLETED, RunStatus.FAILED}
+)
 
 
 async def load_session(store: StateStore, session_id: str) -> SessionSnapshot:
@@ -65,6 +70,46 @@ def exact_session_precondition(snapshot: SessionSnapshot) -> SnapshotPreconditio
         snapshot.session_id,
         snapshot.model_dump(mode="json"),
     )
+
+
+def exact_run_precondition(snapshot: RunSnapshot) -> SnapshotPrecondition:
+    return SnapshotPrecondition(
+        "run",
+        snapshot.run_id,
+        snapshot.version,
+        snapshot.session_id,
+        snapshot.model_dump(mode="json"),
+    )
+
+
+def detach_run_transition(
+    session: SessionSnapshot,
+    run_id: str,
+) -> tuple[SessionSnapshot, str]:
+    if run_id not in session.active_run_ids:
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "run is not owned by session",
+            retryable=False,
+        )
+    remaining = tuple(
+        active_run_id
+        for active_run_id in session.active_run_ids
+        if active_run_id != run_id
+    )
+    close_now = (
+        session.status is SessionStatus.CLOSING
+        and not remaining
+        and not session.active_workflow_run_ids
+    )
+    updated = session.model_copy(
+        update={
+            "active_run_ids": remaining,
+            "status": SessionStatus.CLOSED if close_now else session.status,
+            "version": session.version + 1,
+        }
+    )
+    return updated, "session.closed" if close_now else "session.run.detached"
 
 
 def transition_session(

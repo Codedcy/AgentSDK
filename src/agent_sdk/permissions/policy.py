@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import MappingProxyType
+from collections.abc import Mapping
 from typing import Literal
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
@@ -25,3 +27,7 @@ class PolicyEngine:
         if self._default_outcome == "deny":
             return PermissionDecision.deny()
         return PermissionDecision.ask()
+
+    def execution_config(self) -> Mapping[str, PermissionOutcome]:
+        """Return a detached snapshot of every execution-affecting setting."""
+        return MappingProxyType({"permission_default": self._default_outcome})

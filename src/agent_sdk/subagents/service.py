@@ -8,12 +8,19 @@ from functools import partial
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.models.litellm_gateway import ModelRequest
+from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+    ToolCapabilityDescriptor,
+)
 from agent_sdk.runtime.models import RunResult, RunSnapshot, RunStatus, mutable_model_params
 from agent_sdk.storage.base import StateStore
 from agent_sdk.subagents.models import ChildResult, ChildUsage, TaskEnvelope
+from agent_sdk.tools.models import ToolSpec
 
 
 class _ChildTaskFailure(Enum):
@@ -29,6 +36,8 @@ class SubagentService:
         agents: AgentRegistry,
         *,
         tool_schemas: Callable[[], tuple[dict[str, object], ...]] | None = None,
+        tool_specs: Callable[[], tuple[ToolSpec, ...]] | None = None,
+        policy: PolicyEngine | None = None,
         track_task: Callable[[asyncio.Task[RunResult]], None] | None = None,
     ) -> None:
         self._store = store
@@ -36,6 +45,8 @@ class SubagentService:
         self._engine = engine
         self._agents = agents
         self._tool_schemas = tool_schemas or (lambda: ())
+        self._tool_specs = tool_specs or (lambda: ())
+        self._policy = policy or PolicyEngine()
         self._track_task = track_task
         self._tasks: dict[str, asyncio.Task[RunResult]] = {}
 
@@ -59,7 +70,19 @@ class SubagentService:
                 retryable=False,
             )
         rendered = render_task_envelope(task)
-        created = await self._commands.start_run(
+        config = self._policy.execution_config()
+        descriptor = ExecutionDescriptor.create(
+            agent=agent,
+            messages=({"role": "user", "content": rendered},),
+            tools=tuple(
+                ToolCapabilityDescriptor.from_spec(spec)
+                for spec in self._tool_specs()
+            ),
+            policy=ExecutionPolicyDescriptor.create(
+                permission_default=config["permission_default"]
+            ),
+        )
+        outcome = await self._commands.start_run(
             session_id,
             run_id=run_id,
             agent_revision=agent_revision,
@@ -68,7 +91,9 @@ class SubagentService:
             workflow_run_id=workflow_run_id,
             workflow_node_id=workflow_node_id,
             task_envelope=task,
+            execution_descriptor=descriptor,
         )
+        created = outcome.value
         request = ModelRequest(
             model=agent.model,
             messages=({"role": "user", "content": rendered},),

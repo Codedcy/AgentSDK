@@ -1416,6 +1416,7 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
             session.session_id,
             AgentSpec(name="test", model="fake/model"),
             "two sequential calls",
+            idempotency_key="ordered-tools",
         )
         result = await asyncio.wait_for(run.result(), timeout=1)
 
@@ -1451,13 +1452,27 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
         ]
         assert event_types.count("tool.call.started") == 2
         assert event_types[-1] == "run.completed"
+
+        replay = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "two sequential calls",
+            idempotency_key="ordered-tools",
+        )
+        assert replay.run_id == run.run_id
+        assert await replay.result() == result
+        assert [item.value for item in (await replay.result()).tool_results] == [3, 7]
+        assert handler_calls == 2
+        assert len(requests) == 3
     finally:
         await sdk.close()
 
 
 @pytest.mark.asyncio
-async def test_failure_after_tool_result_preserves_terminal_snapshot() -> None:
-    store = InMemoryStore()
+async def test_failure_after_tool_result_replays_durable_ordered_snapshot(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "failed-tool-replay.db"
     model_calls = 0
 
     async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
@@ -1475,7 +1490,7 @@ async def test_failure_after_tool_result_preserves_terminal_snapshot() -> None:
         return a + b
 
     sdk = AgentSDK.for_test(
-        store=store,
+        database_path=database_path,
         acompletion=acompletion,
         permission_default="allow",
     )
@@ -1486,6 +1501,7 @@ async def test_failure_after_tool_result_preserves_terminal_snapshot() -> None:
             session.session_id,
             AgentSpec(name="test", model="fake/model"),
             "fail after a tool result",
+            idempotency_key="failed-tools",
         )
 
         with pytest.raises(AgentSDKError) as raised:
@@ -1497,6 +1513,38 @@ async def test_failure_after_tool_result_preserves_terminal_snapshot() -> None:
         assert [item.value for item in snapshot.tool_results] == [5]
     finally:
         await sdk.close()
+
+    replay_provider_calls = 0
+
+    async def must_not_call(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal replay_provider_calls
+        replay_provider_calls += 1
+        raise AssertionError("failed durable replay must not call provider")
+
+    reopened = AgentSDK.for_test(
+        database_path=database_path,
+        acompletion=must_not_call,
+        permission_default="allow",
+    )
+    try:
+        _register_add(reopened, handler)
+        replay = await reopened.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "fail after a tool result",
+            idempotency_key="failed-tools",
+        )
+        assert replay.run_id == run.run_id
+        assert replay.attached is False
+        with pytest.raises(AgentSDKError) as replayed_failure:
+            await asyncio.wait_for(replay.result(), timeout=1)
+        assert replayed_failure.value.message == "model call failed"
+        replayed_snapshot = await reopened.runs.get(replay.run_id)
+        assert [item.value for item in replayed_snapshot.tool_results] == [5]
+        assert replay_provider_calls == 0
+        assert model_calls == 2
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio
@@ -1514,23 +1562,45 @@ async def test_sqlite_reopen_preserves_terminal_snapshot_tool_results(
         acompletion=model,
         permission_default="allow",
     )
-    session = await sdk.sessions.create(workspaces=[])
-    _register_add(sdk, handler)
-    run = await sdk.runs.start(
-        session.session_id,
-        AgentSpec(name="test", model="fake/model"),
-        "persist the tool result",
-    )
-    await asyncio.wait_for(run.result(), timeout=1)
-    run_id = run.run_id
-    await sdk.close()
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        _register_add(sdk, handler)
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "persist the tool result",
+            idempotency_key="persist-tools",
+        )
+        expected = await asyncio.wait_for(run.result(), timeout=1)
+        run_id = run.run_id
+    finally:
+        await sdk.close()
+
+    provider_calls = 0
+
+    async def must_not_call(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("completed durable replay must not call provider")
 
     reopened = AgentSDK.for_test(
         database_path=database_path,
-        acompletion=model,
+        acompletion=must_not_call,
         permission_default="allow",
     )
     try:
+        _register_add(reopened, handler)
+        replay = await reopened.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "persist the tool result",
+            idempotency_key="persist-tools",
+        )
+        assert replay.attached is False
+        result = await asyncio.wait_for(replay.result(), timeout=1)
+        assert result == expected
+        assert [item.value for item in result.tool_results] == [9]
+        assert provider_calls == 0
         snapshot = await reopened.runs.get(run_id)
         assert snapshot.status is RunStatus.COMPLETED
         assert [item.value for item in snapshot.tool_results] == [9]
