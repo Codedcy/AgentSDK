@@ -1278,6 +1278,95 @@ async def test_invalid_workflow_key_is_public_invalid_state_without_writes(
         await sdk.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idempotency_key", ["", "x" * 257])
+async def test_invalid_workflow_key_precedes_missing_session(
+    idempotency_key: str,
+) -> None:
+    calls = 0
+
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls
+        del params
+        calls += 1
+        return _chunks("unexpected")
+
+    sdk = _sdk(provider)
+    try:
+        with pytest.raises(AgentSDKError) as invalid:
+            await sdk.workflows.start(
+                "ses_missing",
+                WORKFLOW,
+                idempotency_key=idempotency_key,
+            )
+        assert invalid.value.code is ErrorCode.INVALID_STATE
+        assert invalid.value.message == "idempotency key is invalid"
+        _assert_context_free_sanitizer(
+            invalid.value,
+            secret=idempotency_key or "idempotency text",
+        )
+        assert calls == 0
+    finally:
+        await sdk.close()
+
+
+class _InvalidWorkflowKeyAccessTrap(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.access_count = 0
+
+    def _record(self) -> None:
+        if self.armed:
+            self.access_count += 1
+            raise AssertionError("invalid workflow key reached Store")
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        self._record()
+        return await super().get_snapshot(kind, entity_id)
+
+    async def get_idempotency(self, scope: str, key: str):
+        self._record()
+        return await super().get_idempotency(scope, key)
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        self._record()
+        return await super().commit(batch)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idempotency_key", ["", "x" * 257])
+async def test_invalid_workflow_key_is_rejected_before_any_store_access(
+    idempotency_key: str,
+) -> None:
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        del params
+        return _chunks("unexpected")
+
+    store = _InvalidWorkflowKeyAccessTrap()
+    sdk = AgentSDK.for_test(store=store, acompletion=provider)
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        store.armed = True
+        with pytest.raises(AgentSDKError) as invalid:
+            await sdk.workflows.start(
+                session.session_id,
+                WORKFLOW,
+                idempotency_key=idempotency_key,
+            )
+        assert invalid.value.code is ErrorCode.INVALID_STATE
+        assert invalid.value.message == "idempotency key is invalid"
+        _assert_context_free_sanitizer(
+            invalid.value,
+            secret=idempotency_key or "idempotency text",
+        )
+        assert store.access_count == 0
+    finally:
+        store.armed = False
+        await sdk.close()
+
+
 class _WorkflowHintFailureStore(InMemoryStore):
     def __init__(self, failure: BaseException) -> None:
         super().__init__()
@@ -1390,6 +1479,131 @@ async def test_corrupt_sqlite_workflow_replay_result_is_sanitized_without_execut
         assert calls == 0
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_valid_foreign_workflow_replay_result_is_rejected_and_sanitized(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "substituted-workflow-result.db"
+    secret = "private-substituted-workflow-b-secret"
+    tool_calls = 0
+
+    async def tool_handler(_: ToolContext, **values: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        return values
+
+    tool_spec = ToolSpec(
+        name="unused",
+        description="must remain unused",
+        input_schema={"type": "object"},
+    )
+    workflow_b = WorkflowDefinition.model_validate(
+        {
+            "api_version": "agent-sdk/v1",
+            "kind": "Workflow",
+            "name": "foreign-workflow-b",
+            "nodes": [
+                {
+                    "id": "foreign",
+                    "kind": "agent",
+                    "agent_revision": "foreign:1",
+                    "input": secret,
+                }
+            ],
+            "edges": [],
+        }
+    )
+
+    async def first_provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        return _chunks(f"done:{params['model']}")
+
+    first = AgentSDK.for_test(database_path=database, acompletion=first_provider)
+    first.agents.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    first.agents.define(
+        AgentSpec(
+            name="foreign",
+            revision="1",
+            model="fake/foreign",
+            model_params={"private": secret},
+        )
+    )
+    first.tools.register(tool_spec, tool_handler)
+    try:
+        session = await first.sessions.create(workspaces=[])
+        workflow_a_handle = await first.workflows.start(
+            session.session_id,
+            WORKFLOW,
+            idempotency_key="workflow-a-key",
+        )
+        await workflow_a_handle.result()
+        workflow_b_handle = await first.workflows.start(
+            session.session_id,
+            workflow_b,
+            idempotency_key="workflow-b-key",
+        )
+        await workflow_b_handle.result()
+        workflow_b_snapshot = await first.workflows.get(
+            workflow_b_handle.workflow_run_id
+        )
+    finally:
+        await first.close()
+
+    with sqlite3.connect(database) as connection:
+        before_events = connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        before_runs = connection.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE kind = 'run'"
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE idempotency_records SET result_json = ? WHERE key = ?",
+            (
+                json.dumps(workflow_b_snapshot.model_dump(mode="json")),
+                "workflow-a-key",
+            ),
+        )
+        connection.commit()
+
+    provider_calls = 0
+    async def reopened_provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        del params
+        provider_calls += 1
+        return _chunks("unexpected")
+
+    reopened = AgentSDK.for_test(database_path=database, acompletion=reopened_provider)
+    reopened.agents.define(
+        AgentSpec(name="worker", revision="1", model="fake/worker")
+    )
+    reopened.agents.define(
+        AgentSpec(
+            name="foreign",
+            revision="1",
+            model="fake/foreign",
+            model_params={"private": secret},
+        )
+    )
+    reopened.tools.register(tool_spec, tool_handler)
+    try:
+        with pytest.raises(AgentSDKError) as substituted:
+            await reopened.workflows.start(
+                session.session_id,
+                WORKFLOW,
+                idempotency_key="workflow-a-key",
+            )
+        assert substituted.value.code is ErrorCode.INTERNAL
+        assert substituted.value.retryable is False
+        _assert_context_free_sanitizer(substituted.value, secret=secret)
+        assert provider_calls == 0
+        assert tool_calls == 0
+    finally:
+        await reopened.close()
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before_events
+        assert connection.execute(
+            "SELECT COUNT(*) FROM snapshots WHERE kind = 'run'"
+        ).fetchone()[0] == before_runs
 
 
 @pytest.mark.asyncio

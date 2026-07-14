@@ -29,6 +29,7 @@ from agent_sdk.storage.idempotency import (
     IdempotencyReplayMissError,
     IdempotencyWrite,
     fingerprint_command,
+    validate_replay,
 )
 from agent_sdk.workflow.models import (
     WorkflowFailure,
@@ -70,6 +71,11 @@ class WorkflowState:
                 "legacy workflow cannot use idempotency",
                 retryable=False,
             ) from None
+        scope = f"session/{session_id}/workflow.start"
+        if idempotency_key is not None:
+            validate_replay(
+                IdempotencyReplay(scope, idempotency_key, "0" * 64)
+            )
         workflow_run_id = new_id("wfr")
         nodes = tuple(
             WorkflowNodeSnapshot(
@@ -93,7 +99,6 @@ class WorkflowState:
             execution_descriptor=execution_descriptor,
         )
         snapshot_data = snapshot.model_dump(mode="json")
-        scope = f"session/{session_id}/workflow.start"
         fingerprint: str | None = None
         if idempotency_key is not None:
             fingerprint = fingerprint_command(
@@ -217,6 +222,8 @@ class WorkflowState:
             stored, validation_error = _validated_workflow_result(
                 result,
                 session_id=session_id,
+                expected_workflow=workflow,
+                expected_execution_descriptor=execution_descriptor,
             )
             result = None
             if validation_error is not None:
@@ -604,6 +611,8 @@ def _validated_workflow_result(
     result: CommitResult,
     *,
     session_id: str,
+    expected_workflow: WorkflowIR,
+    expected_execution_descriptor: WorkflowExecutionDescriptor | None,
 ) -> tuple[WorkflowRunSnapshot | None, AgentSDKError | None]:
     record = result.idempotency
     if record is None:
@@ -626,8 +635,17 @@ def _validated_workflow_result(
         validation_failed = True
     finally:
         payload.clear()
-    if validation_failed or snapshot is None or snapshot.session_id != session_id:
+    if (
+        validation_failed
+        or snapshot is None
+        or snapshot.session_id != session_id
+        or snapshot.workflow != expected_workflow
+        or snapshot.execution_compatibility != "current"
+        or snapshot.execution_descriptor != expected_execution_descriptor
+    ):
         snapshot = None
+        del expected_workflow
+        del expected_execution_descriptor
         return (
             None,
             AgentSDKError(
