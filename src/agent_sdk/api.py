@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from enum import Enum
+from functools import partial
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal, cast
 
@@ -384,8 +385,19 @@ class RunAPI:
                     self._engine.execute(snapshot.run_id, request)
                 )
                 self._tasks[snapshot.run_id] = task
+                task.add_done_callback(
+                    partial(self._release_task, snapshot.run_id)
+                )
                 self._track_task(task)
             return RunHandle(snapshot.run_id, self._store, task)
+
+    def _release_task(
+        self,
+        run_id: str,
+        task: asyncio.Task[RunResult],
+    ) -> None:
+        if self._tasks.get(run_id) is task:
+            self._tasks.pop(run_id)
 
     @staticmethod
     async def _await_start_coordinator(

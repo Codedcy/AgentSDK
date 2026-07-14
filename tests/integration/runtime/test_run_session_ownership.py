@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sqlite3
 import traceback
+import weakref
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -103,6 +105,16 @@ class FailingBlockingCompletion(BlockingCompletion):
         raise RuntimeError("must-not-leak-provider-failure")
 
 
+class _ProviderSentinel:
+    pass
+
+
+class _SentinelProviderFailure(RuntimeError):
+    def __init__(self, sentinel: _ProviderSentinel) -> None:
+        super().__init__("must-not-retain-provider-sentinel")
+        self.sentinel = sentinel
+
+
 async def _must_not_call(**_: object) -> AsyncIterator[dict[str, object]]:
     raise AssertionError("durable replay must not call the provider")
 
@@ -127,6 +139,23 @@ def _assert_context_free_sanitizer(
                 assert all(value is not original for value in local_values.values())
             assert secret not in repr(local_values)
         current = current.tb_next
+
+
+async def _yield_until_run_registry_empty(sdk: AgentSDK) -> None:
+    for _ in range(20):
+        if not sdk.runs._tasks:  # type: ignore[attr-defined]
+            return
+        await asyncio.sleep(0)
+
+
+async def _consume_run_failure(handle: Any) -> ErrorCode:
+    try:
+        await handle.result()
+    except AgentSDKError as error:
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        return error.code
+    raise AssertionError("run did not fail")
 
 
 @pytest.fixture
@@ -179,6 +208,10 @@ async def test_concurrent_duplicate_run_start_executes_once(
     )
 
     assert len({handle.run_id for handle in handles}) == 1
+    assert all(handle.attached for handle in handles)
+    assert len(
+        {id(handle._task) for handle in handles}  # type: ignore[attr-defined]
+    ) == 1
     completion.finish()
     await asyncio.gather(*(handle.result() for handle in handles))
     assert completion.call_count == 1
@@ -256,7 +289,7 @@ async def test_model_failure_detaches_run_and_closes_closing_session() -> None:
         await sdk.close()
 
 
-async def test_completed_replay_reuses_local_task_and_durable_result() -> None:
+async def test_completed_replay_is_detached_and_uses_durable_result() -> None:
     completion = CountingCompletion("first result")
     store = InMemoryStore()
     sdk = AgentSDK.for_test(store=store, acompletion=completion)
@@ -269,6 +302,7 @@ async def test_completed_replay_reuses_local_task_and_durable_result() -> None:
             idempotency_key="run-request",
         )
         expected = await first.result()
+        await _yield_until_run_registry_empty(sdk)
 
         replay = await sdk.runs.start(
             session.session_id,
@@ -278,7 +312,7 @@ async def test_completed_replay_reuses_local_task_and_durable_result() -> None:
         )
 
         assert replay.run_id == first.run_id
-        assert replay.attached is True
+        assert replay.attached is False
         assert await replay.result() == expected
         assert completion.call_count == 1
         run_events = [
@@ -287,6 +321,58 @@ async def test_completed_replay_reuses_local_task_and_durable_result() -> None:
             if stored.event.run_id == first.run_id
         ]
         assert sum(event.event.type == "run.created" for event in run_events) == 1
+    finally:
+        await sdk.close()
+
+
+async def test_completed_short_runs_do_not_accumulate_in_run_registry() -> None:
+    completion = CountingCompletion()
+    sdk = AgentSDK.for_test(store=InMemoryStore(), acompletion=completion)
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handles = []
+        for index in range(8):
+            handle = await sdk.runs.start(
+                session.session_id,
+                AGENT,
+                f"input {index}",
+            )
+            handles.append(handle)
+            await handle.result()
+
+        await _yield_until_run_registry_empty(sdk)
+
+        assert sdk.runs._tasks == {}  # type: ignore[attr-defined]
+        assert completion.call_count == 8
+    finally:
+        await sdk.close()
+
+
+async def test_failed_run_registry_does_not_retain_provider_failure() -> None:
+    sentinel_refs: list[weakref.ReferenceType[_ProviderSentinel]] = []
+
+    async def provider(**_: object) -> AsyncIterator[dict[str, object]]:
+        sentinel = _ProviderSentinel()
+        sentinel_refs.append(weakref.ref(sentinel))
+        raise _SentinelProviderFailure(sentinel)
+
+    sdk = AgentSDK.for_test(store=InMemoryStore(), acompletion=provider)
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handle = await sdk.runs.start(session.session_id, AGENT, "fail")
+        run_id = handle.run_id
+        task_ref = weakref.ref(handle._task)  # type: ignore[attr-defined]
+        assert await _consume_run_failure(handle) is ErrorCode.INTERNAL
+
+        await _yield_until_run_registry_empty(sdk)
+        for _ in range(2):
+            await asyncio.sleep(0)
+        del handle
+        gc.collect()
+
+        assert sentinel_refs[0]() is None
+        assert task_ref() is None
+        assert run_id not in sdk.runs._tasks  # type: ignore[attr-defined]
     finally:
         await sdk.close()
 
@@ -1032,3 +1118,60 @@ async def test_corrupted_run_idempotency_hint_is_context_free_and_does_not_execu
         assert completion.call_count == 0
     finally:
         await sdk.close()
+
+
+class _LegacyIdempotencyGuardStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.access_count = 0
+
+    def _record_access(self) -> None:
+        if self.armed:
+            self.access_count += 1
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        self._record_access()
+        return await super().commit(batch)
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        self._record_access()
+        return await super().get_snapshot(kind, entity_id)
+
+    async def get_idempotency(self, scope: str, key: str):
+        self._record_access()
+        return await super().get_idempotency(scope, key)
+
+
+async def test_legacy_run_start_rejects_idempotency_before_store_access() -> None:
+    store = _LegacyIdempotencyGuardStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    cursor_before = await store.latest_cursor()
+    store.armed = True
+
+    for revision in ("legacy:1", "legacy:2"):
+        with pytest.raises(AgentSDKError) as raised:
+            await commands.start_run(
+                session.session_id,
+                agent_revision=revision,
+                user_input="same input",
+                execution_descriptor=None,
+                idempotency_key="legacy-run-request",
+            )
+
+        assert raised.value.code is ErrorCode.INVALID_STATE
+        assert raised.value.retryable is False
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    assert store.access_count == 0
+    store.armed = False
+    assert await store.latest_cursor() == cursor_before
+    assert (
+        await store.get_idempotency(
+            f"session/{session.session_id}/run.start",
+            "legacy-run-request",
+        )
+        is None
+    )

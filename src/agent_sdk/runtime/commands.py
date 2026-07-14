@@ -400,6 +400,12 @@ class RuntimeCommands:
         execution_descriptor: ExecutionDescriptor | None = None,
         idempotency_key: str | None = None,
     ) -> CommandOutcome[RunSnapshot]:
+        if execution_descriptor is None and idempotency_key is not None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "legacy run cannot use idempotency",
+                retryable=False,
+            ) from None
         selected_run_id = run_id or new_id("run")
         compatibility: Literal["legacy_unknown", "current"] = (
             "current" if execution_descriptor is not None else "legacy_unknown"
