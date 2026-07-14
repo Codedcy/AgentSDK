@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -43,6 +44,7 @@ from agent_sdk.runtime.execution import (
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.handles import RunHandle
+from agent_sdk.runtime.leases import Lease
 from agent_sdk.runtime.models import (
     AgentSpec,
     RunResult,
@@ -108,6 +110,31 @@ class _LazySQLiteStore:
 
     async def delete_session(self, session_id: str) -> None:
         await (await self._get()).delete_session(session_id)
+
+    async def acquire_lease(
+        self, *, run_id: str, owner: str, now: datetime, expires_at: datetime
+    ) -> Lease:
+        return await (await self._get()).acquire_lease(
+            run_id=run_id,
+            owner=owner,
+            now=now,
+            expires_at=expires_at,
+        )
+
+    async def renew_lease(
+        self, lease: Lease, *, now: datetime, expires_at: datetime
+    ) -> Lease:
+        return await (await self._get()).renew_lease(
+            lease,
+            now=now,
+            expires_at=expires_at,
+        )
+
+    async def release_lease(self, lease: Lease) -> None:
+        await (await self._get()).release_lease(lease)
+
+    async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None:
+        await (await self._get()).assert_current_lease(lease, now=now)
 
     async def close(self) -> None:
         async with self._lock:

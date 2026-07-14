@@ -24,6 +24,7 @@ from agent_sdk.context import (
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest, UsageReported
+from agent_sdk.runtime.models import SessionSnapshot
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
@@ -647,7 +648,10 @@ async def _seed_projection(store: StateStore, *, session_id: str = "ses_projecti
                     session_id,
                     session_id,
                     1,
-                    {"session_id": session_id},
+                    SessionSnapshot(
+                        session_id=session_id,
+                        workspaces=(),
+                    ).model_dump(mode="json"),
                 ),
             ),
         )

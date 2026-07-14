@@ -1,8 +1,10 @@
 import asyncio
 from copy import deepcopy
+from datetime import datetime
 from typing import Any, TypeAlias
 
 from agent_sdk.events.models import EventEnvelope
+from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
@@ -41,6 +43,7 @@ class InMemoryStore:
         self._events: list[StoredEvent] = []
         self._snapshots: dict[_SnapshotKey, SnapshotWrite] = {}
         self._idempotency: dict[tuple[str, str], IdempotencyRecord] = {}
+        self._leases: dict[str, Lease] = {}
         self._last_cursor = 0
 
     async def commit(self, batch: CommitBatch) -> CommitResult:
@@ -195,6 +198,11 @@ class InMemoryStore:
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
+            run_ids = {
+                snapshot.entity_id
+                for snapshot in self._snapshots.values()
+                if snapshot.kind == "run" and snapshot.session_id == session_id
+            }
             events = [
                 stored for stored in self._events if stored.event.session_id != session_id
             ]
@@ -210,6 +218,72 @@ class InMemoryStore:
                 for key, record in self._idempotency.items()
                 if record.session_id != session_id
             }
+            self._leases = {
+                run_id: lease
+                for run_id, lease in self._leases.items()
+                if run_id not in run_ids
+            }
+
+    async def acquire_lease(
+        self, *, run_id: str, owner: str, now: datetime, expires_at: datetime
+    ) -> Lease:
+        candidate = Lease(
+            run_id=run_id,
+            owner=owner,
+            generation=1,
+            acquired_at=now,
+            renewed_at=now,
+            expires_at=expires_at,
+        )
+        async with self._lock:
+            current = self._leases.get(run_id)
+            if current is not None and current.expires_at > candidate.acquired_at:
+                raise LeaseHeldError
+            generation = 1 if current is None else current.generation + 1
+            acquired = candidate.model_copy(update={"generation": generation})
+            self._leases[run_id] = acquired
+            return acquired.model_copy()
+
+    async def renew_lease(
+        self, lease: Lease, *, now: datetime, expires_at: datetime
+    ) -> Lease:
+        candidate = Lease(
+            run_id=lease.run_id,
+            owner=lease.owner,
+            generation=lease.generation,
+            acquired_at=lease.acquired_at,
+            renewed_at=now,
+            expires_at=expires_at,
+        )
+        async with self._lock:
+            current = self._leases.get(lease.run_id)
+            if (
+                current is None
+                or current.owner != lease.owner
+                or current.generation != lease.generation
+                or current.expires_at <= candidate.renewed_at
+            ):
+                raise LeaseLostError
+            self._leases[lease.run_id] = candidate
+            return candidate.model_copy()
+
+    async def release_lease(self, lease: Lease) -> None:
+        async with self._lock:
+            current = self._leases.get(lease.run_id)
+            if not _lease_matches(current, lease):
+                raise LeaseLostError
+            del self._leases[lease.run_id]
+
+    async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None:
+        async with self._lock:
+            current = self._leases.get(lease.run_id)
+            if (
+                current is None
+                or current.owner != lease.owner
+                or current.generation != lease.generation
+                or current.expires_at <= now
+            ):
+                raise LeaseLostError
 
     @staticmethod
     def _latest_sequences(events: list[StoredEvent]) -> dict[_AggregateKey, int]:
@@ -217,3 +291,11 @@ class InMemoryStore:
         for stored in events:
             sequences[_aggregate_key(stored.event)] = stored.event.sequence
         return sequences
+
+
+def _lease_matches(current: Lease | None, expected: Lease) -> bool:
+    return (
+        current is not None
+        and current.owner == expected.owner
+        and current.generation == expected.generation
+    )

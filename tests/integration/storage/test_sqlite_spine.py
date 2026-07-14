@@ -313,7 +313,7 @@ async def test_v1_upgrade_backfills_only_nonterminal_execution_ownership(tmp_pat
         async with store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cursor:
-            assert await cursor.fetchall() == [(1,), (2,)]
+            assert await cursor.fetchall() == [(1,), (2,), (3,)]
         await sdk.close()
     finally:
         await store.close()
@@ -384,12 +384,12 @@ async def test_concurrent_v1_open_serializes_discovery_and_migration(
             asyncio.gather(first_task, second_task),
             timeout=2,
         )
-        assert discoveries == ["v1", "v2"]
+        assert discoveries == ["v1", "v3"]
         for store in (first, second):
             async with store._connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ) as cursor:
-                assert await cursor.fetchall() == [(1,), (2,)]
+                assert await cursor.fetchall() == [(1,), (2,), (3,)]
     finally:
         release_first.set()
         for task in tasks:
@@ -490,7 +490,7 @@ async def test_v1_upgrade_commit_failure_rolls_back_exactly(
 
 
 @pytest.mark.asyncio
-async def test_cancel_racing_migration_commit_observes_only_complete_v2(
+async def test_cancel_racing_migration_commit_observes_only_complete_v3(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -520,7 +520,7 @@ async def test_cancel_racing_migration_commit_observes_only_complete_v2(
         async with reopened._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cursor:
-            assert await cursor.fetchall() == [(1,), (2,)]
+            assert await cursor.fetchall() == [(1,), (2,), (3,)]
         assert (await reopened.get_snapshot("session", "ses_v1"))["active_run_ids"] == [
             "run_active"
         ]

@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, cast
 import aiosqlite
 
 from agent_sdk.events.models import EventEnvelope
+from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
     CommitBatch,
@@ -38,7 +39,7 @@ from agent_sdk.storage.idempotency import (
     validate_replay,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"
 _OPEN_BUSY_TIMEOUT_MS = 50
 _OPEN_RETRY_SECONDS = 2.0
@@ -72,12 +73,59 @@ _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
         ("session_id", "TEXT", True, 0),
         ("result_json", "TEXT", True, 0),
     ),
+    "leases": (
+        ("run_id", "TEXT", True, 1),
+        ("owner", "TEXT", True, 0),
+        ("generation", "INTEGER", True, 0),
+        ("acquired_at", "TEXT", True, 0),
+        ("renewed_at", "TEXT", True, 0),
+        ("expires_at", "TEXT", True, 0),
+    ),
+    "external_operations": (
+        ("operation_id", "TEXT", True, 1),
+        ("operation_kind", "TEXT", True, 0),
+        ("session_id", "TEXT", True, 0),
+        ("run_id", "TEXT", True, 0),
+        ("turn", "INTEGER", True, 0),
+        ("request_fingerprint", "TEXT", True, 0),
+        ("provider_identity", "TEXT", False, 0),
+        ("tool_identity", "TEXT", False, 0),
+        ("lease_generation", "INTEGER", True, 0),
+        ("status", "TEXT", True, 0),
+        ("data_json", "TEXT", True, 0),
+    ),
+    "run_checkpoints": (
+        ("run_id", "TEXT", True, 1),
+        ("session_id", "TEXT", True, 0),
+        ("checkpoint_version", "INTEGER", True, 0),
+        ("turn", "INTEGER", True, 0),
+        ("phase", "TEXT", True, 0),
+        ("operation_id", "TEXT", False, 0),
+        ("data_json", "TEXT", True, 0),
+    ),
+    "reconciliation_requests": (
+        ("request_id", "TEXT", True, 1),
+        ("session_id", "TEXT", True, 0),
+        ("run_id", "TEXT", True, 0),
+        ("operation_id", "TEXT", False, 0),
+        ("status", "TEXT", True, 0),
+        ("data_json", "TEXT", True, 0),
+    ),
 }
 _EXPECTED_INDEXES = {
     "events_session_cursor": (False, ("session_id", "cursor")),
     "events_aggregate_sequence": (True, (None, "sequence")),
     "snapshots_session": (False, ("session_id",)),
     "idempotency_records_session": (False, ("session_id",)),
+    "leases_expires_at": (False, ("expires_at",)),
+    "external_operations_session": (False, ("session_id",)),
+    "external_operations_run_status": (False, ("run_id", "status")),
+    "run_checkpoints_session": (False, ("session_id",)),
+    "run_checkpoints_phase": (False, ("phase",)),
+    "run_checkpoints_operation": (False, ("operation_id",)),
+    "reconciliation_requests_session": (False, ("session_id",)),
+    "reconciliation_requests_run_status": (False, ("run_id", "status")),
+    "reconciliation_requests_operation": (False, ("operation_id",)),
 }
 _AGGREGATE_INDEX_SQL = (
     "create unique index events_aggregate_sequence "
@@ -123,6 +171,89 @@ _EXPECTED_TABLE_SQL = {
             PRIMARY KEY(scope, key)
         )
     """,
+    "leases": """
+        CREATE TABLE leases(
+            run_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(run_id)) > 0),
+            owner TEXT NOT NULL CHECK(length(trim(owner)) > 0),
+            generation INTEGER NOT NULL CHECK(generation >= 1),
+            acquired_at TEXT NOT NULL CHECK(length(acquired_at) > 0),
+            renewed_at TEXT NOT NULL CHECK(length(renewed_at) > 0),
+            expires_at TEXT NOT NULL CHECK(
+                length(expires_at) > 0
+                AND renewed_at >= acquired_at
+                AND expires_at > renewed_at
+            )
+        )
+    """,
+    "external_operations": """
+        CREATE TABLE external_operations(
+            operation_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(operation_id)) > 0),
+            operation_kind TEXT NOT NULL CHECK(operation_kind IN ('model_call', 'tool_call')),
+            session_id TEXT NOT NULL CHECK(length(trim(session_id)) > 0),
+            run_id TEXT NOT NULL CHECK(length(trim(run_id)) > 0),
+            turn INTEGER NOT NULL CHECK(turn >= 0),
+            request_fingerprint TEXT NOT NULL CHECK(length(trim(request_fingerprint)) > 0),
+            provider_identity TEXT,
+            tool_identity TEXT,
+            lease_generation INTEGER NOT NULL CHECK(lease_generation >= 1),
+            status TEXT NOT NULL CHECK(status IN ('started', 'completed', 'failed')),
+            data_json TEXT NOT NULL CHECK(
+                json_valid(data_json) AND json_type(data_json) = 'object'
+            ),
+            UNIQUE(run_id, turn, operation_kind, operation_id),
+            UNIQUE(operation_id, run_id, session_id),
+            CHECK(
+                (operation_kind = 'model_call'
+                    AND provider_identity IS NOT NULL
+                    AND length(trim(provider_identity)) > 0
+                    AND tool_identity IS NULL)
+                OR
+                (operation_kind = 'tool_call'
+                    AND provider_identity IS NULL
+                    AND tool_identity IS NOT NULL
+                    AND length(trim(tool_identity)) > 0)
+            )
+        )
+    """,
+    "run_checkpoints": """
+        CREATE TABLE run_checkpoints(
+            run_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(run_id)) > 0),
+            session_id TEXT NOT NULL CHECK(length(trim(session_id)) > 0),
+            checkpoint_version INTEGER NOT NULL CHECK(checkpoint_version >= 1),
+            turn INTEGER NOT NULL CHECK(turn >= 0),
+            phase TEXT NOT NULL CHECK(phase IN (
+                'ready_for_model', 'model_in_flight', 'ready_for_tool',
+                'tool_in_flight', 'waiting', 'terminal'
+            )),
+            operation_id TEXT,
+            data_json TEXT NOT NULL CHECK(
+                json_valid(data_json) AND json_type(data_json) = 'object'
+            ),
+            FOREIGN KEY(operation_id, run_id, session_id)
+                REFERENCES external_operations(operation_id, run_id, session_id)
+                ON DELETE RESTRICT,
+            CHECK(
+                (phase IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NOT NULL)
+                OR
+                (phase NOT IN ('model_in_flight', 'tool_in_flight') AND operation_id IS NULL)
+            )
+        )
+    """,
+    "reconciliation_requests": """
+        CREATE TABLE reconciliation_requests(
+            request_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(request_id)) > 0),
+            session_id TEXT NOT NULL CHECK(length(trim(session_id)) > 0),
+            run_id TEXT NOT NULL CHECK(length(trim(run_id)) > 0),
+            operation_id TEXT,
+            status TEXT NOT NULL CHECK(status IN ('pending', 'resolved')),
+            data_json TEXT NOT NULL CHECK(
+                json_valid(data_json) AND json_type(data_json) = 'object'
+            ),
+            FOREIGN KEY(operation_id, run_id, session_id)
+                REFERENCES external_operations(operation_id, run_id, session_id)
+                ON DELETE RESTRICT
+        )
+    """,
 }
 _EXPECTED_INDEX_SQL = {
     "events_session_cursor": (
@@ -133,6 +264,31 @@ _EXPECTED_INDEX_SQL = {
     "idempotency_records_session": (
         "CREATE INDEX idempotency_records_session ON idempotency_records(session_id)"
     ),
+    "leases_expires_at": "CREATE INDEX leases_expires_at ON leases(expires_at)",
+    "external_operations_session": (
+        "CREATE INDEX external_operations_session ON external_operations(session_id)"
+    ),
+    "external_operations_run_status": (
+        "CREATE INDEX external_operations_run_status ON external_operations(run_id, status)"
+    ),
+    "run_checkpoints_session": (
+        "CREATE INDEX run_checkpoints_session ON run_checkpoints(session_id)"
+    ),
+    "run_checkpoints_phase": "CREATE INDEX run_checkpoints_phase ON run_checkpoints(phase)",
+    "run_checkpoints_operation": (
+        "CREATE INDEX run_checkpoints_operation ON run_checkpoints(operation_id)"
+    ),
+    "reconciliation_requests_session": (
+        "CREATE INDEX reconciliation_requests_session ON reconciliation_requests(session_id)"
+    ),
+    "reconciliation_requests_run_status": (
+        "CREATE INDEX reconciliation_requests_run_status "
+        "ON reconciliation_requests(run_id, status)"
+    ),
+    "reconciliation_requests_operation": (
+        "CREATE INDEX reconciliation_requests_operation "
+        "ON reconciliation_requests(operation_id)"
+    ),
 }
 
 
@@ -140,6 +296,7 @@ class _SchemaState(Enum):
     EMPTY = "empty"
     V1 = "v1"
     V2 = "v2"
+    V3 = "v3"
 
 
 def _canonical_json(value: dict[str, Any]) -> str:
@@ -178,6 +335,41 @@ def _is_busy(error: sqlite3.Error) -> bool:
         return True
     message = str(error).casefold()
     return "database is locked" in message or "database table is locked" in message
+
+
+def _lease_from_row(row: sqlite3.Row | tuple[Any, ...]) -> Lease:
+    try:
+        return Lease.model_validate(
+            {
+                "run_id": row[0],
+                "owner": row[1],
+                "generation": row[2],
+                "acquired_at": row[3],
+                "renewed_at": row[4],
+                "expires_at": row[5],
+            }
+        )
+    except ValueError as error:
+        raise ValueError("incompatible lease row") from error
+
+
+def _lease_values(lease: Lease) -> tuple[str, str, int, str, str, str]:
+    return (
+        lease.run_id,
+        lease.owner,
+        lease.generation,
+        lease.acquired_at.isoformat(),
+        lease.renewed_at.isoformat(),
+        lease.expires_at.isoformat(),
+    )
+
+
+def _lease_identity_matches(current: Lease | None, expected: Lease) -> bool:
+    return (
+        current is not None
+        and current.owner == expected.owner
+        and current.generation == expected.generation
+    )
 
 
 async def _with_busy_retry(
@@ -401,11 +593,153 @@ class SQLiteStore:
             self._ensure_open()
             return await self._last_cursor()
 
+    async def acquire_lease(
+        self, *, run_id: str, owner: str, now: datetime, expires_at: datetime
+    ) -> Lease:
+        proposed = Lease(
+            run_id=run_id,
+            owner=owner,
+            generation=1,
+            acquired_at=now,
+            renewed_at=now,
+            expires_at=expires_at,
+        )
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite lease acquisition conflict")
+                current = await self._read_lease(proposed.run_id)
+                if current is not None and current.expires_at > proposed.acquired_at:
+                    raise LeaseHeldError
+                generation = 1 if current is None else current.generation + 1
+                acquired = proposed.model_copy(update={"generation": generation})
+                await self._connection.execute(
+                    """
+                    INSERT INTO leases(
+                        run_id, owner, generation, acquired_at, renewed_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        owner = excluded.owner,
+                        generation = excluded.generation,
+                        acquired_at = excluded.acquired_at,
+                        renewed_at = excluded.renewed_at,
+                        expires_at = excluded.expires_at
+                    """,
+                    _lease_values(acquired),
+                )
+                await self._commit_transaction()
+                return acquired.model_copy()
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def renew_lease(
+        self, lease: Lease, *, now: datetime, expires_at: datetime
+    ) -> Lease:
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite lease renewal conflict")
+                current = await self._read_lease(lease.run_id)
+                if (
+                    current is None
+                    or current.owner != lease.owner
+                    or current.generation != lease.generation
+                    or current.expires_at <= now
+                ):
+                    raise LeaseLostError
+                renewed = Lease(
+                    run_id=current.run_id,
+                    owner=current.owner,
+                    generation=current.generation,
+                    acquired_at=current.acquired_at,
+                    renewed_at=now,
+                    expires_at=expires_at,
+                )
+                result = await self._connection.execute(
+                    """
+                    UPDATE leases SET renewed_at = ?, expires_at = ?
+                    WHERE run_id = ? AND owner = ? AND generation = ?
+                    """,
+                    (
+                        renewed.renewed_at.isoformat(),
+                        renewed.expires_at.isoformat(),
+                        renewed.run_id,
+                        renewed.owner,
+                        renewed.generation,
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise LeaseLostError
+                await self._commit_transaction()
+                return renewed.model_copy()
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def release_lease(self, lease: Lease) -> None:
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite lease release conflict")
+                current = await self._read_lease(lease.run_id)
+                if not _lease_identity_matches(current, lease):
+                    raise LeaseLostError
+                result = await self._connection.execute(
+                    "DELETE FROM leases WHERE run_id = ? AND owner = ? AND generation = ?",
+                    (lease.run_id, lease.owner, lease.generation),
+                )
+                if result.rowcount != 1:
+                    raise LeaseLostError
+                await self._commit_transaction()
+            except BaseException:
+                await self._rollback()
+                raise
+
+    async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None:
+        async with self._lock:
+            self._ensure_open()
+            try:
+                await self._begin_immediate("SQLite lease assertion conflict")
+                current = await self._read_lease(lease.run_id)
+                if (
+                    current is None
+                    or current.owner != lease.owner
+                    or current.generation != lease.generation
+                    or current.expires_at <= now
+                ):
+                    raise LeaseLostError
+                await self._commit_transaction()
+            except BaseException:
+                await self._rollback()
+                raise
+
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:
             self._ensure_open()
             try:
                 await self._connection.execute("BEGIN IMMEDIATE")
+                await self._connection.execute(
+                    "DELETE FROM reconciliation_requests WHERE session_id = ?",
+                    (session_id,),
+                )
+                await self._connection.execute(
+                    "DELETE FROM run_checkpoints WHERE session_id = ?",
+                    (session_id,),
+                )
+                await self._connection.execute(
+                    "DELETE FROM external_operations WHERE session_id = ?",
+                    (session_id,),
+                )
+                await self._connection.execute(
+                    """
+                    DELETE FROM leases WHERE run_id IN (
+                        SELECT entity_id FROM snapshots
+                        WHERE kind = 'run' AND session_id = ?
+                    )
+                    """,
+                    (session_id,),
+                )
                 await self._connection.execute(
                     "DELETE FROM events WHERE session_id = ?",
                     (session_id,),
@@ -430,6 +764,20 @@ class SQLiteStore:
     async def _rollback(self) -> None:
         rollback = asyncio.create_task(self._connection.rollback())
         await self._await_cleanup(rollback)
+
+    async def _commit_transaction(self) -> None:
+        commit = asyncio.create_task(self._connection.commit())
+        await self._await_cleanup(commit)
+
+    async def _begin_immediate(self, message: str) -> None:
+        async def begin() -> None:
+            await self._connection.execute("BEGIN IMMEDIATE")
+
+        await _with_busy_retry(
+            begin,
+            deadline=monotonic() + _OPEN_RETRY_SECONDS,
+            message=message,
+        )
 
     @staticmethod
     async def _await_cleanup(cleanup: asyncio.Task[None]) -> None:
@@ -545,6 +893,17 @@ class SQLiteStore:
             result_json=row[4],
         )
 
+    async def _read_lease(self, run_id: str) -> Lease | None:
+        async with self._connection.execute(
+            """
+            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at
+            FROM leases WHERE run_id = ?
+            """,
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return None if row is None else _lease_from_row(row)
+
     async def _insert_idempotency(self, record: IdempotencyRecord) -> None:
         await self._connection.execute(
             """
@@ -604,7 +963,6 @@ class SQLiteStore:
             await cls._migration_checkpoint(
                 f"migration-schema-discovered-{state.value}"
             )
-            upgraded = state is not _SchemaState.V2
             empty_database = state is _SchemaState.EMPTY
             if empty_database:
                 migration_one = resources.files("agent_sdk.storage").joinpath(
@@ -640,11 +998,35 @@ class SQLiteStore:
                     (2, datetime.now(UTC).isoformat()),
                 )
                 await cls._migration_checkpoint("migration-2-version-inserted")
+                state = _SchemaState.V2
 
-            await cls._validate_schema(connection, expected_version=2)
-            if upgraded:
+            if state is _SchemaState.V2:
+                await cls._validate_schema(connection, expected_version=2)
                 await cls._validate_v2_projections(connection)
-            await cls._migration_checkpoint("migration-2-final-validation")
+                await cls._migration_checkpoint("migration-2-final-validation")
+                migration_three = resources.files("agent_sdk.storage").joinpath(
+                    "migrations", "0003_leases.sql"
+                )
+
+                async def after_migration_three_statement(index: int) -> None:
+                    await cls._migration_checkpoint(f"migration-3-statement-{index}")
+
+                await _execute_script_statements(
+                    connection,
+                    migration_three.read_text(encoding="utf-8"),
+                    after_statement=after_migration_three_statement,
+                )
+                await connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (3, datetime.now(UTC).isoformat()),
+                )
+                await cls._migration_checkpoint("migration-3-version-inserted")
+                state = _SchemaState.V3
+
+            await cls._validate_schema(connection, expected_version=3)
+            await cls._validate_v2_projections(connection)
+            await cls._validate_v3_rows(connection)
+            await cls._migration_checkpoint("migration-3-final-validation")
             commit_task = asyncio.create_task(connection.commit())
             await cls._await_cleanup(commit_task)
         except BaseException:
@@ -704,8 +1086,13 @@ class SQLiteStore:
                 return _SchemaState.EMPTY
             v1_tables = {"schema_migrations", "events", "snapshots"}
             v2_tables = {*v1_tables, "idempotency_records"}
+            v3_tables = set(_EXPECTED_TABLE_INFO)
             frozen_table_names = frozenset(table_names)
-            if frozen_table_names not in {frozenset(v1_tables), frozenset(v2_tables)}:
+            if frozen_table_names not in {
+                frozenset(v1_tables),
+                frozenset(v2_tables),
+                frozenset(v3_tables),
+            }:
                 raise ValueError("incompatible database schema")
             async with connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
@@ -716,6 +1103,8 @@ class SQLiteStore:
                 return _SchemaState.V1
             if table_names == v2_tables and versions == (1, 2):
                 return _SchemaState.V2
+            if table_names == v3_tables and versions == (1, 2, 3):
+                return _SchemaState.V3
             raise ValueError("incompatible database schema version")
         except sqlite3.Error as error:
             raise ValueError("incompatible database schema") from error
@@ -727,11 +1116,18 @@ class SQLiteStore:
         *,
         expected_version: int,
     ) -> None:
-        table_names = (
-            ("schema_migrations", "events", "snapshots")
-            if expected_version == 1
-            else tuple(_EXPECTED_TABLE_INFO)
-        )
+        table_names: tuple[str, ...]
+        if expected_version == 1:
+            table_names = ("schema_migrations", "events", "snapshots")
+        elif expected_version == 2:
+            table_names = (
+                "schema_migrations",
+                "events",
+                "snapshots",
+                "idempotency_records",
+            )
+        else:
+            table_names = tuple(_EXPECTED_TABLE_INFO)
         for table_name in table_names:
             expected_info = _EXPECTED_TABLE_INFO[table_name]
             async with connection.execute(f"PRAGMA table_info({table_name})") as cursor:
@@ -767,14 +1163,44 @@ class SQLiteStore:
         expected_indexes = {
             name: value
             for name, value in _EXPECTED_INDEXES.items()
-            if expected_version == 2 or name != "idempotency_records_session"
+            if (
+                expected_version == 3
+                or (
+                    expected_version == 2
+                    and name
+                    in {
+                        "events_session_cursor",
+                        "events_aggregate_sequence",
+                        "snapshots_session",
+                        "idempotency_records_session",
+                    }
+                )
+                or (
+                    expected_version == 1
+                    and name
+                    in {
+                        "events_session_cursor",
+                        "events_aggregate_sequence",
+                        "snapshots_session",
+                    }
+                )
+            )
         }
         indexes: dict[str, tuple[bool, tuple[str | None, ...]]] = {}
-        for table_name in (
-            ("events", "snapshots")
-            if expected_version == 1
-            else ("events", "snapshots", "idempotency_records")
-        ):
+        indexed_tables = {
+            1: ("events", "snapshots"),
+            2: ("events", "snapshots", "idempotency_records"),
+            3: (
+                "events",
+                "snapshots",
+                "idempotency_records",
+                "leases",
+                "external_operations",
+                "run_checkpoints",
+                "reconciliation_requests",
+            ),
+        }[expected_version]
+        for table_name in indexed_tables:
             async with connection.execute(f"PRAGMA index_list({table_name})") as cursor:
                 index_rows = await cursor.fetchall()
             for index_row in index_rows:
@@ -832,7 +1258,7 @@ class SQLiteStore:
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cursor:
             versions = tuple(row[0] for row in await cursor.fetchall())
-        expected_versions = (1,) if expected_version == 1 else (1, 2)
+        expected_versions = tuple(range(1, expected_version + 1))
         if versions != expected_versions:
             raise ValueError("incompatible database schema version")
 
@@ -853,6 +1279,68 @@ class SQLiteStore:
     @staticmethod
     async def _validate_v2_projections(connection: aiosqlite.Connection) -> None:
         await _validate_current_projection_rows(connection)
+
+    @staticmethod
+    async def _validate_v3_rows(connection: aiosqlite.Connection) -> None:
+        async with connection.execute(
+            """
+            SELECT run_id, owner, generation, acquired_at, renewed_at, expires_at
+            FROM leases
+            """
+        ) as cursor:
+            lease_rows = await cursor.fetchall()
+        for row in lease_rows:
+            try:
+                Lease.model_validate(
+                    {
+                        "run_id": row[0],
+                        "owner": row[1],
+                        "generation": row[2],
+                        "acquired_at": row[3],
+                        "renewed_at": row[4],
+                        "expires_at": row[5],
+                    }
+                )
+            except ValueError as error:
+                raise ValueError("incompatible lease row") from error
+
+        await _validate_json_identity_rows(
+            connection,
+            table="external_operations",
+            columns=(
+                "operation_id",
+                "operation_kind",
+                "session_id",
+                "run_id",
+                "turn",
+                "request_fingerprint",
+                "provider_identity",
+                "tool_identity",
+                "lease_generation",
+                "status",
+            ),
+        )
+        await _validate_json_identity_rows(
+            connection,
+            table="run_checkpoints",
+            columns=(
+                "run_id",
+                "session_id",
+                "checkpoint_version",
+                "turn",
+                "phase",
+                "operation_id",
+            ),
+        )
+        await _validate_json_identity_rows(
+            connection,
+            table="reconciliation_requests",
+            columns=("request_id", "session_id", "run_id", "operation_id", "status"),
+        )
+        async with connection.execute("PRAGMA foreign_key_check") as cursor:
+            foreign_key_errors = await cursor.fetchall()
+        if foreign_key_errors:
+            raise ValueError("incompatible v3 foreign key rows")
 
 
 class _SnapshotRow(NamedTuple):
@@ -896,6 +1384,27 @@ def _strict_json_object(value: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise ValueError("stored JSON must be an object")
     return cast(dict[str, Any], decoded)
+
+
+async def _validate_json_identity_rows(
+    connection: aiosqlite.Connection,
+    *,
+    table: str,
+    columns: tuple[str, ...],
+) -> None:
+    query = f"SELECT {', '.join(columns)}, data_json FROM {table}"
+    async with connection.execute(query) as cursor:
+        rows = await cursor.fetchall()
+    for row in rows:
+        try:
+            data = _strict_json_object(cast(str, row[-1]))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"incompatible {table} JSON") from error
+        if any(
+            column not in data or data[column] != row[index]
+            for index, column in enumerate(columns)
+        ):
+            raise ValueError(f"incompatible {table} row identity")
 
 
 async def _snapshot_rows(connection: aiosqlite.Connection) -> tuple[_SnapshotRow, ...]:

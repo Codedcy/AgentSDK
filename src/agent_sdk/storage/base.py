@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import json
-from typing import Any, NamedTuple, Protocol
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.idempotency import (
@@ -7,6 +10,9 @@ from agent_sdk.storage.idempotency import (
     IdempotencyReplay,
     IdempotencyWrite,
 )
+
+if TYPE_CHECKING:
+    from agent_sdk.runtime.leases import Lease
 
 
 def canonical_snapshot_data(value: dict[str, Any]) -> str:
@@ -101,3 +107,15 @@ class StateStore(Protocol):
     async def latest_cursor(self) -> int: ...
 
     async def delete_session(self, session_id: str) -> None: ...
+
+    async def acquire_lease(
+        self, *, run_id: str, owner: str, now: datetime, expires_at: datetime
+    ) -> Lease: ...
+
+    async def renew_lease(
+        self, lease: Lease, *, now: datetime, expires_at: datetime
+    ) -> Lease: ...
+
+    async def release_lease(self, lease: Lease) -> None: ...
+
+    async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None: ...

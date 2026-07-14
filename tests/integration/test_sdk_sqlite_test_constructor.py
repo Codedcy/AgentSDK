@@ -1,9 +1,12 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agent_sdk import AgentSDK, AgentSDKError, ErrorCode, EventFilter
+from agent_sdk.api import _LazySQLiteStore
+from agent_sdk.runtime.leases import LeaseManager
 from agent_sdk.storage.memory import InMemoryStore
 
 
@@ -42,6 +45,20 @@ async def test_for_test_does_not_own_injected_store() -> None:
     )
     assert [item.event.type for item in result.events] == ["session.created"]
     await reused.close()
+
+
+@pytest.mark.asyncio
+async def test_lazy_sqlite_store_delegates_lease_surface(tmp_path: Path) -> None:
+    store = _LazySQLiteStore(tmp_path / "lazy-leases.db")
+    manager = LeaseManager(store, ttl=timedelta(seconds=30))
+    now = datetime(2026, 7, 14, tzinfo=UTC)
+    try:
+        lease = await manager.acquire("run_1", "coordinator_1", now=now)
+        renewed = await manager.renew(lease, now=now + timedelta(seconds=1))
+        await manager.assert_current(renewed, now=renewed.renewed_at)
+        await manager.release(renewed)
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize("case", ("neither", "both"))
