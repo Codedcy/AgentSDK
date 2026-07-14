@@ -101,13 +101,33 @@ async def test_matching_replay_returns_first_result_without_writes(
 
 @pytest.mark.parametrize("kind", ["memory", "sqlite"])
 async def test_mismatched_reuse_is_atomic(kind: str, tmp_path: Path) -> None:
+    secret_request = "request-secret-do-not-leak"
+    secret_result = "result-secret-do-not-leak"
+    first_fingerprint = fingerprint_command(
+        "session.create", {"secret": secret_request, "attempt": 1}
+    )
+    second_fingerprint = fingerprint_command(
+        "session.create", {"secret": secret_request, "attempt": 2}
+    )
     async with _store(kind, tmp_path) as store:
-        await store.commit(_session_batch("ses_first", _write("a" * 64)))
-        before = await store.latest_cursor()
-        with pytest.raises(IdempotencyConflictError, match="reused"):
-            await store.commit(
-                _session_batch("ses_second", _write("b" * 64))
+        await store.commit(
+            _session_batch(
+                "ses_first",
+                _write(first_fingerprint, result={"secret": secret_result}),
             )
+        )
+        before = await store.latest_cursor()
+        with pytest.raises(IdempotencyConflictError, match="reused") as captured:
+            await store.commit(
+                _session_batch(
+                    "ses_second",
+                    _write(second_fingerprint, result={"secret": "incoming-secret"}),
+                )
+            )
+        error_text = f"{captured.value!s} {captured.value!r}"
+        assert secret_request not in error_text
+        assert secret_result not in error_text
+        assert "incoming-secret" not in error_text
         assert await store.latest_cursor() == before
         assert await store.get_snapshot("session", "ses_second") is None
 

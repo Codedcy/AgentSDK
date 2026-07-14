@@ -201,4 +201,3 @@ def detached_record(record: IdempotencyRecord) -> IdempotencyRecord:
 def canonical_result_json(record: IdempotencyRecord) -> str:
     _, encoded = _canonical_json_object(record.result)
     return encoded
-

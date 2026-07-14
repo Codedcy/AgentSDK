@@ -440,6 +440,7 @@ class RunEngine:
             update={
                 "output_text": output_text,
                 "usage": usage,
+                "tool_results": tuple(tool_results),
             },
         )
         await emitter.close()
@@ -481,6 +482,7 @@ class RunEngine:
             update={
                 "output_text": "".join(chunks),
                 "usage": usage,
+                "tool_results": tuple(tool_results),
                 "error": RunFailure(
                     code=failure.code.value,
                     message=failure.message,

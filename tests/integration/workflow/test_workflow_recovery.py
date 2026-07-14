@@ -577,8 +577,9 @@ async def test_resume_rejects_corrupt_embedded_node_owner_before_write_or_model(
         await handle.result()
     workflow = await executor.get(handle.workflow_run_id)
     corrupt_node = workflow.nodes[0].model_copy(update={"session_id": "ses_foreign"})
-    corrupt = workflow.model_copy(
-        update={
+    corrupt = type(workflow).model_construct(
+        **{
+            **workflow.__dict__,
             "nodes": (corrupt_node, *workflow.nodes[1:]),
         }
     )

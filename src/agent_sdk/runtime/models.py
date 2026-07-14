@@ -175,6 +175,15 @@ class RunSnapshot(BaseModel):
             self.execution_descriptor is not None
         ):
             raise ValueError("run execution compatibility is invalid")
+        if self.execution_descriptor is not None:
+            descriptor = self.execution_descriptor
+            expected_revision = f"{descriptor.agent.name}:{descriptor.agent.revision}"
+            if self.agent_revision != expected_revision:
+                raise ValueError("run agent does not match execution descriptor")
+            expected_messages = ({"role": "user", "content": self.user_input},)
+            actual_messages = tuple(dict(message) for message in descriptor.messages)
+            if actual_messages != expected_messages:
+                raise ValueError("run input messages do not match execution descriptor")
         if self.status is RunStatus.CREATED:
             if self.version != 1 or any(
                 value is not None for value in (self.output_text, self.usage, self.error)

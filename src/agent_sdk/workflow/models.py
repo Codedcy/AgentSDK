@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -204,6 +205,18 @@ class WorkflowNodeSnapshot(BaseModel):
             raise ValueError("failed workflow node state is invalid")
         return self
 
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        data = self.model_dump(mode="json")
+        if update is not None:
+            data.update(update)
+        return type(self).model_validate(data)
+
 
 class WorkflowRunSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -226,6 +239,12 @@ class WorkflowRunSnapshot(BaseModel):
             self.execution_descriptor is not None
         ):
             raise ValueError("workflow execution compatibility is invalid")
+        if (
+            self.execution_descriptor is not None
+            and self.execution_descriptor.workflow.model_dump(mode="json")
+            != self.workflow.model_dump(mode="json")
+        ):
+            raise ValueError("workflow does not match execution descriptor")
         if len(self.nodes) != len(self.workflow.nodes):
             raise ValueError("workflow snapshot node count does not match definition")
         for node, definition_node in zip(self.nodes, self.workflow.nodes, strict=True):
@@ -289,6 +308,18 @@ class WorkflowRunSnapshot(BaseModel):
         if self.version != expected_version:
             raise ValueError("workflow snapshot version does not match node state")
         return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        data = self.model_dump(mode="json")
+        if update is not None:
+            data.update(update)
+        return type(self).model_validate(data)
 
 
 class WorkflowResult(BaseModel):

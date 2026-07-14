@@ -593,6 +593,7 @@ class SQLiteStore:
         async def begin() -> None:
             await connection.execute("BEGIN IMMEDIATE")
 
+        await cls._migration_checkpoint("migration-lock-requested")
         await _with_busy_retry(
             begin,
             deadline=deadline,
@@ -600,6 +601,9 @@ class SQLiteStore:
         )
         try:
             state = await cls._discover_schema_state(connection)
+            await cls._migration_checkpoint(
+                f"migration-schema-discovered-{state.value}"
+            )
             upgraded = state is not _SchemaState.V2
             empty_database = state is _SchemaState.EMPTY
             if empty_database:
@@ -1174,6 +1178,7 @@ async def _validate_v1_events(
     views: Mapping[str, Any],
     evaluations: Mapping[str, Any],
 ) -> None:
+    from agent_sdk.context.models import ContextBudget
     from agent_sdk.events.models import EventEnvelope
     from agent_sdk.runtime.models import RunSnapshot, RunStatus
     from agent_sdk.workflow.models import WorkflowNodeStatus, WorkflowRunStatus
@@ -1372,7 +1377,8 @@ async def _validate_v1_events(
             raise ValueError("incompatible version-1 orphan workflow event")
 
     view_events: dict[str, _EventRow] = {}
-    capsule_events: set[str] = set()
+    compaction_events_by_view: dict[str, _EventRow] = {}
+    capsule_events: dict[str, _EventRow] = {}
     evaluation_events: dict[str, _EventRow] = {}
     for row in events:
         payload = payloads[row.event_id]
@@ -1382,9 +1388,50 @@ async def _validate_v1_events(
                 raise ValueError("incompatible version-1 context event")
             view_events[view_id] = row
         elif row.type == "context.compaction.completed":
+            required = {"view_id", "capsule_id", "level", "model", "budget", "usage"}
+            view_id = payload.get("view_id")
             capsule_id = payload.get("capsule_id")
-            if isinstance(capsule_id, str):
-                capsule_events.add(capsule_id)
+            model = payload.get("model")
+            usage = payload.get("usage")
+            if (
+                set(payload) != required
+                or not isinstance(view_id, str)
+                or not isinstance(capsule_id, str)
+                or not isinstance(model, str)
+                or not model
+                or not isinstance(usage, dict)
+                or set(usage)
+                != {"prompt_tokens", "completion_tokens", "total_tokens"}
+                or any(
+                    value is not None
+                    and (type(value) is not int or value < 0)
+                    for value in usage.values()
+                )
+                or view_id in compaction_events_by_view
+                or capsule_id in capsule_events
+            ):
+                raise ValueError("incompatible version-1 context event")
+            view = views.get(view_id)
+            capsule = capsules.get(capsule_id)
+            try:
+                budget = ContextBudget.model_validate(payload.get("budget"))
+            except ValueError as error:
+                raise ValueError("incompatible version-1 context event") from error
+            if (
+                view is None
+                or capsule is None
+                or row.session_id != view.session_id
+                or row.session_id != capsule[0]
+                or row.run_id != view_id
+                or row.sequence != 1
+                or view.capsule_id != capsule_id
+                or payload.get("level") != view.applied_level.value
+                or view.budget is None
+                or budget != view.budget
+            ):
+                raise ValueError("incompatible version-1 context event")
+            compaction_events_by_view[view_id] = row
+            capsule_events[capsule_id] = row
         elif row.type == "evaluation.completed":
             evaluation_id = payload.get("evaluation_id")
             if not isinstance(evaluation_id, str) or evaluation_id in evaluation_events:
@@ -1400,13 +1447,9 @@ async def _validate_v1_events(
             or payload.get("capsule_id") != view.capsule_id
         ):
             raise ValueError("incompatible version-1 context event")
-    for capsule_id in capsule_events:
+    for capsule_id, event in capsule_events.items():
         capsule = capsules.get(capsule_id)
-        if capsule is None or not any(
-            row.session_id == capsule[0]
-            and payloads[row.event_id].get("capsule_id") == capsule_id
-            for row in events
-        ):
+        if capsule is None or event.session_id != capsule[0]:
             raise ValueError("incompatible version-1 context capsule event")
     for evaluation_id, event in evaluation_events.items():
         evaluation = evaluations.get(evaluation_id)
@@ -1446,14 +1489,12 @@ async def _validate_v1_events(
             or view_event.run_id != view_id
         ):
             raise ValueError("incompatible version-1 context facts")
+        if view.capsule_id is not None and view_id not in compaction_events_by_view:
+            raise ValueError("incompatible version-1 context capsule facts")
     for capsule_id, (session_id, _) in capsules.items():
         if capsule_id not in capsule_events:
             raise ValueError("incompatible version-1 context capsule facts")
-        if not any(
-            row.session_id == session_id
-            and payloads[row.event_id].get("capsule_id") == capsule_id
-            for row in events
-        ):
+        if capsule_events[capsule_id].session_id != session_id:
             raise ValueError("incompatible version-1 context capsule owner")
     for evaluation_id, evaluation in evaluations.items():
         evaluation_event = evaluation_events.get(evaluation_id)

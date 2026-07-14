@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -1442,6 +1443,7 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
         assert messages[4]["tool_call_id"] == "call_two"
         snapshot = await sdk.runs.get(run.run_id)
         assert snapshot.status is RunStatus.COMPLETED
+        assert [item.value for item in snapshot.tool_results] == [3, 7]
         event_types = [
             stored.event.type
             for stored in await store.read_events(after_cursor=0)
@@ -1451,6 +1453,89 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
         assert event_types[-1] == "run.completed"
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_after_tool_result_preserves_terminal_snapshot() -> None:
+    store = InMemoryStore()
+    model_calls = 0
+
+    async def acompletion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal model_calls
+        model_calls += 1
+        if model_calls == 2:
+            raise RuntimeError("second model call failed")
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield _tool_call_chunks('{"a":2,"b":3}', call_id="call_one")[0]
+
+        return chunks()
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        return a + b
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=acompletion,
+        permission_default="allow",
+    )
+    try:
+        _register_add(sdk, handler)
+        session = await sdk.sessions.create(workspaces=[])
+        run = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="test", model="fake/model"),
+            "fail after a tool result",
+        )
+
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(run.result(), timeout=1)
+
+        assert raised.value.message == "model call failed"
+        snapshot = await sdk.runs.get(run.run_id)
+        assert snapshot.status is RunStatus.FAILED
+        assert [item.value for item in snapshot.tool_results] == [5]
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_reopen_preserves_terminal_snapshot_tool_results(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "agent-sdk.db"
+    model = _TwoStepModel(_tool_call_chunks('{"a":4,"b":5}'))
+
+    async def handler(_: ToolContext, a: int, b: int) -> int:
+        return a + b
+
+    sdk = AgentSDK.for_test(
+        database_path=database_path,
+        acompletion=model,
+        permission_default="allow",
+    )
+    session = await sdk.sessions.create(workspaces=[])
+    _register_add(sdk, handler)
+    run = await sdk.runs.start(
+        session.session_id,
+        AgentSpec(name="test", model="fake/model"),
+        "persist the tool result",
+    )
+    await asyncio.wait_for(run.result(), timeout=1)
+    run_id = run.run_id
+    await sdk.close()
+
+    reopened = AgentSDK.for_test(
+        database_path=database_path,
+        acompletion=model,
+        permission_default="allow",
+    )
+    try:
+        snapshot = await reopened.runs.get(run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        assert [item.value for item in snapshot.tool_results] == [9]
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

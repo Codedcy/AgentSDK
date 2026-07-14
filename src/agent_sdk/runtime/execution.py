@@ -72,6 +72,90 @@ class _RevalidatedDescriptor(BaseModel):
         return type(self).model_validate(data)
 
 
+class DurableAgentSpec(_RevalidatedDescriptor):
+    """Cycle-free, strict durable representation of ``AgentSpec``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+
+    name: str
+    model: str
+    model_params: Mapping[str, Any] = Field(default_factory=dict)
+    revision: str = "1"
+
+    @field_validator("model_params", mode="after")
+    @classmethod
+    def _model_params(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = _freeze_json(value)
+        assert isinstance(frozen, Mapping)
+        return frozen
+
+    @field_serializer("model_params")
+    def _serialize_model_params(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        result = _thaw_json(value)
+        assert isinstance(result, dict)
+        return result
+
+
+class DurableAgentNode(_RevalidatedDescriptor):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: Literal["agent"] = "agent"
+    agent_revision: str = Field(min_length=1, max_length=256)
+    input: str = Field(min_length=1, max_length=32_768)
+    run_as: Literal["parent", "child"] = "parent"
+    success_criteria: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    workspace_scopes: tuple[str, ...] = ()
+
+
+class DurableWorkflowEdge(_RevalidatedDescriptor):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    source: str = Field(min_length=1, max_length=128)
+    target: str = Field(min_length=1, max_length=128)
+
+
+class DurableWorkflowIR(_RevalidatedDescriptor):
+    """Cycle-free, strict durable representation of ``WorkflowIR``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    name: str
+    nodes: tuple[DurableAgentNode, ...]
+    edges: tuple[DurableWorkflowEdge, ...]
+    definition_hash: str
+
+    def _content(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "name": self.name,
+            "nodes": [node.model_dump(mode="json") for node in self.nodes],
+            "edges": [edge.model_dump(mode="json") for edge in self.edges],
+        }
+
+    @model_validator(mode="after")
+    def _validate_canonical_ir(self) -> Self:
+        if not self.nodes:
+            raise ValueError("workflow IR must contain at least one node")
+        node_ids = tuple(node.id for node in self.nodes)
+        if len(set(node_ids)) != len(node_ids):
+            raise ValueError("workflow IR node ids must be unique")
+        if self.nodes[0].run_as == "child":
+            raise ValueError("workflow IR root cannot be a child")
+        expected_edges = tuple(
+            (left.id, right.id) for left, right in zip(self.nodes, self.nodes[1:])
+        )
+        actual_edges = tuple((edge.source, edge.target) for edge in self.edges)
+        if actual_edges != expected_edges:
+            raise ValueError("workflow IR must be a canonical sequential chain")
+        if self.definition_hash != _hash(self._content()):
+            raise ValueError("workflow definition hash mismatch")
+        return self
+
+
 class ToolCapabilityDescriptor(_RevalidatedDescriptor):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -111,20 +195,12 @@ class ExecutionPolicyDescriptor(_RevalidatedDescriptor):
 class ExecutionDescriptor(_RevalidatedDescriptor):
     model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
-    agent: Mapping[str, Any]
+    agent: DurableAgentSpec
     agent_hash: str
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[ToolCapabilityDescriptor, ...]
     policy: ExecutionPolicyDescriptor
     descriptor_hash: str
-
-    @field_validator("agent", mode="after")
-    @classmethod
-    def _agent(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        expected = {"name", "model", "model_params", "revision"}
-        if set(value) != expected:
-            raise ValueError("execution agent shape is invalid")
-        return cast(Mapping[str, Any], _freeze_json(value))
 
     @field_validator("messages", mode="after")
     @classmethod
@@ -132,12 +208,6 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         cls, value: tuple[Mapping[str, Any], ...]
     ) -> tuple[Mapping[str, Any], ...]:
         return tuple(cast(Mapping[str, Any], _freeze_json(message)) for message in value)
-
-    @field_serializer("agent")
-    def _serialize_agent(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        result = _thaw_json(value)
-        assert isinstance(result, dict)
-        return result
 
     @field_serializer("messages")
     def _serialize_messages(
@@ -154,27 +224,26 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         tools: tuple[ToolCapabilityDescriptor, ...],
         policy: ExecutionPolicyDescriptor,
     ) -> Self:
-        agent_data = _model_json(agent)
-        canonical_tools = tuple(sorted(tools, key=lambda item: item.spec.name))
+        agent_data = DurableAgentSpec.model_validate(_model_json(agent))
         values: dict[str, Any] = {
             "agent": agent_data,
-            "agent_hash": _hash(agent_data),
+            "agent_hash": _hash(agent_data.model_dump(mode="json")),
             "messages": messages,
-            "tools": canonical_tools,
+            "tools": tools,
             "policy": policy,
         }
         content = {
-            "agent": agent_data,
+            "agent": agent_data.model_dump(mode="json"),
             "agent_hash": values["agent_hash"],
             "messages": list(messages),
-            "tools": [tool.model_dump(mode="json") for tool in canonical_tools],
+            "tools": [tool.model_dump(mode="json") for tool in tools],
             "policy": policy.model_dump(mode="json"),
         }
         return cls(**values, descriptor_hash=_hash(content))
 
     def _content(self) -> dict[str, Any]:
         return {
-            "agent": _thaw_json(self.agent),
+            "agent": self.agent.model_dump(mode="json"),
             "agent_hash": self.agent_hash,
             "messages": [_thaw_json(message) for message in self.messages],
             "tools": [tool.model_dump(mode="json") for tool in self.tools],
@@ -184,9 +253,9 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
     @model_validator(mode="after")
     def _validate_hashes(self) -> Self:
         tool_names = tuple(tool.spec.name for tool in self.tools)
-        if tool_names != tuple(sorted(set(tool_names))):
-            raise ValueError("execution tools must be sorted and unique")
-        if self.agent_hash != _hash(self.agent):
+        if len(set(tool_names)) != len(tool_names):
+            raise ValueError("execution tools must be unique")
+        if self.agent_hash != _hash(self.agent.model_dump(mode="json")):
             raise ValueError("agent hash mismatch")
         if self.descriptor_hash != _hash(self._content()):
             raise ValueError("execution descriptor hash mismatch")
@@ -213,7 +282,7 @@ class WorkflowAgentDescriptor(_RevalidatedDescriptor):
     def _validate_hash(self) -> Self:
         content = {"revision": self.revision, "execution": self.execution.model_dump(mode="json")}
         agent = self.execution.agent
-        if f"{agent['name']}:{agent['revision']}" != self.revision:
+        if f"{agent.name}:{agent.revision}" != self.revision:
             raise ValueError("workflow agent revision mismatch")
         if self.descriptor_hash != _hash(content):
             raise ValueError("workflow agent descriptor hash mismatch")
@@ -221,25 +290,14 @@ class WorkflowAgentDescriptor(_RevalidatedDescriptor):
 
 
 class WorkflowExecutionDescriptor(_RevalidatedDescriptor):
-    model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    workflow: Mapping[str, Any]
+    workflow: DurableWorkflowIR
     workflow_definition_hash: str
     agents: tuple[WorkflowAgentDescriptor, ...]
     tools: tuple[ToolCapabilityDescriptor, ...]
     policy: ExecutionPolicyDescriptor
     descriptor_hash: str
-
-    @field_validator("workflow", mode="after")
-    @classmethod
-    def _workflow(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        return cast(Mapping[str, Any], _freeze_json(value))
-
-    @field_serializer("workflow")
-    def _serialize_workflow(self, value: Mapping[str, Any]) -> dict[str, Any]:
-        result = _thaw_json(value)
-        assert isinstance(result, dict)
-        return result
 
     @classmethod
     def create(
@@ -250,31 +308,38 @@ class WorkflowExecutionDescriptor(_RevalidatedDescriptor):
         tools: tuple[ToolCapabilityDescriptor, ...],
         policy: ExecutionPolicyDescriptor,
     ) -> Self:
-        workflow_data = _model_json(workflow)
-        definition_hash = workflow_data.get("definition_hash")
-        if not isinstance(definition_hash, str):
-            raise ValueError("workflow definition hash is missing")
-        canonical_agents = tuple(sorted(agents, key=lambda item: item.revision))
-        canonical_tools = tuple(sorted(tools, key=lambda item: item.spec.name))
+        workflow_data = DurableWorkflowIR.model_validate(_model_json(workflow))
+        definition_hash = workflow_data.definition_hash
+        referenced_revisions = tuple(
+            dict.fromkeys(node.agent_revision for node in workflow_data.nodes)
+        )
+        if len({agent.revision for agent in agents}) != len(agents):
+            raise ValueError("workflow execution agents must be unique")
+        agents_by_revision = {agent.revision: agent for agent in agents}
+        if set(agents_by_revision) != set(referenced_revisions):
+            raise ValueError("workflow execution agents are invalid")
+        canonical_agents = tuple(
+            agents_by_revision[revision] for revision in referenced_revisions
+        )
         content = {
-            "workflow": workflow_data,
+            "workflow": workflow_data.model_dump(mode="json"),
             "workflow_definition_hash": definition_hash,
             "agents": [agent.model_dump(mode="json") for agent in canonical_agents],
-            "tools": [tool.model_dump(mode="json") for tool in canonical_tools],
+            "tools": [tool.model_dump(mode="json") for tool in tools],
             "policy": policy.model_dump(mode="json"),
         }
         return cls(
             workflow=workflow_data,
             workflow_definition_hash=definition_hash,
             agents=canonical_agents,
-            tools=canonical_tools,
+            tools=tools,
             policy=policy,
             descriptor_hash=_hash(content),
         )
 
     def _content(self) -> dict[str, Any]:
         return {
-            "workflow": _thaw_json(self.workflow),
+            "workflow": self.workflow.model_dump(mode="json"),
             "workflow_definition_hash": self.workflow_definition_hash,
             "agents": [agent.model_dump(mode="json") for agent in self.agents],
             "tools": [tool.model_dump(mode="json") for tool in self.tools],
@@ -285,22 +350,22 @@ class WorkflowExecutionDescriptor(_RevalidatedDescriptor):
     def _validate_hash(self) -> Self:
         agent_revisions = tuple(agent.revision for agent in self.agents)
         tool_names = tuple(tool.spec.name for tool in self.tools)
-        workflow_nodes = self.workflow.get("nodes")
-        if not isinstance(workflow_nodes, tuple):
-            raise ValueError("workflow execution nodes are invalid")
-        referenced_revisions = {
-            node.get("agent_revision")
-            for node in workflow_nodes
-            if isinstance(node, Mapping)
-        }
-        if (
-            agent_revisions != tuple(sorted(set(agent_revisions)))
-            or set(agent_revisions) != referenced_revisions
-        ):
+        referenced_revisions = tuple(
+            dict.fromkeys(node.agent_revision for node in self.workflow.nodes)
+        )
+        if agent_revisions != referenced_revisions:
             raise ValueError("workflow execution agents are invalid")
-        if tool_names != tuple(sorted(set(tool_names))):
-            raise ValueError("workflow execution tools must be sorted and unique")
-        if self.workflow.get("definition_hash") != self.workflow_definition_hash:
+        if len(set(tool_names)) != len(tool_names):
+            raise ValueError("workflow execution tools must be unique")
+        if any(
+            agent.execution.tools != self.tools for agent in self.agents
+        ):
+            raise ValueError("workflow agent tools do not match workflow tools")
+        if any(
+            agent.execution.policy != self.policy for agent in self.agents
+        ):
+            raise ValueError("workflow agent policy does not match workflow policy")
+        if self.workflow.definition_hash != self.workflow_definition_hash:
             raise ValueError("workflow definition hash mismatch")
         if self.descriptor_hash != _hash(self._content()):
             raise ValueError("workflow execution descriptor hash mismatch")

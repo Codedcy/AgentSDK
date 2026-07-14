@@ -13,7 +13,12 @@ import pytest
 from aiosqlite.context import Result
 
 from agent_sdk.api import AgentSDK
-from agent_sdk.context.models import CompactionLevel, ContextCapsule, ContextView
+from agent_sdk.context.models import (
+    CompactionLevel,
+    ContextBudget,
+    ContextCapsule,
+    ContextView,
+)
 from agent_sdk.evaluation.models import EvaluationResult, EvaluationVerdict
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
@@ -136,6 +141,13 @@ def _create_v1_database(path: Path, *, corrupt_run_status: str | None = None) ->
         artifact_refs=(),
         source_event_ids=("evt_run_active",),
     )
+    context_budget = ContextBudget.calculate(
+        model_window=100,
+        output_reserve=10,
+        tool_schema_tokens=5,
+        safety_reserve=5,
+        projected_source_tokens=80,
+    )
     view = ContextView(
         view_id="ctx_v1",
         session_id="ses_v1",
@@ -144,6 +156,7 @@ def _create_v1_database(path: Path, *, corrupt_run_status: str | None = None) ->
         estimated_tokens=1,
         recommended_level=CompactionLevel.L3,
         applied_level=CompactionLevel.L3,
+        budget=context_budget,
     )
     evaluation = EvaluationResult(
         evaluation_id="eval_v1",
@@ -224,7 +237,18 @@ def _create_v1_database(path: Path, *, corrupt_run_status: str | None = None) ->
             "ctx_v1",
             1,
             "context.compaction.completed",
-            {"view_id": "ctx_v1", "capsule_id": "cap_v1"},
+            {
+                "view_id": "ctx_v1",
+                "capsule_id": "cap_v1",
+                "level": "L3",
+                "model": "fake/model",
+                "budget": context_budget.model_dump(mode="json"),
+                "usage": {
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                },
+            },
         ),
         (
             "evt_context_view",
@@ -321,19 +345,60 @@ async def test_v1_unknown_run_status_rolls_back_entire_upgrade(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_concurrent_v1_open_applies_migration_once(tmp_path: Path) -> None:
+async def test_concurrent_v1_open_serializes_discovery_and_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path = tmp_path / "concurrent-v1.db"
     _create_v1_database(path)
-    first, second = await asyncio.gather(SQLiteStore.open(path), SQLiteStore.open(path))
+    first_v1_discovered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_is_competing = asyncio.Event()
+    requested = 0
+    discoveries: list[str] = []
+
+    async def checkpoint(stage: str) -> None:
+        nonlocal requested
+        if stage == "migration-lock-requested":
+            requested += 1
+            if requested == 2:
+                second_is_competing.set()
+        elif stage.startswith("migration-schema-discovered-"):
+            discoveries.append(stage.removeprefix("migration-schema-discovered-"))
+            if stage == "migration-schema-discovered-v1":
+                first_v1_discovered.set()
+                await release_first.wait()
+
+    monkeypatch.setattr(SQLiteStore, "_migration_checkpoint", staticmethod(checkpoint))
+    tasks: list[asyncio.Task[SQLiteStore]] = []
     try:
+        first_task = asyncio.create_task(SQLiteStore.open(path))
+        tasks.append(first_task)
+        await asyncio.wait_for(first_v1_discovered.wait(), timeout=1)
+        second_task = asyncio.create_task(SQLiteStore.open(path))
+        tasks.append(second_task)
+        await asyncio.wait_for(second_is_competing.wait(), timeout=1)
+        assert discoveries == ["v1"]
+        release_first.set()
+        first, second = await asyncio.wait_for(
+            asyncio.gather(first_task, second_task),
+            timeout=2,
+        )
+        assert discoveries == ["v1", "v2"]
         for store in (first, second):
             async with store._connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ) as cursor:
                 assert await cursor.fetchall() == [(1,), (2,)]
     finally:
-        await first.close()
-        await second.close()
+        release_first.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, SQLiteStore):
+                await result.close()
 
 
 @pytest.mark.asyncio
@@ -547,6 +612,83 @@ async def test_v1_upgrade_rejects_missing_or_contradictory_event_facts(
         connection.execute(mutation)
     with pytest.raises(ValueError, match=expected):
         await SQLiteStore.open(path)
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_malformed_extra_compaction_event_atomically(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "malformed-extra-context-event.db"
+    _create_v1_database(path)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            INSERT INTO events(
+                event_id, session_id, run_id, sequence, type, schema_version,
+                occurred_at, payload_json
+            ) VALUES (
+                'evt_context_malformed', 'ses_v1', 'ctx_missing', 1,
+                'context.compaction.completed', 1,
+                '2025-01-01T00:00:00+00:00', '{"view_id":"ctx_missing"}'
+            )
+            """
+        )
+    before = _v1_state(path)
+
+    with pytest.raises(ValueError, match="context event"):
+        await SQLiteStore.open(path)
+
+    assert _v1_state(path) == before
+
+
+@pytest.mark.asyncio
+async def test_v1_upgrade_rejects_cross_owner_duplicate_compaction_atomically(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cross-owner-duplicate-context-event.db"
+    _create_v1_database(path)
+    other = SessionSnapshot(session_id="ses_other", workspaces=()).model_dump(mode="json")
+    other.pop("active_run_ids")
+    other.pop("active_workflow_run_ids")
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "INSERT INTO snapshots VALUES ('session', 'ses_other', 'ses_other', 1, ?)",
+            (json.dumps(other, sort_keys=True, separators=(",", ":")),),
+        )
+        connection.execute(
+            """
+            INSERT INTO events(
+                event_id, session_id, run_id, sequence, type, schema_version,
+                occurred_at, payload_json
+            ) VALUES (
+                'evt_session_other', 'ses_other', NULL, 1, 'session.created', 1,
+                '2025-01-01T00:00:00+00:00', ?
+            )
+            """,
+            (json.dumps(other, sort_keys=True, separators=(",", ":")),),
+        )
+        payload = connection.execute(
+            "SELECT payload_json FROM events WHERE event_id='evt_context_compacted'"
+        ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT INTO events(
+                event_id, session_id, run_id, sequence, type, schema_version,
+                occurred_at, payload_json
+            ) VALUES (
+                'evt_context_cross_owner', 'ses_other', 'ctx_other', 1,
+                'context.compaction.completed', 1,
+                '2025-01-01T00:00:00+00:00', ?
+            )
+            """,
+            (payload,),
+        )
+    before = _v1_state(path)
+
+    with pytest.raises(ValueError, match="context event"):
+        await SQLiteStore.open(path)
+
+    assert _v1_state(path) == before
 
 
 @pytest.mark.parametrize(

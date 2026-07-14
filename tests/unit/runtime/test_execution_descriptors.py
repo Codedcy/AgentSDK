@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -10,16 +13,35 @@ from agent_sdk.runtime.execution import (
     WorkflowAgentDescriptor,
     WorkflowExecutionDescriptor,
 )
-from agent_sdk.runtime.models import AgentSpec, RunSnapshot, RunStatus, SessionSnapshot, SessionStatus
+from agent_sdk.runtime.models import (
+    AgentSpec,
+    RunSnapshot,
+    RunStatus,
+    SessionSnapshot,
+    SessionStatus,
+    TokenUsage,
+)
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.models import (
     AgentNode,
+    WorkflowEdge,
     WorkflowIR,
     WorkflowNodeSnapshot,
     WorkflowNodeStatus,
     WorkflowRunSnapshot,
     WorkflowRunStatus,
 )
+
+
+def _canonical_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _tool(**updates: object) -> ToolSpec:
@@ -116,6 +138,51 @@ def test_execution_descriptor_is_immutable_and_revalidates_hashes() -> None:
     assert changed.descriptor_hash != descriptor.descriptor_hash
 
 
+def test_execution_descriptor_rejects_rehashed_noncanonical_agent() -> None:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    tampered = descriptor.model_dump(mode="json")
+    tampered["agent"]["revision"] = 2
+    tampered["agent_hash"] = _canonical_hash(tampered["agent"])
+    tampered["descriptor_hash"] = _canonical_hash(
+        {key: value for key, value in tampered.items() if key != "descriptor_hash"}
+    )
+
+    with pytest.raises(ValidationError):
+        ExecutionDescriptor.model_validate(tampered)
+
+
+def test_execution_tool_order_is_preserved_and_hash_is_order_sensitive() -> None:
+    bash = ToolCapabilityDescriptor.from_spec(_tool(name="bash"))
+    write = ToolCapabilityDescriptor.from_spec(_tool(name="write"))
+    kwargs = {
+        "agent": AgentSpec(name="coder", model="openai/test"),
+        "messages": ({"role": "user", "content": "hello"},),
+        "policy": ExecutionPolicyDescriptor.create(permission_default="ask"),
+    }
+
+    forward = ExecutionDescriptor.create(tools=(bash, write), **kwargs)
+    reverse = ExecutionDescriptor.create(tools=(write, bash), **kwargs)
+
+    assert tuple(tool.spec.name for tool in reverse.tools) == ("write", "bash")
+    assert reverse.descriptor_hash != forward.descriptor_hash
+
+
+def test_execution_tools_require_order_preserving_uniqueness() -> None:
+    bash = ToolCapabilityDescriptor.from_spec(_tool(name="bash"))
+    with pytest.raises(ValidationError, match="unique"):
+        ExecutionDescriptor.create(
+            agent=AgentSpec(name="coder", model="openai/test"),
+            messages=({"role": "user", "content": "hello"},),
+            tools=(bash, bash),
+            policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+        )
+
+
 def test_workflow_descriptor_covers_agents_workflow_tools_and_policy() -> None:
     workflow = WorkflowIR.create(
         name="single",
@@ -137,6 +204,95 @@ def test_workflow_descriptor_covers_agents_workflow_tools_and_policy() -> None:
     )
     assert descriptor.workflow_definition_hash == workflow.definition_hash
     assert descriptor.descriptor_hash
+
+
+def test_workflow_descriptor_rejects_rehashed_noncanonical_workflow() -> None:
+    workflow = WorkflowIR.create(
+        name="single",
+        nodes=(AgentNode(id="one", agent_revision="coder:1", input="work"),),
+        edges=(),
+    )
+    run_descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(WorkflowAgentDescriptor.create("coder:1", run_descriptor),),
+        tools=(),
+        policy=run_descriptor.policy,
+    )
+    tampered = descriptor.model_dump(mode="json")
+    tampered["workflow"]["nodes"][0]["run_as"] = "sideways"
+    workflow_content = {
+        key: value
+        for key, value in tampered["workflow"].items()
+        if key != "definition_hash"
+    }
+    tampered["workflow"]["definition_hash"] = _canonical_hash(workflow_content)
+    tampered["workflow_definition_hash"] = tampered["workflow"]["definition_hash"]
+    tampered["descriptor_hash"] = _canonical_hash(
+        {key: value for key, value in tampered.items() if key != "descriptor_hash"}
+    )
+
+    with pytest.raises(ValidationError):
+        WorkflowExecutionDescriptor.model_validate(tampered)
+
+
+def test_workflow_agent_order_uses_first_node_reference_and_tools_keep_order() -> None:
+    workflow = WorkflowIR.create(
+        name="two",
+        nodes=(
+            AgentNode(id="first", agent_revision="zeta:1", input="first"),
+            AgentNode(id="second", agent_revision="alpha:1", input="second"),
+        ),
+        edges=(WorkflowEdge(source="first", target="second"),),
+    )
+    bash = ToolCapabilityDescriptor.from_spec(_tool(name="bash"))
+    write = ToolCapabilityDescriptor.from_spec(_tool(name="write"))
+    policy = ExecutionPolicyDescriptor.create(permission_default="ask")
+
+    def agent(name: str, message: str) -> WorkflowAgentDescriptor:
+        execution = ExecutionDescriptor.create(
+            agent=AgentSpec(name=name, model="openai/test"),
+            messages=({"role": "user", "content": message},),
+            tools=(write, bash),
+            policy=policy,
+        )
+        return WorkflowAgentDescriptor.create(f"{name}:1", execution)
+
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(agent("alpha", "second"), agent("zeta", "first")),
+        tools=(write, bash),
+        policy=policy,
+    )
+
+    assert tuple(item.revision for item in descriptor.agents) == ("zeta:1", "alpha:1")
+    assert tuple(item.spec.name for item in descriptor.tools) == ("write", "bash")
+
+
+def test_workflow_descriptor_requires_agent_policy_and_tools_consistency() -> None:
+    workflow = WorkflowIR.create(
+        name="single",
+        nodes=(AgentNode(id="one", agent_revision="coder:1", input="work"),),
+        edges=(),
+    )
+    execution = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="allow"),
+    )
+    with pytest.raises(ValidationError, match="policy"):
+        WorkflowExecutionDescriptor.create(
+            workflow=workflow,
+            agents=(WorkflowAgentDescriptor.create("coder:1", execution),),
+            tools=(),
+            policy=ExecutionPolicyDescriptor.create(permission_default="deny"),
+        )
 
 
 def test_session_snapshot_is_strict_and_owns_sorted_unique_active_work() -> None:
@@ -183,6 +339,24 @@ def test_run_compatibility_requires_descriptor_only_for_current() -> None:
         }
     )
     assert current.execution_descriptor == descriptor
+    with pytest.raises(ValidationError, match="agent"):
+        RunSnapshot.model_validate(
+            {
+                **legacy.model_dump(mode="json"),
+                "agent_revision": "other:1",
+                "execution_compatibility": "current",
+                "execution_descriptor": descriptor.model_dump(mode="json"),
+            }
+        )
+    with pytest.raises(ValidationError, match="input|message"):
+        RunSnapshot.model_validate(
+            {
+                **legacy.model_dump(mode="json"),
+                "user_input": "different",
+                "execution_compatibility": "current",
+                "execution_descriptor": descriptor.model_dump(mode="json"),
+            }
+        )
     with pytest.raises(ValidationError):
         RunSnapshot.model_validate(
             {**legacy.model_dump(mode="json"), "execution_descriptor": descriptor.model_dump(mode="json")}
@@ -220,3 +394,96 @@ def test_workflow_compatibility_requires_descriptor_only_for_current() -> None:
         WorkflowRunSnapshot.model_validate(
             {**legacy.model_dump(mode="json"), "execution_compatibility": "current"}
         )
+
+    execution = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(WorkflowAgentDescriptor.create("coder:1", execution),),
+        tools=(),
+        policy=execution.policy,
+    )
+    current = WorkflowRunSnapshot.model_validate(
+        {
+            **legacy.model_dump(mode="json"),
+            "execution_compatibility": "current",
+            "execution_descriptor": descriptor.model_dump(mode="json"),
+        }
+    )
+    assert current.execution_descriptor == descriptor
+
+    different_workflow = WorkflowIR.create(
+        name="different",
+        nodes=workflow.nodes,
+        edges=workflow.edges,
+    )
+    with pytest.raises(ValidationError, match="workflow"):
+        WorkflowRunSnapshot.model_validate(
+            {
+                **legacy.model_dump(mode="json"),
+                "workflow": different_workflow.model_dump(mode="json"),
+                "execution_compatibility": "current",
+                "execution_descriptor": descriptor.model_dump(mode="json"),
+            }
+        )
+
+
+def test_workflow_snapshots_model_copy_revalidates_invariants() -> None:
+    workflow = WorkflowIR.create(
+        name="single",
+        nodes=(AgentNode(id="one", agent_revision="coder:1", input="work"),),
+        edges=(),
+    )
+    pending = WorkflowNodeSnapshot(
+        entity_id="wf_1:one",
+        workflow_run_id="wf_1",
+        session_id="ses_1",
+        node_id="one",
+        status=WorkflowNodeStatus.PENDING,
+    )
+    with pytest.raises(ValidationError, match="running|version"):
+        pending.model_copy(update={"status": "running", "version": 1})
+
+    running = pending.model_copy(
+        update={"status": "running", "version": 2, "run_id": "run_1"}
+    )
+    completed = running.model_copy(
+        update={
+            "status": "completed",
+            "version": 3,
+            "output_text": "done",
+            "usage": TokenUsage(total_tokens=1),
+        }
+    )
+    with pytest.raises(ValidationError, match="completed"):
+        completed.model_copy(update={"output_text": None})
+
+    execution = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(WorkflowAgentDescriptor.create("coder:1", execution),),
+        tools=(),
+        policy=execution.policy,
+    )
+    current = WorkflowRunSnapshot(
+        workflow_run_id="wf_1",
+        session_id="ses_1",
+        status=WorkflowRunStatus.RUNNING,
+        workflow=workflow,
+        nodes=(pending,),
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    )
+    with pytest.raises(ValidationError, match="compatibility"):
+        current.model_copy(update={"execution_descriptor": None})
+    with pytest.raises(ValidationError, match="completed"):
+        current.model_copy(update={"status": "completed", "version": 2})
