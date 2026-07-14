@@ -20,6 +20,7 @@ from agent_sdk.runtime.leases import (
     LeaseLostError,
     canonical_lease_timestamp,
 )
+from agent_sdk.runtime.models import RunSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
@@ -35,6 +36,7 @@ from agent_sdk.runtime.reconciliation import (
     _context_free_recovery_errors,
     _external_operation_from_json,
     _reconciliation_request_from_json,
+    _valid_checkpoint_replay_shape,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -929,6 +931,8 @@ class SQLiteStore:
                     else _canonical_record_json(existing)
                 )
                 if existing_json == checkpoint_json:
+                    if not _valid_checkpoint_replay_shape(checkpoint, expected):
+                        raise RecoveryStateConflictError
                     await self._check_checkpoint_operation(checkpoint, lease)
                     await self._commit_transaction()
                     return _checkpoint_from_json(checkpoint_json)
@@ -1501,6 +1505,27 @@ class SQLiteStore:
     ) -> None:
         async with self._connection.execute(
             """
+            SELECT session_id, version, data_json FROM snapshots
+            WHERE kind = 'run' AND entity_id = ?
+            """,
+            (run_id,),
+        ) as cursor:
+            snapshot_row = await cursor.fetchone()
+        if snapshot_row is None or cast(str, snapshot_row[0]) != session_id:
+            raise RecoveryStateConflictError
+        try:
+            snapshot_data = _strict_json_object(cast(str, snapshot_row[2]))
+            run = RunSnapshot.model_validate(snapshot_data)
+        except (TypeError, ValueError):
+            raise RecoveryStateConflictError from None
+        if (
+            run.run_id != run_id
+            or run.session_id != session_id
+            or run.version != cast(int, snapshot_row[1])
+        ):
+            raise RecoveryStateConflictError
+        async with self._connection.execute(
+            """
             SELECT session_id FROM external_operations WHERE run_id = ?
             UNION ALL
             SELECT session_id FROM run_checkpoints WHERE run_id = ?
@@ -2033,6 +2058,15 @@ class SQLiteStore:
             raise ValueError("incompatible v3 foreign key rows")
 
         async with connection.execute(
+            "SELECT entity_id, session_id FROM snapshots WHERE kind = 'run'"
+        ) as cursor:
+            run_snapshot_rows = await cursor.fetchall()
+        authoritative_run_sessions = {
+            cast(str, entity_id): cast(str, session_id)
+            for entity_id, session_id in run_snapshot_rows
+        }
+
+        async with connection.execute(
             "SELECT operation_id, data_json FROM external_operations"
         ) as cursor:
             operation_rows = await cursor.fetchall()
@@ -2045,6 +2079,11 @@ class SQLiteStore:
                 raise ValueError("incompatible external operation row") from None
             if operation.operation_id != operation_id:
                 raise ValueError("incompatible external operation row")
+            if (
+                authoritative_run_sessions.get(operation.run_id)
+                != operation.session_id
+            ):
+                raise ValueError("incompatible recovery run snapshot ownership")
             owner_session = recovery_run_sessions.setdefault(
                 operation.run_id, operation.session_id
             )
@@ -2063,6 +2102,11 @@ class SQLiteStore:
                 raise ValueError("incompatible run checkpoint row") from None
             if checkpoint.run_id != run_id:
                 raise ValueError("incompatible run checkpoint row")
+            if (
+                authoritative_run_sessions.get(checkpoint.run_id)
+                != checkpoint.session_id
+            ):
+                raise ValueError("incompatible recovery run snapshot ownership")
             owner_session = recovery_run_sessions.setdefault(
                 checkpoint.run_id, checkpoint.session_id
             )
@@ -2090,6 +2134,11 @@ class SQLiteStore:
                 raise ValueError("incompatible reconciliation request row") from None
             if request.request_id != request_id:
                 raise ValueError("incompatible reconciliation request row")
+            if (
+                authoritative_run_sessions.get(request.run_id)
+                != request.session_id
+            ):
+                raise ValueError("incompatible recovery run snapshot ownership")
             owner_session = recovery_run_sessions.setdefault(
                 request.run_id, request.session_id
             )

@@ -8,6 +8,8 @@ from typing import Any
 
 import pytest
 
+from agent_sdk.events.models import EventEnvelope
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
     ModelCallOperation,
@@ -16,6 +18,7 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpointPhase,
     ToolCallOperation,
 )
+from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.sqlite import SQLiteStore
 
 
@@ -24,6 +27,54 @@ NOW = datetime(2026, 7, 14, 8, tzinfo=UTC)
 
 async def _create_valid_database(path: Path) -> None:
     store = await SQLiteStore.open(path)
+    session = SessionSnapshot(session_id="ses_1", workspaces=("workspace",))
+    run = RunSnapshot(
+        run_id="run_1",
+        session_id=session.session_id,
+        agent_revision="agent:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope(
+                    event_id="evt_session_created",
+                    type="session.created",
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=1,
+                    payload=session.model_dump(mode="json"),
+                    occurred_at=NOW,
+                ),
+                EventEnvelope(
+                    event_id="evt_run_created",
+                    type="run.created",
+                    session_id=run.session_id,
+                    run_id=run.run_id,
+                    sequence=1,
+                    payload=run.model_dump(mode="json"),
+                    occurred_at=NOW,
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    kind="session",
+                    entity_id=session.session_id,
+                    session_id=session.session_id,
+                    version=session.version,
+                    data=session.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    kind="run",
+                    entity_id=run.run_id,
+                    session_id=run.session_id,
+                    version=run.version,
+                    data=run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
     lease = await store.acquire_lease(
         run_id="run_1",
         owner="worker_1",
@@ -111,7 +162,40 @@ def _corrupt_database(path: Path, corruption: str) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute("PRAGMA ignore_check_constraints=ON")
-        if corruption.startswith("operation_"):
+        if corruption == "recovery_missing_run_snapshot":
+            connection.execute(
+                "DELETE FROM snapshots WHERE kind = 'run' AND entity_id = 'run_1'"
+            )
+            connection.execute("DELETE FROM events WHERE run_id = 'run_1'")
+        elif corruption == "recovery_wrong_authoritative_session":
+            for operation_id, data_json in connection.execute(
+                "SELECT operation_id, data_json FROM external_operations"
+            ).fetchall():
+                data = json.loads(data_json)
+                data["session_id"] = "ses_other"
+                connection.execute(
+                    "UPDATE external_operations SET session_id = 'ses_other', "
+                    "data_json = ? WHERE operation_id = ?",
+                    (
+                        json.dumps(data, sort_keys=True, separators=(",", ":")),
+                        operation_id,
+                    ),
+                )
+            checkpoint = _json_row(connection, "run_checkpoints", "run_1")
+            checkpoint["session_id"] = "ses_other"
+            connection.execute(
+                "UPDATE run_checkpoints SET session_id = 'ses_other', data_json = ? "
+                "WHERE run_id = 'run_1'",
+                (json.dumps(checkpoint, sort_keys=True, separators=(",", ":")),),
+            )
+            request = _json_row(connection, "reconciliation_requests", "rec_1")
+            request["session_id"] = "ses_other"
+            connection.execute(
+                "UPDATE reconciliation_requests SET session_id = 'ses_other', "
+                "data_json = ? WHERE request_id = 'rec_1'",
+                (json.dumps(request, sort_keys=True, separators=(",", ":")),),
+            )
+        elif corruption.startswith("operation_"):
             data = _json_row(connection, "external_operations", "op_model")
             if corruption == "operation_terminal_missing_outcome":
                 data["status"] = "completed"
@@ -242,6 +326,8 @@ def _corrupt_database(path: Path, corruption: str) -> None:
         "reconciliation_resolved_without_resolution",
         "reconciliation_pending_with_resolution",
         "reconciliation_cross_owner_operation",
+        "recovery_missing_run_snapshot",
+        "recovery_wrong_authoritative_session",
     ],
 )
 @pytest.mark.asyncio

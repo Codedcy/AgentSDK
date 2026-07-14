@@ -374,3 +374,16 @@ def _checkpoint_from_json(value: str) -> RunCheckpoint:
 
 def _reconciliation_request_from_json(value: str) -> ReconciliationRequest:
     return ReconciliationRequest.model_validate_json(value)
+
+
+def _valid_checkpoint_replay_shape(
+    checkpoint: RunCheckpoint, expected: RunCheckpoint | None
+) -> bool:
+    if expected is None:
+        return checkpoint.checkpoint_version == 1
+    return (
+        checkpoint != expected
+        and checkpoint.run_id == expected.run_id
+        and checkpoint.session_id == expected.session_id
+        and checkpoint.checkpoint_version == expected.checkpoint_version + 1
+    )

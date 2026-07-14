@@ -22,8 +22,9 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpointPhase,
     ToolCallOperation,
 )
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
+from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
-from agent_sdk.storage.base import CommitBatch
 from agent_sdk.storage.sqlite import SQLiteStore
 
 
@@ -138,6 +139,86 @@ async def _lease(store: Any, run_id: str = "run_1") -> Any:
     )
 
 
+async def _put_authoritative_run_snapshot(
+    store: Any,
+    *,
+    run_id: str = "run_1",
+    session_id: str = "ses_1",
+) -> None:
+    run = RunSnapshot(
+        run_id=run_id,
+        session_id=session_id,
+        agent_revision="agent:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    kind="run",
+                    entity_id=run_id,
+                    session_id=session_id,
+                    version=run.version,
+                    data=run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+
+async def _put_authoritative_run_history(store: Any) -> None:
+    session = SessionSnapshot(session_id="ses_1", workspaces=("workspace",))
+    run = RunSnapshot(
+        run_id="run_1",
+        session_id=session.session_id,
+        agent_revision="agent:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope(
+                    event_id="evt_session_created",
+                    type="session.created",
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=1,
+                    payload=session.model_dump(mode="json"),
+                    occurred_at=NOW,
+                ),
+                EventEnvelope(
+                    event_id="evt_run_created",
+                    type="run.created",
+                    session_id=session.session_id,
+                    run_id=run.run_id,
+                    sequence=1,
+                    payload=run.model_dump(mode="json"),
+                    occurred_at=NOW,
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    kind="session",
+                    entity_id=session.session_id,
+                    session_id=session.session_id,
+                    version=session.version,
+                    data=session.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    kind="run",
+                    entity_id=run.run_id,
+                    session_id=run.session_id,
+                    version=run.version,
+                    data=run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+
 @pytest_asyncio.fixture(params=("memory", "sqlite", "lazy_sqlite"))
 async def recovery_store(
     request: pytest.FixtureRequest, tmp_path: Path
@@ -156,11 +237,107 @@ async def recovery_store(
         await store.close()
 
 
+@pytest_asyncio.fixture
+async def seeded_recovery_store(recovery_store: Any) -> Any:
+    await _put_authoritative_run_snapshot(recovery_store)
+    await _put_authoritative_run_snapshot(recovery_store, run_id="run_initial")
+    return recovery_store
+
+
+async def _create_first_recovery_record(
+    store: Any, record_kind: str, *, session_id: str
+) -> Any:
+    if record_kind == "operation":
+        lease = await _lease(store)
+        operation = _model_operation(session_id=session_id)
+        return await store.create_external_operation(
+            operation, lease=lease, now=NOW
+        )
+    if record_kind == "checkpoint":
+        lease = await _lease(store)
+        checkpoint = _checkpoint(session_id=session_id)
+        return await store.put_run_checkpoint(
+            checkpoint, expected=None, lease=lease, now=NOW
+        )
+    request = _request(session_id=session_id)
+    assert request.operation_id is None
+    return await store.create_reconciliation_request(request)
+
+
+@pytest.mark.parametrize("record_kind", ("operation", "checkpoint", "request"))
 @pytest.mark.asyncio
-async def test_external_operation_create_replay_get_and_ordered_list(
+async def test_first_recovery_record_rejects_missing_authoritative_run_snapshot(
+    recovery_store: Any,
+    record_kind: str,
+) -> None:
+    with pytest.raises(RecoveryStateConflictError):
+        await _create_first_recovery_record(
+            recovery_store, record_kind, session_id="ses_1"
+        )
+
+
+@pytest.mark.parametrize("record_kind", ("operation", "checkpoint", "request"))
+@pytest.mark.asyncio
+async def test_first_recovery_record_rejects_wrong_authoritative_session(
+    recovery_store: Any,
+    record_kind: str,
+) -> None:
+    await _put_authoritative_run_snapshot(recovery_store)
+
+    with pytest.raises(RecoveryStateConflictError):
+        await _create_first_recovery_record(
+            recovery_store, record_kind, session_id="ses_other"
+        )
+
+
+@pytest.mark.parametrize("record_kind", ("operation", "checkpoint", "request"))
+@pytest.mark.asyncio
+async def test_first_recovery_record_accepts_matching_authoritative_run_snapshot(
+    recovery_store: Any,
+    record_kind: str,
+) -> None:
+    await _put_authoritative_run_snapshot(recovery_store)
+
+    created = await _create_first_recovery_record(
+        recovery_store, record_kind, session_id="ses_1"
+    )
+
+    if record_kind == "operation":
+        assert await recovery_store.get_external_operation(created.operation_id) == created
+    elif record_kind == "checkpoint":
+        assert await recovery_store.get_run_checkpoint(created.run_id) == created
+    else:
+        assert await recovery_store.get_reconciliation_request(created.request_id) == created
+
+
+@pytest.mark.asyncio
+async def test_first_recovery_record_rejects_malformed_run_snapshot(
     recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    await recovery_store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    kind="run",
+                    entity_id="run_1",
+                    session_id="ses_1",
+                    version=1,
+                    data={"run_id": "run_1", "session_id": "ses_1"},
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(RecoveryStateConflictError):
+        await recovery_store.create_reconciliation_request(_request())
+
+
+@pytest.mark.asyncio
+async def test_external_operation_create_replay_get_and_ordered_list(
+    seeded_recovery_store: Any,
+) -> None:
+    store = seeded_recovery_store
     lease = await _lease(store)
     operations = (
         _tool_operation(operation_id="op_z", turn=2),
@@ -200,9 +377,9 @@ async def test_external_operation_create_replay_get_and_ordered_list(
 
 @pytest.mark.asyncio
 async def test_external_operation_terminal_cas_replay_and_fencing(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     started = _model_operation()
     await store.create_external_operation(started, lease=lease, now=NOW)
@@ -269,9 +446,9 @@ async def test_external_operation_terminal_cas_replay_and_fencing(
 
 @pytest.mark.asyncio
 async def test_checkpoint_full_record_cas_and_operation_identity(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     first = _checkpoint()
 
@@ -330,9 +507,9 @@ async def test_checkpoint_full_record_cas_and_operation_identity(
 
 @pytest.mark.asyncio
 async def test_checkpoint_rejects_missing_operation_and_stale_lease(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     first = _checkpoint()
     await store.put_run_checkpoint(first, expected=None, lease=lease, now=NOW)
@@ -365,10 +542,78 @@ async def test_checkpoint_rejects_missing_operation_and_stale_lease(
 
 
 @pytest.mark.asyncio
-async def test_reconciliation_create_replay_identity_and_ordering(
-    recovery_store: Any,
+async def test_checkpoint_exact_target_replay_validates_expected_shape_and_adjacency(
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
+    initial_lease = await _lease(store, run_id="run_initial")
+    initial = _checkpoint(run_id="run_initial")
+    await store.put_run_checkpoint(
+        initial, expected=None, lease=initial_lease, now=NOW
+    )
+    assert await store.put_run_checkpoint(
+        initial, expected=None, lease=initial_lease, now=NOW
+    ) == initial
+
+    lease = await _lease(store)
+    first = _checkpoint()
+    second = _checkpoint(checkpoint_version=2, turn=1)
+    third = _checkpoint(checkpoint_version=3, turn=2)
+    await store.put_run_checkpoint(first, expected=None, lease=lease, now=NOW)
+    await store.put_run_checkpoint(second, expected=first, lease=lease, now=NOW)
+
+    assert await store.put_run_checkpoint(
+        second, expected=first, lease=lease, now=NOW
+    ) == second
+    alternate_adjacent_predecessor = first.model_copy(
+        update={"messages": ({"role": "user", "content": "alternate"},)}
+    )
+    assert await store.put_run_checkpoint(
+        second,
+        expected=alternate_adjacent_predecessor,
+        lease=lease,
+        now=NOW,
+    ) == second
+
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            second, expected=None, lease=lease, now=NOW
+        )
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            second, expected=second, lease=lease, now=NOW
+        )
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            second,
+            expected=first.model_copy(update={"run_id": "run_other"}),
+            lease=lease,
+            now=NOW,
+        )
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            second,
+            expected=first.model_copy(update={"session_id": "ses_other"}),
+            lease=lease,
+            now=NOW,
+        )
+
+    await store.put_run_checkpoint(third, expected=second, lease=lease, now=NOW)
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            third, expected=first, lease=lease, now=NOW
+        )
+    with pytest.raises(RecoveryStateConflictError):
+        await store.put_run_checkpoint(
+            third, expected=third, lease=lease, now=NOW
+        )
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_create_replay_identity_and_ordering(
+    seeded_recovery_store: Any,
+) -> None:
+    store = seeded_recovery_store
     lease = await _lease(store)
     operation = _model_operation()
     await store.create_external_operation(operation, lease=lease, now=NOW)
@@ -408,9 +653,9 @@ async def test_reconciliation_create_replay_identity_and_ordering(
 
 @pytest.mark.asyncio
 async def test_reconciliation_resolution_is_atomic_audited_and_replayable(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     request = _request()
     await store.create_reconciliation_request(request)
     resolved = _resolved_request(request)
@@ -453,9 +698,9 @@ async def test_reconciliation_resolution_is_atomic_audited_and_replayable(
 
 @pytest.mark.asyncio
 async def test_failed_resolution_does_not_mutate_request_or_events(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     request = _request(request_id="rec_atomic")
     await store.create_reconciliation_request(request)
     resolved = _resolved_request(request, event_id="evt_atomic")
@@ -476,9 +721,9 @@ async def test_failed_resolution_does_not_mutate_request_or_events(
 
 @pytest.mark.asyncio
 async def test_delete_session_removes_every_recovery_record(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     operation = _model_operation()
     checkpoint = _checkpoint(
@@ -492,6 +737,11 @@ async def test_delete_session_removes_every_recovery_record(
     )
     await store.create_reconciliation_request(request)
 
+    await store.delete_session("ses_other")
+    assert await store.get_external_operation(operation.operation_id) == operation
+    assert await store.get_run_checkpoint("run_1") == checkpoint
+    assert await store.get_reconciliation_request(request.request_id) == request
+
     await store.delete_session("ses_1")
 
     assert await store.get_external_operation(operation.operation_id) is None
@@ -499,6 +749,11 @@ async def test_delete_session_removes_every_recovery_record(
     assert await store.get_reconciliation_request(request.request_id) is None
     assert await store.list_unresolved_external_operations("run_1") == ()
     assert await store.list_pending_reconciliation_requests("run_1") == ()
+    assert await store.get_snapshot("run", "run_1") is None
+    with pytest.raises(RecoveryStateConflictError):
+        await store.create_reconciliation_request(
+            _request(request_id="rec_false_owner", session_id="ses_other")
+        )
 
 
 @pytest.mark.asyncio
@@ -507,6 +762,7 @@ async def test_sqlite_reopen_round_trips_exact_typed_recovery_records(
 ) -> None:
     path = tmp_path / "reopen.db"
     store = await SQLiteStore.open(path)
+    await _put_authoritative_run_history(store)
     lease = await _lease(store)
     operation = _model_operation(
         recovery_metadata={"status_query": {"supported": True}}
@@ -523,7 +779,7 @@ async def test_sqlite_reopen_round_trips_exact_typed_recovery_records(
     )
     await store.create_reconciliation_request(request)
     resolved = _resolved_request(request)
-    event = _resolution_event(resolved)
+    event = _resolution_event(resolved, sequence=2)
     await store.resolve_reconciliation_request(
         expected=request,
         resolved=resolved,
@@ -543,9 +799,9 @@ async def test_sqlite_reopen_round_trips_exact_typed_recovery_records(
         assert fetched_checkpoint is not checkpoint
         assert fetched_request == resolved
         assert fetched_request is not resolved
-        assert [
-            stored.event for stored in await reopened.read_events(after_cursor=0)
-        ] == [event]
+        events = await reopened.read_events(after_cursor=0)
+        assert len(events) == 3
+        assert events[-1].event == event
     finally:
         await reopened.close()
 
@@ -555,6 +811,7 @@ async def test_lazy_sqlite_facade_forwards_the_recovery_contract(
     tmp_path: Path,
 ) -> None:
     store = _LazySQLiteStore(tmp_path / "lazy-recovery.db")
+    await _put_authoritative_run_snapshot(store)
     lease = await _lease(store)
     operation = _model_operation()
     checkpoint = _checkpoint()
@@ -603,17 +860,32 @@ def _sdk_traceback_locals(error: BaseException) -> tuple[dict[str, Any], ...]:
     locals_by_frame: list[dict[str, Any]] = []
     traceback = error.__traceback__
     while traceback is not None:
-        if "src\\agent_sdk" in traceback.tb_frame.f_code.co_filename:
+        if _is_sdk_traceback_filename(traceback.tb_frame.f_code.co_filename):
             locals_by_frame.append(dict(traceback.tb_frame.f_locals))
         traceback = traceback.tb_next
     return tuple(locals_by_frame)
 
 
+def _is_sdk_traceback_filename(filename: str) -> bool:
+    return "/src/agent_sdk/" in filename.replace("\\", "/")
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "/workspace/src/agent_sdk/storage/memory.py",
+        r"D:\workspace\src\agent_sdk\storage\sqlite.py",
+    ),
+)
+def test_sdk_traceback_frame_detection_is_cross_platform(filename: str) -> None:
+    assert _is_sdk_traceback_filename(filename)
+
+
 @pytest.mark.asyncio
 async def test_recovery_conflict_traceback_does_not_retain_secret_records(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     secret = "provider-secret-4bd6b8b7"
     operation = _model_operation(recovery_metadata={"credential": secret})
@@ -635,9 +907,9 @@ async def test_recovery_conflict_traceback_does_not_retain_secret_records(
 
 @pytest.mark.asyncio
 async def test_recovery_conflict_discards_underlying_store_error_context(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     existing = EventEnvelope(
         event_id="evt_existing",
         type="run.marker",
@@ -669,9 +941,9 @@ async def test_recovery_conflict_discards_underlying_store_error_context(
 
 @pytest.mark.asyncio
 async def test_store_rejects_cross_record_run_session_identity(
-    recovery_store: Any,
+    seeded_recovery_store: Any,
 ) -> None:
-    store = recovery_store
+    store = seeded_recovery_store
     lease = await _lease(store)
     operation = _model_operation()
     await store.create_external_operation(operation, lease=lease, now=NOW)

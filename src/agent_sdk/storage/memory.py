@@ -5,6 +5,7 @@ from typing import Any, TypeAlias
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError
+from agent_sdk.runtime.models import RunSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
@@ -20,6 +21,7 @@ from agent_sdk.runtime.reconciliation import (
     _context_free_recovery_errors,
     _external_operation_from_json,
     _reconciliation_request_from_json,
+    _valid_checkpoint_replay_shape,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -329,6 +331,8 @@ class InMemoryStore:
             )
             existing = self._run_checkpoints.get(checkpoint.run_id)
             if existing == checkpoint_json:
+                if not _valid_checkpoint_replay_shape(checkpoint, expected):
+                    raise RecoveryStateConflictError
                 self._check_checkpoint_operation(checkpoint, lease)
                 return _checkpoint_from_json(existing)
             if expected is None:
@@ -588,6 +592,21 @@ class InMemoryStore:
             raise RecoveryStateConflictError
 
     def _check_recovery_run_session(self, run_id: str, session_id: str) -> None:
+        snapshot = self._snapshots.get(("run", run_id))
+        if snapshot is None:
+            raise RecoveryStateConflictError
+        try:
+            run = RunSnapshot.model_validate(snapshot.data)
+        except ValueError:
+            raise RecoveryStateConflictError from None
+        if (
+            snapshot.entity_id != run_id
+            or snapshot.session_id != session_id
+            or snapshot.version != run.version
+            or run.run_id != run_id
+            or run.session_id != session_id
+        ):
+            raise RecoveryStateConflictError
         operation_sessions = (
             _external_operation_from_json(serialized).session_id
             for serialized in self._external_operations.values()
