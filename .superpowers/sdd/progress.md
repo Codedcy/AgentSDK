@@ -46,8 +46,9 @@ Phase 3C1: complete (commits 25db10a..4e6c138, initial review C0/I2/M0, fix re-r
 Phase 3C1 brief/report: .superpowers/sdd/M02-T002-phase3c1-brief.md, .superpowers/sdd/M02-T002-phase3c1-report.md
 Phase 3C1 final gates: focused 115 passed; Phase3B 38; Phase3A 117; Phase2 136; Phase1+T001 188; Session/ownership 108; full 1179 passed + 1 pre-existing environment skip; Ruff clean; mypy clean across 73 source files; diff/scope/schema clean; controller focused rerun 115 passed
 Phase 3C1 fixed review findings: event-tail terminal ownership was not bidirectional; lease-free reconciliation exact replay did not strictly validate durable request wrapper and linked operation before early return
-Phase 3C2: implementation complete; initial review C0/I3/M0 and second re-review C0/I1/M0 fixed; fresh independent Spec and Quality re-review pending
+Phase 3C2: complete (commits 4e6c138..9ad98f0, initial review C0/I3/M0, second re-review C0/I1/M0, final re-review Spec C0/I0/M1 and Quality C0/I0/M1; approved)
 Phase 3C2 brief/report: .superpowers/sdd/M02-T002-phase3c2-brief.md, .superpowers/sdd/M02-T002-phase3c2-report.md
 Phase 3C2 fixed review findings: recovery-start lacked checkpoint CAS; LeaseHeld followers could wait forever after owner loss/expiry/close; completed no-Tool Model operation could be resent after terminal precommit failure; READY_FOR_TOOL did not require an exact completed current-turn Model operation/outcome/checkpoint/event relation
 Phase 3C2 final second-fix gates: focused 89 passed; Phase3C1 115; Phase3B 38; Phase3A 117; Phase2 139; Phase1+T001 188; Session/Run/Tool/MCP/Workflow recovery/child compatibility 237; full 1272 passed; Ruff clean; mypy clean across 73 source files; diff/scope/schema clean
-Next action: obtain fresh read-only Phase 3C2 Spec and Quality approval with C0/I0 before Phase 3D provider authoritative-status and certified same-operation-id recovery adapters; Workflow recovery remains Phase 4
+Phase 3C2 final Minor: multi-turn READY_FOR_TOOL validates aggregate started/completed counts and the final completed payload, but not every historical turn's event ordering and completed payload; add Memory/SQLite multi-turn reopen negative coverage during whole-branch triage
+Next action: execute Phase 3D provider authoritative-status and certified same-operation-id recovery adapters; Workflow recovery remains Phase 4

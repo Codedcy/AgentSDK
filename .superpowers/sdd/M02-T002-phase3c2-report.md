@@ -2,9 +2,9 @@
 
 ## Status
 
-IMPLEMENTED with the first independent review's three Important findings and the
-second re-review's one new Important finding fixed; fresh independent read-only
-Spec and Quality re-review is pending.
+COMPLETE. The first independent review's three Important findings and the second
+re-review's one new Important finding are fixed. The final independent read-only
+re-review approved Spec at C0/I0/M1 and Quality at C0/I0/M1.
 Phase 3C2 exposes explicit Run recovery after one coordinated startup scan,
 validates the exact registered execution capability before ownership or external
 work, resumes only exact safe checkpoints, and atomically routes every unsafe or
@@ -266,5 +266,8 @@ schema/migration change remain explicitly out of scope for Phase 3C2.
 The first independent review returned C0/I3/M0; the second re-review closed those
 findings and returned C0/I1/M0 for the separate READY_FOR_TOOL relation gap. The
 two fixes address all four findings with the RED/GREEN evidence and final gates
-above. No self-review conclusion substitutes for the required fresh independent
-Spec and Quality C0/I0 re-review of the second fix commit.
+above. The final independent re-review approved Spec at C0/I0/M1 and Quality at
+C0/I0/M1. Its Minor notes that multi-turn READY_FOR_TOOL currently validates
+aggregate Model started/completed counts and the final completed payload, not
+every historical turn's event ordering and completed payload; that hardening is
+recorded for whole-branch triage.
