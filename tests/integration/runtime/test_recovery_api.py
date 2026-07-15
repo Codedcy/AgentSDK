@@ -317,11 +317,12 @@ async def _seed_ready_model_interrupted(
 
 
 async def _seed_ready_tool_interrupted(
-    store: InMemoryStore,
+    store: Any,
     spec: AgentSpec,
     tool_spec: ToolSpec,
     *,
     permission_default: str = "allow",
+    relation_invalidity: str | None = None,
 ) -> tuple[str, RunCheckpoint]:
     run_id = await _seed_pristine_current_run(
         store,
@@ -355,6 +356,56 @@ async def _seed_ready_tool_interrupted(
             ),
         )
     )
+    operation_text = "draft "
+    operation_usage = TokenUsage(
+        prompt_tokens=3,
+        completion_tokens=1,
+        total_tokens=4,
+    )
+    operation_call = {
+        "index": 0,
+        "call_id": "call_resume",
+        "name": tool_spec.name,
+        "arguments_json": '{"query":"value"}',
+    }
+    operation_outcome: dict[str, object] = {
+        "finish_reason": "tool_calls",
+        "text": operation_text,
+        "tool_calls": [operation_call],
+        "usage": operation_usage.model_dump(mode="json"),
+    }
+    if relation_invalidity == "outcome_text":
+        operation_outcome["text"] = "different operation text"
+    elif relation_invalidity == "outcome_usage":
+        operation_outcome["usage"] = {
+            "prompt_tokens": 30,
+            "completion_tokens": 10,
+            "total_tokens": 40,
+        }
+    elif relation_invalidity in {
+        "outcome_call_id",
+        "outcome_call_name",
+        "outcome_call_arguments",
+    }:
+        changed_call = dict(operation_call)
+        changed_field = {
+            "outcome_call_id": "call_id",
+            "outcome_call_name": "name",
+            "outcome_call_arguments": "arguments_json",
+        }[relation_invalidity]
+        changed_call[changed_field] = f"different-{changed_field}"
+        operation_outcome["tool_calls"] = [changed_call]
+
+    assistant_content = (
+        "different checkpoint text"
+        if relation_invalidity == "checkpoint_assistant"
+        else operation_text
+    )
+    checkpoint_usage = (
+        TokenUsage(prompt_tokens=30, completion_tokens=10, total_tokens=40)
+        if relation_invalidity == "cumulative_usage"
+        else operation_usage
+    )
     checkpoint = RunCheckpoint(
         run_id=run_id,
         session_id=running.session_id,
@@ -365,7 +416,7 @@ async def _seed_ready_tool_interrupted(
             {"role": "user", "content": "resume me"},
             {
                 "role": "assistant",
-                "content": "",
+                "content": assistant_content,
                 "tool_calls": [
                     {
                         "id": "call_resume",
@@ -379,7 +430,7 @@ async def _seed_ready_tool_interrupted(
             },
         ),
         output_parts=("draft ",),
-        usage=TokenUsage(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        usage=checkpoint_usage,
     )
     now = datetime(2026, 7, 15, 12, tzinfo=UTC)
     lease = await store.acquire_lease(
@@ -388,8 +439,86 @@ async def _seed_ready_tool_interrupted(
         now=now,
         expires_at=now + timedelta(seconds=30),
     )
+    model_events: list[EventEnvelope] = []
+    operation_count = 2 if relation_invalidity == "duplicate" else 1
+    if relation_invalidity != "missing":
+        for index in range(operation_count):
+            started = ModelCallOperation(
+                operation_id=f"op_ready_tool_model_{index}",
+                session_id=running.session_id,
+                run_id=run_id,
+                turn=0,
+                request_fingerprint=f"sha256:ready-tool-{index}",
+                lease_generation=lease.generation,
+                status=ExternalOperationStatus.STARTED,
+                provider_identity=spec.model,
+            )
+            await store.create_external_operation(started, lease=lease, now=now)
+            status = (
+                ExternalOperationStatus.FAILED
+                if relation_invalidity == "failed"
+                else ExternalOperationStatus.COMPLETED
+            )
+            outcome: dict[str, object] = (
+                {"error": {"code": "internal", "message": "model call failed"}}
+                if status is ExternalOperationStatus.FAILED
+                else operation_outcome
+            )
+            await store.transition_external_operation(
+                expected=started,
+                updated=started.model_copy(update={"status": status, "outcome": outcome}),
+                lease=lease,
+                now=now,
+            )
+            event_sequence = 3 + len(model_events)
+            model_events.append(
+                EventEnvelope.new(
+                    type="model.call.started",
+                    session_id=running.session_id,
+                    run_id=run_id,
+                    sequence=event_sequence,
+                    payload={"model": spec.model},
+                )
+            )
+            terminal_type = (
+                "model.call.failed"
+                if status is ExternalOperationStatus.FAILED
+                else "model.call.completed"
+            )
+            terminal_payload: dict[str, object] = (
+                {"error": {"code": "internal", "message": "model call failed"}}
+                if status is ExternalOperationStatus.FAILED
+                else {
+                    "finish_reason": (
+                        "different-finish-reason"
+                        if relation_invalidity == "completed_event"
+                        else "tool_calls"
+                    )
+                }
+            )
+            model_events.append(
+                EventEnvelope.new(
+                    type=terminal_type,
+                    session_id=running.session_id,
+                    run_id=run_id,
+                    sequence=event_sequence + 1,
+                    payload=terminal_payload,
+                )
+            )
+    if relation_invalidity == "event_tail":
+        model_events.append(
+            EventEnvelope.new(
+                type="model.unexpected",
+                session_id=running.session_id,
+                run_id=run_id,
+                sequence=3 + len(model_events),
+                payload={"bounded": True},
+            )
+        )
     await store.put_run_checkpoint(checkpoint, expected=None, lease=lease, now=now)
     await store.release_lease(lease)
+    if model_events:
+        await store.commit(CommitBatch(events=tuple(model_events)))
     interrupted = running.model_copy(
         update={"status": RunStatus.INTERRUPTED, "version": 3}
     )
@@ -400,7 +529,7 @@ async def _seed_ready_tool_interrupted(
                     type="run.interrupted",
                     session_id=interrupted.session_id,
                     run_id=interrupted.run_id,
-                    sequence=3,
+                    sequence=3 + len(model_events),
                     payload={"status": "interrupted"},
                 ),
             ),
@@ -2636,3 +2765,116 @@ async def test_completed_model_terminal_precommit_gap_reconciles_without_resend(
         await second.close()
         if backend == "sqlite":
             await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "relation_invalidity",
+    (
+        "failed",
+        "missing",
+        "duplicate",
+        "outcome_text",
+        "outcome_usage",
+        "outcome_call_id",
+        "outcome_call_name",
+        "outcome_call_arguments",
+        "checkpoint_assistant",
+        "cumulative_usage",
+        "completed_event",
+        "event_tail",
+    ),
+)
+async def test_ready_tool_requires_exact_completed_model_relation_after_reopen(
+    backend: str,
+    relation_invalidity: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / f"ready-tool-relation-{relation_invalidity}.db"
+    if backend == "memory":
+        initial: Any = InMemoryStore()
+    else:
+        initial = await SQLiteStore.open(database_path)
+    spec = AgentSpec(
+        name=f"ready-tool-relation-{backend}-{relation_invalidity}",
+        model="fake/recovery",
+    )
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="lookup",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    )
+    run_id, _checkpoint = await _seed_ready_tool_interrupted(
+        initial,
+        spec,
+        tool_spec,
+        relation_invalidity=relation_invalidity,
+    )
+    if backend == "sqlite":
+        await initial.close()
+        store = await SQLiteStore.open(database_path)
+    else:
+        store = initial
+    provider_calls = 0
+    tool_calls = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _success_chunks()
+
+    async def handler(_context: ToolContext, **_: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        return {"answer": 42}
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        recovered = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError) as caught:
+            await recovered.result()
+
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery required"
+        assert caught.value.retryable is True
+        assert provider_calls == 0
+        assert tool_calls == 0
+        requests = await sdk.recovery.pending_requests(run_id)
+        assert len(requests) == 1
+        assert requests[0].operation_id is None
+        assert requests[0].reason == "recovery_state_invalid"
+        assert requests[0].details == {
+            "checkpoint_phase": RunCheckpointPhase.READY_FOR_TOOL.value
+        }
+        assert (await sdk.runs.get(run_id)).status is RunStatus.WAITING_RECONCILIATION
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        reconciliation_events = tuple(
+            event for event in events if event.type == "reconciliation.requested"
+        )
+        assert len(reconciliation_events) == 1
+        assert reconciliation_events[0].payload == {
+            "request_id": requests[0].request_id,
+            "operation_id": None,
+            "reason": "recovery_state_invalid",
+        }
+        assert not any(event.type == "run.recovery.started" for event in events)
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()

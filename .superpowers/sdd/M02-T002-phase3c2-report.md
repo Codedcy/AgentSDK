@@ -2,8 +2,9 @@
 
 ## Status
 
-IMPLEMENTED with the first independent review's three Important findings fixed;
-fresh independent read-only Spec and Quality re-review is pending.
+IMPLEMENTED with the first independent review's three Important findings and the
+second re-review's one new Important finding fixed; fresh independent read-only
+Spec and Quality re-review is pending.
 Phase 3C2 exposes explicit Run recovery after one coordinated startup scan,
 validates the exact registered execution capability before ownership or external
 work, resumes only exact safe checkpoints, and atomically routes every unsafe or
@@ -14,6 +15,8 @@ Phase 4.
 The original implementation was based on
 `4e6c13879d1f5b57a997b837c637abc1c9b8f62d`; this correction is based on the
 reviewed Phase 3C2 commit `9f7728e390d7541c657fe14088ebb4b41c450894`.
+The second correction is based on the first fix commit
+`8b33a54b9531d4f9111b44c901538311ee49a0f1`.
 
 ## Post-review corrections
 
@@ -37,6 +40,14 @@ reviewed Phase 3C2 commit `9f7728e390d7541c657fe14088ebb4b41c450894`.
   `model_call_completed_terminalization_unknown` reconciliation with the exact
   operation id; any mismatch fails closed to generic reconciliation. Memory and
   SQLite crash/close/reopen tests prove the provider remains at one call.
+- READY_FOR_TOOL now requires exactly one COMPLETED current-turn Model operation,
+  no future operation, and a complete ordered Model-turn chain. Every completed
+  outcome must have the exact shape and one Tool call; the current outcome's
+  text and call id/name/arguments must exactly reconstruct the final assistant
+  message, accumulated Model usage must equal the checkpoint usage, and the
+  started/completed event counts, completion payload, and interrupted tail must
+  agree. Any FAILED, missing, duplicate, or mismatched relation enters one
+  bounded generic reconciliation before Tool or provider work.
 
 ## Delivered behavior
 
@@ -187,8 +198,15 @@ boundaries; no wall-clock sleeps were introduced in the new recovery tests.
   operation and called the provider twice (`2 failed`, `DID NOT RAISE`). GREEN:
   both produce one reconciliation request with the original operation id and
   keep provider calls at one, `2 passed`.
-- The final Phase 3C2 focused result is `65 passed in 65.71s`; the current-lease
-  Memory/SQLite/lazy parity addition is `3 passed`.
+- Second-review I1 RED: all 24 Memory/SQLite reopen cases for FAILED, missing,
+  duplicate, outcome text/usage/call identity, checkpoint assistant/usage, and
+  completion event/tail mismatches executed Tool/provider work and completed
+  instead of raising. GREEN: all `24 passed in 4.81s`, with zero Tool/provider
+  calls and exactly one bounded reconciliation request/event/status per case.
+  Existing real allow, permission-deny, and cross-SDK READY_FOR_TOOL paths remain
+  green (`3 passed in 3.33s`).
+- The final Phase 3C2 focused result is `89 passed in 67.02s`; the current-lease
+  Memory/SQLite/lazy parity addition remains `3 passed`.
 
 ## Fresh final-code gates
 
@@ -197,22 +215,22 @@ All commands used
 Python 3.13.
 
 - Phase 3C2 focused (`test_recovery_api.py`):
-  `65 passed in 65.71s`.
+  `89 passed in 67.02s`.
 - Phase 3C1 focused (`test_recovery_scanner.py`, `test_abandoned_runs.py`,
   `test_run_progress_reconciliation.py`):
-  `115 passed in 7.07s`.
+  `115 passed in 6.69s`.
 - Phase 3B live progress:
-  `38 passed in 3.34s`.
+  `38 passed in 3.40s`.
 - Phase 3A Run-progress transaction:
-  `117 passed in 6.69s`.
+  `117 passed in 6.64s`.
 - Phase 2 recovery models/records/SQLite validation:
-  `139 passed in 7.55s`.
+  `139 passed in 7.46s`.
 - Phase 1 + M02-T001 regressions:
-  `188 passed in 14.07s`.
+  `188 passed in 14.71s`.
 - Session/Run/Tool/MCP/Workflow recovery/child compatibility regressions:
-  `237 passed in 10.58s`.
+  `237 passed in 10.36s`.
 - Full Python 3.13 pytest after the last test change:
-  `1248 passed in 104.91s`.
+  `1272 passed in 103.48s`.
 - Public package import check: `RecoveryAPI` imports from `agent_sdk` and appears
   in `agent_sdk.__all__`.
 - Ruff: `All checks passed!`.
@@ -245,7 +263,8 @@ in this phase. Provider status queries/resend certification, reconciliation
 resolution actions, Tool retry metadata, Workflow recovery, and any
 schema/migration change remain explicitly out of scope for Phase 3C2.
 
-The first independent review returned C0/I3/M0. This fix addresses all three
-Important findings with the RED/GREEN evidence and final gates above. No
-self-review conclusion substitutes for the required fresh independent Spec and
-Quality C0/I0 re-review of the fix commit.
+The first independent review returned C0/I3/M0; the second re-review closed those
+findings and returned C0/I1/M0 for the separate READY_FOR_TOOL relation gap. The
+two fixes address all four findings with the RED/GREEN evidence and final gates
+above. No self-review conclusion substitutes for the required fresh independent
+Spec and Quality C0/I0 re-review of the second fix commit.

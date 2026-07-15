@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -37,7 +37,6 @@ from agent_sdk.runtime.reconciliation import (
     RecoveryStateConflictError,
     RunCheckpoint,
     RunCheckpointPhase,
-    ToolCallOperation,
 )
 from agent_sdk.runtime.session_lifecycle import (
     exact_run_precondition,
@@ -470,40 +469,165 @@ class RunRecoveryService:
     @staticmethod
     def _is_safe_checkpoint(evidence: _RecoveryEvidence) -> bool:
         checkpoint = evidence.checkpoint
-        return (
-            checkpoint is not None
-            and checkpoint.run_id == evidence.run.run_id
-            and checkpoint.session_id == evidence.run.session_id
-            and checkpoint.phase
-            in {
+        if (
+            checkpoint is None
+            or checkpoint.run_id != evidence.run.run_id
+            or checkpoint.session_id != evidence.run.session_id
+            or checkpoint.phase
+            not in {
                 RunCheckpointPhase.READY_FOR_MODEL,
                 RunCheckpointPhase.READY_FOR_TOOL,
             }
-            and checkpoint.operation_id is None
-            and not evidence.pending
-            and not any(
+            or checkpoint.operation_id is not None
+            or evidence.pending
+            or any(
                 operation.status is ExternalOperationStatus.STARTED
                 for operation in evidence.operations
             )
-            and not RunRecoveryService._checkpoint_repeats_terminal_operation(
-                evidence
-            )
+        ):
+            return False
+        if checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
+            return RunRecoveryService._is_exact_ready_tool_relation(evidence)
+        return not any(
+            operation.turn >= checkpoint.turn
+            for operation in evidence.operations
         )
 
     @staticmethod
-    def _checkpoint_repeats_terminal_operation(evidence: _RecoveryEvidence) -> bool:
+    def _is_exact_ready_tool_relation(evidence: _RecoveryEvidence) -> bool:
         checkpoint = evidence.checkpoint
         assert checkpoint is not None
-        if checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL:
-            return any(
-                operation.turn >= checkpoint.turn
+        current_operations = tuple(
+            operation
+            for operation in evidence.operations
+            if operation.turn == checkpoint.turn
+        )
+        if (
+            len(current_operations) != 1
+            or not isinstance(current_operations[0], ModelCallOperation)
+            or any(
+                operation.turn > checkpoint.turn
                 for operation in evidence.operations
             )
-        return any(
-            isinstance(operation, ToolCallOperation)
-            and operation.turn >= checkpoint.turn
+        ):
+            return False
+
+        model_operations = tuple(
+            operation
             for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
         )
+        if tuple(operation.turn for operation in model_operations) != tuple(
+            range(checkpoint.turn + 1)
+        ):
+            return False
+        outcomes = tuple(
+            RunRecoveryService._completed_model_outcome(operation)
+            for operation in model_operations
+        )
+        if any(outcome is None for outcome in outcomes):
+            return False
+        completed_outcomes = tuple(outcome for outcome in outcomes if outcome is not None)
+        if any(len(outcome[2]) != 1 for outcome in completed_outcomes):
+            return False
+        finish_reason, text, calls, _usage = completed_outcomes[-1]
+        call = calls[0]
+
+        messages = checkpoint.model_dump(mode="json")["messages"]
+        if not messages or messages[-1] != {
+            "role": "assistant",
+            "content": text or None,
+            "tool_calls": [
+                {
+                    "id": call["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments_json"],
+                    },
+                }
+            ],
+        }:
+            return False
+        if not "".join(checkpoint.output_parts).endswith(text):
+            return False
+
+        cumulative: dict[str, int | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+        for _finish_reason, _text, _calls, usage in completed_outcomes:
+            for field in cumulative:
+                value = getattr(usage, field)
+                if value is not None:
+                    cumulative[field] = (cumulative[field] or 0) + value
+        if checkpoint.usage != TokenUsage(**cumulative):
+            return False
+
+        started_events = tuple(
+            event for event in evidence.run_events if event.type == "model.call.started"
+        )
+        completed_events = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "model.call.completed"
+        )
+        failed_events = tuple(
+            event for event in evidence.run_events if event.type == "model.call.failed"
+        )
+        if (
+            len(started_events) != len(model_operations)
+            or len(completed_events) != len(model_operations)
+            or failed_events
+            or completed_events[-1].payload != {"finish_reason": finish_reason}
+        ):
+            return False
+        completion_index = evidence.run_events.index(completed_events[-1])
+        return tuple(
+            event.type for event in evidence.run_events[completion_index + 1 :]
+        ) == ("run.interrupted",)
+
+    @staticmethod
+    def _completed_model_outcome(
+        operation: ModelCallOperation,
+    ) -> tuple[str | None, str, tuple[Mapping[str, object], ...], TokenUsage] | None:
+        if (
+            operation.status is not ExternalOperationStatus.COMPLETED
+            or operation.outcome is None
+            or set(operation.outcome)
+            != {"finish_reason", "text", "tool_calls", "usage"}
+        ):
+            return None
+        finish_reason = operation.outcome["finish_reason"]
+        text = operation.outcome["text"]
+        calls = operation.outcome["tool_calls"]
+        if (
+            (finish_reason is not None and not isinstance(finish_reason, str))
+            or not isinstance(text, str)
+            or not isinstance(calls, tuple)
+        ):
+            return None
+        validated_calls: list[Mapping[str, object]] = []
+        for call in calls:
+            if (
+                not isinstance(call, Mapping)
+                or set(call)
+                != {"index", "call_id", "name", "arguments_json"}
+                or type(call["index"]) is not int
+                or call["index"] != len(validated_calls)
+                or not all(
+                    isinstance(call[field], str) and bool(call[field])
+                    for field in ("call_id", "name", "arguments_json")
+                )
+            ):
+                return None
+            validated_calls.append(call)
+        try:
+            usage = TokenUsage.model_validate(operation.outcome["usage"])
+        except Exception:
+            return None
+        return finish_reason, text, tuple(validated_calls), usage
 
     @staticmethod
     def _completed_model_terminalization_gap(
