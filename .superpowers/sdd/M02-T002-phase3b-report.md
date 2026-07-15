@@ -209,3 +209,42 @@ is the final result.
   no model messages/params, provider payloads, Tool arguments/results, or original
   cause/context.
 - No known Critical, Important, or in-scope correctness concern remains.
+
+## Review-finding fix (2026-07-15)
+
+The Phase 3B review identified two Important cleanup races and one defensive
+model-stream invariant gap. All three were reproduced before production changes:
+
+- Buffered delta/heartbeat-loss RED: `1 failed`; `execute` returned with one live
+  `_RunEmitter._flush_after_delay` task. `_RunEmitter.close()` now runs an owned,
+  repeated-cancel-safe cleanup that first detaches/cancels the timer and discards
+  buffered deltas without committing when the lease is already lost.
+- Double-cancel/release RED: `1 failed`; `execute` was already done before the
+  blocking release settled, and asyncio reported an unretrieved late release
+  exception. Cleanup now creates exactly one release task, waits through repeated
+  owner cancellation, consumes its late failure, and preserves the original
+  cancellation or lease-loss error.
+- Missing-`ModelCompleted` RED: `1 failed`; the terminal batch contained only
+  `run.failed` and Session detach while the started model operation remained
+  unresolved. The defensive path now uses `emitter.fail_model`, atomically CASing
+  that operation to FAILED with `model.call.failed`, `step.failed`, `run.failed`,
+  terminal checkpoint, and Session detach.
+
+Targeted GREEN was `3 passed in 3.18s`. A strengthened lease-loss plus blocking
+failing release plus second-cancel combination passed independently (`1 passed in
+3.15s`) and proves one release invocation, stable public `CONFLICT`, no release
+task after return, and consumed late release failure.
+
+Fresh final-code gates after these fixes:
+
+- Phase 3B focused: `38 passed in 4.55s`.
+- Phase 3A Run-progress transaction: `117 passed in 6.96s`.
+- Phase 2 recovery models/records/SQLite validation: `136 passed in 7.30s`.
+- Phase 1 + M02-T001 regressions: `188 passed in 14.35s`.
+- Existing runtime/Tool/Workflow/subagent regressions: `137 passed in 6.95s`.
+- Full Python 3.13 pytest: `1065 passed in 38.15s`.
+- Ruff: `All checks passed!`.
+- Mypy: `Success: no issues found in 72 source files`.
+- `git diff --check`: exit 0; only Windows LF-to-CRLF informational warnings.
+- Forbidden-scope diff (storage, API, Run/status models, reconciliation,
+  Workflow, docs): zero lines. Schema remains exact v3.

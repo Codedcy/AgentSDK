@@ -9,7 +9,11 @@ from typing import Any
 
 import pytest
 
-from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
+from agent_sdk.models.litellm_gateway import (
+    LiteLLMGateway,
+    ModelEvent,
+    ModelRequest,
+)
 from agent_sdk import AgentSDKError, ErrorCode, PermissionDecision
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.policy import PolicyEngine
@@ -98,6 +102,41 @@ class _RenewLossStore(InMemoryStore):
         del lease, now, expires_at
         self.renew_attempted.set()
         raise LeaseLostError
+
+
+class _BlockingFailingReleaseStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release_entered = asyncio.Event()
+        self.allow_release = asyncio.Event()
+        self.release_finished = asyncio.Event()
+        self.release_calls = 0
+
+    async def release_lease(self, lease: Lease) -> None:
+        self.release_calls += 1
+        self.release_entered.set()
+        await self.allow_release.wait()
+        self.release_finished.set()
+        del lease
+        raise RuntimeError("late release failure")
+
+
+class _RenewLossBlockingFailingReleaseStore(_BlockingFailingReleaseStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.renew_attempted = asyncio.Event()
+
+    async def renew_lease(self, lease: Lease, *, now: datetime, expires_at: datetime) -> Lease:
+        del lease, now, expires_at
+        self.renew_attempted.set()
+        raise LeaseLostError
+
+
+class _MissingModelCompletedGateway(LiteLLMGateway):
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelEvent]:
+        del request
+        for event in ():
+            yield event
 
 
 class _AmbiguousModelStartStore(InMemoryStore):
@@ -698,6 +737,211 @@ async def test_heartbeat_loss_rejects_provider_result_that_suppresses_cancel() -
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_loss_closes_buffer_timer_without_late_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_sdk.runtime.engine._DELTA_FLUSH_SECONDS", 3600.0)
+    store = _RenewLossStore()
+    ticker = _ManualTicker()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="legacy:1",
+        user_input="hello",
+    )
+    provider_blocked = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+
+    async def provider(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {"choices": [{"delta": {"content": "buffered"}}]}
+            provider_blocked.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+        return chunks()
+
+    task = asyncio.create_task(
+        RunEngine(
+            store,
+            LiteLLMGateway._for_test(provider),
+            lease_manager=LeaseManager(store, ttl=timedelta(seconds=3)),
+            _clock=lambda: ticker.now,
+            _sleep=ticker.sleep,
+            _heartbeat_interval=1.0,
+        ).execute(
+            run.run_id,
+            ModelRequest(
+                model="fake/model",
+                messages=({"role": "user", "content": "hello"},),
+            ),
+        )
+    )
+    pending_flushes: list[asyncio.Task[object]] = []
+    try:
+        await asyncio.wait_for(provider_blocked.wait(), timeout=1)
+        await asyncio.wait_for(ticker.sleeping.wait(), timeout=1)
+        ticker.advance(timedelta(seconds=1))
+        await asyncio.wait_for(store.renew_attempted.wait(), timeout=1)
+
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(task, timeout=1)
+        assert raised.value.code is ErrorCode.CONFLICT
+        assert raised.value.message == "run lease is no longer current"
+        assert provider_cancelled.is_set()
+        pending_flushes = [
+            pending
+            for pending in asyncio.all_tasks()
+            if "_RunEmitter._flush_after_delay"
+            in getattr(pending.get_coro(), "__qualname__", "")
+        ]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for pending in pending_flushes:
+            pending.cancel()
+        await asyncio.gather(*pending_flushes, return_exceptions=True)
+
+    assert pending_flushes == []
+    events = [
+        stored.event.type
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run.run_id
+    ]
+    assert "model.text.delta" not in events
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_waits_for_single_failing_lease_release() -> None:
+    store = _BlockingFailingReleaseStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="legacy:1",
+        user_input="hello",
+    )
+    provider_entered = asyncio.Event()
+
+    async def provider(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        RunEngine(store, LiteLLMGateway._for_test(provider)).execute(
+            run.run_id,
+            ModelRequest(
+                model="fake/model",
+                messages=({"role": "user", "content": "hello"},),
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(provider_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.wait_for(store.release_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        store.allow_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert store.release_finished.is_set()
+        assert store.release_calls == 1
+    finally:
+        store.allow_release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if store.release_entered.is_set() and not store.release_finished.is_set():
+            await asyncio.wait_for(store.release_finished.wait(), timeout=1)
+
+    await asyncio.sleep(0)
+    release_tasks = [
+        pending
+        for pending in asyncio.all_tasks()
+        if "LeaseManager.release" in getattr(pending.get_coro(), "__qualname__", "")
+    ]
+    assert release_tasks == []
+
+
+@pytest.mark.asyncio
+async def test_lease_loss_survives_double_cancel_and_failing_release() -> None:
+    store = _RenewLossBlockingFailingReleaseStore()
+    ticker = _ManualTicker()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="legacy:1",
+        user_input="hello",
+    )
+    provider_entered = asyncio.Event()
+
+    async def provider(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    task = asyncio.create_task(
+        RunEngine(
+            store,
+            LiteLLMGateway._for_test(provider),
+            lease_manager=LeaseManager(store, ttl=timedelta(seconds=3)),
+            _clock=lambda: ticker.now,
+            _sleep=ticker.sleep,
+            _heartbeat_interval=1.0,
+        ).execute(
+            run.run_id,
+            ModelRequest(
+                model="fake/model",
+                messages=({"role": "user", "content": "hello"},),
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(provider_entered.wait(), timeout=1)
+        await asyncio.wait_for(ticker.sleeping.wait(), timeout=1)
+        ticker.advance(timedelta(seconds=1))
+        await asyncio.wait_for(store.renew_attempted.wait(), timeout=1)
+        await asyncio.wait_for(store.release_entered.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        store.allow_release.set()
+        with pytest.raises(AgentSDKError) as raised:
+            await asyncio.wait_for(task, timeout=1)
+        assert raised.value.code is ErrorCode.CONFLICT
+        assert raised.value.message == "run lease is no longer current"
+        assert store.release_finished.is_set()
+        assert store.release_calls == 1
+    finally:
+        store.allow_release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if store.release_entered.is_set() and not store.release_finished.is_set():
+            await asyncio.wait_for(store.release_finished.wait(), timeout=1)
+
+    await asyncio.sleep(0)
+    release_tasks = [
+        pending
+        for pending in asyncio.all_tasks()
+        if "LeaseManager.release" in getattr(pending.get_coro(), "__qualname__", "")
+    ]
+    assert release_tasks == []
+
+
+@pytest.mark.asyncio
 async def test_model_outcome_and_safe_checkpoint_commit_atomically() -> None:
     store = _InitialBoundaryStore()
     commands = RuntimeCommands(store)
@@ -889,6 +1133,51 @@ async def test_provider_failure_is_atomic_and_public_traceback_is_secret_free() 
     )
     await asyncio.sleep(0)
     assert set(asyncio.all_tasks()) <= before_tasks
+
+
+@pytest.mark.asyncio
+async def test_missing_model_completed_atomically_fails_started_operation() -> None:
+    store = _InitialBoundaryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="legacy:1",
+        user_input="hello",
+    )
+
+    with pytest.raises(AgentSDKError) as raised:
+        await RunEngine(store, _MissingModelCompletedGateway()).execute(
+            run.run_id,
+            ModelRequest(
+                model="fake/model",
+                messages=({"role": "user", "content": "hello"},),
+            ),
+        )
+
+    assert raised.value.code is ErrorCode.INTERNAL
+    assert raised.value.message == "model call failed"
+    failure_batches = [
+        batch
+        for batch in store.progress_batches
+        if any(event.type == "run.failed" for event in batch.events)
+    ]
+    assert len(failure_batches) == 1
+    failure_batch = failure_batches[0]
+    assert [event.type for event in failure_batch.events] == [
+        "model.call.failed",
+        "step.failed",
+        "run.failed",
+        "session.run.detached",
+    ]
+    assert failure_batch.operation is not None
+    assert failure_batch.operation.expected is not None
+    assert failure_batch.operation.updated.status is ExternalOperationStatus.FAILED
+    assert failure_batch.checkpoint is not None
+    assert failure_batch.checkpoint.updated.phase is RunCheckpointPhase.TERMINAL
+    assert failure_batch.checkpoint.updated.operation_id is None
+    assert await store.list_unresolved_external_operations(run.run_id) == ()
+    assert (await commands.get_session(session.session_id)).active_run_ids == ()
 
 
 @pytest.mark.asyncio

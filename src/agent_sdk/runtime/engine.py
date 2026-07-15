@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from contextlib import suppress
@@ -607,7 +608,44 @@ class _RunEmitter:
         await self._settle_cancelled_timer(cancelled_timer)
 
     async def close(self) -> None:
-        await self.flush_delta()
+        close_task = asyncio.create_task(self._close_owned())
+        cancellation = await _settle_background_task(close_task)
+        if cancellation is not None:
+            raise cancellation from None
+        close_task.result()
+
+    async def _close_owned(self) -> None:
+        cancelled_timer: asyncio.Task[None] | None = None
+        close_error: BaseException | None = None
+        lease_lost = False
+        async with self._lock:
+            cancelled_timer = self._detach_timer_locked()
+            lease_lost = self._lease_error() is not None
+            timer_error = self._timer_error
+            self._timer_error = None
+            if lease_lost:
+                self._delta_parts.clear()
+                self._delta_bytes = 0
+            else:
+                try:
+                    if timer_error is not None:
+                        raise timer_error
+                    await self._flush_delta_locked()
+                except BaseException as error:
+                    close_error = error
+
+        if cancelled_timer is not None:
+            await asyncio.gather(cancelled_timer, return_exceptions=True)
+            if (
+                close_error is None
+                and not lease_lost
+                and not cancelled_timer.cancelled()
+            ):
+                close_error = cancelled_timer.exception()
+        if lease_lost:
+            raise LeaseLostError from None
+        if close_error is not None:
+            raise close_error
 
     async def _flush_after_delay(self) -> None:
         await asyncio.sleep(_DELTA_FLUSH_SECONDS)
@@ -936,10 +974,15 @@ class RunEngine:
                 raise LeaseLostError from None
             raise
         finally:
+            active_error = sys.exception()
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-            with suppress(Exception):
-                await asyncio.shield(self._leases.release(lease))
+            cleanup_cancellation = await _settle_background_task(heartbeat)
+            release = asyncio.create_task(self._leases.release(lease))
+            release_cancellation = await _settle_background_task(release)
+            if cleanup_cancellation is None:
+                cleanup_cancellation = release_cancellation
+            if active_error is None and cleanup_cancellation is not None:
+                raise cleanup_cancellation from None
 
     async def _heartbeat(self, lease: Lease) -> None:
         while True:
@@ -1066,15 +1109,16 @@ class RunEngine:
                         "model call failed",
                         retryable=False,
                     )
-                    await self._fail_run(
-                        emitter,
+                    await emitter.flush_delta()
+                    await emitter.fail_model(
+                        operation,
                         failure,
-                        chunks,
-                        usage,
-                        tool_results,
-                        model_call_failed=True,
+                        output_parts=chunks,
+                        usage=usage,
+                        tool_results=tool_results,
                     )
-                    raise failure
+                    await emitter.close()
+                    raise failure from None
                 await emitter.complete_model(
                     operation,
                     finish_reason=model_completed.finish_reason,
@@ -1325,6 +1369,26 @@ class RunEngine:
                 retryable=False,
             )
         return run
+
+
+async def _settle_background_task(
+    task: asyncio.Task[Any],
+) -> asyncio.CancelledError | None:
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.done() and task.cancelled():
+                break
+            if cancellation is None:
+                cancellation = error
+            continue
+        except Exception:
+            break
+    if task.done() and not task.cancelled():
+        task.exception()
+    return cancellation
 
 
 async def _commit_progress(
