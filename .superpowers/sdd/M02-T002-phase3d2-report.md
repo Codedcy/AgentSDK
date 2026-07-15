@@ -2,7 +2,7 @@
 
 ## Outcome
 
-IMPLEMENTATION COMPLETE; PENDING INDEPENDENT REVIEW. Phase 3D2 adds an
+REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -10,7 +10,12 @@ so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
 call may re-fence and retry the same durable Tool operation after an
 interrupted `TOOL_IN_FLIGHT` checkpoint.
 
-Default, legacy, missing, changed, malformed, or internally inconsistent Tool
+The initial independent review found Spec/Quality C1/I1/M1: checkpoint content
+was not fully reconstructed from durable operations/events, Tool registry
+identity could change between certification and permission/handler work, and
+recovery observability exposed unbounded call/Tool identities. Those findings
+now have strict RED regressions and final-code fixes. Default, legacy, missing,
+changed, malformed, or internally inconsistent Tool
 evidence performs no permission, handler, MCP, or LiteLLM work and creates one
 bounded reconciliation request. Workflow recovery, reconciliation resolution,
 provider behavior, SQLite schema, and migrations are unchanged.
@@ -27,15 +32,21 @@ provider behavior, SQLite schema, and migrations are unchanged.
 - Live Tool start preserves the exact existing unsafe metadata for `never` and
   stamps only `{safe_retry=true,retry_class=<policy>}` for certified Tools,
   before handler work.
-- Recovery reconstructs exactly one current Tool call from the final assistant
-  message and validates the current Run/Session descriptor, ordered Tool
-  capability, retry metadata, Tool identity, strict JSON/schema arguments,
-  request fingerprint, current and historical Model operations, accumulated
-  usage/output, Tool operations, and event relationship before external work.
+- Recovery starts from the execution descriptor and reconstructs every turn
+  from the exact Model and Tool operations/outcomes: Model request
+  fingerprints, assistant messages, Tool capability/schema/fingerprints,
+  historical Tool results/messages, accumulated usage, joined output, and
+  critical event counts/payloads/order. The reconstructed messages and ordered
+  Tool results must exactly equal the checkpoint before external work.
 - A fresh lease atomically appends a bounded
   `tool.recovery.retry.started` event and re-fences the same STARTED Tool
   operation against the exact in-flight checkpoint. No new operation or
   duplicate `tool.call.started` event is created.
+- The exact `RegisteredTool` object certified before the audit is rechecked
+  after the audit, before permission, after permission, on every early
+  completion path, immediately before the handler, and before outcome commit.
+  A missing or replaced registration becomes one generation-fenced durable
+  `recovery_state_invalid` reconciliation request.
 - Recovery uses the normal ToolExecutor. Permission is re-evaluated; ask uses
   the normal bridge; denial creates the normal denied ToolResult without
   invoking the handler. Recovery permission events and denial text are bounded
@@ -43,6 +54,9 @@ provider behavior, SQLite schema, and migrations are unchanged.
 - The lease is asserted immediately before handler work. The same Tool result,
   operation terminal state, Tool message/event, and READY_FOR_MODEL checkpoint
   are committed atomically. Only the following normal model turn uses LiteLLM.
+- Recovery audit, permission, and authorization events represent operation,
+  call, Tool, and permission-request identities only as stable SHA-256 objects;
+  their size is independent of application-controlled identity length.
 - Handler exceptions, non-JSON results, timeout, and cancellation retain normal
   ToolResult/cancellation semantics. Repeated certified attempts accept only a
   strict sequence of bounded prior retry audit/lifecycle events.
@@ -83,6 +97,19 @@ Production changes followed observable failing tests:
 8. Corrupted checkpoint usage was initially accepted. Admission now validates
    sequential Model operations, exact cumulative usage/output, and complete
    Model started/completed relationships.
+9. Review RED showed forged checkpoint system messages and Tool results reached
+   the handler on both Memory and SQLite. Descriptor-to-checkpoint replay now
+   rejects those plus multi-turn message/ToolResult/fingerprint/outcome/event
+   insert, delete, reorder, and modification cases before any external work.
+10. Review RED showed unregister-after-plan and audit-time registry changes
+    either had no durable reconciliation or could execute a replacement
+    handler. Exact registration-object preflight plus owned conflict
+    coordination makes missing/schema/version/source/effects/timeout/handler
+    changes and ask-deny races one durable reconciliation with zero handler or
+    model calls.
+11. Review RED showed 4 KiB Tool/call identities containing a secret copied
+    into audit, permission, and authorization events. Public recovery identity
+    payloads now contain only exact SHA-256 digests and remain bounded.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -94,9 +121,10 @@ All commands used
 `C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` with
 Python 3.13.
 
-- Phase 3D2 policy/recovery plus complete live progress: `82 passed in 5.16s`.
-  This is policy 8, Tool recovery/fault/e2e 34, and live progress 40.
-- Phase 3D1 provider recovery plus Store re-fence: `183 passed in 6.99s`.
+- Phase 3D2 policy/recovery plus complete live progress:
+  `109 passed in 5.87s`.
+- Phase 3D1 provider recovery, Store reconciliation, and recovery API neighbor
+  group: `195 passed in 69.72s`.
 - Phase 3C2 recovery API: `89 passed in 66.94s`.
 - Phase 3C1 scanner/admission: `115 passed in 7.02s`.
 - Phase 3A Run-progress transaction: `123 passed in 6.26s`.
@@ -105,9 +133,9 @@ Python 3.13.
 - Session/Run/Tool/MCP/permission/Workflow/child compatibility:
   `237 passed in 10.04s`.
 - Full Python 3.13 pytest on the final tree:
-  `1382 passed in 105.08s`; zero skipped.
+  `1409 passed in 105.64s`; zero skipped.
 - Ruff: `All checks passed!`.
-- Mypy: `Success: no issues found in 74 source files`.
+- Mypy: `Success: no issues found in 75 source files`.
 - Public import/default canonical smoke: passed.
 - `git diff --check`: exit 0; only Windows line-ending information.
 - Forbidden scope is empty and SQLite `_SCHEMA_VERSION` remains exactly 3.
@@ -116,7 +144,9 @@ Python 3.13.
 
 Focused tests cover both certification policies, exact Memory and SQLite
 close/reopen success, conservative SQLite default recovery, seven changed or
-missing capability variants, six corrupted evidence variants, allow/ask
+missing capability variants, descriptor/checkpoint forgeries on both stores,
+ten multi-turn historical evidence mutations, recovery permission-event
+mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
 handler and SDK-close cancellation, repeated cancellation, 20 same-SDK callers,
 two SDK instances, audit and Tool-outcome precommit/ambiguous replay, Run CAS,
@@ -132,6 +162,8 @@ Production changes are limited to:
 - `src/agent_sdk/tools/executor.py` for recovery-only denial sanitization;
 - `src/agent_sdk/runtime/engine.py` for live stamping and reuse of the exact
   Tool operation; and
+- `src/agent_sdk/runtime/_recovery_observability.py` for stable hashed public
+  recovery identities; and
 - `src/agent_sdk/runtime/recovery.py` for exact admission, coordination,
   reconciliation, lifecycle, and public error cleanup.
 
@@ -143,6 +175,10 @@ production/recovery, roadmap, milestones, or task index.
 Residual trust boundary: certification is supplied by the application. The SDK
 enforces exact identity and evidence matching, but cannot prove that an
 application-labeled Tool is actually idempotent or otherwise safe to retry.
+The durable Model outcome and `model.text.delta` events preserve exact joined
+text but not the original provider stream's chunk partition, so recovery
+authenticates exact joined output rather than inventing an unavailable chunk
+boundary.
 
 This report records implementation and gate evidence only. It does not
 self-approve Phase 3D2. Fresh independent Spec and Quality review at C0/I0 is

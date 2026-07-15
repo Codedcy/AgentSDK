@@ -24,6 +24,7 @@ from agent_sdk.models.litellm_gateway import (
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.runtime._recovery_observability import hashed_identity
 from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError, LeaseManager
 from agent_sdk.runtime.execution import (
     ExecutionPolicyDescriptor,
@@ -1103,6 +1104,7 @@ class RunEngine:
         checkpoint: RunCheckpoint,
         operation: ToolCallOperation,
         call: ToolCallCompleted,
+        registered: RegisteredTool,
         request: ModelRequest,
         lease: Lease,
         *,
@@ -1116,7 +1118,7 @@ class RunEngine:
             checkpoint=checkpoint,
             sequence=sequence,
             recovery_session=session,
-            recovered_tool=(operation, call),
+            recovered_tool=(operation, call, registered),
         )
 
     async def fail_recovered_model(
@@ -1361,7 +1363,12 @@ class RunEngine:
         sequence: int = 2,
         recovery_session: SessionSnapshot | None = None,
         recovered_model: tuple[ModelCallOperation, ProviderRecoveryResult] | None = None,
-        recovered_tool: tuple[ToolCallOperation, ToolCallCompleted] | None = None,
+        recovered_tool: tuple[
+            ToolCallOperation,
+            ToolCallCompleted,
+            RegisteredTool,
+        ]
+        | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1396,12 +1403,13 @@ class RunEngine:
         )
         try:
             if recovered_tool is not None:
-                recovered_operation, pending_call = recovered_tool
+                recovered_operation, pending_call, recovered_registered = recovered_tool
                 tool_result = await self._execute_recovered_tool_call(
                     executor,
                     emitter,
                     pending_call,
                     recovered_operation,
+                    recovered_registered,
                     lease,
                     run_id=run_id,
                     chunks=chunks,
@@ -1725,6 +1733,7 @@ class RunEngine:
         emitter: _RunEmitter,
         call: ToolCallCompleted,
         operation: ToolCallOperation,
+        expected_registered: RegisteredTool,
         lease: Lease,
         *,
         run_id: str,
@@ -1732,19 +1741,17 @@ class RunEngine:
         usage: TokenUsage,
         tool_results: list[ToolResult],
     ) -> ToolResult:
-        async def before_handler(
-            hook_call: ToolCallCompleted,
-            registered: RegisteredTool,
-            arguments: Mapping[str, Any],
-        ) -> None:
-            del hook_call, arguments
-            current = self._tools.get(call.name)
-            if current is not registered:
+        async def preflight() -> None:
+            try:
+                current = self._tools.get(call.name)
+            except AgentSDKError:
+                raise RecoveryStateConflictError from None
+            if current is not expected_registered:
                 raise RecoveryStateConflictError
-            capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+            capability = ToolCapabilityDescriptor.from_spec(current.spec)
             expected_metadata = {
                 "safe_retry": True,
-                "retry_class": registered.spec.retry_policy.value,
+                "retry_class": current.spec.retry_policy.value,
             }
             if (
                 operation.tool_identity != capability.capability_hash
@@ -1753,11 +1760,34 @@ class RunEngine:
                 raise RecoveryStateConflictError
             await self._leases.assert_current(lease, now=self._clock())
 
+        async def before_handler(
+            hook_call: ToolCallCompleted,
+            registered: RegisteredTool,
+            arguments: Mapping[str, Any],
+        ) -> None:
+            if hook_call != call or registered is not expected_registered:
+                raise RecoveryStateConflictError
+            await preflight()
+            capability = ToolCapabilityDescriptor.from_spec(expected_registered.spec)
+            if (
+                _tool_request_fingerprint(call, capability, arguments)
+                != operation.request_fingerprint
+            ):
+                raise RecoveryStateConflictError
+
         async def call_completed(
             hook_call: ToolCallCompleted,
             result: ToolResult,
         ) -> None:
             await emitter.complete_tool(hook_call, result, operation)
+
+        async def recovery_emit(event_type: str, payload: dict[str, Any]) -> None:
+            if event_type == "tool.call.authorized":
+                payload = {
+                    "call": hashed_identity(call.call_id),
+                    "tool": hashed_identity(call.name),
+                }
+            await emitter.emit(event_type, payload)
 
         try:
             return await executor.execute(
@@ -1766,7 +1796,7 @@ class RunEngine:
                     run_id=run_id,
                     session_id=emitter.current_snapshot.session_id,
                 ),
-                emit=emitter.emit,
+                emit=recovery_emit,
                 on_permission_requested=lambda permission, decision: (
                     self._recovery_permission_transition(
                         emitter,
@@ -1787,6 +1817,7 @@ class RunEngine:
                 ),
                 on_before_handler=before_handler,
                 on_call_completed=call_completed,
+                on_preflight=preflight,
                 sanitize_permission_denial=True,
             )
         except asyncio.CancelledError:
@@ -1882,8 +1913,8 @@ class RunEngine:
         decision: PermissionDecision | None,
     ) -> None:
         payload: dict[str, Any] = {
-            "request_id": request.request_id,
-            "tool_name": request.tool_name,
+            "request": hashed_identity(request.request_id),
+            "tool": hashed_identity(request.tool_name),
         }
         if decision is not None:
             payload["allowed"] = decision.allowed

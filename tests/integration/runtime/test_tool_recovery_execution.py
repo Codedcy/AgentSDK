@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,9 @@ class _ToolRecoveryAuditFaultStore(InMemoryStore):
             self.reached.set()
             await self.release.wait()
         result = await super().commit_run_progress(batch)
+        if self.mode == "post_audit_barrier" and self.calls == 1:
+            self.reached.set()
+            await self.release.wait()
         if self.mode == "lease_loss" and self.calls == 1:
             await self.release_lease(batch.lease)
         if self.mode in {"ambiguous", "outcome_ambiguous"} and self.calls == 1:
@@ -81,9 +86,11 @@ def _tool_spec(
     retry_policy: ToolRetryPolicy,
     *,
     timeout_seconds: float | None = None,
+    name: str = "recoverable",
+    source: str = "application",
 ) -> ToolSpec:
     return ToolSpec(
-        name="recoverable",
+        name=name,
         description="recoverable",
         input_schema={
             "type": "object",
@@ -95,6 +102,7 @@ def _tool_spec(
             "additionalProperties": False,
         },
         version="handler-v1",
+        source=source,
         effects=("compute",),
         timeout_seconds=timeout_seconds,
         retry_policy=retry_policy,
@@ -108,6 +116,9 @@ async def _seed_interrupted_tool_call(
     permission_default: str = "allow",
     arguments_json: str = '{"value":7}',
     timeout_seconds: float | None = None,
+    tool_name: str = "recoverable",
+    call_id: str = "call_recovery",
+    tool_source: str = "application",
 ) -> tuple[str, AgentSpec, ToolSpec, str]:
     handler_started = asyncio.Event()
     handler_cancelled = asyncio.Event()
@@ -134,9 +145,9 @@ async def _seed_interrupted_tool_call(
                             "tool_calls": [
                                 {
                                     "index": 0,
-                                    "id": "call_recovery",
+                                    "id": call_id,
                                     "function": {
-                                        "name": "recoverable",
+                                        "name": tool_name,
                                         "arguments": arguments_json,
                                     },
                                 }
@@ -150,7 +161,12 @@ async def _seed_interrupted_tool_call(
         return chunks()
 
     spec = AgentSpec(name="tool-recovery", model="fake/tool-recovery")
-    tool_spec = _tool_spec(retry_policy, timeout_seconds=timeout_seconds)
+    tool_spec = _tool_spec(
+        retry_policy,
+        timeout_seconds=timeout_seconds,
+        name=tool_name,
+        source=tool_source,
+    )
     sdk = AgentSDK.for_test(
         store=store,
         acompletion=first_completion,
@@ -189,6 +205,87 @@ async def _seed_interrupted_tool_call(
     finally:
         await scanner.close()
     return handle.run_id, spec, tool_spec, operation_id
+
+
+async def _seed_interrupted_second_tool_call(
+    store: StateStore,
+) -> tuple[str, AgentSpec, ToolSpec]:
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    model_turn = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal model_turn
+        model_turn += 1
+        turn = model_turn
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": f"turn-{turn}",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_history_{turn}",
+                                    "function": {
+                                        "name": "recoverable",
+                                        "arguments": json.dumps({"value": turn}),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": turn,
+                    "completion_tokens": 1,
+                    "total_tokens": turn + 1,
+                },
+            }
+
+        return chunks()
+
+    async def handler(_: ToolContext, value: int) -> int:
+        if value == 1:
+            return 11
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    spec = AgentSpec(name="tool-recovery-history", model="fake/tool-recovery")
+    tool_spec = _tool_spec(ToolRetryPolicy.IDEMPOTENT)
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.tools.register(tool_spec, handler)
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.runs.start(session.session_id, spec, "recover history")
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    handle._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+    await sdk.close()
+
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+    return handle.run_id, spec, tool_spec
 
 
 async def _final_completion(counter: list[int]) -> AsyncIterator[dict[str, object]]:
@@ -1179,5 +1276,678 @@ async def test_recovered_tool_outcome_commit_is_atomic_and_exactly_replayed(
         assert result.output_text == "done"
         assert handler_calls == 2
         assert model_calls == [1]
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("corruption", ["historical_tool_result", "system_message"])
+async def test_forged_checkpoint_transcript_never_reaches_tool_or_model(
+    backend: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"FORGED_SECRET_{backend}_{corruption}"
+    path = tmp_path / f"forged-{backend}-{corruption}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.SAFE_RETRY,
+    )
+
+    def corrupt(data: dict[str, Any]) -> None:
+        if corruption == "historical_tool_result":
+            data["tool_results"].append(
+                {
+                    "call_id": "forged_call",
+                    "tool_name": "forged_tool",
+                    "status": "succeeded",
+                    "content": json.dumps({"secret": secret}),
+                    "value": {"secret": secret},
+                    "error": None,
+                }
+            )
+        else:
+            data["messages"].insert(
+                len(data["messages"]) - 1,
+                {"role": "system", "content": secret},
+            )
+
+    if backend == "memory":
+        assert isinstance(store, InMemoryStore)
+        checkpoint_data = json.loads(store._run_checkpoints[run_id])
+        corrupt(checkpoint_data)
+        store._run_checkpoints[run_id] = json.dumps(
+            checkpoint_data,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        assert isinstance(store, SQLiteStore)
+        await store.close()
+        connection = sqlite3.connect(path)
+        try:
+            row = connection.execute(
+                "SELECT data_json FROM run_checkpoints WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            assert row is not None
+            checkpoint_data = json.loads(row[0])
+            corrupt(checkpoint_data)
+            connection.execute(
+                "UPDATE run_checkpoints SET data_json = ? WHERE run_id = ?",
+                (
+                    json.dumps(
+                        checkpoint_data,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    run_id,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        store = await SQLiteStore.open(path)
+
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required") as caught:
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        task = handle._task  # type: ignore[attr-defined]
+        assert task is not None
+        task_error = task.exception()
+        assert isinstance(task_error, AgentSDKError)
+        public = repr(caught.value.to_dict()) + repr(task_error.to_dict())
+        assert secret not in public
+        assert all(
+            secret not in repr(frame)
+            for frame in _sdk_traceback_locals(task_error)
+        )
+        recovery_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert secret not in repr(recovery_events)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "delete_message",
+        "reorder_messages",
+        "modify_tool_result",
+        "model_fingerprint",
+        "model_outcome",
+        "tool_fingerprint",
+        "tool_outcome",
+        "delete_event",
+        "reorder_events",
+        "modify_event",
+    ],
+)
+async def test_historical_recovery_evidence_is_reconstructed_exactly(
+    corruption: str,
+) -> None:
+    secret = f"forged-history-{corruption}"
+    store = InMemoryStore()
+    run_id, spec, tool_spec = await _seed_interrupted_second_tool_call(store)
+
+    def canonical(data: dict[str, Any]) -> str:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    if corruption in {
+        "delete_message",
+        "reorder_messages",
+        "modify_tool_result",
+    }:
+        checkpoint = json.loads(store._run_checkpoints[run_id])
+        tool_index = next(
+            index
+            for index, message in enumerate(checkpoint["messages"])
+            if message["role"] == "tool"
+        )
+        if corruption == "delete_message":
+            del checkpoint["messages"][tool_index]
+        elif corruption == "reorder_messages":
+            checkpoint["messages"][tool_index - 1 : tool_index + 1] = reversed(
+                checkpoint["messages"][tool_index - 1 : tool_index + 1]
+            )
+        else:
+            checkpoint["tool_results"][0]["content"] = secret
+        store._run_checkpoints[run_id] = canonical(checkpoint)
+    elif corruption in {
+        "model_fingerprint",
+        "model_outcome",
+        "tool_fingerprint",
+        "tool_outcome",
+    }:
+        records = [
+            (operation_id, json.loads(serialized))
+            for operation_id, serialized in store._external_operations.items()
+        ]
+        kind = "model_call" if corruption.startswith("model_") else "tool_call"
+        operation_id, operation = next(
+            item
+            for item in records
+            if item[1]["turn"] == 0 and item[1]["operation_kind"] == kind
+        )
+        if corruption.endswith("fingerprint"):
+            operation["request_fingerprint"] = secret
+        elif corruption == "model_outcome":
+            operation["outcome"]["text"] = secret
+        else:
+            operation["outcome"]["content"] = secret
+        store._external_operations[operation_id] = canonical(operation)
+    else:
+        run_events = [
+            (index, stored)
+            for index, stored in enumerate(store._events)
+            if stored.event.run_id == run_id
+        ]
+        if corruption == "delete_event":
+            index, _ = next(
+                item for item in run_events if item[1].event.type == "tool.call.proposed"
+            )
+            del store._events[index]
+        elif corruption == "reorder_events":
+            proposed_index, proposed = next(
+                item for item in run_events if item[1].event.type == "tool.call.proposed"
+            )
+            authorized_index, authorized = next(
+                item for item in run_events if item[1].event.type == "tool.call.authorized"
+            )
+            store._events[proposed_index] = type(proposed)(
+                proposed.cursor,
+                proposed.event.model_copy(update={"type": "tool.call.authorized"}),
+            )
+            store._events[authorized_index] = type(authorized)(
+                authorized.cursor,
+                authorized.event.model_copy(update={"type": "tool.call.proposed"}),
+            )
+        else:
+            event_index, stored = next(
+                item for item in run_events if item[1].event.type == "model.call.completed"
+            )
+            store._events[event_index] = type(stored)(
+                stored.cursor,
+                stored.event.model_copy(
+                    update={"payload": {"finish_reason": secret}}
+                ),
+            )
+
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required") as caught:
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        assert secret not in repr(caught.value.to_dict())
+        reconciliation_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert secret not in repr(reconciliation_events)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_modified_recovery_permission_evidence_forces_reconciliation() -> None:
+    secret = "forged-recovery-permission-event"
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+    )
+    first_handler_started = asyncio.Event()
+    first_handler_cancelled = asyncio.Event()
+
+    async def first_handler(_: ToolContext, value: int) -> int:
+        del value
+        first_handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_handler_cancelled.set()
+            raise
+
+    first_sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion([]),
+        permission_default="ask",
+    )
+    first_sdk.agents.define(spec)
+    first_sdk.tools.register(tool_spec, first_handler)
+    first = await first_sdk.recovery.recover_run(run_id)
+    permission = await asyncio.wait_for(
+        first_sdk.permissions.next_request(run_id),
+        timeout=1,
+    )
+    await first_sdk.permissions.resolve(
+        permission.request_id,
+        PermissionDecision.allow_once(),
+    )
+    await asyncio.wait_for(first_handler_started.wait(), timeout=1)
+    first._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await first.result()
+    await asyncio.wait_for(first_handler_cancelled.wait(), timeout=1)
+    await first_sdk.close()
+
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion([]),
+        permission_default="ask",
+    )
+    try:
+        await scanner.recovery.scan()
+    finally:
+        await scanner.close()
+
+    event_index, stored = next(
+        (index, stored)
+        for index, stored in enumerate(store._events)
+        if stored.event.run_id == run_id
+        and stored.event.type == "permission.resolved"
+        and "allowed" in stored.event.payload
+    )
+    forged_payload = dict(stored.event.payload)
+    forged_payload["tool"] = {"sha256": secret}
+    store._events[event_index] = type(stored)(
+        stored.cursor,
+        stored.event.model_copy(update={"payload": forged_payload}),
+    )
+
+    second_handler_calls = 0
+    model_calls: list[int] = []
+
+    async def second_handler(_: ToolContext, value: int) -> int:
+        nonlocal second_handler_calls
+        second_handler_calls += 1
+        return value
+
+    second_sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    second_sdk.agents.define(spec)
+    second_sdk.tools.register(tool_spec, second_handler)
+    handle = await second_sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert second_handler_calls == 0
+        assert model_calls == []
+        pending = await second_sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        reconciliation_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert secret not in repr(reconciliation_events)
+    finally:
+        await second_sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_removed_after_plan_becomes_durable_reconciliation() -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+    )
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    registered = sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    assert sdk.tools.unregister(tool_spec.name, expected=registered)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "recovery_state_invalid"
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing",
+        "retry_policy",
+        "schema",
+        "version",
+        "source",
+        "effects",
+        "timeout",
+        "handler",
+    ],
+)
+async def test_registry_change_after_audit_reconciles_before_permission_or_handler(
+    change: str,
+) -> None:
+    store = _ToolRecoveryAuditFaultStore("post_audit_barrier")
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.SAFE_RETRY,
+        tool_source="mcp/server" if change == "handler" else "application",
+    )
+    original_calls = 0
+    replacement_calls = 0
+    model_calls: list[int] = []
+
+    async def original(_: ToolContext, value: int) -> int:
+        nonlocal original_calls
+        original_calls += 1
+        return value
+
+    async def replacement(_: ToolContext, value: Any) -> Any:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    registered = sdk.tools.register(tool_spec, original)
+    store.enabled = True
+    handle = await sdk.recovery.recover_run(run_id)
+    await asyncio.wait_for(store.reached.wait(), timeout=1)
+    assert sdk.tools.unregister(tool_spec.name, expected=registered)
+    data = tool_spec.model_dump(mode="json")
+    if change == "retry_policy":
+        data["retry_policy"] = ToolRetryPolicy.IDEMPOTENT
+    elif change == "schema":
+        data["input_schema"] = {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        }
+    elif change == "version":
+        data["version"] = "replacement-v2"
+    elif change == "source":
+        data["source"] = "mcp/replacement"
+    elif change == "effects":
+        data["effects"] = ["filesystem"]
+    elif change == "timeout":
+        data["timeout_seconds"] = 5.0
+    if change != "missing":
+        replacement_spec = ToolSpec.model_validate(data)
+        sdk.tools.register(replacement_spec, replacement)
+    store.release.set()
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert original_calls == 0
+        assert replacement_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "recovery_state_invalid"
+    finally:
+        store.release.set()
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_handler_swap_during_ask_deny_reconciles_without_early_completion() -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+        tool_source="mcp/server",
+    )
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    original = sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    permission = await asyncio.wait_for(
+        sdk.permissions.next_request(run_id),
+        timeout=1,
+    )
+    assert sdk.tools.unregister(tool_spec.name, expected=original)
+    sdk.tools.register(tool_spec, handler)
+    await sdk.permissions.resolve(
+        permission.request_id,
+        PermissionDecision.deny("must not become a Tool result"),
+    )
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "recovery_state_invalid"
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_observability_hashes_unbounded_tool_identities() -> None:
+    secret = "private-identity-3d2"
+    tool_name = "tool_" + secret + ("x" * 4_096)
+    call_id = "call_" + secret + ("y" * 4_096)
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+        tool_name=tool_name,
+        call_id=call_id,
+    )
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        permission = await asyncio.wait_for(
+            sdk.permissions.next_request(run_id),
+            timeout=1,
+        )
+        await sdk.permissions.resolve(
+            permission.request_id,
+            PermissionDecision.allow_once(),
+        )
+        await handle.result()
+        events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type
+            in {
+                "tool.recovery.retry.started",
+                "permission.requested",
+                "permission.resolved",
+                "tool.call.authorized",
+            }
+        ]
+        recovery = events[
+            next(
+                index
+                for index, event in enumerate(events)
+                if event["type"] == "tool.recovery.retry.started"
+            ) :
+        ]
+        serialized = json.dumps(recovery, ensure_ascii=False, sort_keys=True)
+        assert secret not in serialized
+        assert tool_name not in serialized
+        assert call_id not in serialized
+        assert len(serialized.encode("utf-8")) < 4_096
+
+        expected_tool = hashlib.sha256(tool_name.encode()).hexdigest()
+        expected_call = hashlib.sha256(call_id.encode()).hexdigest()
+        audit = recovery[0]["payload"]
+        assert audit["tool"] == {"sha256": expected_tool}
+        assert audit["call"] == {"sha256": expected_call}
+        assert set(audit["operation"]) == {"sha256"}
+        for event in recovery:
+            payload = event["payload"]
+            if event["type"] == "tool.call.authorized":
+                assert payload == {
+                    "call": {"sha256": expected_call},
+                    "tool": {"sha256": expected_tool},
+                }
+            if event["type"].startswith("permission."):
+                assert payload["tool"] == {"sha256": expected_tool}
+                assert set(payload["request"]) == {"sha256"}
+        assert model_calls == [1]
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_long_registry_conflict_identity_is_not_retained_by_public_task() -> None:
+    secret = "private-registry-conflict-identity"
+    tool_name = "tool_" + secret + ("x" * 4_096)
+    call_id = "call_" + secret + ("y" * 4_096)
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        tool_name=tool_name,
+        call_id=call_id,
+    )
+
+    async def handler(_: ToolContext, value: int) -> int:
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion([]),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    registered = sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    assert sdk.tools.unregister(tool_name, expected=registered)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required") as caught:
+            await handle.result()
+        task = handle._task  # type: ignore[attr-defined]
+        assert task is not None
+        task_error = task.exception()
+        assert isinstance(task_error, AgentSDKError)
+        assert secret not in repr(caught.value.to_dict())
+        assert secret not in repr(task_error.to_dict())
+        assert all(
+            secret not in repr(frame)
+            for frame in _sdk_traceback_locals(task_error)
+        )
+        reconciliation_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert secret not in repr(reconciliation_events)
     finally:
         await sdk.close()

@@ -27,6 +27,7 @@ _Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 _PermissionTransition = Callable[[PermissionRequest, PermissionDecision | None], Awaitable[None]]
 _BeforeHandler = Callable[[ToolCallCompleted, RegisteredTool, Mapping[str, Any]], Awaitable[None]]
 _CompleteCall = Callable[[ToolCallCompleted, ToolResult], Awaitable[None]]
+_Preflight = Callable[[], Awaitable[None]]
 
 
 class ToolExecutor:
@@ -49,8 +50,11 @@ class ToolExecutor:
         on_permission_resolved: _PermissionTransition,
         on_before_handler: _BeforeHandler | None = None,
         on_call_completed: _CompleteCall | None = None,
+        on_preflight: _Preflight | None = None,
         sanitize_permission_denial: bool = False,
     ) -> ToolResult:
+        if on_preflight is not None:
+            await on_preflight()
         try:
             registered = self._registry.get(call.name)
         except AgentSDKError:
@@ -60,6 +64,7 @@ class ToolExecutor:
                 "tool not found",
                 emit,
                 on_call_completed,
+                on_preflight,
             )
 
         try:
@@ -91,13 +96,19 @@ class ToolExecutor:
                 "invalid tool arguments",
                 emit,
                 on_call_completed,
+                on_preflight,
             )
+
+        if on_preflight is not None:
+            await on_preflight()
 
         decision = await self._permissions.authorize(
             request,
             on_requested=on_permission_requested,
             on_resolved=on_permission_resolved,
         )
+        if on_preflight is not None:
+            await on_preflight()
         if not decision.allowed:
             return await self._complete_error(
                 call,
@@ -109,6 +120,7 @@ class ToolExecutor:
                 ),
                 emit,
                 on_call_completed,
+                on_preflight,
             )
 
         await emit(
@@ -171,6 +183,8 @@ class ToolExecutor:
                 "tool handler failed",
             )
 
+        if on_preflight is not None:
+            await on_preflight()
         if on_call_completed is None:
             await emit("tool.call.completed", self._result_payload(result))
         else:
@@ -184,7 +198,10 @@ class ToolExecutor:
         message: str,
         emit: _Emit,
         on_call_completed: _CompleteCall | None = None,
+        on_preflight: _Preflight | None = None,
     ) -> ToolResult:
+        if on_preflight is not None:
+            await on_preflight()
         result = ToolResult.normalized_error(
             call.call_id,
             call.name,
