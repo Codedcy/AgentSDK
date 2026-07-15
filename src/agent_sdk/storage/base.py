@@ -220,6 +220,10 @@ class StateStore(Protocol):
         self, run_id: str
     ) -> tuple[ExternalOperation, ...]: ...
 
+    async def list_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]: ...
+
     async def transition_external_operation(
         self,
         *,

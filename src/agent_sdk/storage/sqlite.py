@@ -1679,6 +1679,100 @@ class SQLiteStore:
             )
 
     @_context_free_recovery_errors
+    async def list_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        async with self._lock:
+            self._ensure_open()
+            async with self._connection.execute(
+                """
+                SELECT session_id, version, data_json FROM snapshots
+                WHERE kind = 'run' AND entity_id = ?
+                """,
+                (run_id,),
+            ) as cursor:
+                run_row = await cursor.fetchone()
+            if run_row is None:
+                raise RecoveryStateConflictError
+            try:
+                run_data = _strict_json_object(cast(str, run_row[2]))
+                run = RunSnapshot.model_validate(run_data)
+            except (TypeError, ValueError):
+                raise RecoveryStateConflictError from None
+            if (
+                run.run_id != run_id
+                or run.session_id != cast(str, run_row[0])
+                or run.version != cast(int, run_row[1])
+                or _canonical_json(run.model_dump(mode="json"))
+                != cast(str, run_row[2])
+            ):
+                raise RecoveryStateConflictError
+            async with self._connection.execute(
+                """
+                SELECT session_id, version, data_json FROM snapshots
+                WHERE kind = 'session' AND entity_id = ?
+                """,
+                (run.session_id,),
+            ) as cursor:
+                session_row = await cursor.fetchone()
+            if session_row is None:
+                raise RecoveryStateConflictError
+            try:
+                session_data = _strict_json_object(cast(str, session_row[2]))
+                session = SessionSnapshot.model_validate(session_data)
+            except (TypeError, ValueError):
+                raise RecoveryStateConflictError from None
+            if (
+                session.session_id != run.session_id
+                or session.session_id != cast(str, session_row[0])
+                or session.version != cast(int, session_row[1])
+                or run.run_id not in session.active_run_ids
+                or _canonical_json(session.model_dump(mode="json"))
+                != cast(str, session_row[2])
+            ):
+                raise RecoveryStateConflictError
+            async with self._connection.execute(
+                """
+                SELECT operation_id, operation_kind, session_id, run_id, turn,
+                       request_fingerprint, provider_identity, tool_identity,
+                       lease_generation, status, data_json
+                FROM external_operations
+                WHERE run_id = ?
+                ORDER BY turn, operation_kind, operation_id
+                """,
+                (run_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            operations: list[ExternalOperation] = []
+            identities: set[str] = set()
+            for row in rows:
+                serialized = cast(str, row[10])
+                try:
+                    operation = _external_operation_from_json(serialized)
+                except (TypeError, ValueError):
+                    raise RecoveryStateConflictError from None
+                if (
+                    _canonical_record_json(operation) != serialized
+                    or operation.operation_id != cast(str, row[0])
+                    or operation.operation_kind.value != cast(str, row[1])
+                    or operation.session_id != cast(str, row[2])
+                    or operation.run_id != cast(str, row[3])
+                    or operation.turn != cast(int, row[4])
+                    or operation.request_fingerprint != cast(str, row[5])
+                    or operation.provider_identity != cast(str | None, row[6])
+                    or operation.tool_identity != cast(str | None, row[7])
+                    or operation.lease_generation != cast(int, row[8])
+                    or operation.status.value != cast(str, row[9])
+                    or operation.run_id != run_id
+                    or operation.session_id != run.session_id
+                    or operation.operation_id in identities
+                ):
+                    raise RecoveryStateConflictError
+                identities.add(operation.operation_id)
+                operations.append(operation)
+            return tuple(operations)
+
+    @_context_free_recovery_errors
     async def transition_external_operation(
         self,
         *,

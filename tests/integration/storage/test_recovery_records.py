@@ -408,6 +408,25 @@ async def test_external_operation_terminal_cas_replay_and_fencing(
     seeded_recovery_store: Any,
 ) -> None:
     store = seeded_recovery_store
+    session = SessionSnapshot(
+        session_id="ses_1",
+        workspaces=("workspace",),
+        active_run_ids=("run_1",),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "session",
+                    session.session_id,
+                    session.session_id,
+                    session.version,
+                    session.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
     lease = await _lease(store)
     started = _model_operation()
     await store.create_external_operation(started, lease=lease, now=NOW)
@@ -424,6 +443,9 @@ async def test_external_operation_terminal_cas_replay_and_fencing(
     assert transitioned == completed
     assert transitioned is not completed
     assert await store.list_unresolved_external_operations("run_1") == ()
+    all_operations = await store.list_external_operations("run_1")
+    assert all_operations == (completed,)
+    assert all_operations[0] is not completed
     assert await store.transition_external_operation(
         expected=started,
         updated=completed,

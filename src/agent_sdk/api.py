@@ -53,6 +53,10 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     mutable_model_params,
 )
+from agent_sdk.runtime.recovery import (
+    RecoveryScanner,
+    RunRecoveryService,
+)
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ReconciliationRequest,
@@ -180,6 +184,12 @@ class _LazySQLiteStore:
         return await (await self._get()).list_unresolved_external_operations(run_id)
 
     @_context_free_recovery_errors
+    async def list_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        return await (await self._get()).list_external_operations(run_id)
+
+    @_context_free_recovery_errors
     async def transition_external_operation(
         self,
         *,
@@ -249,9 +259,18 @@ class _LazySQLiteStore:
             if self._closed:
                 return
             self._closed = True
-            if self._open_task is None:
+            open_task = self._open_task
+            self._open_task = None
+            if open_task is None:
                 return
-            store = await self._open_task
+            try:
+                store = await open_task
+            except asyncio.CancelledError:
+                if open_task.cancelled():
+                    return
+                raise
+            except Exception:
+                return
             await store.close()
 
     async def _get(self) -> SQLiteStore:
@@ -611,6 +630,82 @@ class RunAPI:
         return snapshot
 
 
+class RecoveryAPI:
+    def __init__(
+        self,
+        store: StateStore,
+        scanner: RecoveryScanner,
+        engine: RunEngine,
+        agents: AgentRegistry,
+        tools: ToolRegistry,
+        policy: PolicyEngine,
+        track_task: Callable[[asyncio.Task[RunResult]], None],
+        lifecycle: _SDKLifecycle,
+        ensure_startup_scan: Callable[
+            [], Awaitable[tuple[asyncio.Task[None], bool]]
+        ],
+    ) -> None:
+        self._store = store
+        self._scanner = scanner
+        self._engine = engine
+        self._agents = agents
+        self._tools = tools
+        self._policy = policy
+        self._track_task = track_task
+        self._lifecycle = lifecycle
+        self._ensure_startup_scan = ensure_startup_scan
+        self._start_lock = asyncio.Lock()
+        self._tasks: dict[str, asyncio.Task[RunResult]] = {}
+        self._service = RunRecoveryService(
+            store,
+            engine,
+            agents,
+            tools,
+            policy,
+        )
+
+    async def scan(self) -> None:
+        async with self._lifecycle.admit():
+            startup, created = await self._ensure_startup_scan()
+            settled_at_entry = startup.done()
+            await asyncio.shield(startup)
+            if not created and settled_at_entry:
+                await self._scanner.scan()
+
+    async def recover_run(self, run_id: str) -> RunHandle:
+        async with self._lifecycle.admit():
+            startup, _created = await self._ensure_startup_scan()
+            await asyncio.shield(startup)
+            async with self._start_lock:
+                existing = self._tasks.get(run_id)
+                if existing is not None:
+                    return RunHandle(run_id, self._store, existing)
+                plan = await self._service.plan(run_id)
+                if plan.kind == "detached":
+                    return RunHandle(run_id, self._store, None)
+                task = asyncio.create_task(self._service.execute(plan))
+                self._tasks[run_id] = task
+                task.add_done_callback(partial(self._release_task, run_id))
+                self._track_task(task)
+                return RunHandle(run_id, self._store, task)
+
+    async def pending_requests(
+        self,
+        run_id: str,
+    ) -> tuple[ReconciliationRequest, ...]:
+        async with self._lifecycle.admit():
+            startup, _created = await self._ensure_startup_scan()
+            await asyncio.shield(startup)
+            return await self._service.pending_requests(run_id)
+
+    def _release_task(
+        self,
+        run_id: str,
+        task: asyncio.Task[RunResult],
+    ) -> None:
+        if self._tasks.get(run_id) is task:
+            self._tasks.pop(run_id)
+
 class ContextAPI:
     def __init__(
         self,
@@ -872,6 +967,8 @@ class AgentSDK:
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._owned_close = owned_close
         self._lifecycle = _SDKLifecycle()
+        self._startup_scan_lock = asyncio.Lock()
+        self._startup_scan_task: asyncio.Task[None] | None = None
         commands = RuntimeCommands(store)
         tools = ToolRegistry()
         policy = PolicyEngine(permission_default)
@@ -883,6 +980,7 @@ class AgentSDK:
             permission_bridge,
         )
         agents = AgentRegistry()
+        recovery_scanner = RecoveryScanner(store)
         workflows = WorkflowExecutor(
             store,
             commands,
@@ -915,6 +1013,37 @@ class AgentSDK:
         )
         self.evaluations = EvaluationAPI(EvaluationEngine(store), self._lifecycle)
         self.analytics = AnalyticsAPI(AnalyticsQueries(store), self._lifecycle)
+        self._recovery_scanner = recovery_scanner
+        self.recovery = RecoveryAPI(
+            store,
+            recovery_scanner,
+            engine,
+            agents,
+            tools,
+            policy,
+            self._track_task,
+            self._lifecycle,
+            self._ensure_startup_scan,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            self._startup_scan_task = loop.create_task(recovery_scanner.scan())
+            self._track_task(self._startup_scan_task)
+
+    async def _ensure_startup_scan(
+        self,
+    ) -> tuple[asyncio.Task[None], bool]:
+        async with self._startup_scan_lock:
+            task = self._startup_scan_task
+            if task is not None:
+                return task, False
+            task = asyncio.create_task(self._recovery_scanner.scan())
+            self._startup_scan_task = task
+            self._track_task(task)
+            return task, True
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
         self._active_tasks.add(task)

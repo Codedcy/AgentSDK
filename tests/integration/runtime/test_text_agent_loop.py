@@ -978,6 +978,7 @@ async def test_configured_sdk_does_not_lazy_reopen_after_close(tmp_path: Path) -
     sdk = AgentSDK(AgentSDKConfig(database_path=database_path))
     try:
         await sdk.close()
+        database_path.unlink()
 
         with pytest.raises(AgentSDKError) as raised:
             await sdk.sessions.create(workspaces=[])

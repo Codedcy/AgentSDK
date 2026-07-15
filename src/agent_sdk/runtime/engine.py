@@ -24,7 +24,7 @@ from agent_sdk.models.litellm_gateway import (
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
-from agent_sdk.runtime.leases import Lease, LeaseLostError, LeaseManager
+from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseLostError, LeaseManager
 from agent_sdk.runtime.execution import (
     ExecutionPolicyDescriptor,
     ToolCapabilityDescriptor,
@@ -34,6 +34,7 @@ from agent_sdk.runtime.models import (
     RunResult,
     RunSnapshot,
     RunStatus,
+    SessionSnapshot,
     TokenUsage,
 )
 from agent_sdk.runtime.session_lifecycle import (
@@ -102,14 +103,17 @@ class _RunEmitter:
         lease: Lease,
         clock: Callable[[], datetime],
         lease_error: Callable[[], BaseException | None],
+        *,
+        checkpoint: RunCheckpoint | None = None,
+        sequence: int = 2,
     ) -> None:
         self._store = store
         self._run = run
         self._lease = lease
         self._clock = clock
         self._lease_error = lease_error
-        self._checkpoint: RunCheckpoint | None = None
-        self._sequence = 2
+        self._checkpoint = checkpoint
+        self._sequence = sequence
         self._lock = asyncio.Lock()
         self._delta_parts: list[str] = []
         self._delta_bytes = 0
@@ -120,9 +124,15 @@ class _RunEmitter:
     def current_snapshot(self) -> RunSnapshot:
         return self._run
 
+    @property
+    def current_checkpoint(self) -> RunCheckpoint:
+        assert self._checkpoint is not None
+        return self._checkpoint
+
     async def initialize(self, messages: tuple[dict[str, Any], ...]) -> None:
         async with self._lock:
             self._ensure_lease_current()
+            assert self._checkpoint is None
             snapshot = self._run.model_copy(
                 update={
                     "status": RunStatus.RUNNING,
@@ -154,6 +164,42 @@ class _RunEmitter:
             )
             self._run = snapshot
             self._checkpoint = checkpoint
+            self._sequence += 1
+
+    async def resume(self, session: SessionSnapshot) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            if self._run.status is not RunStatus.INTERRUPTED:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "run is not safe to resume",
+                    retryable=False,
+                ) from None
+            snapshot = self._run.model_copy(
+                update={
+                    "status": RunStatus.RUNNING,
+                    "version": self._run.version + 1,
+                }
+            )
+            event = self._new_event(
+                "run.recovery.started",
+                {"status": RunStatus.RUNNING.value},
+            )
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    snapshots=(self._run_write(snapshot),),
+                    preconditions=(
+                        exact_session_precondition(session),
+                        exact_run_precondition(self._run),
+                    ),
+                ),
+            )
+            self._run = snapshot
             self._sequence += 1
 
     async def start_model(self, request: ModelRequest) -> ModelCallOperation:
@@ -922,17 +968,57 @@ class RunEngine:
 
     async def execute(self, run_id: str, request: ModelRequest) -> RunResult:
         public_error: tuple[ErrorCode, str, bool] | None = None
+        lease_held = False
         try:
             return await self._execute_private(run_id, request)
+        except LeaseHeldError:
+            lease_held = True
         except AgentSDKError as error:
             public_error = (error.code, error.message, error.retryable)
         del self, run_id, request
+        if lease_held:
+            raise LeaseHeldError from None
         assert public_error is not None
         raise AgentSDKError(
             public_error[0],
             public_error[1],
             retryable=public_error[2],
         ) from None
+
+    async def resume(
+        self,
+        run_id: str,
+        checkpoint: RunCheckpoint,
+        request: ModelRequest,
+    ) -> RunResult:
+        public_error: tuple[ErrorCode, str, bool] | None = None
+        lease_held = False
+        try:
+            return await self._resume_private(run_id, checkpoint, request)
+        except LeaseHeldError:
+            lease_held = True
+        except AgentSDKError as error:
+            public_error = (error.code, error.message, error.retryable)
+        del self, run_id, checkpoint, request
+        if lease_held:
+            raise LeaseHeldError from None
+        assert public_error is not None
+        raise AgentSDKError(
+            public_error[0],
+            public_error[1],
+            retryable=public_error[2],
+        ) from None
+
+    def validate_resume_checkpoint(self, checkpoint: RunCheckpoint) -> None:
+        """Validate recovery-only checkpoint content before lease admission."""
+        if checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
+            if len(checkpoint.tool_results) >= _MAX_TOOL_STEPS:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "run is not safe to resume",
+                    retryable=False,
+                ) from None
+            self._tool_call_from_checkpoint(checkpoint)
 
     async def _execute_private(self, run_id: str, request: ModelRequest) -> RunResult:
         created = await self._load_created_run(run_id)
@@ -969,6 +1055,103 @@ class RunEngine:
                         retryable=False,
                     ) from None
                 raise
+        except asyncio.CancelledError:
+            if heartbeat_error is not None:
+                raise LeaseLostError from None
+            raise
+        finally:
+            active_error = sys.exception()
+            heartbeat.cancel()
+            cleanup_cancellation = await _settle_background_task(heartbeat)
+            release = asyncio.create_task(self._leases.release(lease))
+            release_cancellation = await _settle_background_task(release)
+            if cleanup_cancellation is None:
+                cleanup_cancellation = release_cancellation
+            if active_error is None and cleanup_cancellation is not None:
+                raise cleanup_cancellation from None
+
+    async def _resume_private(
+        self,
+        run_id: str,
+        checkpoint: RunCheckpoint,
+        request: ModelRequest,
+    ) -> RunResult:
+        interrupted = await self._load_run(run_id)
+        if interrupted.status is not RunStatus.INTERRUPTED:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        if (
+            checkpoint.run_id != interrupted.run_id
+            or checkpoint.session_id != interrupted.session_id
+            or checkpoint.phase
+            not in {
+                RunCheckpointPhase.READY_FOR_MODEL,
+                RunCheckpointPhase.READY_FOR_TOOL,
+            }
+            or checkpoint.operation_id is not None
+        ):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        self.validate_resume_checkpoint(checkpoint)
+        durable_checkpoint = await self._store.get_run_checkpoint(run_id)
+        if durable_checkpoint != checkpoint:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        if await self._store.list_unresolved_external_operations(run_id):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        session = await load_session(self._store, interrupted.session_id)
+        if interrupted.run_id not in session.active_run_ids:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        sequence = await self._store.latest_run_event_sequence(run_id)
+        if sequence is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        self._validate_live_execution(interrupted, request)
+        lease = await self._leases.acquire(run_id, new_id("coord"), now=self._clock())
+        owner = asyncio.current_task()
+        assert owner is not None
+        heartbeat_error: BaseException | None = None
+        heartbeat = asyncio.create_task(self._heartbeat(lease))
+
+        def heartbeat_finished(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception()
+            if heartbeat_error is not None and not owner.done():
+                owner.cancel()
+
+        heartbeat.add_done_callback(heartbeat_finished)
+        try:
+            return await self._execute_owned(
+                interrupted,
+                request,
+                lease,
+                lambda: heartbeat_error,
+                checkpoint=checkpoint,
+                sequence=sequence + 1,
+                recovery_session=session,
+            )
         except asyncio.CancelledError:
             if heartbeat_error is not None:
                 raise LeaseLostError from None
@@ -1026,6 +1209,10 @@ class RunEngine:
         request: ModelRequest,
         lease: Lease,
         lease_error: Callable[[], BaseException | None],
+        *,
+        checkpoint: RunCheckpoint | None = None,
+        sequence: int = 2,
+        recovery_session: SessionSnapshot | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1034,23 +1221,61 @@ class RunEngine:
             lease,
             self._clock,
             lease_error,
+            checkpoint=checkpoint,
+            sequence=sequence,
         )
-        initial_messages = request.messages
-        if created.execution_descriptor is not None:
-            initial_messages = tuple(
-                dict(message) for message in created.execution_descriptor.messages
-            )
-        await emitter.initialize(initial_messages)
-        chunks: list[str] = []
-        usage = TokenUsage()
-        tool_results: list[ToolResult] = []
-        messages = deepcopy(list(request.messages))
+        if checkpoint is None:
+            initial_messages = request.messages
+            if created.execution_descriptor is not None:
+                initial_messages = tuple(
+                    dict(message) for message in created.execution_descriptor.messages
+                )
+            await emitter.initialize(initial_messages)
+        else:
+            assert recovery_session is not None
+            await emitter.resume(recovery_session)
+        current_checkpoint = emitter.current_checkpoint
+        chunks = list(current_checkpoint.output_parts)
+        usage = current_checkpoint.usage
+        tool_results = list(current_checkpoint.tool_results)
+        messages = list(current_checkpoint.model_dump(mode="json")["messages"])
         executor = ToolExecutor(
             self._tools,
             self._policy,
             self._permission_bridge,
         )
         try:
+            if current_checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
+                if len(tool_results) >= _MAX_TOOL_STEPS:
+                    failure = AgentSDKError(
+                        ErrorCode.INVALID_STATE,
+                        "tool step limit exceeded",
+                        retryable=False,
+                    )
+                    await self._fail_run(
+                        emitter,
+                        failure,
+                        chunks,
+                        usage,
+                        tool_results,
+                    )
+                    await emitter.close()
+                    raise failure
+                pending_call = self._tool_call_from_checkpoint(current_checkpoint)
+                tool_result = await self._execute_tool_call(
+                    executor,
+                    emitter,
+                    pending_call,
+                    run_id=run_id,
+                    chunks=chunks,
+                    usage=usage,
+                    tool_results=tool_results,
+                )
+                tool_results.append(tool_result)
+                await emitter.emit("step.completed")
+                messages = list(
+                    emitter.current_checkpoint.model_dump(mode="json")["messages"]
+                )
             while True:
                 step_chunks: list[str] = []
                 step_usage = TokenUsage()
@@ -1167,111 +1392,19 @@ class RunEngine:
                     break
 
                 call = calls[0]
-                await emitter.emit(
-                    "tool.call.proposed",
-                    {"call_id": call.call_id, "tool_name": call.name},
+                tool_result = await self._execute_tool_call(
+                    executor,
+                    emitter,
+                    call,
+                    run_id=run_id,
+                    chunks=chunks,
+                    usage=usage,
+                    tool_results=tool_results,
                 )
-                tool_operation: ToolCallOperation | None = None
-
-                async def before_handler(
-                    hook_call: ToolCallCompleted,
-                    registered: RegisteredTool,
-                    arguments: Mapping[str, Any],
-                ) -> None:
-                    nonlocal tool_operation
-                    tool_operation = await emitter.start_tool(hook_call, registered, arguments)
-
-                async def call_completed(
-                    hook_call: ToolCallCompleted,
-                    result: ToolResult,
-                ) -> None:
-                    await emitter.complete_tool(hook_call, result, tool_operation)
-
-                try:
-                    tool_result = await executor.execute(
-                        call,
-                        ToolContext(
-                            run_id=run_id,
-                            session_id=emitter.current_snapshot.session_id,
-                        ),
-                        emit=emitter.emit,
-                        on_permission_requested=lambda permission, decision: (
-                            self._permission_transition(
-                                emitter,
-                                "permission.requested",
-                                RunStatus.WAITING_PERMISSION,
-                                permission,
-                                decision,
-                            )
-                        ),
-                        on_permission_resolved=lambda permission, decision: (
-                            self._permission_transition(
-                                emitter,
-                                "permission.resolved",
-                                RunStatus.RUNNING,
-                                permission,
-                                decision,
-                            )
-                        ),
-                        on_before_handler=before_handler,
-                        on_call_completed=call_completed,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except (LeaseLostError, _RunProgressError):
-                    raise
-                except Exception as cause:
-                    failure = (
-                        cause
-                        if isinstance(cause, AgentSDKError)
-                        else AgentSDKError(
-                            ErrorCode.INTERNAL,
-                            "tool execution failed",
-                            retryable=False,
-                        )
-                    )
-                    try:
-                        await self._fail_run(
-                            emitter,
-                            failure,
-                            chunks,
-                            usage,
-                            tool_results,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        await emitter.close()
-                    except Exception:
-                        pass
-                    if failure is cause:
-                        raise failure
-                    raise failure from cause
                 tool_results.append(tool_result)
                 await emitter.emit("step.completed")
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "".join(step_chunks) or None,
-                        "tool_calls": [
-                            {
-                                "id": call.call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": call.name,
-                                    "arguments": call.arguments_json,
-                                },
-                            }
-                        ],
-                    }
-                )
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.call_id,
-                        "name": call.name,
-                        "content": tool_result.content,
-                    }
+                messages = list(
+                    emitter.current_checkpoint.model_dump(mode="json")["messages"]
                 )
         except asyncio.CancelledError:
             if self._permission_bridge is not None:
@@ -1307,6 +1440,139 @@ class RunEngine:
         )
         await emitter.close()
         return run_result
+
+    async def _execute_tool_call(
+        self,
+        executor: ToolExecutor,
+        emitter: _RunEmitter,
+        call: ToolCallCompleted,
+        *,
+        run_id: str,
+        chunks: list[str],
+        usage: TokenUsage,
+        tool_results: list[ToolResult],
+    ) -> ToolResult:
+        await emitter.emit(
+            "tool.call.proposed",
+            {"call_id": call.call_id, "tool_name": call.name},
+        )
+        tool_operation: ToolCallOperation | None = None
+
+        async def before_handler(
+            hook_call: ToolCallCompleted,
+            registered: RegisteredTool,
+            arguments: Mapping[str, Any],
+        ) -> None:
+            nonlocal tool_operation
+            tool_operation = await emitter.start_tool(
+                hook_call,
+                registered,
+                arguments,
+            )
+
+        async def call_completed(
+            hook_call: ToolCallCompleted,
+            result: ToolResult,
+        ) -> None:
+            await emitter.complete_tool(hook_call, result, tool_operation)
+
+        try:
+            return await executor.execute(
+                call,
+                ToolContext(
+                    run_id=run_id,
+                    session_id=emitter.current_snapshot.session_id,
+                ),
+                emit=emitter.emit,
+                on_permission_requested=lambda permission, decision: (
+                    self._permission_transition(
+                        emitter,
+                        "permission.requested",
+                        RunStatus.WAITING_PERMISSION,
+                        permission,
+                        decision,
+                    )
+                ),
+                on_permission_resolved=lambda permission, decision: (
+                    self._permission_transition(
+                        emitter,
+                        "permission.resolved",
+                        RunStatus.RUNNING,
+                        permission,
+                        decision,
+                    )
+                ),
+                on_before_handler=before_handler,
+                on_call_completed=call_completed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (LeaseLostError, _RunProgressError):
+            raise
+        except Exception as cause:
+            failure = (
+                cause
+                if isinstance(cause, AgentSDKError)
+                else AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "tool execution failed",
+                    retryable=False,
+                )
+            )
+            try:
+                await self._fail_run(
+                    emitter,
+                    failure,
+                    chunks,
+                    usage,
+                    tool_results,
+                )
+            except Exception:
+                pass
+            try:
+                await emitter.close()
+            except Exception:
+                pass
+            if failure is cause:
+                raise failure
+            raise failure from cause
+
+    def _tool_call_from_checkpoint(
+        self,
+        checkpoint: RunCheckpoint,
+    ) -> ToolCallCompleted:
+        data = checkpoint.model_dump(mode="json")
+        messages = data["messages"]
+        try:
+            assistant = messages[-1]
+            calls = assistant["tool_calls"]
+            if assistant["role"] != "assistant" or len(calls) != 1:
+                raise ValueError
+            raw_call = calls[0]
+            function = raw_call["function"]
+            if raw_call["type"] != "function":
+                raise ValueError
+            call_id = raw_call["id"]
+            name = function["name"]
+            arguments_json = function["arguments"]
+            if not all(
+                isinstance(value, str) and value
+                for value in (call_id, name, arguments_json)
+            ):
+                raise ValueError
+            self._tools.get(name)
+        except (AgentSDKError, KeyError, TypeError, ValueError):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not safe to resume",
+                retryable=False,
+            ) from None
+        return ToolCallCompleted(
+            index=0,
+            call_id=call_id,
+            name=name,
+            arguments_json=arguments_json,
+        )
 
     @staticmethod
     async def _permission_transition(
@@ -1354,6 +1620,16 @@ class RunEngine:
         )
 
     async def _load_created_run(self, run_id: str) -> RunSnapshot:
+        run = await self._load_run(run_id)
+        if run.status is not RunStatus.CREATED:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not ready to start",
+                retryable=False,
+            )
+        return run
+
+    async def _load_run(self, run_id: str) -> RunSnapshot:
         data = await self._store.get_snapshot("run", run_id)
         if data is None:
             raise AgentSDKError(
@@ -1361,13 +1637,20 @@ class RunEngine:
                 "run not found",
                 retryable=False,
             )
-        run = RunSnapshot.model_validate(data)
-        if run.status is not RunStatus.CREATED:
+        try:
+            run = RunSnapshot.model_validate(data)
+        except ValueError:
             raise AgentSDKError(
-                ErrorCode.INVALID_STATE,
-                "run is not ready to start",
+                ErrorCode.INTERNAL,
+                "failed to load run",
                 retryable=False,
-            )
+            ) from None
+        if run.run_id != run_id:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "failed to load run",
+                retryable=False,
+            ) from None
         return run
 
 

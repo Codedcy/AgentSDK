@@ -935,6 +935,69 @@ class InMemoryStore:
             )
 
     @_context_free_recovery_errors
+    async def list_external_operations(
+        self, run_id: str
+    ) -> tuple[ExternalOperation, ...]:
+        async with self._lock:
+            run_write = self._snapshots.get(("run", run_id))
+            if run_write is None:
+                raise RecoveryStateConflictError
+            try:
+                run = RunSnapshot.model_validate(run_write.data)
+            except ValueError:
+                raise RecoveryStateConflictError from None
+            if (
+                run.run_id != run_id
+                or run.session_id != run_write.session_id
+                or run.version != run_write.version
+            ):
+                raise RecoveryStateConflictError
+            session_write = self._snapshots.get(("session", run.session_id))
+            if session_write is None:
+                raise RecoveryStateConflictError
+            try:
+                session = SessionSnapshot.model_validate(session_write.data)
+            except ValueError:
+                raise RecoveryStateConflictError from None
+            if (
+                session.session_id != run.session_id
+                or session.session_id != session_write.session_id
+                or session.version != session_write.version
+                or run.run_id not in session.active_run_ids
+            ):
+                raise RecoveryStateConflictError
+            operations: list[ExternalOperation] = []
+            identities: set[str] = set()
+            for wrapper_id, serialized in self._external_operations.items():
+                try:
+                    operation = _external_operation_from_json(serialized)
+                except (TypeError, ValueError):
+                    raise RecoveryStateConflictError from None
+                if _canonical_record_json(operation) != serialized:
+                    raise RecoveryStateConflictError
+                if operation.operation_id != wrapper_id:
+                    raise RecoveryStateConflictError
+                if operation.run_id != run_id:
+                    continue
+                if (
+                    operation.operation_id in identities
+                    or operation.session_id != run.session_id
+                ):
+                    raise RecoveryStateConflictError
+                identities.add(operation.operation_id)
+                operations.append(operation)
+            return tuple(
+                sorted(
+                    operations,
+                    key=lambda operation: (
+                        operation.turn,
+                        operation.operation_kind.value,
+                        operation.operation_id,
+                    ),
+                )
+            )
+
+    @_context_free_recovery_errors
     async def transition_external_operation(
         self,
         *,
