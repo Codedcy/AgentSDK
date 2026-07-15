@@ -233,7 +233,7 @@ class WorkflowExecutor:
             retryable=True,
         ) from None
 
-    async def recover(
+    async def _recover(
         self,
         workflow_run_id: str,
         recover_run: Callable[[str], Awaitable[RunHandle]],

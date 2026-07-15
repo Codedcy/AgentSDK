@@ -111,3 +111,89 @@ Session-delete coverage, incomplete Session attach/detach assertions at
 ambiguous commit boundaries, and brittle mixed one-second/unbounded test
 barriers. The bounded remediation is recorded in
 `M02-T002-phase4-review-fix-brief.md`; Phase 5 remains blocked.
+
+## Whole-Phase-4 review remediation
+
+The first whole-Phase-4 review findings were remediated within the exact
+review-fix boundary. This is implementation evidence for a new independent
+review; it does not claim approval and does not begin Phase 5.
+
+### Public recovery surface
+
+- Added a public-surface regression that requires
+  `RecoveryAPI.recover_workflow(self, workflow_run_id: str) -> WorkflowHandle`
+  to remain the sole new public recovery entry.
+- The RED failed because exported `WorkflowExecutor` still exposed public
+  `recover(...)` callback injection.
+- Renamed that internal entry to `_recover` and changed only the internal API
+  assembly call. `WorkflowAPI.resume`, root exports, behavior, and schema were
+  unchanged.
+
+### Complete two-SDK matrix
+
+Memory and SQLite now run the same deterministic, independently constructed SDK
+matrix. SQLite always uses two independently opened connections to one database.
+
+- Pending node: both callers converge on one exact selected Run id, one
+  `workflow.node.started`, one `run.created`, one Session attachment, and one
+  Provider execution.
+- Selected RUNNING node with a missing Run: the exact selected id is recreated
+  once, attached once, and executed once.
+- Selected CREATED Run: two lease contenders produce one lease owner, one
+  logical Provider execution, and the same terminal Workflow result.
+- Selected live Run with a valid lease owner: the second SDK follows durable
+  state without recording a synthetic node or Workflow failure.
+- Expired/unreconciled Run: both callers receive the bounded retryable
+  `CONFLICT / recovery required` outcome; the Run remains
+  `WAITING_RECONCILIATION`, Workflow/node/Session ownership remains active, and
+  no terminal projection or Provider work is recorded.
+- Authoritative Session deletion: a deterministic two-SDK node-selection race
+  deletes the Session before either candidate commit. Both recoveries return
+  `NOT_FOUND`; Session, Workflow, nodes, candidate Runs, events, idempotency,
+  leases, checkpoints, unresolved operations, and reconciliation requests stay
+  absent, with clean local registries.
+
+### Ambiguous-commit ownership proof
+
+All nine existing post-commit fault cases now assert complete durable ownership
+pairs instead of only the headline event count. They prove the exact selected
+Run id, Run attach/detach, active ownership while nonterminal, terminal absence
+from Session active ids, exact node projection consistency, stable Session
+status, terminal checkpoint ownership, no unresolved external work, and one
+Workflow detach. SQLite terminal cases close the faulting connection and read
+through a newly opened connection. A second recovery proves terminal
+idempotency, unchanged events and Session state, one Provider execution, and
+clean Workflow/recovery registries.
+
+### Deterministic synchronization
+
+- Replaced one-second and direct barrier waits with one shared 10-second
+  diagnostic timeout.
+- Arrival, winner, owner, and release conditions use explicit events.
+- Timeout diagnostics include the coordination phase, arrival counts, selected
+  ids, or durable Run state as applicable.
+- Every Projection, Lease, Deletion, Provider, Run-read, and plan release is
+  opened in `finally`, so a failed assertion cannot strand its peer.
+
+### Fresh verification after remediation
+
+- Exact public-surface RED/GREEN: **1 passed** after the intentional RED.
+- Complete Memory/SQLite two-SDK state matrix: **10 passed**.
+- Authoritative deletion race: **2 passed**.
+- Ambiguous durable-commit ownership matrix: **9 passed**.
+- Complete Phase 4A + Phase 4B Workflow admission file: **97 passed**.
+- Final Python 3.13 full suite: **1677 passed**, zero failed, zero skipped, in
+  127.07 seconds.
+- Ruff: all `src` and `tests` checks passed.
+- mypy: 75 source files passed.
+- `git diff --check`: passed.
+- Public import/signature smoke: 99 unique root exports; exact
+  `(self, workflow_run_id: str) -> WorkflowHandle` contract retained;
+  `WorkflowExecutor.recover` is absent from its public class dictionary.
+- Scope/schema: production edits are limited to the internal executor rename
+  and its internal caller; tests are limited to the Phase 4 admission file;
+  SQLite remains schema v3. No migration, design, roadmap, milestone,
+  task-index, dependency, or lockfile change was made.
+
+The remediation is ready for a fresh whole-Phase-4 independent Spec/Quality
+review. Phase 5, M02-T003, and M02-T004 remain blocked pending that verdict.

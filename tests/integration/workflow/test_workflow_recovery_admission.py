@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import traceback
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from agent_sdk import (
     AgentSpec,
     ErrorCode,
     PermissionDecision,
+    RecoveryAPI,
     ToolContext,
 )
 from agent_sdk.events.models import EventEnvelope
@@ -24,6 +26,7 @@ from agent_sdk.mcp import MCPManager, MCPServerConfig, StdioMCPTransport
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionStatus
 from agent_sdk.runtime.recovery import RecoveryPlan
+from agent_sdk.runtime.reconciliation import RunCheckpointPhase
 from agent_sdk.runtime.session_lifecycle import exact_session_precondition, session_write
 from agent_sdk.storage.base import CommitBatch, RunProgressBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
@@ -91,6 +94,21 @@ TOOL = ToolSpec(
     timeout_seconds=2.0,
     retry_policy=ToolRetryPolicy.IDEMPOTENT,
 )
+_DIAGNOSTIC_TIMEOUT_SECONDS = 10.0
+
+
+async def _wait_for_event(
+    event: asyncio.Event,
+    *,
+    diagnostic: Callable[[], object],
+) -> None:
+    try:
+        await asyncio.wait_for(
+            event.wait(),
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        raise AssertionError(f"coordination timeout: {diagnostic()!r}") from None
 
 
 class _CountingCompletion:
@@ -105,7 +123,10 @@ class _CountingCompletion:
         self.calls += 1
         self.started.set()
         if self.block:
-            await self.release.wait()
+            await _wait_for_event(
+                self.release,
+                diagnostic=lambda: {"phase": "provider_release", "calls": self.calls},
+            )
         if self.fail:
             raise RuntimeError("RAW_PROVIDER_SECRET")
         text = "verified" if params.get("model") == "fake/worker" else "planned"
@@ -242,7 +263,14 @@ class _RunReadBarrierStore:
             self.run_reads += 1
             if self.run_reads == self.block_on_read:
                 self.blocked.set()
-                await self.release.wait()
+                await _wait_for_event(
+                    self.release,
+                    diagnostic=lambda: {
+                        "phase": "run_read_release",
+                        "run_reads": self.run_reads,
+                        "block_on_read": self.block_on_read,
+                    },
+                )
         return value
 
 
@@ -275,50 +303,27 @@ class _ProjectionBarrierStore:
             self.barrier.arrivals += 1
             if self.barrier.arrivals == 2:
                 self.barrier.both_arrived.set()
-            await self.barrier.both_arrived.wait()
+            await _wait_for_event(
+                self.barrier.both_arrived,
+                diagnostic=lambda: {
+                    "phase": "projection_arrivals",
+                    "arrivals": self.barrier.arrivals,
+                    "event_type": self.event_type,
+                },
+            )
             if self.recovery_winner:
                 result = await self.delegate.commit(batch)
                 self.barrier.recovery_committed.set()
                 return result
-            await self.barrier.recovery_committed.wait()
+            await _wait_for_event(
+                self.barrier.recovery_committed,
+                diagnostic=lambda: {
+                    "phase": "projection_winner_commit",
+                    "arrivals": self.barrier.arrivals,
+                    "event_type": self.event_type,
+                },
+            )
         return await self.delegate.commit(batch)
-
-
-class _TwoSDKWorkflowRaceStore:
-    def __init__(
-        self,
-        *,
-        block_node_selection: bool = False,
-        block_run_lease: bool = False,
-    ) -> None:
-        self.delegate = InMemoryStore()
-        self.block_node_selection = block_node_selection
-        self.block_run_lease = block_run_lease
-        self.node_selection_arrivals = 0
-        self.run_lease_arrivals = 0
-        self.node_selection_ready = asyncio.Event()
-        self.run_lease_ready = asyncio.Event()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.delegate, name)
-
-    async def commit(self, batch: CommitBatch) -> Any:
-        if self.block_node_selection and any(
-            event.type == "workflow.node.started" for event in batch.events
-        ):
-            self.node_selection_arrivals += 1
-            if self.node_selection_arrivals == 2:
-                self.node_selection_ready.set()
-            await asyncio.wait_for(self.node_selection_ready.wait(), timeout=1)
-        return await self.delegate.commit(batch)
-
-    async def acquire_lease(self, **values: Any) -> Any:
-        if self.block_run_lease:
-            self.run_lease_arrivals += 1
-            if self.run_lease_arrivals == 2:
-                self.run_lease_ready.set()
-            await asyncio.wait_for(self.run_lease_ready.wait(), timeout=1)
-        return await self.delegate.acquire_lease(**values)
 
 
 class _LeaseBarrier:
@@ -339,8 +344,54 @@ class _LeaseBarrierStore:
         self.barrier.arrivals += 1
         if self.barrier.arrivals == 2:
             self.barrier.ready.set()
-        await asyncio.wait_for(self.barrier.ready.wait(), timeout=1)
+        await _wait_for_event(
+            self.barrier.ready,
+            diagnostic=lambda: {
+                "phase": "lease_arrivals",
+                "arrivals": self.barrier.arrivals,
+            },
+        )
         return await self.delegate.acquire_lease(**values)
+
+
+class _DeletionBarrier:
+    def __init__(self) -> None:
+        self.arrivals = 0
+        self.ready = asyncio.Event()
+        self.release = asyncio.Event()
+        self.selected_run_ids: list[str] = []
+
+
+class _DeletionBarrierStore:
+    def __init__(self, delegate: Any, barrier: _DeletionBarrier) -> None:
+        self.delegate = delegate
+        self.barrier = barrier
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: CommitBatch) -> Any:
+        started = [
+            event
+            for event in batch.events
+            if event.type == "workflow.node.started"
+        ]
+        if started:
+            run_id = started[0].payload.get("run_id")
+            assert isinstance(run_id, str)
+            self.barrier.selected_run_ids.append(run_id)
+            self.barrier.arrivals += 1
+            if self.barrier.arrivals == 2:
+                self.barrier.ready.set()
+            await _wait_for_event(
+                self.barrier.release,
+                diagnostic=lambda: {
+                    "phase": "delete_race_release",
+                    "arrivals": self.barrier.arrivals,
+                    "selected_run_ids": tuple(self.barrier.selected_run_ids),
+                },
+            )
+        return await self.delegate.commit(batch)
 
 
 class _ToolCompletion:
@@ -402,7 +453,13 @@ class _BlockingToolCompletion(_ToolCompletion):
     async def __call__(self, **values: Any) -> AsyncIterator[dict[str, object]]:
         if self.calls == 0:
             self.started.set()
-            await self.release.wait()
+            await _wait_for_event(
+                self.release,
+                diagnostic=lambda: {
+                    "phase": "blocking_tool_provider_release",
+                    "calls": self.calls,
+                },
+            )
         return await super().__call__(**values)
 
 
@@ -549,6 +606,14 @@ def _assert_public_error_is_secret_free(error: BaseException, secret: str) -> No
     assert sdk_frames > 0
 
 
+def test_workflow_recovery_has_one_public_entry_point() -> None:
+    assert "recover" not in workflow_executor_module.WorkflowExecutor.__dict__
+    signature = inspect.signature(RecoveryAPI.recover_workflow)
+    assert tuple(signature.parameters) == ("self", "workflow_run_id")
+    assert signature.parameters["workflow_run_id"].annotation == "str"
+    assert signature.return_annotation == "WorkflowHandle"
+
+
 @pytest.mark.asyncio
 async def test_capability_mutation_during_session_admission_is_zero_mutation() -> None:
     store = InMemoryStore()
@@ -568,7 +633,13 @@ async def test_capability_mutation_during_session_admission_is_zero_mutation() -
         load_count += 1
         if load_count == 2:
             ownership_blocked.set()
-            await release_ownership.wait()
+            await _wait_for_event(
+                release_ownership,
+                diagnostic=lambda: {
+                    "phase": "capability_mutation_release",
+                    "load_count": load_count,
+                },
+            )
         return await original_load_session(store_value, session_id)
 
     workflow_executor_module.load_session = blocked_load_session
@@ -577,7 +648,13 @@ async def test_capability_mutation_during_session_admission_is_zero_mutation() -
     cursor_before = await store.latest_cursor()
     try:
         handle = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
-        await asyncio.wait_for(ownership_blocked.wait(), timeout=1)
+        await _wait_for_event(
+            ownership_blocked,
+            diagnostic=lambda: {
+                "phase": "capability_mutation_arrival",
+                "load_count": load_count,
+            },
+        )
         assert sdk.tools.unregister(TOOL.name) is True
         release_ownership.set()
 
@@ -744,7 +821,14 @@ async def test_normal_and_recovery_converge_when_selected_run_is_missing() -> No
     normal_handle = await normal.workflows.start(session.session_id, _workflow_yaml())
     recovery: AgentSDK | None = None
     try:
-        await asyncio.wait_for(normal_store.blocked.wait(), timeout=1)
+        await _wait_for_event(
+            normal_store.blocked,
+            diagnostic=lambda: {
+                "phase": "normal_run_read",
+                "normal_reads": normal_store.run_reads,
+                "recovery_reads": recovery_store.run_reads,
+            },
+        )
         selected = await normal.workflows.get(normal_handle.workflow_run_id)
         selected_run_id = selected.nodes[0].run_id
         assert selected_run_id is not None
@@ -755,15 +839,28 @@ async def test_normal_and_recovery_converge_when_selected_run_is_missing() -> No
         recovery_handle = await recovery.recovery.recover_workflow(
             normal_handle.workflow_run_id
         )
-        await asyncio.wait_for(recovery_store.blocked.wait(), timeout=1)
+        await _wait_for_event(
+            recovery_store.blocked,
+            diagnostic=lambda: {
+                "phase": "recovery_run_read",
+                "normal_reads": normal_store.run_reads,
+                "recovery_reads": recovery_store.run_reads,
+            },
+        )
         normal_store.release.set()
         recovery_store.release.set()
-        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "normal_recovery_provider_owner",
+                "calls": completion.calls,
+            },
+        )
         completion.release.set()
 
         normal_result, recovery_result = await asyncio.wait_for(
             asyncio.gather(normal_handle.result(), recovery_handle.result()),
-            timeout=2,
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
         )
         assert normal_result == recovery_result
         assert normal_result.status is WorkflowRunStatus.COMPLETED
@@ -812,7 +909,10 @@ async def test_normal_and_recovery_converge_from_precreated_selected_run() -> No
         if block_once:
             block_once = False
             plan_blocked.set()
-            await release_plan.wait()
+            await _wait_for_event(
+                release_plan,
+                diagnostic=lambda: {"phase": "normal_plan_release"},
+            )
         return await original_plan(run_id)
 
     normal.recovery._service.plan = blocked_plan  # type: ignore[attr-defined,method-assign]
@@ -820,7 +920,10 @@ async def test_normal_and_recovery_converge_from_precreated_selected_run() -> No
     normal_handle = await normal.workflows.start(session.session_id, _workflow_yaml())
     recovery: AgentSDK | None = None
     try:
-        await asyncio.wait_for(plan_blocked.wait(), timeout=1)
+        await _wait_for_event(
+            plan_blocked,
+            diagnostic=lambda: {"phase": "normal_plan_arrival"},
+        )
         selected = await normal.workflows.get(normal_handle.workflow_run_id)
         selected_run_id = selected.nodes[0].run_id
         assert selected_run_id is not None
@@ -831,14 +934,26 @@ async def test_normal_and_recovery_converge_from_precreated_selected_run() -> No
         recovery_handle = await recovery.recovery.recover_workflow(
             normal_handle.workflow_run_id
         )
-        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "precreated_provider_owner",
+                "calls": completion.calls,
+            },
+        )
         release_plan.set()
         completion.release.set()
-        await asyncio.wait_for(projection.both_arrived.wait(), timeout=1)
+        await _wait_for_event(
+            projection.both_arrived,
+            diagnostic=lambda: {
+                "phase": "precreated_projection_arrivals",
+                "arrivals": projection.arrivals,
+            },
+        )
 
         normal_result, recovery_result = await asyncio.wait_for(
             asyncio.gather(normal_handle.result(), recovery_handle.result()),
-            timeout=2,
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
         )
         assert normal_result == recovery_result
         assert normal_result.status is WorkflowRunStatus.COMPLETED
@@ -848,6 +963,7 @@ async def test_normal_and_recovery_converge_from_precreated_selected_run() -> No
     finally:
         release_plan.set()
         completion.release.set()
+        projection.both_arrived.set()
         projection.recovery_committed.set()
         if recovery is not None:
             await recovery.close()
@@ -974,11 +1090,31 @@ async def test_recover_selected_created_run_uses_run_recovery() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_sdks_pending_node_select_one_run_and_converge() -> None:
-    store = _TwoSDKWorkflowRaceStore(block_node_selection=True)
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_pending_node_select_one_run_and_converge(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "pending-node-race.db",
+    )
+    barrier = _ProjectionBarrier()
+    first_store = _ProjectionBarrierStore(
+        first_delegate,
+        barrier,
+        recovery_winner=True,
+        event_type="workflow.node.started",
+    )
+    second_store = _ProjectionBarrierStore(
+        second_delegate,
+        barrier,
+        recovery_winner=False,
+        event_type="workflow.node.started",
+    )
     completion = _CountingCompletion()
-    first, workflow = await _seed_current_workflow(store, completion)  # type: ignore[arg-type]
-    second = AgentSDK.for_test(store=store, acompletion=completion)
+    first, workflow = await _seed_current_workflow(first_store, completion)  # type: ignore[arg-type]
+    second = AgentSDK.for_test(store=second_store, acompletion=completion)
     second.agents.define(AGENT)
     try:
         first_handle, second_handle = await asyncio.gather(
@@ -993,25 +1129,102 @@ async def test_two_sdks_pending_node_select_one_run_and_converge() -> None:
         selected_run_id = first_result.nodes[0].run_id
         assert selected_run_id is not None
         assert second_result.nodes[0].run_id == selected_run_id
-        events = await store.read_events(
+        events = await first_delegate.read_events(
             after_cursor=0,
             session_id=workflow.session_id,
         )
+        assert barrier.arrivals == 2
         assert sum(item.event.type == "workflow.node.started" for item in events) == 1
         assert sum(item.event.type == "run.created" for item in events) == 1
+        assert sum(item.event.type == "session.run.attached" for item in events) == 1
         assert completion.calls == 1
     finally:
+        barrier.both_arrived.set()
+        barrier.recovery_committed.set()
         await asyncio.gather(first.close(), second.close())
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
 
 
 @pytest.mark.asyncio
-async def test_two_sdks_selected_created_run_have_one_lease_owner() -> None:
-    store = _TwoSDKWorkflowRaceStore(block_run_lease=True)
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_selected_missing_run_recreate_exactly_once(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "selected-missing-race.db",
+    )
+    barrier = _ProjectionBarrier()
+    first_store = _ProjectionBarrierStore(
+        first_delegate,
+        barrier,
+        recovery_winner=True,
+        event_type="run.created",
+    )
+    second_store = _ProjectionBarrierStore(
+        second_delegate,
+        barrier,
+        recovery_winner=False,
+        event_type="run.created",
+    )
     completion = _CountingCompletion()
-    first, workflow = await _seed_current_workflow(store, completion)  # type: ignore[arg-type]
-    selected = await _select_root(store, workflow)  # type: ignore[arg-type]
+    first, workflow = await _seed_current_workflow(first_store, completion)  # type: ignore[arg-type]
+    selected = await _select_root(
+        first_store,  # type: ignore[arg-type]
+        workflow,
+        "run_two_sdk_exact_missing",
+    )
+    second = AgentSDK.for_test(store=second_store, acompletion=completion)
+    second.agents.define(AGENT)
+    try:
+        first_handle, second_handle = await asyncio.gather(
+            first.recovery.recover_workflow(workflow.workflow_run_id),
+            second.recovery.recover_workflow(workflow.workflow_run_id),
+        )
+        first_result, second_result = await asyncio.gather(
+            first_handle.result(),
+            second_handle.result(),
+        )
+
+        assert first_result == second_result
+        assert first_result.nodes[0].run_id == "run_two_sdk_exact_missing"
+        assert selected.nodes[0].run_id == "run_two_sdk_exact_missing"
+        assert barrier.arrivals == 2
+        run = await first.runs.get("run_two_sdk_exact_missing")
+        assert run.status is RunStatus.COMPLETED
+        events = await first_delegate.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        assert sum(item.event.type == "run.created" for item in events) == 1
+        assert sum(item.event.type == "session.run.attached" for item in events) == 1
+        assert completion.calls == 1
+    finally:
+        barrier.both_arrived.set()
+        barrier.recovery_committed.set()
+        await asyncio.gather(first.close(), second.close())
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_selected_created_run_have_one_lease_owner(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "selected-created-race.db",
+    )
+    barrier = _LeaseBarrier()
+    first_store = _LeaseBarrierStore(first_delegate, barrier)
+    second_store = _LeaseBarrierStore(second_delegate, barrier)
+    completion = _CountingCompletion()
+    first, workflow = await _seed_current_workflow(first_store, completion)  # type: ignore[arg-type]
+    selected = await _select_root(first_store, workflow)  # type: ignore[arg-type]
     created = await _create_selected_run(first, selected)
-    second = AgentSDK.for_test(store=store, acompletion=completion)
+    second = AgentSDK.for_test(store=second_store, acompletion=completion)
     second.agents.define(AGENT)
     try:
         first_handle, second_handle = await asyncio.gather(
@@ -1025,15 +1238,282 @@ async def test_two_sdks_selected_created_run_have_one_lease_owner() -> None:
 
         assert first_result.nodes[0].run_id == created.run_id
         assert second_result.nodes[0].run_id == created.run_id
-        assert store.run_lease_arrivals == 2
-        events = await store.read_events(
+        assert barrier.arrivals == 2
+        events = await first_delegate.read_events(
             after_cursor=0,
             session_id=workflow.session_id,
         )
         assert sum(item.event.type == "run.created" for item in events) == 1
         assert completion.calls == 1
     finally:
+        barrier.ready.set()
         await asyncio.gather(first.close(), second.close())
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_follow_live_selected_run_owner_without_failure(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_store, second_store, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "selected-live-owner.db",
+    )
+    completion = _CountingCompletion(block=True)
+    first, workflow = await _seed_current_workflow(first_store, completion)
+    selected = await _select_root(first_store, workflow)
+    created = await _create_selected_run(first, selected)
+    second = AgentSDK.for_test(store=second_store, acompletion=completion)
+    second.agents.define(AGENT)
+    first_handle = await first.recovery.recover_workflow(workflow.workflow_run_id)
+    try:
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "live_run_owner",
+                "provider_calls": completion.calls,
+                "run_id": created.run_id,
+            },
+        )
+        live = await first.runs.get(created.run_id)
+        lease = await first_store.get_run_lease(created.run_id)
+        assert live.status is RunStatus.RUNNING
+        assert lease is not None
+        second_handle = await second.recovery.recover_workflow(
+            workflow.workflow_run_id
+        )
+        completion.release.set()
+        first_result, second_result = await asyncio.wait_for(
+            asyncio.gather(first_handle.result(), second_handle.result()),
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+
+        assert first_result == second_result
+        assert first_result.nodes[0].run_id == created.run_id
+        assert completion.calls == 1
+        events = await first_store.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        assert not any(
+            item.event.type in {"workflow.node.failed", "workflow.failed"}
+            for item in events
+        )
+    finally:
+        completion.release.set()
+        await asyncio.gather(first.close(), second.close())
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_expired_unreconciled_run_stays_active_and_bounded(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "expired-unreconciled.db",
+    )
+    barrier = _LeaseBarrier()
+    first_store = _LeaseBarrierStore(first_delegate, barrier)
+    second_store = _LeaseBarrierStore(second_delegate, barrier)
+    completion = _CountingCompletion()
+    first: AgentSDK | None = None
+    second: AgentSDK | None = None
+    try:
+        first, workflow = await _seed_current_workflow(  # type: ignore[arg-type]
+            first_store,
+            completion,
+        )
+        selected = await _select_root(first_store, workflow)  # type: ignore[arg-type]
+        created = await _create_selected_run(first, selected)
+        interrupted = created.model_copy(
+            update={"status": RunStatus.INTERRUPTED, "version": 3}
+        )
+        await first_delegate.commit(
+            CommitBatch(
+                events=(),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        interrupted.run_id,
+                        interrupted.session_id,
+                        interrupted.version,
+                        interrupted.model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+        second = AgentSDK.for_test(store=second_store, acompletion=completion)
+        second.agents.define(AGENT)
+        first_handle, second_handle = await asyncio.gather(
+            first.recovery.recover_workflow(workflow.workflow_run_id),
+            second.recovery.recover_workflow(workflow.workflow_run_id),
+        )
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                first_handle.result(),
+                second_handle.result(),
+                return_exceptions=True,
+            ),
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+
+        assert barrier.arrivals == 2
+        assert len(outcomes) == 2
+        for outcome in outcomes:
+            assert isinstance(outcome, AgentSDKError)
+            assert outcome.code is ErrorCode.CONFLICT
+            assert outcome.message == "recovery required"
+            assert outcome.retryable is True
+        durable_run = await first.runs.get(created.run_id)
+        durable_workflow = await first.workflows.get(workflow.workflow_run_id)
+        session = await first.sessions.get(workflow.session_id)
+        assert durable_run.status is RunStatus.WAITING_RECONCILIATION
+        assert durable_workflow.status is WorkflowRunStatus.RUNNING
+        assert durable_workflow.nodes[0].status is WorkflowNodeStatus.RUNNING
+        assert created.run_id in session.active_run_ids
+        assert workflow.workflow_run_id in session.active_workflow_run_ids
+        assert completion.calls == 0
+        events = await first_delegate.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        assert not any(
+            item.event.type
+            in {
+                "run.completed",
+                "run.failed",
+                "workflow.node.completed",
+                "workflow.node.failed",
+                "workflow.completed",
+                "workflow.failed",
+            }
+            for item in events
+        )
+    finally:
+        barrier.ready.set()
+        await asyncio.gather(
+            *(sdk.close() for sdk in (first, second) if sdk is not None)
+        )
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_two_sdks_delete_winner_prevents_all_recovery_resurrection(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
+        backend,
+        tmp_path / "workflow-delete-race.db",
+    )
+    barrier = _DeletionBarrier()
+    first_store = _DeletionBarrierStore(first_delegate, barrier)
+    second_store = _DeletionBarrierStore(second_delegate, barrier)
+    completion = _CountingCompletion()
+    first: AgentSDK | None = None
+    second: AgentSDK | None = None
+    workflow: Any = None
+    try:
+        first = AgentSDK.for_test(store=first_store, acompletion=completion)
+        first.agents.define(AGENT)
+        session = await first.sessions.create(workspaces=[])
+        workflow_ir = WorkflowCompiler().compile_yaml(_workflow_yaml())
+        descriptor = (
+            first.workflows._executor._workflow_execution_descriptor(  # type: ignore[attr-defined]
+                workflow_ir
+            )
+        )
+        workflow = (
+            await WorkflowState(first_store).create(
+                session.session_id,
+                workflow_ir,
+                execution_descriptor=descriptor,
+                idempotency_key="phase4-delete-race",
+            )
+        ).value
+        second = AgentSDK.for_test(store=second_store, acompletion=completion)
+        second.agents.define(AGENT)
+        first_handle, second_handle = await asyncio.gather(
+            first.recovery.recover_workflow(workflow.workflow_run_id),
+            second.recovery.recover_workflow(workflow.workflow_run_id),
+        )
+        await _wait_for_event(
+            barrier.ready,
+            diagnostic=lambda: {
+                "phase": "delete_race_arrivals",
+                "arrivals": barrier.arrivals,
+                "selected_run_ids": tuple(barrier.selected_run_ids),
+            },
+        )
+        assert barrier.arrivals == 2
+        await first_delegate.delete_session(session.session_id)
+        barrier.release.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                first_handle.result(),
+                second_handle.result(),
+                return_exceptions=True,
+            ),
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
+        )
+
+        assert len(outcomes) == 2
+        for outcome in outcomes:
+            assert isinstance(outcome, AgentSDKError)
+            assert outcome.code is ErrorCode.NOT_FOUND
+        assert await first_delegate.get_snapshot("session", session.session_id) is None
+        assert (
+            await first_delegate.get_snapshot(
+                "workflow",
+                workflow.workflow_run_id,
+            )
+            is None
+        )
+        for node in workflow.nodes:
+            assert (
+                await first_delegate.get_snapshot("workflow_node", node.entity_id)
+                is None
+            )
+        assert len(barrier.selected_run_ids) == 2
+        for run_id in barrier.selected_run_ids:
+            assert await first_delegate.get_snapshot("run", run_id) is None
+            assert await first_delegate.get_run_lease(run_id) is None
+            assert await first_delegate.get_run_checkpoint(run_id) is None
+            assert (
+                await first_delegate.list_unresolved_external_operations(run_id)
+                == ()
+            )
+            assert (
+                await first_delegate.list_pending_reconciliation_requests(run_id)
+                == ()
+            )
+        assert await first_delegate.read_events(after_cursor=0) == []
+        assert (
+            await first_delegate.get_idempotency(
+                f"session/{session.session_id}/workflow.start",
+                "phase4-delete-race",
+            )
+            is None
+        )
+        assert completion.calls == 0
+        await asyncio.sleep(0)
+        assert first.workflows._executor._active == {}  # type: ignore[attr-defined]
+        assert second.workflows._executor._active == {}  # type: ignore[attr-defined]
+        assert first.recovery._tasks == {}  # type: ignore[attr-defined]
+        assert second.recovery._tasks == {}  # type: ignore[attr-defined]
+    finally:
+        barrier.release.set()
+        barrier.ready.set()
+        await asyncio.gather(
+            *(sdk.close() for sdk in (first, second) if sdk is not None)
+        )
+        await asyncio.gather(*(store.close() for store in sqlite_stores))
 
 
 @pytest.mark.asyncio
@@ -1096,6 +1576,8 @@ async def test_two_sdks_terminal_run_project_node_once(
         assert sum(item.event.type == "workflow.completed" for item in events) == 1
         assert completion.calls == 1
     finally:
+        barrier.both_arrived.set()
+        barrier.recovery_committed.set()
         await asyncio.gather(first.close(), second.close())
         if sqlite_stores is not None:
             await asyncio.gather(*(store.close() for store in sqlite_stores))
@@ -1167,6 +1649,8 @@ async def test_two_sdks_terminal_node_project_workflow_once(
         ) == 1
         assert completion.calls == 1
     finally:
+        barrier.both_arrived.set()
+        barrier.recovery_committed.set()
         await asyncio.gather(first.close(), second.close())
         if sqlite_stores is not None:
             await asyncio.gather(*(store.close() for store in sqlite_stores))
@@ -1243,6 +1727,7 @@ async def test_two_sdks_provider_tool_provider_side_effects_execute_once(
         assert completion.calls == 2
         assert handler_calls in [[("first", 7)], [("second", 7)]]
     finally:
+        lease_barrier.ready.set()
         await asyncio.gather(first.close(), second.close())
         await asyncio.gather(*(store.close() for store in sqlite_stores))
 
@@ -1309,6 +1794,7 @@ async def test_two_sdks_mcp_backed_tool_transport_executes_once(
         assert completion.calls == 2
         assert transport_calls == [("echo", {"value": 7})]
     finally:
+        lease_barrier.ready.set()
         await asyncio.gather(first_manager.close(), second_manager.close())
         await asyncio.gather(first.close(), second.close())
         await asyncio.gather(*(store.close() for store in sqlite_stores))
@@ -1373,9 +1859,15 @@ async def test_two_sdks_permission_ask_has_one_request_decision_and_tool_call(
         ]
         done, pending = await asyncio.wait(
             permission_tasks,
-            timeout=1,
+            timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
             return_when=asyncio.FIRST_COMPLETED,
         )
+        if not done:
+            durable = await first.runs.get(created.run_id)
+            raise AssertionError(
+                "permission owner timeout: "
+                f"lease_arrivals={lease_barrier.arrivals}, run={durable!r}"
+            )
         assert len(done) == 1
         request_task = done.pop()
         request = request_task.result()
@@ -1404,6 +1896,7 @@ async def test_two_sdks_permission_ask_has_one_request_decision_and_tool_call(
         assert sum(item.event.type == "permission.requested" for item in events) == 1
         assert sum(item.event.type == "permission.resolved" for item in events) == 1
     finally:
+        lease_barrier.ready.set()
         for task in permission_tasks:
             task.cancel()
         await asyncio.gather(*permission_tasks, return_exceptions=True)
@@ -1474,23 +1967,109 @@ async def test_workflow_recovery_reuses_ambiguous_durable_commit(
         crashing_store,
         completion,
     )
-    first_handle = await first.recovery.recover_workflow(workflow.workflow_run_id)
-    if run_progress:
-        assert (await first_handle.result()).status is WorkflowRunStatus.COMPLETED
-    else:
-        with pytest.raises(asyncio.CancelledError):
-            await first_handle.result()
-    assert crashing_store.fired is True
-    await first.close()
-
-    if backend == "sqlite":
-        await raw_store.close()
-        recovered_store: Any = await SQLiteStore.open(database)
-    else:
-        recovered_store = raw_store
-    reopened = AgentSDK.for_test(store=recovered_store, acompletion=completion)
-    reopened.agents.define(AGENT)
+    recovered_store: Any = None
+    reopened: AgentSDK | None = None
     try:
+        first_handle = await first.recovery.recover_workflow(
+            workflow.workflow_run_id
+        )
+        if run_progress:
+            assert (
+                await first_handle.result()
+            ).status is WorkflowRunStatus.COMPLETED
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await first_handle.result()
+        assert crashing_store.fired is True
+
+        committed = await first.workflows.get(workflow.workflow_run_id)
+        committed_session = await first.sessions.get(workflow.session_id)
+        committed_events = await raw_store.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        selected_run_id = committed.nodes[0].run_id
+        assert selected_run_id is not None
+        started_events = [
+            item.event
+            for item in committed_events
+            if item.event.type == "workflow.node.started"
+        ]
+        assert len(started_events) == 1
+        assert started_events[0].payload["run_id"] == selected_run_id
+        assert committed.nodes[0].run_id == selected_run_id
+
+        if event_type == "workflow.node.started":
+            assert committed.status is WorkflowRunStatus.RUNNING
+            assert committed.nodes[0].status is WorkflowNodeStatus.RUNNING
+            assert (
+                await raw_store.get_snapshot("run", selected_run_id)
+                is None
+            )
+            assert committed_session.active_run_ids == ()
+            assert workflow.workflow_run_id in (
+                committed_session.active_workflow_run_ids
+            )
+        elif event_type == "run.created":
+            created = await first.runs.get(selected_run_id)
+            assert created.status is RunStatus.CREATED
+            assert created.workflow_run_id == workflow.workflow_run_id
+            assert created.workflow_node_id == committed.nodes[0].node_id
+            assert committed.nodes[0].status is WorkflowNodeStatus.RUNNING
+            assert committed_session.active_run_ids == (selected_run_id,)
+            assert sum(
+                item.event.type == "run.created" for item in committed_events
+            ) == 1
+            assert sum(
+                item.event.type == "session.run.attached"
+                for item in committed_events
+            ) == 1
+        elif event_type in {"workflow.node.completed", "workflow.node.failed"}:
+            expected_node_status = (
+                WorkflowNodeStatus.FAILED
+                if provider_fails
+                else WorkflowNodeStatus.COMPLETED
+            )
+            assert committed.status is WorkflowRunStatus.RUNNING
+            assert committed.nodes[0].status is expected_node_status
+            assert committed_session.active_run_ids == ()
+            assert committed_session.active_workflow_run_ids == (
+                workflow.workflow_run_id,
+            )
+            node_write = await raw_store.get_snapshot(
+                "workflow_node",
+                committed.nodes[0].entity_id,
+            )
+            assert node_write is not None
+            assert node_write == committed.nodes[0].model_dump(mode="json")
+        else:
+            expected_status = (
+                WorkflowRunStatus.FAILED
+                if provider_fails
+                else WorkflowRunStatus.COMPLETED
+            )
+            assert committed.status is expected_status
+            assert committed_session.status is SessionStatus.ACTIVE
+            assert committed_session.active_run_ids == ()
+            assert committed_session.active_workflow_run_ids == ()
+            assert sum(
+                item.event.type == "session.workflow.detached"
+                for item in committed_events
+            ) == 1
+
+        await first.close()
+        first = None  # type: ignore[assignment]
+        if backend == "sqlite":
+            await raw_store.close()
+            raw_store = None
+            recovered_store = await SQLiteStore.open(database)
+        else:
+            recovered_store = crashing_store.delegate
+        reopened = AgentSDK.for_test(
+            store=recovered_store,
+            acompletion=completion,
+        )
+        reopened.agents.define(AGENT)
         recovered_handle = await reopened.recovery.recover_workflow(
             workflow.workflow_run_id
         )
@@ -1503,15 +2082,131 @@ async def test_workflow_recovery_reuses_ambiguous_durable_commit(
             recovered_result = await recovered_handle.result()
             assert recovered_result.status is WorkflowRunStatus.COMPLETED
 
+        recovered = await reopened.workflows.get(workflow.workflow_run_id)
+        selected_run_id = recovered.nodes[0].run_id
+        assert selected_run_id is not None
+        recovered_run = await reopened.runs.get(selected_run_id)
+        recovered_session = await reopened.sessions.get(workflow.session_id)
+        expected_run_status = (
+            RunStatus.FAILED if provider_fails else RunStatus.COMPLETED
+        )
+        expected_node_status = (
+            WorkflowNodeStatus.FAILED
+            if provider_fails
+            else WorkflowNodeStatus.COMPLETED
+        )
+        expected_workflow_status = (
+            WorkflowRunStatus.FAILED
+            if provider_fails
+            else WorkflowRunStatus.COMPLETED
+        )
+        assert recovered_run.status is expected_run_status
+        assert recovered_run.workflow_run_id == recovered.workflow_run_id
+        assert recovered_run.workflow_node_id == recovered.nodes[0].node_id
+        assert recovered.nodes[0].run_id == recovered_run.run_id
+        assert recovered.nodes[0].status is expected_node_status
+        assert recovered.status is expected_workflow_status
+        assert recovered_session.status is SessionStatus.ACTIVE
+        assert recovered_session.active_run_ids == ()
+        assert recovered_session.active_workflow_run_ids == ()
+        node_write = await recovered_store.get_snapshot(
+            "workflow_node",
+            recovered.nodes[0].entity_id,
+        )
+        assert node_write is not None
+        assert node_write == recovered.nodes[0].model_dump(mode="json")
+
         events = await recovered_store.read_events(
             after_cursor=0,
             session_id=workflow.session_id,
         )
         assert sum(item.event.type == event_type for item in events) == 1
+        assert sum(
+            item.event.type == "session.workflow.attached" for item in events
+        ) == 1
+        assert sum(
+            item.event.type == "workflow.node.started" for item in events
+        ) == 1
+        assert sum(item.event.type == "run.created" for item in events) == 1
+        assert sum(
+            item.event.type == "session.run.attached" for item in events
+        ) == 1
+        assert sum(
+            item.event.type
+            == ("run.failed" if provider_fails else "run.completed")
+            for item in events
+        ) == 1
+        assert sum(
+            item.event.type == "session.run.detached" for item in events
+        ) == 1
+        assert sum(
+            item.event.type
+            == (
+                "workflow.node.failed"
+                if provider_fails
+                else "workflow.node.completed"
+            )
+            for item in events
+        ) == 1
+        assert sum(
+            item.event.type
+            == ("workflow.failed" if provider_fails else "workflow.completed")
+            for item in events
+        ) == 1
+        assert sum(
+            item.event.type == "session.workflow.detached" for item in events
+        ) == 1
+        assert (
+            await recovered_store.list_unresolved_external_operations(
+                selected_run_id
+            )
+            == ()
+        )
+        terminal_checkpoint = await recovered_store.get_run_checkpoint(
+            selected_run_id
+        )
+        assert terminal_checkpoint is not None
+        assert terminal_checkpoint.run_id == selected_run_id
+        assert terminal_checkpoint.phase is RunCheckpointPhase.TERMINAL
+        assert (
+            await recovered_store.list_pending_reconciliation_requests(
+                selected_run_id
+            )
+            == ()
+        )
+
+        repeated_handle = await reopened.recovery.recover_workflow(
+            workflow.workflow_run_id
+        )
+        if provider_fails:
+            with pytest.raises(AgentSDKError):
+                await repeated_handle.result()
+        else:
+            repeated = await repeated_handle.result()
+            assert repeated.workflow_run_id == recovered.workflow_run_id
+            assert repeated.status is recovered.status
+            assert repeated.nodes == recovered.nodes
+            assert repeated.output_text == recovered.output_text
+            assert repeated.usage == recovered.usage
+        assert await reopened.sessions.get(workflow.session_id) == recovered_session
+        assert await reopened.workflows.get(workflow.workflow_run_id) == recovered
+        repeated_events = await recovered_store.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        assert repeated_events == events
         assert completion.calls == 1
+        await asyncio.sleep(0)
+        assert reopened.workflows._executor._active == {}  # type: ignore[attr-defined]
+        assert reopened.recovery._tasks == {}  # type: ignore[attr-defined]
     finally:
-        await reopened.close()
-        if backend == "sqlite":
+        if first is not None:
+            await first.close()
+        if reopened is not None:
+            await reopened.close()
+        if backend == "sqlite" and raw_store is not None:
+            await raw_store.close()
+        if backend == "sqlite" and recovered_store is not None:
             await recovered_store.close()
 
 
@@ -1719,13 +2414,19 @@ async def test_sdk_close_settles_workflow_recovery_before_rejecting_new_work() -
     selected = await _select_root(store, workflow)
     created = await _create_selected_run(sdk, selected)
     handle = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
-    await asyncio.wait_for(completion.started.wait(), timeout=1)
+    await _wait_for_event(
+        completion.started,
+        diagnostic=lambda: {
+            "phase": "sdk_close_provider_owner",
+            "calls": completion.calls,
+        },
+    )
     closing = asyncio.create_task(sdk.close())
     try:
         await asyncio.sleep(0)
         assert closing.done() is False
         completion.release.set()
-        await asyncio.wait_for(closing, timeout=2)
+        await asyncio.wait_for(closing, timeout=_DIAGNOSTIC_TIMEOUT_SECONDS)
 
         result = await handle.result()
         assert result.status is WorkflowRunStatus.COMPLETED
@@ -2308,7 +3009,13 @@ async def test_same_sdk_recovery_calls_attach_once_and_caller_cancel_is_shielded
         handles = await asyncio.gather(
             *(sdk.recovery.recover_workflow(workflow.workflow_run_id) for _ in range(20))
         )
-        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "same_sdk_provider_owner",
+                "calls": completion.calls,
+            },
+        )
         tasks = {id(handle._task) for handle in handles}  # type: ignore[attr-defined]
         assert len(tasks) == 1
 
@@ -2347,7 +3054,10 @@ async def test_cancelled_recovery_admission_still_registers_one_coordinator() ->
         if block_once:
             block_once = False
             blocked.set()
-            await release.wait()
+            await _wait_for_event(
+                release,
+                diagnostic=lambda: {"phase": "cancelled_admission_release"},
+            )
         return await original_load(workflow_run_id)
 
     executor._state.load = blocked_load
@@ -2355,7 +3065,10 @@ async def test_cancelled_recovery_admission_still_registers_one_coordinator() ->
         sdk.recovery.recover_workflow(workflow.workflow_run_id)
     )
     try:
-        await asyncio.wait_for(blocked.wait(), timeout=1)
+        await _wait_for_event(
+            blocked,
+            diagnostic=lambda: {"phase": "cancelled_admission_arrival"},
+        )
         caller.cancel()
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -2363,7 +3076,13 @@ async def test_cancelled_recovery_admission_still_registers_one_coordinator() ->
 
         executor._state.load = original_load
         attached = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
-        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "cancelled_admission_provider_owner",
+                "calls": completion.calls,
+            },
+        )
         assert attached.attached is True
         assert len(executor._active) == 1
         completion.release.set()
@@ -2386,7 +3105,13 @@ async def test_recovery_attaches_same_sdk_live_normal_workflow() -> None:
     session = await sdk.sessions.create(workspaces=[])
     normal = await sdk.workflows.start(session.session_id, _workflow_yaml())
     try:
-        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "same_sdk_live_provider_owner",
+                "calls": completion.calls,
+            },
+        )
         recovered = await sdk.recovery.recover_workflow(normal.workflow_run_id)
 
         assert recovered._task is normal._task  # type: ignore[attr-defined]

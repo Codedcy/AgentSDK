@@ -723,7 +723,7 @@ class RecoveryAPI:
         async with self._lifecycle.admit():
             startup, _created = await self._ensure_startup_scan()
             await asyncio.shield(startup)
-            return await self._workflows.recover(
+            return await self._workflows._recover(
                 workflow_run_id,
                 self._recover_run_handle,
             )
