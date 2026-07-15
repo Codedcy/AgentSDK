@@ -143,6 +143,25 @@ class _RecoveryAuditFaultStore(InMemoryStore):
         await super().assert_current_lease(lease, now=now)
 
 
+class _ProviderLeaseAssertBarrier:
+    def __init__(self, delegate: Any, *, target: int) -> None:
+        self._delegate = delegate
+        self._target = target
+        self.calls = 0
+        self.reached = asyncio.Event()
+        self.release_gate = asyncio.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def assert_current(self, lease: Lease, *, now: datetime) -> None:
+        self.calls += 1
+        if self.calls == self._target:
+            self.reached.set()
+            await self.release_gate.wait()
+        await self._delegate.assert_current(lease, now=now)
+
+
 async def _unused_acompletion(**kwargs: object) -> Any:
     raise AssertionError(f"provider recovery called LiteLLM: {sorted(kwargs)}")
 
@@ -2911,6 +2930,134 @@ async def test_sdk_close_cancels_adapter_and_leaves_same_operation_recoverable(
     assert calls == 1
     assert side_effect_operation_ids == {operation_id}
     assert result.output_text == "retried-query"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    ("callback_boundary", "registry_change"),
+    [
+        ("query", "unregister"),
+        ("query", "same_metadata"),
+        ("query", "version"),
+        ("query", "adapter_id"),
+        ("query", "certification"),
+        ("resend", "same_metadata"),
+    ],
+)
+async def test_provider_registry_change_at_final_callback_preflight_reconciles_once(
+    backend: str,
+    callback_boundary: str,
+    registry_change: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"provider-final-preflight-{callback_boundary}-{registry_change}.db"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    metadata = {
+        "adapter_id": "application.adapter",
+        "adapter_version": "1",
+        "authoritative_status": True,
+        "same_operation_id_resend": True,
+    }
+    spec, run_id, operation_id, _request = await _seed_model_in_flight(
+        store,
+        metadata=metadata,
+    )
+    query_calls = 0
+    resend_calls = 0
+    replacement_calls = 0
+
+    async def query(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        assert request.operation_id == operation_id
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.NOT_EXECUTED
+        )
+
+    async def resend(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError(f"stale resend reached provider: {request.operation_id}")
+
+    async def replacement_callback(
+        request: ProviderRecoveryRequest,
+    ) -> ProviderRecoveryResult:
+        nonlocal replacement_calls
+        replacement_calls += 1
+        raise AssertionError(
+            f"replacement adapter reached provider: {request.operation_id}"
+        )
+
+    initial = _adapter(query, resend)
+    owner = await _sdk(store, spec, initial)
+    follower = await _sdk(store, spec, initial)
+    service = owner.recovery._service  # type: ignore[attr-defined]
+    barrier = _ProviderLeaseAssertBarrier(
+        service._leases,
+        target=1 if callback_boundary == "query" else 2,
+    )
+    service._leases = barrier
+    owner_handle = await owner.recovery.recover_run(run_id)
+    owner_result = asyncio.create_task(owner_handle.result())
+    await asyncio.wait_for(barrier.reached.wait(), timeout=2)
+    follower_handle = await follower.recovery.recover_run(run_id)
+    follower_result = asyncio.create_task(follower_handle.result())
+    await asyncio.sleep(0)
+
+    registered = owner.recovery.get_adapter("provider/model")
+    assert owner.recovery.unregister_adapter(
+        "provider/model",
+        expected=registered,
+    )
+    if registry_change != "unregister":
+        replacement = ProviderRecoveryAdapter(
+            provider_identity="provider/model",
+            adapter_id=(
+                "replacement.adapter"
+                if registry_change == "adapter_id"
+                else "application.adapter"
+            ),
+            version="2" if registry_change == "version" else "1",
+            authoritative_status=registry_change != "certification",
+            same_operation_id_resend=True,
+            query_status=(
+                None if registry_change == "certification" else replacement_callback
+            ),
+            resend=replacement_callback,
+        )
+        owner.recovery.register_adapter(replacement)
+    barrier.release_gate.set()
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await owner_result
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await follower_result
+        assert query_calls == (1 if callback_boundary == "resend" else 0)
+        assert resend_calls == 0
+        assert replacement_calls == 0
+        pending = await owner.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].operation_id == operation_id
+        assert pending[0].reason == "recovery_state_invalid"
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        assert sum(event.type == "reconciliation.requested" for event in events) == 1
+        assert sum(event.type == "model.recovery.query.started" for event in events) == 1
+        assert sum(event.type == "model.recovery.resend.started" for event in events) == (
+            1 if callback_boundary == "resend" else 0
+        )
+    finally:
+        barrier.release_gate.set()
+        await owner.close()
+        await follower.close()
+        if backend == "sqlite":
+            await store.close()
 
 
 @pytest.mark.asyncio

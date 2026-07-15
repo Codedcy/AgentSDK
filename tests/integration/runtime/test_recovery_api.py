@@ -13,9 +13,13 @@ import pytest
 from agent_sdk.api import AgentSDK
 from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.models.litellm_gateway import ModelRequest
+from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
 from agent_sdk.permissions.models import PermissionDecision
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.engine import (
+    _model_request_fingerprint,
+    _tool_request_fingerprint,
+)
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
@@ -432,6 +436,21 @@ async def _seed_ready_tool_interrupted(
         output_parts=("draft ",),
         usage=checkpoint_usage,
     )
+    model_request = ModelRequest(
+        model=spec.model,
+        messages=({"role": "user", "content": "resume me"},),
+        tools=(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_spec.name,
+                    "description": tool_spec.description,
+                    "parameters": tool_spec.model_dump(mode="json")["input_schema"],
+                },
+            },
+        ),
+        params=dict(spec.model_params),
+    )
     now = datetime(2026, 7, 15, 12, tzinfo=UTC)
     lease = await store.acquire_lease(
         run_id=run_id,
@@ -448,7 +467,7 @@ async def _seed_ready_tool_interrupted(
                 session_id=running.session_id,
                 run_id=run_id,
                 turn=0,
-                request_fingerprint=f"sha256:ready-tool-{index}",
+                request_fingerprint=_model_request_fingerprint(model_request),
                 lease_generation=lease.generation,
                 status=ExternalOperationStatus.STARTED,
                 provider_identity=spec.model,
@@ -470,40 +489,46 @@ async def _seed_ready_tool_interrupted(
                 lease=lease,
                 now=now,
             )
+            event_specs: tuple[tuple[str, dict[str, object]], ...] = (
+                ("step.started", {}),
+                ("model.call.started", {"model": spec.model}),
+                ("model.text.delta", {"text": operation_text}),
+                (
+                    "model.usage.reported",
+                    operation_usage.model_dump(mode="json"),
+                ),
+                (
+                    "model.call.failed"
+                    if status is ExternalOperationStatus.FAILED
+                    else "model.call.completed",
+                    (
+                        {
+                            "error": {
+                                "code": "internal",
+                                "message": "model call failed",
+                            }
+                        }
+                        if status is ExternalOperationStatus.FAILED
+                        else {
+                            "finish_reason": (
+                                "different-finish-reason"
+                                if relation_invalidity == "completed_event"
+                                else "tool_calls"
+                            )
+                        }
+                    ),
+                ),
+            )
             event_sequence = 3 + len(model_events)
-            model_events.append(
+            model_events.extend(
                 EventEnvelope.new(
-                    type="model.call.started",
+                    type=event_type,
                     session_id=running.session_id,
                     run_id=run_id,
-                    sequence=event_sequence,
-                    payload={"model": spec.model},
+                    sequence=event_sequence + offset,
+                    payload=payload,
                 )
-            )
-            terminal_type = (
-                "model.call.failed"
-                if status is ExternalOperationStatus.FAILED
-                else "model.call.completed"
-            )
-            terminal_payload: dict[str, object] = (
-                {"error": {"code": "internal", "message": "model call failed"}}
-                if status is ExternalOperationStatus.FAILED
-                else {
-                    "finish_reason": (
-                        "different-finish-reason"
-                        if relation_invalidity == "completed_event"
-                        else "tool_calls"
-                    )
-                }
-            )
-            model_events.append(
-                EventEnvelope.new(
-                    type=terminal_type,
-                    session_id=running.session_id,
-                    run_id=run_id,
-                    sequence=event_sequence + 1,
-                    payload=terminal_payload,
-                )
+                for offset, (event_type, payload) in enumerate(event_specs)
             )
     if relation_invalidity == "event_tail":
         model_events.append(
@@ -538,6 +563,393 @@ async def _seed_ready_tool_interrupted(
                     "run",
                     interrupted.run_id,
                     interrupted.session_id,
+                    interrupted.version,
+                    interrupted.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    return run_id, checkpoint
+
+
+async def _seed_multi_turn_ready_tool_interrupted(
+    store: Any,
+    spec: AgentSpec,
+    tool_spec: ToolSpec,
+    *,
+    relation_invalidity: str | None = None,
+) -> tuple[str, RunCheckpoint]:
+    run_id = await _seed_pristine_current_run(
+        store,
+        spec,
+        tool_specs=(tool_spec,),
+        permission_default="allow",
+    )
+    run_data = await store.get_snapshot("run", run_id)
+    assert run_data is not None
+    created = RunSnapshot.model_validate(run_data)
+    running = created.model_copy(update={"status": RunStatus.RUNNING, "version": 2})
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="run.started",
+                    session_id=running.session_id,
+                    run_id=run_id,
+                    sequence=2,
+                    payload={"status": "running"},
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run_id,
+                    running.session_id,
+                    running.version,
+                    running.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+    tool_schema = (
+        {
+            "type": "function",
+            "function": {
+                "name": tool_spec.name,
+                "description": tool_spec.description,
+                "parameters": tool_spec.model_dump(mode="json")["input_schema"],
+            },
+        },
+    )
+    initial_messages: tuple[dict[str, object], ...] = (
+        {"role": "user", "content": "resume me"},
+    )
+    historical_text = "historical "
+    pending_text = "pending "
+    historical_usage = TokenUsage(
+        prompt_tokens=2,
+        completion_tokens=1,
+        total_tokens=3,
+    )
+    pending_usage = TokenUsage(
+        prompt_tokens=3,
+        completion_tokens=1,
+        total_tokens=4,
+    )
+    historical_call = ToolCallCompleted(
+        index=0,
+        call_id="call_historical",
+        name=tool_spec.name,
+        arguments_json='{"query":"historical"}',
+    )
+    pending_call = ToolCallCompleted(
+        index=0,
+        call_id="call_pending",
+        name=tool_spec.name,
+        arguments_json='{"query":"pending"}',
+    )
+    historical_result = ToolResult.succeeded(
+        historical_call.call_id,
+        historical_call.name,
+        {"answer": "historical"},
+    )
+    historical_assistant = {
+        "role": "assistant",
+        "content": historical_text,
+        "tool_calls": [
+            {
+                "id": historical_call.call_id,
+                "type": "function",
+                "function": {
+                    "name": historical_call.name,
+                    "arguments": historical_call.arguments_json,
+                },
+            }
+        ],
+    }
+    historical_tool_message = {
+        "role": "tool",
+        "tool_call_id": historical_call.call_id,
+        "name": historical_call.name,
+        "content": historical_result.content,
+    }
+    pending_assistant = {
+        "role": "assistant",
+        "content": pending_text,
+        "tool_calls": [
+            {
+                "id": pending_call.call_id,
+                "type": "function",
+                "function": {
+                    "name": pending_call.name,
+                    "arguments": pending_call.arguments_json,
+                },
+            }
+        ],
+    }
+    turn_one_messages = (
+        *initial_messages,
+        historical_assistant,
+        historical_tool_message,
+    )
+    historical_request = ModelRequest(
+        model=spec.model,
+        messages=initial_messages,
+        tools=tool_schema,
+        params=dict(spec.model_params),
+    )
+    pending_request = ModelRequest(
+        model=spec.model,
+        messages=turn_one_messages,
+        tools=tool_schema,
+        params=dict(spec.model_params),
+    )
+    historical_fingerprint = _model_request_fingerprint(historical_request)
+    pending_fingerprint = _model_request_fingerprint(pending_request)
+    if relation_invalidity == "historical_request_fingerprint":
+        historical_fingerprint = "0" * 64
+    elif relation_invalidity == "historical_wrong_turn_request":
+        historical_fingerprint = pending_fingerprint
+
+    historical_outcome_call = {
+        "index": historical_call.index,
+        "call_id": historical_call.call_id,
+        "name": historical_call.name,
+        "arguments_json": historical_call.arguments_json,
+    }
+    if relation_invalidity == "historical_outcome_call":
+        historical_outcome_call["arguments_json"] = '{"query":"forged"}'
+    historical_operation_usage = historical_usage
+    pending_operation_usage = pending_usage
+    if relation_invalidity == "usage_distribution":
+        historical_operation_usage = TokenUsage(
+            prompt_tokens=3,
+            completion_tokens=1,
+            total_tokens=4,
+        )
+        pending_operation_usage = TokenUsage(
+            prompt_tokens=2,
+            completion_tokens=1,
+            total_tokens=3,
+        )
+    historical_outcome = {
+        "finish_reason": "tool_calls",
+        "text": (
+            "forged historical "
+            if relation_invalidity == "historical_outcome_text"
+            else historical_text
+        ),
+        "tool_calls": [historical_outcome_call],
+        "usage": historical_operation_usage.model_dump(mode="json"),
+    }
+    pending_outcome = {
+        "finish_reason": "tool_calls",
+        "text": pending_text,
+        "tool_calls": [
+            {
+                "index": pending_call.index,
+                "call_id": pending_call.call_id,
+                "name": pending_call.name,
+                "arguments_json": pending_call.arguments_json,
+            }
+        ],
+        "usage": pending_operation_usage.model_dump(mode="json"),
+    }
+
+    now = datetime(2026, 7, 16, 9, tzinfo=UTC)
+    lease = await store.acquire_lease(
+        run_id=run_id,
+        owner="crashed-owner",
+        now=now,
+        expires_at=now + timedelta(seconds=30),
+    )
+    historical_model = ModelCallOperation(
+        operation_id="op_ready_tool_model_historical",
+        session_id=running.session_id,
+        run_id=run_id,
+        turn=0,
+        request_fingerprint=historical_fingerprint,
+        lease_generation=lease.generation,
+        status=ExternalOperationStatus.STARTED,
+        provider_identity=spec.model,
+        recovery_metadata={
+            "authoritative_status": False,
+            "same_operation_id_resend": False,
+        },
+    )
+    await store.create_external_operation(historical_model, lease=lease, now=now)
+    await store.transition_external_operation(
+        expected=historical_model,
+        updated=historical_model.model_copy(
+            update={
+                "status": ExternalOperationStatus.COMPLETED,
+                "outcome": historical_outcome,
+            }
+        ),
+        lease=lease,
+        now=now,
+    )
+    capability = ToolCapabilityDescriptor.from_spec(tool_spec)
+    historical_tool = ToolCallOperation(
+        operation_id="op_ready_tool_historical",
+        session_id=running.session_id,
+        run_id=run_id,
+        turn=0,
+        request_fingerprint=_tool_request_fingerprint(
+            historical_call,
+            capability,
+            {"query": "historical"},
+        ),
+        lease_generation=lease.generation,
+        status=ExternalOperationStatus.STARTED,
+        tool_identity=capability.capability_hash,
+        recovery_metadata={"safe_retry": False, "retry_class": "unsafe"},
+    )
+    await store.create_external_operation(historical_tool, lease=lease, now=now)
+    await store.transition_external_operation(
+        expected=historical_tool,
+        updated=historical_tool.model_copy(
+            update={
+                "status": ExternalOperationStatus.COMPLETED,
+                "outcome": historical_result.model_dump(mode="json"),
+            }
+        ),
+        lease=lease,
+        now=now,
+    )
+    pending_model = ModelCallOperation(
+        operation_id="op_ready_tool_model_pending",
+        session_id=running.session_id,
+        run_id=run_id,
+        turn=1,
+        request_fingerprint=pending_fingerprint,
+        lease_generation=lease.generation,
+        status=ExternalOperationStatus.STARTED,
+        provider_identity=spec.model,
+        recovery_metadata={
+            "authoritative_status": False,
+            "same_operation_id_resend": False,
+        },
+    )
+    await store.create_external_operation(pending_model, lease=lease, now=now)
+    await store.transition_external_operation(
+        expected=pending_model,
+        updated=pending_model.model_copy(
+            update={
+                "status": ExternalOperationStatus.COMPLETED,
+                "outcome": pending_outcome,
+            }
+        ),
+        lease=lease,
+        now=now,
+    )
+
+    checkpoint_messages = [
+        *initial_messages,
+        historical_assistant,
+        historical_tool_message,
+        pending_assistant,
+    ]
+    if relation_invalidity == "historical_checkpoint_assistant":
+        checkpoint_messages[1] = {
+            **historical_assistant,
+            "content": "forged checkpoint historical",
+        }
+    elif relation_invalidity == "historical_tool_message":
+        checkpoint_messages[2] = {
+            **historical_tool_message,
+            "content": '{"answer":"forged"}',
+        }
+    elif relation_invalidity == "historical_message_order":
+        checkpoint_messages[1], checkpoint_messages[2] = (
+            checkpoint_messages[2],
+            checkpoint_messages[1],
+        )
+    checkpoint = RunCheckpoint(
+        run_id=run_id,
+        session_id=running.session_id,
+        checkpoint_version=1,
+        turn=1,
+        phase=RunCheckpointPhase.READY_FOR_TOOL,
+        messages=tuple(checkpoint_messages),
+        output_parts=(
+            "forged output "
+            if relation_invalidity == "historical_output"
+            else historical_text,
+            pending_text,
+        ),
+        usage=TokenUsage(prompt_tokens=5, completion_tokens=2, total_tokens=7),
+        tool_results=(historical_result,),
+    )
+    await store.put_run_checkpoint(checkpoint, expected=None, lease=lease, now=now)
+    await store.release_lease(lease)
+
+    event_items: list[tuple[str, dict[str, object]]] = [
+        ("step.started", {}),
+        ("model.call.started", {"model": spec.model}),
+        ("model.text.delta", {"text": historical_text}),
+        ("model.usage.reported", historical_usage.model_dump(mode="json")),
+        ("model.call.completed", {"finish_reason": "tool_calls"}),
+        (
+            "tool.call.proposed",
+            {"call_id": historical_call.call_id, "tool_name": historical_call.name},
+        ),
+        (
+            "tool.call.authorized",
+            {"call_id": historical_call.call_id, "tool_name": historical_call.name},
+        ),
+        (
+            "tool.call.started",
+            {"call_id": historical_call.call_id, "tool_name": historical_call.name},
+        ),
+        ("tool.call.completed", historical_result.model_dump(mode="json")),
+        ("step.completed", {}),
+        ("step.started", {}),
+        ("model.call.started", {"model": spec.model}),
+        ("model.text.delta", {"text": pending_text}),
+        ("model.usage.reported", pending_usage.model_dump(mode="json")),
+        ("model.call.completed", {"finish_reason": "tool_calls"}),
+    ]
+    if relation_invalidity == "historical_started_payload":
+        event_items[1] = ("model.call.started", {"model": "forged/provider"})
+    elif relation_invalidity == "historical_completed_payload":
+        event_items[4] = ("model.call.completed", {"finish_reason": "stop"})
+    elif relation_invalidity == "historical_event_order":
+        event_items[1], event_items[4] = event_items[4], event_items[1]
+    elif relation_invalidity == "historical_event_wrong_turn":
+        historical_started = event_items.pop(1)
+        event_items.insert(11, historical_started)
+    events = tuple(
+        EventEnvelope.new(
+            type=event_type,
+            session_id=running.session_id,
+            run_id=run_id,
+            sequence=index + 3,
+            payload=payload,
+        )
+        for index, (event_type, payload) in enumerate(event_items)
+    )
+    interrupted = running.model_copy(
+        update={"status": RunStatus.INTERRUPTED, "version": 3}
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                *events,
+                EventEnvelope.new(
+                    type="run.interrupted",
+                    session_id=running.session_id,
+                    run_id=run_id,
+                    sequence=3 + len(events),
+                    payload={"status": "interrupted"},
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run_id,
+                    running.session_id,
                     interrupted.version,
                     interrupted.model_dump(mode="json"),
                 ),
@@ -2874,6 +3286,178 @@ async def test_ready_tool_requires_exact_completed_model_relation_after_reopen(
             "reason": "recovery_state_invalid",
         }
         assert not any(event.type == "run.recovery.started" for event in events)
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_multi_turn_ready_tool_authoritative_history_resumes_after_reopen(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "multi-turn-ready-tool-positive.db"
+    initial: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(database_path)
+    )
+    spec = AgentSpec(name=f"multi-turn-ready-tool-{backend}", model="fake/recovery")
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="lookup",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        source="mcp:test-server",
+    )
+    run_id, checkpoint = await _seed_multi_turn_ready_tool_interrupted(
+        initial,
+        spec,
+        tool_spec,
+    )
+    if backend == "sqlite":
+        await initial.close()
+        store: Any = await SQLiteStore.open(database_path)
+    else:
+        store = initial
+    tool_calls: list[str] = []
+    provider_messages: list[list[dict[str, object]]] = []
+
+    async def handler(_context: ToolContext, *, query: str) -> object:
+        tool_calls.append(query)
+        return {"answer": query}
+
+    async def completion(**kwargs: object) -> AsyncIterator[dict[str, object]]:
+        messages = kwargs["messages"]
+        assert isinstance(messages, list)
+        provider_messages.append(messages)
+        return _success_chunks()
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+        assert tool_calls == ["pending"]
+        assert len(provider_messages) == 1
+        assert [message["role"] for message in provider_messages[0]] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+            "tool",
+        ]
+        assert provider_messages[0][:4] == checkpoint.model_dump(mode="json")[
+            "messages"
+        ]
+        assert result.output_text == "historical pending recovered"
+        assert len(result.tool_results) == 2
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "relation_invalidity",
+    (
+        "historical_started_payload",
+        "historical_completed_payload",
+        "historical_event_order",
+        "historical_event_wrong_turn",
+        "historical_request_fingerprint",
+        "historical_wrong_turn_request",
+        "historical_outcome_text",
+        "historical_outcome_call",
+        "historical_checkpoint_assistant",
+        "historical_tool_message",
+        "historical_message_order",
+        "historical_output",
+        "usage_distribution",
+    ),
+)
+async def test_multi_turn_ready_tool_requires_each_authoritative_model_relation(
+    backend: str,
+    relation_invalidity: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / f"multi-turn-ready-tool-{relation_invalidity}.db"
+    initial: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(database_path)
+    )
+    spec = AgentSpec(
+        name=f"multi-turn-ready-tool-{backend}-{relation_invalidity}",
+        model="fake/recovery",
+    )
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="lookup",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        source="mcp:test-server",
+    )
+    run_id, _checkpoint = await _seed_multi_turn_ready_tool_interrupted(
+        initial,
+        spec,
+        tool_spec,
+        relation_invalidity=relation_invalidity,
+    )
+    if backend == "sqlite":
+        await initial.close()
+        store: Any = await SQLiteStore.open(database_path)
+    else:
+        store = initial
+    tool_calls = 0
+    provider_calls = 0
+
+    async def handler(_context: ToolContext, **_: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        raise AssertionError("forged history reached Tool/MCP handler")
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("forged history reached LiteLLM")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await (await sdk.recovery.recover_run(run_id)).result()
+        assert tool_calls == 0
+        assert provider_calls == 0
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].operation_id is None
+        assert pending[0].reason == "recovery_state_invalid"
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        assert sum(event.type == "reconciliation.requested" for event in events) == 1
+        assert not any(event.type == "run.recovery.started" for event in events)
+        assert not any(event.type == "permission.requested" for event in events)
     finally:
         await sdk.close()
         if backend == "sqlite":
