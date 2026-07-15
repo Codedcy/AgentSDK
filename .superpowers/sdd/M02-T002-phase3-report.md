@@ -2,7 +2,8 @@
 
 ## Outcome
 
-WHOLE-PHASE REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3 now
+COMPLETE AND INDEPENDENTLY APPROVED. The whole-Phase-3 release fix passed fresh
+independent re-review with Spec C0/I0/M0 and Quality C0/I0/M0. Phase 3 now
 provides durable Run progress transactions, live execution persistence,
 conservative recovery planning, fenced coordination, application-certified
 Provider recovery, and application-certified Tool retry. Every Phase 3 slice
@@ -165,7 +166,8 @@ dual-Python smoke passed. All release-fix build output was external and removed.
 
 ## Release decision
 
-This report records verified release-fix evidence and does not self-approve
-Phase 3. A fresh independent whole-Phase-3 Spec and Quality re-review over
-`2309dfb..HEAD` must return C0/I0 before Phase 3 is marked complete and Phase 4
-Workflow recovery begins.
+This report records verified release-fix evidence. The fresh independent
+whole-Phase-3 re-review approved Spec C0/I0/M0 and Quality C0/I0/M0 after
+rerunning the exact Provider and READY_FOR_TOOL matrices, all changed Phase 3
+tests, E2E, static, import, scope, and schema gates. Phase 3 is complete and
+Phase 4 Workflow recovery may begin.
