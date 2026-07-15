@@ -20,7 +20,7 @@ from agent_sdk.runtime.leases import (
     LeaseLostError,
     canonical_lease_timestamp,
 )
-from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
@@ -657,6 +657,7 @@ class SQLiteStore:
             or batch.snapshots
             or batch.operation is not None
             or batch.checkpoint is not None
+            or batch.reconciliation is not None
         ):
             raise RecoveryStateConflictError
         if batch.now.tzinfo is None or batch.now.utcoffset() is None:
@@ -694,6 +695,7 @@ class SQLiteStore:
                 await self._check_run_progress_snapshot_targets(batch)
                 await self._check_run_progress_operation_target(batch)
                 await self._check_run_progress_checkpoint_target(batch)
+                await self._check_run_progress_reconciliation_target(batch)
 
                 for event in batch.events:
                     await self._insert_event(event)
@@ -701,6 +703,7 @@ class SQLiteStore:
                     await self._upsert_newer_snapshot(snapshot)
                 await self._apply_run_progress_operation(batch)
                 await self._apply_run_progress_checkpoint(batch)
+                await self._apply_run_progress_reconciliation(batch)
                 cursor = await self._last_cursor()
                 await self._commit_transaction()
                 return CommitResult(last_cursor=cursor)
@@ -790,6 +793,13 @@ class SQLiteStore:
                 or checkpoint.session_id != run.session_id
             ):
                 raise RecoveryStateConflictError
+        if batch.reconciliation is not None:
+            request = batch.reconciliation.updated
+            if (
+                request.run_id != run.run_id
+                or request.session_id != run.session_id
+            ):
+                raise RecoveryStateConflictError
 
     @staticmethod
     def _validate_run_progress_write_shapes(batch: RunProgressBatch) -> None:
@@ -809,6 +819,36 @@ class SQLiteStore:
             batch.checkpoint.updated, batch.checkpoint.expected
         ):
             raise RecoveryStateConflictError
+        if batch.reconciliation is not None:
+            if batch.reconciliation.expected is None:
+                legal_reconciliation = (
+                    batch.reconciliation.updated.status
+                    is ReconciliationStatus.PENDING
+                )
+            else:
+                resolution = batch.reconciliation.updated.resolution
+                resolution_event = (
+                    None
+                    if resolution is None
+                    else next(
+                        (
+                            event
+                            for event in batch.events
+                            if event.event_id == resolution.event_id
+                        ),
+                        None,
+                    )
+                )
+                legal_reconciliation = (
+                    resolution_event is not None
+                    and _valid_reconciliation_resolution(
+                        batch.reconciliation.expected,
+                        batch.reconciliation.updated,
+                        resolution_event,
+                    )
+                )
+            if not legal_reconciliation:
+                raise RecoveryStateConflictError
 
     @staticmethod
     def _validate_run_progress_internal_targets(
@@ -896,6 +936,20 @@ class SQLiteStore:
             elif current_checkpoint is None or (
                 batch.checkpoint.expected is not None
                 and current_checkpoint == batch.checkpoint.expected
+            ):
+                states.append("absent")
+            else:
+                states.append("conflict")
+        if batch.reconciliation is not None:
+            request_target = batch.reconciliation.updated
+            current_request = await self._read_reconciliation_request(
+                request_target.request_id
+            )
+            if current_request == request_target:
+                states.append("exact")
+            elif current_request is None or (
+                batch.reconciliation.expected is not None
+                and current_request == batch.reconciliation.expected
             ):
                 states.append("absent")
             else:
@@ -998,6 +1052,32 @@ class SQLiteStore:
                 raise RecoveryStateConflictError
         elif current != batch.checkpoint.expected:
             raise RecoveryStateConflictError
+
+    async def _check_run_progress_reconciliation_target(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.reconciliation is None:
+            return
+        request = batch.reconciliation.updated
+        current = await self._read_reconciliation_request(request.request_id)
+        if batch.reconciliation.expected is None:
+            if current is not None:
+                raise RecoveryStateConflictError
+        elif current != batch.reconciliation.expected:
+            raise RecoveryStateConflictError
+        if request.operation_id is not None:
+            operation: ExternalOperation | None = None
+            if batch.operation is not None and (
+                batch.operation.updated.operation_id == request.operation_id
+            ):
+                operation = batch.operation.updated
+            if operation is None:
+                operation = await self._read_external_operation(request.operation_id)
+            if operation is None or (
+                operation.run_id != request.run_id
+                or operation.session_id != request.session_id
+            ):
+                raise RecoveryStateConflictError
 
     async def _check_run_progress_checkpoint_operation(
         self, batch: RunProgressBatch
@@ -1125,6 +1205,45 @@ class SQLiteStore:
             if result.rowcount != 1:
                 raise RecoveryStateConflictError
 
+    async def _apply_run_progress_reconciliation(
+        self, batch: RunProgressBatch
+    ) -> None:
+        if batch.reconciliation is None:
+            return
+        request = batch.reconciliation.updated
+        serialized = _canonical_record_json(request)
+        if batch.reconciliation.expected is None:
+            await self._connection.execute(
+                """
+                INSERT INTO reconciliation_requests(
+                    request_id, session_id, run_id, operation_id, status, data_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    request.request_id,
+                    request.session_id,
+                    request.run_id,
+                    request.operation_id,
+                    request.status.value,
+                    serialized,
+                ),
+            )
+        else:
+            result = await self._connection.execute(
+                """
+                UPDATE reconciliation_requests SET status = ?, data_json = ?
+                WHERE request_id = ? AND status = 'pending' AND data_json = ?
+                """,
+                (
+                    request.status.value,
+                    serialized,
+                    request.request_id,
+                    _canonical_record_json(batch.reconciliation.expected),
+                ),
+            )
+            if result.rowcount != 1:
+                raise RecoveryStateConflictError
+
     async def _check_snapshot_preconditions(
         self, preconditions: tuple[SnapshotPrecondition, ...]
     ) -> None:
@@ -1224,6 +1343,225 @@ class SQLiteStore:
             if row is None:
                 return None
             return _json_object(cast(str, row[0]))
+
+    @_context_free_recovery_errors
+    async def list_abandoned_run_ids(self, *, now: datetime) -> tuple[str, ...]:
+        try:
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise RecoveryStateConflictError
+            normalized_now = now.astimezone(UTC)
+            async with self._lock:
+                self._ensure_open()
+                async with self._connection.execute(
+                    """
+                    SELECT run_id, owner, generation, acquired_at, renewed_at,
+                           expires_at, released
+                    FROM leases ORDER BY run_id
+                    """
+                ) as cursor:
+                    lease_rows = await cursor.fetchall()
+                for lease_row in lease_rows:
+                    if (
+                        type(lease_row[2]) is not int
+                        or type(lease_row[6]) is not int
+                        or lease_row[6] not in (0, 1)
+                    ):
+                        raise RecoveryStateConflictError
+                    lease = _lease_from_row(lease_row)
+                    if (
+                        lease_row[0] != lease.run_id
+                        or lease_row[1] != lease.owner
+                        or lease_row[2] != lease.generation
+                        or lease_row[3]
+                        != canonical_lease_timestamp(lease.acquired_at)
+                        or lease_row[4]
+                        != canonical_lease_timestamp(lease.renewed_at)
+                        or lease_row[5]
+                        != canonical_lease_timestamp(lease.expires_at)
+                    ):
+                        raise RecoveryStateConflictError
+                async with self._connection.execute(
+                    """
+                    SELECT entity_id, session_id, version, data_json
+                    FROM snapshots WHERE kind = 'run'
+                    ORDER BY entity_id
+                    """
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                abandoned: list[str] = []
+                for row in rows:
+                    data_json = cast(str, row[3])
+                    data = _strict_json_object(data_json)
+                    if _canonical_json(data) != data_json:
+                        raise RecoveryStateConflictError
+                    run = RunSnapshot.model_validate(data)
+                    if (
+                        row[0] != run.run_id
+                        or row[1] != run.session_id
+                        or type(row[2]) is not int
+                        or row[2] != run.version
+                    ):
+                        raise RecoveryStateConflictError
+                    async with self._connection.execute(
+                        """
+                        SELECT entity_id, session_id, version, data_json
+                        FROM snapshots
+                        WHERE kind = 'session' AND entity_id = ?
+                        """,
+                        (run.session_id,),
+                    ) as cursor:
+                        session_row = await cursor.fetchone()
+                    if session_row is None:
+                        raise RecoveryStateConflictError
+                    session_json = cast(str, session_row[3])
+                    session_data = _strict_json_object(session_json)
+                    if _canonical_json(session_data) != session_json:
+                        raise RecoveryStateConflictError
+                    session = SessionSnapshot.model_validate(session_data)
+                    session_owns_run = run.run_id in session.active_run_ids
+                    run_is_final = run.status in {
+                        RunStatus.COMPLETED,
+                        RunStatus.FAILED,
+                    }
+                    if (
+                        session_row[0] != session.session_id
+                        or session_row[1] != session.session_id
+                        or type(session_row[2]) is not int
+                        or session_row[2] != session.version
+                        or session.session_id != run.session_id
+                        or session_owns_run == run_is_final
+                    ):
+                        raise RecoveryStateConflictError
+                    if run.status not in {
+                        RunStatus.RUNNING,
+                        RunStatus.WAITING_PERMISSION,
+                    }:
+                        continue
+                    stored_lease = await self._read_lease(run.run_id)
+                    if stored_lease is None or stored_lease.released or (
+                        stored_lease.lease.expires_at <= normalized_now
+                    ):
+                        abandoned.append(run.run_id)
+                return tuple(abandoned)
+        except RecoveryStateConflictError:
+            raise
+        except Exception:
+            raise RecoveryStateConflictError from None
+
+    @_context_free_recovery_errors
+    async def latest_run_event_sequence(self, run_id: str) -> int | None:
+        try:
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise RecoveryStateConflictError
+            async with self._lock:
+                self._ensure_open()
+                async with self._connection.execute(
+                    """
+                    SELECT entity_id, session_id, version, data_json
+                    FROM snapshots WHERE kind = 'run' AND entity_id = ?
+                    """,
+                    (run_id,),
+                ) as cursor:
+                    run_row = await cursor.fetchone()
+                if run_row is None:
+                    async with self._connection.execute(
+                        "SELECT 1 FROM events WHERE run_id = ? LIMIT 1",
+                        (run_id,),
+                    ) as cursor:
+                        event_row = await cursor.fetchone()
+                    if event_row is not None:
+                        raise RecoveryStateConflictError
+                    return None
+                run_json = cast(str, run_row[3])
+                run_data = _strict_json_object(run_json)
+                if _canonical_json(run_data) != run_json:
+                    raise RecoveryStateConflictError
+                run = RunSnapshot.model_validate(run_data)
+                if (
+                    run_row[0] != run.run_id
+                    or run_row[1] != run.session_id
+                    or type(run_row[2]) is not int
+                    or run_row[2] != run.version
+                    or run.run_id != run_id
+                ):
+                    raise RecoveryStateConflictError
+                async with self._connection.execute(
+                    """
+                    SELECT entity_id, session_id, version, data_json
+                    FROM snapshots
+                    WHERE kind = 'session' AND entity_id = ?
+                    """,
+                    (run.session_id,),
+                ) as cursor:
+                    session_row = await cursor.fetchone()
+                if session_row is None:
+                    raise RecoveryStateConflictError
+                session_json = cast(str, session_row[3])
+                session_data = _strict_json_object(session_json)
+                if _canonical_json(session_data) != session_json:
+                    raise RecoveryStateConflictError
+                session = SessionSnapshot.model_validate(session_data)
+                if (
+                    session_row[0] != session.session_id
+                    or session_row[1] != session.session_id
+                    or type(session_row[2]) is not int
+                    or session_row[2] != session.version
+                    or session.session_id != run.session_id
+                    or (
+                        run.status not in {
+                            RunStatus.COMPLETED,
+                            RunStatus.FAILED,
+                        }
+                        and run.run_id not in session.active_run_ids
+                    )
+                ):
+                    raise RecoveryStateConflictError
+                async with self._connection.execute(
+                    """
+                    SELECT cursor, event_id, schema_version, type, session_id,
+                           run_id, sequence, payload_json, occurred_at
+                    FROM events WHERE run_id = ? ORDER BY cursor
+                    """,
+                    (run_id,),
+                ) as cursor:
+                    event_rows = await cursor.fetchall()
+                sequences: list[int] = []
+                event_ids: set[str] = set()
+                for event_row in event_rows:
+                    payload_json = cast(str, event_row[7])
+                    payload = _strict_json_object(payload_json)
+                    event = self._stored_event(event_row).event
+                    if (
+                        type(event_row[0]) is not int
+                        or event_row[0] <= 0
+                        or not isinstance(event_row[1], str)
+                        or not event_row[1].strip()
+                        or event_row[1] in event_ids
+                        or type(event_row[2]) is not int
+                        or event_row[2] <= 0
+                        or not isinstance(event_row[3], str)
+                        or not event_row[3].strip()
+                        or event_row[4] != run.session_id
+                        or event_row[5] != run_id
+                        or type(event_row[6]) is not int
+                        or event_row[6] <= 0
+                        or event_row[6] in sequences
+                        or _canonical_json(payload) != payload_json
+                        or event.event_id != event_row[1]
+                        or event.session_id != run.session_id
+                        or event.run_id != run_id
+                        or event.sequence != event_row[6]
+                        or event.occurred_at.tzinfo is None
+                        or event.occurred_at.utcoffset() is None
+                    ):
+                        raise RecoveryStateConflictError
+                    event_ids.add(event.event_id)
+                    sequences.append(event.sequence)
+                return max(sequences, default=None)
+        except RecoveryStateConflictError:
+            raise
+        except Exception:
+            raise RecoveryStateConflictError from None
 
     async def get_idempotency(self, scope: str, key: str) -> IdempotencyRecord | None:
         async with self._lock:
@@ -1961,7 +2299,11 @@ class SQLiteStore:
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
-        return None if row is None else _StoredLease(_lease_from_row(row), bool(row[6]))
+        if row is None:
+            return None
+        if type(row[6]) is not int or row[6] not in (0, 1):
+            raise ValueError("incompatible lease row")
+        return _StoredLease(_lease_from_row(row), bool(row[6]))
 
     async def _check_recovery_lease(
         self,

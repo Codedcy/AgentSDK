@@ -90,6 +90,11 @@ class RunCheckpointWrite(NamedTuple):
     updated: RunCheckpoint
 
 
+class ReconciliationRequestWrite(NamedTuple):
+    expected: ReconciliationRequest | None
+    updated: ReconciliationRequest
+
+
 class RunProgressBatch(NamedTuple):
     lease: Lease
     now: datetime
@@ -99,6 +104,7 @@ class RunProgressBatch(NamedTuple):
     event_preconditions: tuple[EventPrecondition, ...] = ()
     operation: ExternalOperationWrite | None = None
     checkpoint: RunCheckpointWrite | None = None
+    reconciliation: ReconciliationRequestWrite | None = None
 
 
 _SIGNED_INT64_MIN = -(1 << 63)
@@ -197,6 +203,10 @@ class StateStore(Protocol):
     async def release_lease(self, lease: Lease) -> None: ...
 
     async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None: ...
+
+    async def list_abandoned_run_ids(self, *, now: datetime) -> tuple[str, ...]: ...
+
+    async def latest_run_event_sequence(self, run_id: str) -> int | None: ...
 
     async def create_external_operation(
         self, operation: ExternalOperation, *, lease: Lease, now: datetime

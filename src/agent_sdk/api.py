@@ -154,6 +154,14 @@ class _LazySQLiteStore:
         await (await self._get()).assert_current_lease(lease, now=now)
 
     @_context_free_recovery_errors
+    async def list_abandoned_run_ids(self, *, now: datetime) -> tuple[str, ...]:
+        return await (await self._get()).list_abandoned_run_ids(now=now)
+
+    @_context_free_recovery_errors
+    async def latest_run_event_sequence(self, run_id: str) -> int | None:
+        return await (await self._get()).latest_run_event_sequence(run_id)
+
+    @_context_free_recovery_errors
     async def create_external_operation(
         self, operation: ExternalOperation, *, lease: Lease, now: datetime
     ) -> ExternalOperation:

@@ -22,6 +22,8 @@ class RunStatus(StrEnum):
     CREATED = "created"
     RUNNING = "running"
     WAITING_PERMISSION = "waiting_permission"
+    INTERRUPTED = "interrupted"
+    WAITING_RECONCILIATION = "waiting_reconciliation"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -189,7 +191,12 @@ class RunSnapshot(BaseModel):
                 value is not None for value in (self.output_text, self.usage, self.error)
             ):
                 raise ValueError("created run contains execution state")
-        elif self.status in {RunStatus.RUNNING, RunStatus.WAITING_PERMISSION}:
+        elif self.status in {
+            RunStatus.RUNNING,
+            RunStatus.WAITING_PERMISSION,
+            RunStatus.INTERRUPTED,
+            RunStatus.WAITING_RECONCILIATION,
+        }:
             minimum_version = 2 if self.status is RunStatus.RUNNING else 3
             if self.version < minimum_version:
                 raise ValueError("nonterminal run version is invalid")
@@ -216,6 +223,8 @@ class RunSnapshot(BaseModel):
             RunStatus.CREATED,
             RunStatus.RUNNING,
             RunStatus.WAITING_PERMISSION,
+            RunStatus.INTERRUPTED,
+            RunStatus.WAITING_RECONCILIATION,
         } and self.tool_results:
             raise ValueError("nonterminal run contains durable tool results")
         return self
