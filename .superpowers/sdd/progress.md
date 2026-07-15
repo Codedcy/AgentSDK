@@ -111,3 +111,7 @@ Phase 3 whole-review final: Approved; Spec C0/I0/M0 and Quality C0/I0/M0. Fresh 
 Phase 3: complete - durable progress, conservative recovery, certified Provider recovery, and certified Tool retry
 Phase 4: in progress - Workflow recovery
 Next action: execute the Phase 4 Workflow recovery plan with strict TDD and independent slice review
+Phase 4 operational plan: .superpowers/sdd/M02-T002-phase4-plan.md
+Phase 4A: in progress - exact Workflow admission and single-coordinator recovery
+Phase 4A brief: .superpowers/sdd/M02-T002-phase4a-brief.md
+Phase 4B remains pending until Phase 4A independent Spec C0/I0 and Quality C0/I0 review
