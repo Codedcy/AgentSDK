@@ -136,3 +136,10 @@ Phase 4 first review-fix gates: admission97; full Python3.13 1677 passed with ze
 Phase 4 first re-review: Not Approved; Spec C0/I1/M0 and Quality C0/I0/M0
 Phase 4 remaining finding: expired/interrupted test fabricated an unreachable Run snapshot instead of real lease-expiry scanner transition; delete race bypassed supported busy lifecycle through direct Store deletion
 Phase 4 second review fix: in progress - real scanner interruption and public busy-delete race; Phase 5 remains blocked
+Phase 4 second review-fix implementation: 20cf09ec40f89f63e055202b4deab24f543124f5
+Phase 4 second review-fix gates: authenticity6; admission99; full Python3.13 1679 passed with zero skips; Ruff/mypy75/diff/import/scope/schema clean
+Phase 4 final review: Approved; Spec C0/I0/M0 and Quality C0/I0/M1
+Phase 4 final fresh review gates: authenticity7; admission99; adjacent recovery/ownership673; full Python3.13 1679 with zero skips; Ruff/mypy75/diff/import/scope/schema clean
+Phase 4 nonblocking minor: one older single-SDK waiting-reconciliation test fabricates INTERRUPTED state; replace with reachable state in Phase 5
+Phase 4: complete - exact sequential Workflow recovery, two-SDK concurrency, fault boundaries, lifecycle, and sanitization
+Phase 5: in progress - reconciliation decisions, subprocess/fault E2E, dual-Python release gate, and ledger

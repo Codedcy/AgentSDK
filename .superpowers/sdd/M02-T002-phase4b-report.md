@@ -121,6 +121,18 @@ calling the Store directly. The fix brief now requires a real expired-lease
 `RecoveryScanner` transition and public busy-delete behavior; Phase 5 remains
 blocked.
 
+## Final whole-Phase-4 review
+
+After the reachable scanner and public busy-delete corrections in `20cf09e`,
+the fresh independent review **Approved** Phase 4: Spec Compliance C0/I0/M0
+and Task Quality C0/I0/M1. Fresh evidence passed the exact authenticity matrix
+7, complete Phase 4 file 99, adjacent recovery/ownership suites 673, full
+Python 3.13 suite 1679 with zero skips, Ruff, mypy across 75 source files, and
+all diff/import/signature/scope/schema checks. The nonblocking Quality Minor is
+one older single-SDK waiting-reconciliation test that still fabricates an
+INTERRUPTED snapshot; Phase 5 will replace that misleading fixture with a
+reachable production state. Phase 4 is complete and Phase 5 may proceed.
+
 ## Whole-Phase-4 review remediation
 
 The first whole-Phase-4 review findings were remediated within the exact
