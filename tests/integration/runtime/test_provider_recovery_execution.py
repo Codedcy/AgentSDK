@@ -14,12 +14,14 @@ from agent_sdk import (
     AgentSDKError,
     AgentSpec,
     ErrorCode,
+    PermissionDecision,
     ProviderRecoveryAdapter,
     ProviderRecoveryDisposition,
     ProviderRecoveryRequest,
     ProviderRecoveryResult,
     RunStatus,
     TokenUsage,
+    ToolRetryPolicy,
 )
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
@@ -383,6 +385,43 @@ async def _insert_provider_run_event(
     await store._connection.execute(
         "UPDATE sqlite_sequence SET seq = (SELECT MAX(cursor) FROM events) "
         "WHERE name = 'events'"
+    )
+    await store._connection.commit()
+
+
+async def _replace_provider_run_event_payload(
+    store: Any,
+    run_id: str,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    selected = next(
+        stored
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id and stored.event.type == event_type
+    )
+    changed = selected.event.model_copy(update={"payload": payload})
+    if isinstance(store, InMemoryStore):
+        store._events = [
+            type(stored)(stored.cursor, changed)
+            if stored.event.event_id == selected.event.event_id
+            else stored
+            for stored in store._events
+        ]
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE events SET payload_json = ? WHERE event_id = ?",
+        (
+            json.dumps(
+                changed.payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            changed.event_id,
+        ),
     )
     await store._connection.commit()
 
@@ -1712,6 +1751,660 @@ async def test_recovered_tool_call_executes_tool_then_uses_litellm_for_next_turn
     assert tool_calls == 1
     assert litellm_calls == 1
     assert len(result.tool_results) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_provider_recovery_to_interrupted_tool_can_cross_kind_recover(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"provider-to-tool-cycle-{backend}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="Lookup a value",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+    )
+    spec, run_id, model_operation_id, _request = await _seed_model_in_flight(
+        store,
+        metadata={
+            "adapter_id": "application.adapter",
+            "adapter_version": "1",
+            "authoritative_status": True,
+            "same_operation_id_resend": False,
+        },
+        tool_specs=(tool_spec,),
+    )
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    query_calls = 0
+
+    async def query(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        assert request.operation_id == model_operation_id
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="tool_calls",
+            text="provider-recovered:",
+            tool_call=ToolCallCompleted(
+                index=0,
+                call_id="call_cross_kind",
+                name="lookup",
+                arguments_json='{"value":7}',
+            ),
+            usage=TokenUsage(total_tokens=2),
+        )
+
+    async def interrupted_handler(_context: ToolContext, *, value: int) -> object:
+        del value
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    async def unexpected_completion(**_: object) -> Any:
+        raise AssertionError("following model must not start before Tool recovery")
+
+    first = await _sdk(
+        store,
+        spec,
+        _adapter(query, None),
+        acompletion=unexpected_completion,
+    )
+    first.tools.register(tool_spec, interrupted_handler)
+    first_handle = await first.recovery.recover_run(run_id)
+    started_wait = asyncio.create_task(handler_started.wait())
+    done, _pending = await asyncio.wait(
+        {started_wait, first_handle._task},  # type: ignore[attr-defined]
+        timeout=1,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if started_wait not in done:
+        started_wait.cancel()
+        await asyncio.gather(started_wait, return_exceptions=True)
+        await first_handle.result()
+    await first.close()
+    await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+    with pytest.raises(AgentSDKError):
+        await first_handle.result()
+
+    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+
+    handler_calls: list[int] = []
+    model_calls = 0
+    final_model_started = asyncio.Event()
+    release_final_model = asyncio.Event()
+
+    async def recovered_handler(_context: ToolContext, *, value: int) -> object:
+        handler_calls.append(value)
+        return {"value": value + 1}
+
+    async def final_completion(**_: object) -> Any:
+        nonlocal model_calls
+        model_calls += 1
+        final_model_started.set()
+        await release_final_model.wait()
+
+        async def chunks() -> Any:
+            yield {
+                "choices": [
+                    {"delta": {"content": "done"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    second = AgentSDK.for_test(
+        store=store,
+        acompletion=final_completion,
+        permission_default="allow",
+    )
+    second.agents.define(spec)
+    second.tools.register(tool_spec, recovered_handler)
+    try:
+        second_handle = await second.recovery.recover_run(run_id)
+        await asyncio.wait_for(final_model_started.wait(), timeout=1)
+        in_progress = await store.list_external_operations(run_id)
+        assert tuple(
+            (item.operation_kind.value, item.turn, item.status.value)
+            for item in in_progress
+        ) == (
+            ("model_call", 0, "completed"),
+            ("tool_call", 0, "completed"),
+            ("model_call", 1, "started"),
+        )
+        release_final_model.set()
+        result = await second_handle.result()
+        assert result.output_text == "provider-recovered:done"
+        assert handler_calls == [7]
+        assert model_calls == 1
+        assert query_calls == 1
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ]
+        assert event_types.count("model.recovery.query.started") == 1
+        assert event_types.count("tool.recovery.retry.started") == 1
+        assert event_types.count("run.recovery.started") == 2
+    finally:
+        await second.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"tool-to-provider-cycle-{backend}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    spec = AgentSpec(name="cross-kind-agent", model="provider/model")
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="Lookup a value",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+    )
+    first_handler_started = asyncio.Event()
+    first_handler_cancelled = asyncio.Event()
+
+    async def initial_completion(**_: object) -> Any:
+        async def chunks() -> Any:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_tool_first",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"value":3}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    async def first_handler(_context: ToolContext, *, value: int) -> object:
+        del value
+        first_handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            first_handler_cancelled.set()
+            raise
+
+    seed = AgentSDK.for_test(
+        store=store,
+        acompletion=initial_completion,
+        permission_default="allow",
+    )
+    seed.tools.register(tool_spec, first_handler)
+    session = await seed.sessions.create(workspaces=[])
+    seed_handle = await seed.runs.start(session.session_id, spec, "cross kind")
+    await asyncio.wait_for(first_handler_started.wait(), timeout=1)
+    seed_handle._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await seed_handle.result()
+    await asyncio.wait_for(first_handler_cancelled.wait(), timeout=1)
+    await seed.close()
+
+    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+
+    second_model_started = asyncio.Event()
+    second_model_cancelled = asyncio.Event()
+    tool_calls: list[int] = []
+    query_calls = 0
+    query_started = asyncio.Event()
+    release_query = asyncio.Event()
+
+    async def query(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        query_started.set()
+        await release_query.wait()
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text=f"provider:{request.turn}",
+            usage=TokenUsage(total_tokens=4),
+        )
+
+    async def recovered_tool(_context: ToolContext, *, value: int) -> object:
+        tool_calls.append(value)
+        return {"value": value + 1}
+
+    async def interrupted_model(**_: object) -> Any:
+        second_model_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            second_model_cancelled.set()
+            raise
+
+    second = AgentSDK.for_test(
+        store=store,
+        acompletion=interrupted_model,
+        permission_default="allow",
+    )
+    second.agents.define(spec)
+    second.tools.register(tool_spec, recovered_tool)
+    second.recovery.register_adapter(_adapter(query, None))
+    second_handle = await second.recovery.recover_run(seed_handle.run_id)
+    await asyncio.wait_for(second_model_started.wait(), timeout=1)
+    await second.close()
+    await asyncio.wait_for(second_model_cancelled.wait(), timeout=1)
+    with pytest.raises(AgentSDKError):
+        await second_handle.result()
+
+    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+
+    third = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        permission_default="allow",
+    )
+    third.agents.define(spec)
+    third.tools.register(tool_spec, recovered_tool)
+    third.recovery.register_adapter(_adapter(query, None))
+    try:
+        third_handle = await third.recovery.recover_run(seed_handle.run_id)
+        await asyncio.wait_for(query_started.wait(), timeout=1)
+        in_progress = await store.list_external_operations(seed_handle.run_id)
+        assert tuple(
+            (item.operation_kind.value, item.turn, item.status.value)
+            for item in in_progress
+        ) == (
+            ("model_call", 0, "completed"),
+            ("tool_call", 0, "completed"),
+            ("model_call", 1, "started"),
+        )
+        release_query.set()
+        result = await third_handle.result()
+        assert result.output_text == "provider:1"
+        assert tool_calls == [3]
+        assert query_calls == 1
+        event_types = [
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == seed_handle.run_id
+        ]
+        assert event_types.count("tool.recovery.retry.started") == 1
+        assert event_types.count("model.recovery.query.started") == 1
+        assert event_types.count("run.recovery.started") == 2
+    finally:
+        await third.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["forbidden_extra", "malformed_arguments", "tool_field_mismatch"],
+)
+async def test_provider_historical_permission_request_is_strictly_reconstructed(
+    backend: str,
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"provider-permission-request-{backend}-{mutation}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    spec = AgentSpec(name="permission-history", model="provider/model")
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="Lookup a value",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        effects=("network",),
+    )
+    model_turn = 0
+    current_model_started = asyncio.Event()
+    current_model_cancelled = asyncio.Event()
+    handler_calls = 0
+
+    async def completion(**_: object) -> Any:
+        nonlocal model_turn
+        model_turn += 1
+        if model_turn == 1:
+            async def chunks() -> Any:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_permission_history",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"value":5}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+
+            return chunks()
+        current_model_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            current_model_cancelled.set()
+            raise
+
+    async def handler(_context: ToolContext, *, value: int) -> object:
+        nonlocal handler_calls
+        handler_calls += 1
+        return {"value": value}
+
+    async def unused_query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        raise AssertionError("seed run must not invoke recovery adapter")
+
+    seed = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="ask",
+    )
+    seed.tools.register(tool_spec, handler)
+    seed.recovery.register_adapter(_adapter(unused_query, None))
+    session = await seed.sessions.create(workspaces=[])
+    seed_handle = await seed.runs.start(session.session_id, spec, "permission history")
+    permission = await asyncio.wait_for(
+        seed.permissions.next_request(seed_handle.run_id),
+        timeout=1,
+    )
+    await seed.permissions.resolve(
+        permission.request_id,
+        PermissionDecision.allow_once(),
+    )
+    await asyncio.wait_for(current_model_started.wait(), timeout=1)
+    seed_handle._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await seed_handle.result()
+    await asyncio.wait_for(current_model_cancelled.wait(), timeout=1)
+    await seed.close()
+
+    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+
+    events = [
+        stored.event
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == seed_handle.run_id
+    ]
+    requested = next(event for event in events if event.type == "permission.requested")
+    resolved = next(event for event in events if event.type == "permission.resolved")
+    request_payload = dict(requested.payload["request"])
+    if mutation == "forbidden_extra":
+        request_payload["forbidden"] = f"forbidden-{backend}"
+    elif mutation == "malformed_arguments":
+        request_payload["arguments"] = ["not", "a", "mapping"]
+    else:
+        request_payload["tool_name"] = "other_tool"
+    await _replace_provider_run_event_payload(
+        store,
+        seed_handle.run_id,
+        "permission.requested",
+        {"request": request_payload},
+    )
+    await _replace_provider_run_event_payload(
+        store,
+        seed_handle.run_id,
+        "permission.resolved",
+        {**resolved.payload, "request": request_payload},
+    )
+
+    query_calls = 0
+    litellm_calls = 0
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text="must-not-complete",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def unexpected_completion(**_: object) -> Any:
+        nonlocal litellm_calls
+        litellm_calls += 1
+        raise AssertionError("malformed permission history reached LiteLLM")
+
+    recovered = AgentSDK.for_test(
+        store=store,
+        acompletion=unexpected_completion,
+        permission_default="ask",
+    )
+    recovered.agents.define(spec)
+    recovered.tools.register(tool_spec, handler)
+    recovered.recovery.register_adapter(_adapter(query, None))
+    try:
+        handle = await recovered.recovery.recover_run(seed_handle.run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert query_calls == 0
+        assert litellm_calls == 0
+        assert handler_calls == 1
+        pending = await recovered.recovery.pending_requests(seed_handle.run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        assert sum(
+            event.type == "reconciliation.requested"
+            for event in (
+                stored.event
+                for stored in await store.read_events(after_cursor=0)
+                if stored.event.run_id == seed_handle.run_id
+            )
+        ) == 1
+    finally:
+        await recovered.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("decision_action", ["allow", "deny"])
+async def test_provider_historical_permission_decision_remains_recoverable(
+    backend: str,
+    decision_action: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"provider-permission-{backend}-{decision_action}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    spec = AgentSpec(name="permission-positive", model="provider/model")
+    tool_spec = ToolSpec(
+        name="lookup",
+        description="Lookup a value",
+        input_schema={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        effects=("network",),
+    )
+    model_turn = 0
+    current_model_started = asyncio.Event()
+    current_model_cancelled = asyncio.Event()
+    handler_calls: list[int] = []
+
+    async def completion(**_: object) -> Any:
+        nonlocal model_turn
+        model_turn += 1
+        if model_turn == 1:
+
+            async def chunks() -> Any:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"call_permission_{decision_action}",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"value":9}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+
+            return chunks()
+        current_model_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            current_model_cancelled.set()
+            raise
+
+    async def handler(_context: ToolContext, *, value: int) -> object:
+        handler_calls.append(value)
+        return {"value": value}
+
+    async def unused_query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        raise AssertionError("seed run must not invoke recovery adapter")
+
+    seed = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="ask",
+    )
+    seed.tools.register(tool_spec, handler)
+    seed.recovery.register_adapter(_adapter(unused_query, None))
+    session = await seed.sessions.create(workspaces=[])
+    seed_handle = await seed.runs.start(session.session_id, spec, "permission positive")
+    permission = await asyncio.wait_for(
+        seed.permissions.next_request(seed_handle.run_id),
+        timeout=1,
+    )
+    decision = (
+        PermissionDecision.allow_once()
+        if decision_action == "allow"
+        else PermissionDecision.deny("operator denied")
+    )
+    await seed.permissions.resolve(permission.request_id, decision)
+    await asyncio.wait_for(current_model_started.wait(), timeout=1)
+    seed_handle._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await seed_handle.result()
+    await asyncio.wait_for(current_model_cancelled.wait(), timeout=1)
+    await seed.close()
+
+    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+
+    query_calls = 0
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text=f"recovered-{decision_action}",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def unexpected_completion(**_: object) -> Any:
+        raise AssertionError("certified Provider recovery must not call LiteLLM")
+
+    recovered = AgentSDK.for_test(
+        store=store,
+        acompletion=unexpected_completion,
+        permission_default="ask",
+    )
+    recovered.agents.define(spec)
+    recovered.tools.register(tool_spec, handler)
+    recovered.recovery.register_adapter(_adapter(query, None))
+    try:
+        result = await (
+            await recovered.recovery.recover_run(seed_handle.run_id)
+        ).result()
+        assert result.output_text == f"recovered-{decision_action}"
+        assert query_calls == 1
+        assert handler_calls == ([9] if decision_action == "allow" else [])
+        assert not any(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == seed_handle.run_id
+        )
+    finally:
+        await recovered.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
 
 
 @pytest.mark.asyncio

@@ -2,7 +2,7 @@
 
 ## Outcome
 
-FIFTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+SIXTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -59,6 +59,23 @@ lifecycle state machine. Every certified event is consumed exactly once by a
 valid transition; valid cancellation, audit-only retry, query-to-resend, and
 repeated recovery cycles remain accepted.
 
+The sixth independent review again confirmed every earlier finding closed and
+reported Spec/Quality C0/I2/M0. First, lifecycle replay crossed a historical
+recovery transition against the operation's final projection, so a legal
+Provider-to-Tool or Tool-to-Provider sequence was rejected once the earlier
+operation had completed. Tool certification also selected the Run's first
+interrupt rather than the current Tool cycle. Second, Provider certification
+did not strictly reconstruct a historical normal PermissionRequest with the
+same canonical request/decision/result relation already required by Tool
+history. Both findings now have public Memory/SQLite RED-to-GREEN coverage.
+Lifecycle state is reconstructed from the ordered event prefix, while only the
+final checkpoint crosses the current unresolved operation. Recovery-only
+controls are separated from the logical business history, current Tool retry
+starts at the interrupt after its own `tool.call.started`, and one shared strict
+PermissionRequest/Decision parser is used for Provider and Tool admission.
+Legal historical ask-allow and ask-deny plus both cross-kind recovery directions
+remain executable.
+
 ## Implemented contract
 
 - Added and root-exported strict `ToolRetryPolicy` values `never`,
@@ -106,13 +123,23 @@ repeated recovery cycles remain accepted.
   consumer. It follows ready-for-step, Model in-flight/completed, Tool
   proposed/permission/authorized/in-flight/completed, interrupted, and
   recovery states. A recovery audit is legal only while interrupted and must
-  identify the exact current operation, turn, call, and Tool represented by
-  the checkpoint; `run.recovery.started` must consume the corresponding audit
-  before resuming that phase. Provider audits cannot appear before the first
+  identify the exact operation, turn, call, and Tool represented by the event
+  prefix; `run.recovery.started` must consume the corresponding audit before
+  resuming that phase. Historical transitions are not compared with the
+  operation's later final projection; after complete replay, the final state
+  alone must match the checkpoint kind/turn/operation. Provider audits cannot
+  appear before the first
   interrupt, after recovery has started, or inside Tool permission states;
   Model delta/usage tokens cannot appear after Tool execution starts. Each
   transition validates its bounded payload shape and crosses current
   operation/checkpoint/descriptor identity before advancing.
+- Current Tool certification anchors its retry suffix at the first interrupt
+  after that Tool's own exact `tool.call.started`, rather than at the Run's
+  first interrupt. Recovery-only audits, lifecycle, hashed authorization, and
+  hashed permission controls are consumed by the lifecycle FSM and excluded
+  from normal business-turn counts. This permits Provider-to-Tool and
+  Tool-to-Provider recovery without allowing a historical audit to certify the
+  current operation.
 - Historical permission evidence is reconstructed through strict
   `PermissionRequest` and `PermissionDecision` validation with canonical exact
   round trips and forbidden extras. Requested/resolved requests must match;
@@ -253,6 +280,20 @@ Production changes followed observable failing tests:
     historical operation/turn identities. All are green with exactly one
     reconciliation, while twelve focused positive cancellation/retry/repeated
     cycle cases and both complete recovery files remain green.
+17. Sixth-review public cross-kind REDs executed a legal Provider recovery
+    that produced the current interrupted Tool, and the inverse legal Tool
+    recovery that produced the current interrupted Model. Both directions
+    reconciled on Memory and SQLite (`4/4` RED) because historical recovery was
+    compared with the operation's final projection and Tool admission selected
+    the first Run interrupt. Prefix-state replay, current-cycle anchoring, and
+    recovery-control filtering made all `4/4` green and execute the current
+    handler or Provider adapter followed by the normal next phase. A second
+    Memory/SQLite matrix changed both copies of one historical normal permission
+    request with a forbidden extra, malformed argument type, or mismatched Tool
+    (`6/6` RED). Shared canonical PermissionRequest/Decision reconstruction made
+    all `6/6` reconcile before query, LiteLLM, or Tool work, with exactly one
+    request. Four ask-allow/ask-deny Memory/SQLite positive cases remain
+    certified and complete through Provider recovery.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -264,6 +305,16 @@ All commands used
 `C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` with
 Python 3.13.
 
+- Sixth-review exact cross-kind/strict-permission/legal-decision matrix:
+  `14 passed in 7.53s`.
+- Complete Provider recovery file: `72 passed in 7.05s`.
+- Complete Tool recovery plus RecoveryAPI: `220 passed in 77.30s`.
+- Fresh Provider/live/scanner/Store validation and reconciliation neighbor
+  gate: `241 passed in 13.71s`.
+- Full Python 3.13 pytest on the sixth-review final tree:
+  `1515 passed in 115.86s`; zero skipped.
+- Ruff: `All checks passed!`; mypy:
+  `Success: no issues found in 75 source files`; diff-check clean.
 - Phase 3D2 policy/recovery plus complete live progress:
   `164 passed in 12.18s`.
 - Phase 3D1 provider recovery, Store reconciliation, and recovery API neighbor
@@ -301,6 +352,8 @@ Python 3.13.
 Focused tests cover both certification policies, exact Memory and SQLite
 close/reopen success, conservative SQLite default recovery, seven changed or
 missing capability variants, descriptor/checkpoint forgeries on both stores,
+both legal Provider-to-Tool and Tool-to-Provider repeated recovery directions,
+historical normal ask-allow and ask-deny Provider recovery on both stores,
 ten multi-turn historical evidence mutations, recovery permission-event
 mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
@@ -330,7 +383,8 @@ Production changes are limited to:
 - `src/agent_sdk/runtime/recovery.py` for exact admission, coordination,
   reconciliation, lifecycle, and public error cleanup.
 
-Tests are limited to the new Tool policy/recovery suites and live Tool stamping.
+Tests are limited to the Tool policy/recovery suites, Provider recovery
+certification regressions, and live Tool stamping.
 This report and the progress ledger are the only documentation changes. There
 are no changes to storage, migrations, provider gateway/recovery, Workflow
 production/recovery, roadmap, milestones, or task index.
