@@ -1741,7 +1741,15 @@ class RunEngine:
         usage: TokenUsage,
         tool_results: list[ToolResult],
     ) -> ToolResult:
-        async def preflight() -> None:
+        expected_capability = ToolCapabilityDescriptor.from_spec(
+            expected_registered.spec
+        )
+        expected_metadata = {
+            "safe_retry": True,
+            "retry_class": expected_registered.spec.retry_policy.value,
+        }
+
+        def validate_registered_tool() -> None:
             try:
                 current = self._tools.get(call.name)
             except AgentSDKError:
@@ -1749,16 +1757,18 @@ class RunEngine:
             if current is not expected_registered:
                 raise RecoveryStateConflictError
             capability = ToolCapabilityDescriptor.from_spec(current.spec)
-            expected_metadata = {
-                "safe_retry": True,
-                "retry_class": current.spec.retry_policy.value,
-            }
             if (
-                operation.tool_identity != capability.capability_hash
+                current.spec != expected_registered.spec
+                or capability != expected_capability
+                or operation.tool_identity != capability.capability_hash
                 or dict(operation.recovery_metadata) != expected_metadata
             ):
                 raise RecoveryStateConflictError
+
+        async def preflight() -> None:
+            validate_registered_tool()
             await self._leases.assert_current(lease, now=self._clock())
+            validate_registered_tool()
 
         async def before_handler(
             hook_call: ToolCallCompleted,
@@ -1768,9 +1778,8 @@ class RunEngine:
             if hook_call != call or registered is not expected_registered:
                 raise RecoveryStateConflictError
             await preflight()
-            capability = ToolCapabilityDescriptor.from_spec(expected_registered.spec)
             if (
-                _tool_request_fingerprint(call, capability, arguments)
+                _tool_request_fingerprint(call, expected_capability, arguments)
                 != operation.request_fingerprint
             ):
                 raise RecoveryStateConflictError

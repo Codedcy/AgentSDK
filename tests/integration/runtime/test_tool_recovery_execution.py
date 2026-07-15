@@ -71,6 +71,22 @@ class _ToolRecoveryAuditFaultStore(InMemoryStore):
         return result
 
 
+class _LeaseAssertBarrier:
+    def __init__(self, delegate: Any, *, target: int) -> None:
+        self._delegate = delegate
+        self._target = target
+        self.calls = 0
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def assert_current(self, lease: Any, *, now: Any = None) -> None:
+        self.calls += 1
+        if self.calls == self._target:
+            self.reached.set()
+            await self.release.wait()
+        await self._delegate.assert_current(lease, now=now)
+
+
 def _sdk_traceback_locals(error: BaseException) -> tuple[dict[str, Any], ...]:
     frames: list[dict[str, Any]] = []
     traceback = error.__traceback__
@@ -286,6 +302,129 @@ async def _seed_interrupted_second_tool_call(
     finally:
         await scanner.close()
     return handle.run_id, spec, tool_spec
+
+
+async def _seed_safe_pre_handler_history(
+    store: StateStore,
+    *,
+    history: str,
+) -> tuple[str, AgentSpec, ToolSpec, ToolResultStatus, str]:
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+    model_turn = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal model_turn
+        model_turn += 1
+        turn = model_turn
+        if turn == 1 and history == "tool_not_found":
+            tool_name = "missing_history_tool"
+            arguments = '{"value":1}'
+        elif turn == 1 and history == "invalid_arguments":
+            tool_name = "recoverable"
+            arguments = '{"value":"invalid"}'
+        else:
+            tool_name = "recoverable"
+            arguments = json.dumps({"value": turn})
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "content": f"safe-history-{history}-{turn}",
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_safe_history_{turn}",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": turn,
+                    "completion_tokens": 1,
+                    "total_tokens": turn + 1,
+                },
+            }
+
+        return chunks()
+
+    async def handler(_: ToolContext, value: int) -> int:
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    permission_default = "ask" if history == "permission_denied" else "allow"
+    expected_status = {
+        "permission_denied": ToolResultStatus.DENIED,
+        "invalid_arguments": ToolResultStatus.INVALID_ARGUMENTS,
+        "tool_not_found": ToolResultStatus.FAILED,
+    }[history]
+    spec = AgentSpec(name="safe-pre-handler-history", model="fake/tool-recovery")
+    tool_spec = _tool_spec(ToolRetryPolicy.IDEMPOTENT)
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default=permission_default,  # type: ignore[arg-type]
+    )
+    sdk.tools.register(tool_spec, handler)
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.runs.start(session.session_id, spec, "safe history")
+    if history == "permission_denied":
+        denied = await asyncio.wait_for(
+            sdk.permissions.next_request(handle.run_id),
+            timeout=1,
+        )
+        await sdk.permissions.resolve(
+            denied.request_id,
+            PermissionDecision.deny("historical denial"),
+        )
+        allowed = await asyncio.wait_for(
+            sdk.permissions.next_request(handle.run_id),
+            timeout=1,
+        )
+        await sdk.permissions.resolve(
+            allowed.request_id,
+            PermissionDecision.allow_once(),
+        )
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    handle._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await asyncio.wait_for(handler_cancelled.wait(), timeout=1)
+    checkpoint = await store.get_run_checkpoint(handle.run_id)
+    assert checkpoint is not None
+    assert checkpoint.tool_results[0].status is expected_status
+    operations = await store.list_external_operations(handle.run_id)
+    assert tuple((item.turn, item.operation_kind.value) for item in operations) == (
+        (0, "model_call"),
+        (1, "model_call"),
+        (1, "tool_call"),
+    )
+    operation_id = operations[-1].operation_id
+    await sdk.close()
+
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default=permission_default,  # type: ignore[arg-type]
+    )
+    try:
+        await scanner.recovery.scan()
+        assert (await scanner.runs.get(handle.run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await scanner.close()
+    return handle.run_id, spec, tool_spec, expected_status, operation_id
 
 
 async def _final_completion(counter: list[int]) -> AsyncIterator[dict[str, object]]:
@@ -1553,6 +1692,206 @@ async def test_historical_recovery_evidence_is_reconstructed_exactly(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "history",
+    ["permission_denied", "invalid_arguments", "tool_not_found"],
+)
+async def test_safe_pre_handler_history_allows_certified_current_retry(
+    backend: str,
+    history: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"safe-history-{backend}-{history}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    (
+        run_id,
+        spec,
+        tool_spec,
+        expected_status,
+        operation_id,
+    ) = await _seed_safe_pre_handler_history(store, history=history)
+    if isinstance(store, SQLiteStore):
+        await store.close()
+        store = await SQLiteStore.open(path)
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value + 10
+
+    permission_default = "ask" if history == "permission_denied" else "allow"
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default=permission_default,  # type: ignore[arg-type]
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    permission_task: asyncio.Task[None] | None = None
+
+    async def allow_recovery() -> None:
+        request = await sdk.permissions.next_request(run_id)
+        await sdk.permissions.resolve(
+            request.request_id,
+            PermissionDecision.allow_once(),
+        )
+
+    if history == "permission_denied":
+        permission_task = asyncio.create_task(allow_recovery())
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        result = await handle.result()
+        if permission_task is not None:
+            await permission_task
+        assert handler_calls == 1
+        assert model_calls == [1]
+        assert tuple(item.status for item in result.tool_results) == (
+            expected_status,
+            ToolResultStatus.SUCCEEDED,
+        )
+        operation = await store.get_external_operation(operation_id)
+        assert isinstance(operation, ToolCallOperation)
+        assert operation.status is ExternalOperationStatus.COMPLETED
+    finally:
+        if permission_task is not None and not permission_task.done():
+            permission_task.cancel()
+            await asyncio.gather(permission_task, return_exceptions=True)
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history", "corruption"),
+    [
+        ("invalid_arguments", "modify_tool_result"),
+        ("tool_not_found", "insert_tool_result"),
+        ("permission_denied", "modify_permission_event"),
+        ("invalid_arguments", "insert_permission_event"),
+    ],
+)
+async def test_forged_safe_pre_handler_history_never_reaches_external_work(
+    history: str,
+    corruption: str,
+) -> None:
+    secret = f"forged-safe-history-{corruption}"
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _, _ = await _seed_safe_pre_handler_history(
+        store,
+        history=history,
+    )
+
+    if corruption in {"modify_tool_result", "insert_tool_result"}:
+        checkpoint = json.loads(store._run_checkpoints[run_id])
+        if corruption == "modify_tool_result":
+            checkpoint["tool_results"][0]["content"] = secret
+        else:
+            checkpoint["tool_results"].append(
+                {
+                    "call_id": "forged_safe_call",
+                    "tool_name": "forged_safe_tool",
+                    "status": "succeeded",
+                    "content": json.dumps({"secret": secret}),
+                    "value": {"secret": secret},
+                    "error": None,
+                }
+            )
+        store._run_checkpoints[run_id] = json.dumps(
+            checkpoint,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    elif corruption == "modify_permission_event":
+        event_index, stored = next(
+            (index, stored)
+            for index, stored in enumerate(store._events)
+            if stored.event.run_id == run_id
+            and stored.event.type == "permission.resolved"
+        )
+        payload = dict(stored.event.payload)
+        payload["decision"] = {
+            "action": "allow",
+            "scope": "once",
+            "reason": secret,
+        }
+        store._events[event_index] = type(stored)(
+            stored.cursor,
+            stored.event.model_copy(update={"payload": payload}),
+        )
+    else:
+        target_index, target = next(
+            (index, stored)
+            for index, stored in enumerate(store._events)
+            if stored.event.run_id == run_id
+            and stored.event.type == "tool.call.completed"
+        )
+        target_cursor = target.cursor
+        target_sequence = target.event.sequence
+        shifted = []
+        for stored in store._events:
+            cursor = stored.cursor + (stored.cursor >= target_cursor)
+            event = stored.event
+            if event.run_id == run_id and event.sequence >= target_sequence:
+                event = event.model_copy(
+                    update={"sequence": event.sequence + 1}
+                )
+            shifted.append(type(stored)(cursor, event))
+        inserted = EventEnvelope.new(
+            type="permission.requested",
+            session_id=target.event.session_id,
+            run_id=run_id,
+            sequence=target_sequence,
+            payload={"request": {"request_id": secret}},
+        )
+        shifted.insert(target_index, type(target)(target_cursor, inserted))
+        store._events = shifted
+        store._last_cursor += 1
+
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    permission_default = "ask" if history == "permission_denied" else "allow"
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default=permission_default,  # type: ignore[arg-type]
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        reconciliation_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert secret not in repr(reconciliation_events)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
 async def test_modified_recovery_permission_evidence_forces_reconciliation() -> None:
     secret = "forged-recovery-permission-event"
     store = InMemoryStore()
@@ -1819,6 +2158,57 @@ async def test_handler_swap_during_ask_deny_reconciles_without_early_completion(
         assert len(pending) == 1
         assert pending[0].reason == "recovery_state_invalid"
     finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_swap_during_final_handler_preflight_reconciles() -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        tool_source="mcp/server",
+    )
+    old_handler_calls = 0
+    new_handler_calls = 0
+    model_calls: list[int] = []
+
+    async def old_handler(_: ToolContext, value: int) -> int:
+        nonlocal old_handler_calls
+        old_handler_calls += 1
+        return value
+
+    async def new_handler(_: ToolContext, value: int) -> int:
+        nonlocal new_handler_calls
+        new_handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    original = sdk.tools.register(tool_spec, old_handler)
+    engine = sdk.recovery._service._engine  # type: ignore[attr-defined]
+    barrier = _LeaseAssertBarrier(engine._leases, target=4)
+    engine._leases = barrier
+    handle = await sdk.recovery.recover_run(run_id)
+    await asyncio.wait_for(barrier.reached.wait(), timeout=1)
+    assert sdk.tools.unregister(tool_spec.name, expected=original)
+    sdk.tools.register(tool_spec, new_handler)
+    barrier.release.set()
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert old_handler_calls == 0
+        assert new_handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "recovery_state_invalid"
+    finally:
+        barrier.release.set()
         await sdk.close()
 
 

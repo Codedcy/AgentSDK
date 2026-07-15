@@ -2,7 +2,7 @@
 
 ## Outcome
 
-REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+SECOND REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -14,7 +14,12 @@ The initial independent review found Spec/Quality C1/I1/M1: checkpoint content
 was not fully reconstructed from durable operations/events, Tool registry
 identity could change between certification and permission/handler work, and
 recovery observability exposed unbounded call/Tool identities. Those findings
-now have strict RED regressions and final-code fixes. Default, legacy, missing,
+now have strict RED regressions and final-code fixes and were confirmed closed
+by the second independent review. That review found Spec/Quality C0/I2/M0:
+the final handler preflight had a registry TOCTOU after its lease await, and
+valid historical handler-before safe rejections had no Tool operation and were
+rejected by the authoritative replay. Both Important findings now have strict
+reviewer reproductions and final-code fixes. Default, legacy, missing,
 changed, malformed, or internally inconsistent Tool
 evidence performs no permission, handler, MCP, or LiteLLM work and creates one
 bounded reconciliation request. Workflow recovery, reconciliation resolution,
@@ -38,6 +43,12 @@ provider behavior, SQLite schema, and migrations are unchanged.
   historical Tool results/messages, accumulated usage, joined output, and
   critical event counts/payloads/order. The reconstructed messages and ordered
   Tool results must exactly equal the checkpoint before external work.
+- A historical turn may have no Tool operation only for an exactly reconstructed
+  handler-before `tool not found`, invalid-arguments, or permission-denied
+  result. Its normalized Tool result is derived from the durable completion
+  event, crossed against the assistant call, descriptor/schema or missing
+  capability, permission evidence, Tool message, and checkpoint. All other
+  missing-operation shapes remain reconciliation-only.
 - A fresh lease atomically appends a bounded
   `tool.recovery.retry.started` event and re-fences the same STARTED Tool
   operation against the exact in-flight checkpoint. No new operation or
@@ -47,6 +58,10 @@ provider behavior, SQLite schema, and migrations are unchanged.
   completion path, immediately before the handler, and before outcome commit.
   A missing or replaced registration becomes one generation-fenced durable
   `recovery_state_invalid` reconciliation request.
+- Every recovery preflight performs a second synchronous registry/spec/
+  capability/metadata check after the lease await. The final handler preflight
+  then verifies the Tool fingerprint and invokes the already certified handler
+  without another await window.
 - Recovery uses the normal ToolExecutor. Permission is re-evaluated; ask uses
   the normal bridge; denial creates the normal denied ToolResult without
   invoking the handler. Recovery permission events and denial text are bounded
@@ -110,6 +125,21 @@ Production changes followed observable failing tests:
 11. Review RED showed 4 KiB Tool/call identities containing a secret copied
     into audit, permission, and authorization events. Public recovery identity
     payloads now contain only exact SHA-256 digests and remain bounded.
+12. Second-review barrier RED swapped an exact-schema MCP-style registration
+    inside the fourth lease assertion. Recovery entered reconciliation only
+    after invoking the captured old handler once. Preflight now re-reads and
+    compares the exact registration object, spec, capability descriptor/hash,
+    and recovery metadata synchronously after every lease await. The reviewer
+    barrier is green with old/new handlers and model all zero and one durable
+    reconciliation request.
+13. Second-review Memory/SQLite RED built valid two-turn histories where turn
+    zero ended before a handler because permission was denied, arguments were
+    invalid, or the Tool was missing; turn one held a certified in-flight Tool.
+    All six were incorrectly reconciled because replay demanded two operations
+    per turn. Replay now admits only the exact Model-only safe-rejection shape;
+    all six recover the same current operation and resume the model. Four
+    dedicated ToolResult/permission modification/insertion cases remain
+    zero-external reconciliation paths, as do all earlier forgery regressions.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -122,18 +152,18 @@ All commands used
 Python 3.13.
 
 - Phase 3D2 policy/recovery plus complete live progress:
-  `109 passed in 5.87s`.
+  `120 passed in 6.93s`.
 - Phase 3D1 provider recovery, Store reconciliation, and recovery API neighbor
-  group: `195 passed in 69.72s`.
-- Phase 3C2 recovery API: `89 passed in 66.94s`.
-- Phase 3C1 scanner/admission: `115 passed in 7.02s`.
-- Phase 3A Run-progress transaction: `123 passed in 6.26s`.
-- Phase 2 recovery records/SQLite validation: `139 passed in 6.94s`.
-- Phase 1 + M02-T001 regressions: `188 passed in 14.00s`.
+  group: `195 passed in 69.35s`.
+- Phase 3C1 scanner/admission: `115 passed in 6.88s`.
+- Phase 3B live progress: `40 passed in 3.52s`.
+- Phase 3A Run-progress transaction: `123 passed in 6.99s`.
+- Phase 2 recovery records/SQLite validation: `139 passed in 8.56s`.
+- Phase 1 + M02-T001 regressions: `188 passed in 13.39s`.
 - Session/Run/Tool/MCP/permission/Workflow/child compatibility:
-  `237 passed in 10.04s`.
+  `150 passed in 7.74s`, plus ownership `87 passed in 5.46s` = 237.
 - Full Python 3.13 pytest on the final tree:
-  `1409 passed in 105.64s`; zero skipped.
+  `1420 passed in 107.58s`; zero skipped.
 - Ruff: `All checks passed!`.
 - Mypy: `Success: no issues found in 75 source files`.
 - Public import/default canonical smoke: passed.
@@ -148,6 +178,9 @@ missing capability variants, descriptor/checkpoint forgeries on both stores,
 ten multi-turn historical evidence mutations, recovery permission-event
 mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
+Memory/SQLite close-reopen historical permission-deny/invalid-arguments/
+missing-Tool safe rejections, four no-operation ToolResult/permission forgery
+cases, the final handler-preflight lease barrier,
 handler and SDK-close cancellation, repeated cancellation, 20 same-SDK callers,
 two SDK instances, audit and Tool-outcome precommit/ambiguous replay, Run CAS,
 audit-time lease loss and takeover, same-operation retry after interrupted
