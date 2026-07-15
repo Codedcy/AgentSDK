@@ -119,4 +119,9 @@ Phase 4A implementation: a50b05017c90e19951d87fa3b836ea9f3dc4ce0a
 Phase 4A initial review: Not Approved; Spec C0/I3/M0 and Quality C0/I3/M0
 Phase 4A review findings: capability-admission TOCTOU allowed node CAS before failure; child creation did not authenticate the durable completed parent Run; normal-live and explicit recovery create/lease/projection races did not converge and could synthesize Workflow failure
 Phase 4A review-fix brief: .superpowers/sdd/M02-T002-phase4a-review-fix-brief.md
-Phase 4A review fix: in progress; Phase 4B remains blocked
+Phase 4A review-fix implementation: e3d29654ef5cb505c36f65c8f3acc4ddc6476925
+Phase 4A review-fix gates: exact 14; Phase 4A file 51; adjacent core 270; Provider/Tool 261; full Python3.13 1631 passed with zero skips; Ruff/mypy75/diff/import/scope/schema clean
+Phase 4A final re-review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
+Phase 4A: complete and independently approved
+Phase 4B: in progress - two-SDK concurrency, external-side-effect, crash-boundary, lifecycle, and sanitization hardening
+Phase 4B brief: .superpowers/sdd/M02-T002-phase4b-brief.md
