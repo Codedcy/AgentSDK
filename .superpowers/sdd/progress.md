@@ -143,3 +143,6 @@ Phase 4 final fresh review gates: authenticity7; admission99; adjacent recovery/
 Phase 4 nonblocking minor: one older single-SDK waiting-reconciliation test fabricates INTERRUPTED state; replace with reachable state in Phase 5
 Phase 4: complete - exact sequential Workflow recovery, two-SDK concurrency, fault boundaries, lifecycle, and sanitization
 Phase 5: in progress - reconciliation decisions, subprocess/fault E2E, dual-Python release gate, and ledger
+Phase 5 operational plan: .superpowers/sdd/M02-T002-phase5-plan.md
+Phase 5A: in progress - strict resolution admission and explicit safe retry decisions
+Phase 5A brief: .superpowers/sdd/M02-T002-phase5a-brief.md
