@@ -15,6 +15,7 @@ from agent_sdk import (
     AgentSpec,
     ErrorCode,
     PermissionDecision,
+    PermissionRequest,
     ProviderRecoveryAdapter,
     ProviderRecoveryDisposition,
     ProviderRecoveryRequest,
@@ -2278,6 +2279,10 @@ async def test_provider_historical_permission_request_is_strictly_reconstructed(
     [
         "allow",
         "deny",
+        "direct_allow",
+        "direct_allow_forged_permission",
+        "direct_deny",
+        "direct_deny_forged_permission",
         "handler_failed",
         "handler_invalid",
         "handler_timeout",
@@ -2312,6 +2317,15 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     current_model_started = asyncio.Event()
     current_model_cancelled = asyncio.Event()
     handler_calls: list[int] = []
+    recorded_default = (
+        "allow"
+        if scenario in {"direct_allow", "direct_allow_forged_permission"}
+        else (
+            "deny"
+            if scenario in {"direct_deny", "direct_deny_forged_permission"}
+            else "ask"
+        )
+    )
 
     async def completion(**_: object) -> Any:
         nonlocal model_turn
@@ -2366,22 +2380,23 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     seed = AgentSDK.for_test(
         store=store,
         acompletion=completion,
-        permission_default="ask",
+        permission_default=recorded_default,  # type: ignore[arg-type]
     )
     seed.tools.register(tool_spec, handler)
     seed.recovery.register_adapter(_adapter(unused_query, unused_resend))
     session = await seed.sessions.create(workspaces=[])
     seed_handle = await seed.runs.start(session.session_id, spec, "permission positive")
-    permission = await asyncio.wait_for(
-        seed.permissions.next_request(seed_handle.run_id),
-        timeout=1,
-    )
-    decision = (
-        PermissionDecision.allow_once()
-        if scenario != "deny"
-        else PermissionDecision.deny("operator denied")
-    )
-    await seed.permissions.resolve(permission.request_id, decision)
+    if recorded_default == "ask":
+        permission = await asyncio.wait_for(
+            seed.permissions.next_request(seed_handle.run_id),
+            timeout=1,
+        )
+        decision = (
+            PermissionDecision.allow_once()
+            if scenario != "deny"
+            else PermissionDecision.deny("operator denied")
+        )
+        await seed.permissions.resolve(permission.request_id, decision)
     await asyncio.wait_for(current_model_started.wait(), timeout=1)
     seed_handle._task.cancel()  # type: ignore[attr-defined]
     with pytest.raises(AgentSDKError):
@@ -2396,6 +2411,10 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     finally:
         await scanner.close()
 
+    forged = scenario.startswith("forged_") or scenario in {
+        "direct_allow_forged_permission",
+        "direct_deny_forged_permission",
+    }
     if scenario.startswith("forged_"):
         completed = next(
             stored.event
@@ -2415,6 +2434,41 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
             seed_handle.run_id,
             "tool.call.completed",
             forged_payload,
+        )
+    elif scenario in {
+        "direct_allow_forged_permission",
+        "direct_deny_forged_permission",
+    }:
+        forged_request = PermissionRequest(
+            request_id="prm_forged_direct_deny",
+            run_id=seed_handle.run_id,
+            session_id=session.session_id,
+            tool_name="lookup",
+            arguments={"value": 9},
+            effects=("network",),
+        ).model_dump(mode="json")
+        await _insert_provider_run_event(
+            store,
+            seed_handle.run_id,
+            anchor_type="tool.call.proposed",
+            after=True,
+            event_type="permission.requested",
+            payload={"request": forged_request},
+        )
+        await _insert_provider_run_event(
+            store,
+            seed_handle.run_id,
+            anchor_type="permission.requested",
+            after=True,
+            event_type="permission.resolved",
+            payload={
+                "request": forged_request,
+                "decision": (
+                    PermissionDecision.allow_once()
+                    if scenario == "direct_allow_forged_permission"
+                    else PermissionDecision.deny()
+                ).model_dump(mode="json"),
+            },
         )
 
     query_calls = 0
@@ -2441,19 +2495,21 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     recovered = AgentSDK.for_test(
         store=store,
         acompletion=unexpected_completion,
-        permission_default="ask",
+        permission_default=recorded_default,  # type: ignore[arg-type]
     )
     recovered.agents.define(spec)
     recovered.tools.register(tool_spec, handler)
     recovered.recovery.register_adapter(_adapter(query, resend))
     try:
         handle = await recovered.recovery.recover_run(seed_handle.run_id)
-        if scenario.startswith("forged_"):
+        if forged:
             with pytest.raises(AgentSDKError, match="recovery required"):
                 await handle.result()
             assert query_calls == 0
             assert resend_calls == 0
-            assert handler_calls == [9]
+            assert handler_calls == (
+                [] if scenario == "direct_deny_forged_permission" else [9]
+            )
             pending = await recovered.recovery.pending_requests(seed_handle.run_id)
             assert len(pending) == 1
             assert pending[0].reason == "model_call_unknown_outcome"
@@ -2462,9 +2518,7 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
                 for stored in await store.read_events(after_cursor=0)
                 if stored.event.run_id == seed_handle.run_id
             ]
-            assert sum(
-                event.type == "permission.requested" for event in run_events
-            ) == 1
+            assert sum(event.type == "permission.requested" for event in run_events) == 1
             assert sum(
                 event.type == "reconciliation.requested" for event in run_events
             ) == 1
@@ -2473,7 +2527,9 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
             assert result.output_text == f"recovered-{scenario}"
             assert query_calls == 1
             assert resend_calls == 0
-            assert handler_calls == ([] if scenario == "deny" else [9])
+            assert handler_calls == (
+                [] if scenario in {"deny", "direct_deny"} else [9]
+            )
             assert not any(
                 stored.event.type == "reconciliation.requested"
                 for stored in await store.read_events(after_cursor=0)

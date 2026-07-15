@@ -2,7 +2,7 @@
 
 ## Outcome
 
-SEVENTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+EIGHTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -90,6 +90,20 @@ must also have the exact terminal status, normalized outcome, capability,
 recovery metadata, and request fingerprint; operation-free history remains
 limited to the previously proven missing/invalid/denied normalized paths.
 
+The eighth independent review confirmed every previous finding closed and
+reported the sole remaining Spec/Quality C0/I1/M0 issue. A canonical normal
+`permission.requested`/`permission.resolved` pair was reconstructed exactly,
+but its existence was not crossed against the permission decision reachable
+from the recorded execution policy. A Run recorded with direct deny could
+therefore contain a forged ask/deny pair and still reach the Provider adapter.
+The fix deterministically evaluates the recorded policy through the production
+`PolicyEngine` while replaying each historical call. Initial ask requires the
+exact request and optional allow/deny resolution; initial allow permits no
+request/resolution and requires authorization/execution; initial deny permits
+no request/resolution/authorization and only the exact normalized denied
+no-operation result. The same lifecycle consumer protects Provider and Tool
+certification, and replay performs no broker callbacks.
+
 ## Implemented contract
 
 - Added and root-exported strict `ToolRetryPolicy` values `never`,
@@ -161,6 +175,18 @@ limited to the previously proven missing/invalid/denied normalized paths.
   id, Run, Session, Tool, arguments, and effects are crossed against the
   descriptor and call, decision scope remains within its strict model, and the
   denial reason is crossed against the normalized Tool result.
+- Historical permission lifecycle reachability is derived by passing the
+  strictly reconstructed request and the recorded execution-policy descriptor
+  through the production `PolicyEngine`. An initial `ask` decision requires
+  the canonical request and, when the call terminates, its exact allow/deny
+  resolution; `allow` cannot contain requested/resolved events and must proceed
+  through authorization/execution; `deny` cannot contain requested/resolved or
+  authorization events and may produce only the exact normalized denied
+  no-operation completion. This evaluation is local and deterministic, so
+  replay never calls an application permission bridge. The currently persisted
+  policy descriptor exposes `permission_default` only; no nonexistent
+  rule/workspace interpreter was added in parallel with the production policy
+  implementation.
 - Every historical `tool.call.completed` is canonically reconstructed once in
   the shared lifecycle consumer. Its exact ToolResult must equal the ordered
   checkpoint ToolResult and Tool message. When a ToolCallOperation exists, the
@@ -329,6 +355,17 @@ Production changes followed observable failing tests:
     failure histories before Provider recovery. Existing operation-free
     denied/invalid/missing histories and the complete Tool recovery suite remain
     green.
+19. Eighth-review public Memory/SQLite RED inserted a canonical matching
+    `permission.requested` plus deny `permission.resolved` between proposal and
+    completion for a Run whose recorded policy directly denied the call. Both
+    cases still reached the Provider query (`2/2` RED), even though a real
+    broker direct-deny path emits no permission callbacks. Production-policy
+    evaluation made both `2/2` green with zero query/resend work and exactly one
+    bounded reconciliation. The expanded thirty-six-case matrix covers legal
+    direct allow, legal direct deny, forged permission pairs under both direct
+    decisions, legal ask allow/deny, strict request reconstruction, historical
+    ToolResult authentication, and cross-kind recovery across Memory/SQLite.
+    Provider and Tool share the evaluator-backed lifecycle semantics.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -351,6 +388,19 @@ Python 3.13.
   `605 passed in 25.07s`.
 - Full Python 3.13 pytest on the seventh-review final tree:
   `1529 passed in 116.02s`; zero skipped.
+- Ruff: `All checks passed!`; mypy:
+  `Success: no issues found in 75 source files`; diff/scope clean; SQLite
+  `_SCHEMA_VERSION` remains exactly 3.
+- Eighth-review exact plus expanded permission-reachability matrix:
+  `36 passed in 9.09s`.
+- Complete Provider + Tool recovery files: `225 passed in 16.41s`.
+- Provider + Tool + RecoveryAPI: `314 passed in 83.72s`.
+- Provider/live/scanner/Store validation and reconciliation neighbors:
+  `301 passed in 17.03s`.
+- Phase 3C1/3B/3A, Phase 2, and Phase 1 + M02-T001 combined fresh gate:
+  `605 passed in 26.22s`.
+- Full Python 3.13 pytest on the eighth-review final tree:
+  `1537 passed in 117.52s`; zero skipped.
 - Ruff: `All checks passed!`; mypy:
   `Success: no issues found in 75 source files`; diff/scope clean; SQLite
   `_SCHEMA_VERSION` remains exactly 3.
@@ -403,6 +453,8 @@ close/reopen success, conservative SQLite default recovery, seven changed or
 missing capability variants, descriptor/checkpoint forgeries on both stores,
 both legal Provider-to-Tool and Tool-to-Provider repeated recovery directions,
 historical normal ask-allow and ask-deny Provider recovery on both stores,
+recorded direct-allow and direct-deny permission reachability with forged
+normal permission pairs rejected on both stores,
 historical ToolResult value/status/content substitutions, normalized handler
 failure/non-JSON/timeout results, and Tool-recovery-produced completed/failed
 operations before Provider recovery,

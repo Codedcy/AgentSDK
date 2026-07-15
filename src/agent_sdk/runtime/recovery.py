@@ -734,6 +734,33 @@ class RunRecoveryService:
         request_payload = payload["request"]
         if not isinstance(request_payload, Mapping):
             return None
+        try:
+            request = PermissionRequest.model_validate(request_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        expected = RunRecoveryService._recorded_permission_request(
+            evidence,
+            call,
+            request_id=request.request_id,
+        )
+        if (
+            request.model_dump(mode="json") != request_payload
+            or expected is None
+            or request != expected
+        ):
+            return None
+        return request
+
+    @staticmethod
+    def _recorded_permission_request(
+        evidence: _RecoveryEvidence,
+        call: ToolCallCompleted,
+        *,
+        request_id: str,
+    ) -> PermissionRequest | None:
+        descriptor = evidence.run.execution_descriptor
+        if descriptor is None or not request_id.strip():
+            return None
         capabilities = tuple(
             tool for tool in descriptor.tools if tool.spec.name == call.name
         )
@@ -746,20 +773,37 @@ class RunRecoveryService:
             )
             if not isinstance(arguments, dict):
                 return None
-            request = PermissionRequest.model_validate(request_payload)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-        if (
-            request.model_dump(mode="json") != request_payload
-            or not request.request_id.strip()
-            or request.run_id != evidence.run.run_id
-            or request.session_id != evidence.run.session_id
-            or request.tool_name != call.name
-            or request.arguments != arguments
-            or request.effects != capabilities[0].spec.effects
+            Draft202012Validator(
+                thaw_json(capabilities[0].spec.input_schema)
+            ).validate(arguments)
+            return PermissionRequest(
+                request_id=request_id,
+                run_id=evidence.run.run_id,
+                session_id=evidence.run.session_id,
+                tool_name=call.name,
+                arguments=arguments,
+                effects=capabilities[0].spec.effects,
+            )
+        except (
+            JSONSchemaValidationError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
         ):
             return None
-        return request
+
+    @staticmethod
+    def _recorded_permission_decision(
+        evidence: _RecoveryEvidence,
+        request: PermissionRequest,
+    ) -> PermissionDecision | None:
+        descriptor = evidence.run.execution_descriptor
+        if descriptor is None:
+            return None
+        try:
+            return PolicyEngine(descriptor.policy.permission_default).evaluate(request)
+        except AgentSDKError:
+            return None
 
     @staticmethod
     def _validated_permission_decision(
@@ -815,6 +859,7 @@ class RunRecoveryService:
         operation: ToolCallOperation | None,
         result: ToolResult,
         permission_decision: PermissionDecision | None,
+        initial_permission_decision: PermissionDecision | None,
         permission_recovery: bool,
         permission_allowed: bool | None,
     ) -> bool:
@@ -922,7 +967,13 @@ class RunRecoveryService:
             elif (
                 result.status is ToolResultStatus.DENIED
                 and permission_recovery
-                and permission_allowed is False
+                and (
+                    permission_allowed is False
+                    or (
+                        initial_permission_decision is not None
+                        and initial_permission_decision.action == "deny"
+                    )
+                )
             ):
                 normalized_result = ToolResult.normalized_error(
                     call.call_id,
@@ -961,7 +1012,10 @@ class RunRecoveryService:
                 ToolResultStatus.INVALID_ARGUMENTS,
                 "invalid tool arguments",
             )
-        elif descriptor.policy.permission_default == "deny":
+        elif (
+            initial_permission_decision is not None
+            and initial_permission_decision.action == "deny"
+        ):
             expected = ToolResult.normalized_error(
                 call.call_id,
                 call.name,
@@ -969,7 +1023,8 @@ class RunRecoveryService:
                 "permission denied",
             )
         elif (
-            descriptor.policy.permission_default == "ask"
+            initial_permission_decision is not None
+            and initial_permission_decision.action == "ask"
             and permission_decision is not None
             and not permission_decision.allowed
         ):
@@ -1021,6 +1076,7 @@ class RunRecoveryService:
         current_call: ToolCallCompleted | None = None
         pending_permission: Mapping[str, Any] | None = None
         permission_decision: PermissionDecision | None = None
+        initial_permission_decision: PermissionDecision | None = None
         permission_recovery = False
         permission_allowed: bool | None = None
         completed_result_count = 0
@@ -1125,6 +1181,9 @@ class RunRecoveryService:
                 current_tool = None
                 current_call = None
                 permission_decision = None
+                initial_permission_decision = None
+                permission_recovery = False
+                permission_allowed = None
                 state = "model_starting"
                 continue
             if event_type == "model.call.started":
@@ -1207,12 +1266,28 @@ class RunRecoveryService:
                 pending_permission = None
                 permission_allowed = None
                 permission_decision = None
+                permission_recovery = False
+                replay_request = RunRecoveryService._recorded_permission_request(
+                    evidence,
+                    current_call,
+                    request_id="prm_recovery_replay",
+                )
+                initial_permission_decision = (
+                    RunRecoveryService._recorded_permission_decision(
+                        evidence,
+                        replay_request,
+                    )
+                    if replay_request is not None
+                    else None
+                )
                 state = "tool_proposed"
                 continue
             if event_type == "permission.requested":
                 if (
                     state not in {"tool_proposed", "tool_recovering"}
                     or current_call is None
+                    or initial_permission_decision is None
+                    or initial_permission_decision.action != "ask"
                 ):
                     return False
                 permission_recovery = state == "tool_recovering"
@@ -1225,12 +1300,22 @@ class RunRecoveryService:
                         or payload["tool"] != hashed_identity(current_call.name)
                     ):
                         return False
-                elif RunRecoveryService._validated_permission_request(
-                    evidence,
-                    current_call,
-                    payload,
-                ) is None:
-                    return False
+                else:
+                    request = RunRecoveryService._validated_permission_request(
+                        evidence,
+                        current_call,
+                        payload,
+                    )
+                    if request is None:
+                        return False
+                    recorded_decision = (
+                        RunRecoveryService._recorded_permission_decision(
+                            evidence,
+                            request,
+                        )
+                    )
+                    if recorded_decision is None or recorded_decision.action != "ask":
+                        return False
                 pending_permission = payload
                 permission_allowed = None
                 permission_decision = None
@@ -1268,6 +1353,20 @@ class RunRecoveryService:
                     or state
                     not in {"tool_proposed", "tool_recovering", "permission_resolved"}
                     or (state == "permission_resolved" and permission_allowed is not True)
+                    or (
+                        state in {"tool_proposed", "tool_recovering"}
+                        and (
+                            initial_permission_decision is None
+                            or initial_permission_decision.action != "allow"
+                        )
+                    )
+                    or (
+                        state == "permission_resolved"
+                        and (
+                            initial_permission_decision is None
+                            or initial_permission_decision.action != "ask"
+                        )
+                    )
                 ):
                     return False
                 expected = (
@@ -1303,9 +1402,26 @@ class RunRecoveryService:
             if event_type == "tool.call.completed":
                 if state not in {
                     "tool_proposed",
+                    "tool_recovering",
                     "permission_resolved",
                     "tool_in_flight",
-                } or (state == "permission_resolved" and permission_allowed is not False):
+                }:
+                    return False
+                if state == "permission_resolved" and (
+                    permission_allowed is not False
+                    or initial_permission_decision is None
+                    or initial_permission_decision.action != "ask"
+                ):
+                    return False
+                if state in {"tool_proposed", "tool_recovering"} and (
+                    initial_permission_decision is not None
+                    and initial_permission_decision.action != "deny"
+                ):
+                    return False
+                if (
+                    state == "tool_recovering"
+                    and initial_permission_decision is None
+                ):
                     return False
                 try:
                     result = ToolResult.model_validate(payload)
@@ -1335,6 +1451,7 @@ class RunRecoveryService:
                         operation=current_tool,
                         result=result,
                         permission_decision=permission_decision,
+                        initial_permission_decision=initial_permission_decision,
                         permission_recovery=permission_recovery,
                         permission_allowed=permission_allowed,
                     )
@@ -2048,6 +2165,19 @@ class RunRecoveryService:
                     ):
                         return None
 
+                recorded_permission_request = self._recorded_permission_request(
+                    evidence,
+                    call,
+                    request_id="prm_tool_history_replay",
+                )
+                initial_permission = (
+                    self._recorded_permission_decision(
+                        evidence,
+                        recorded_permission_request,
+                    )
+                    if recorded_permission_request is not None
+                    else None
+                )
                 result: ToolResult | None = None
                 permission_allowed: bool | None = None
                 if turn == checkpoint.turn:
@@ -2063,7 +2193,10 @@ class RunRecoveryService:
                         call=call,
                         registered=registered,
                     )
-                    if descriptor.policy.permission_default == "ask":
+                    if (
+                        initial_permission is not None
+                        and initial_permission.action == "ask"
+                    ):
                         permission_allowed = True
                 else:
                     result = ToolResult.model_validate(
@@ -2100,10 +2233,14 @@ class RunRecoveryService:
                                 or not arguments_valid
                             ):
                                 return None
-                            if descriptor.policy.permission_default == "ask":
+                            if (
+                                initial_permission is not None
+                                and initial_permission.action == "ask"
+                            ):
                                 permission_allowed = False
                             elif (
-                                descriptor.policy.permission_default != "deny"
+                                initial_permission is None
+                                or initial_permission.action != "deny"
                                 or result
                                 != ToolResult.normalized_error(
                                     call.call_id,
@@ -2137,7 +2274,10 @@ class RunRecoveryService:
                             != tool_operation.model_dump(mode="json")["outcome"]
                         ):
                             return None
-                        if descriptor.policy.permission_default == "ask":
+                        if (
+                            initial_permission is not None
+                            and initial_permission.action == "ask"
+                        ):
                             permission_allowed = True
                     reconstructed_results.append(result)
                     reconstructed_messages.append(
