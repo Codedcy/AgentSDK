@@ -1,19 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
+
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
-from agent_sdk.models.litellm_gateway import ModelRequest
+from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.agents import AgentRegistry
-from agent_sdk.runtime.engine import RunEngine, _model_request_fingerprint
+from agent_sdk.runtime.engine import (
+    RunEngine,
+    _model_request_fingerprint,
+    _tool_request_fingerprint,
+)
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
@@ -49,6 +57,7 @@ from agent_sdk.runtime.reconciliation import (
     RecoveryStateConflictError,
     RunCheckpoint,
     RunCheckpointPhase,
+    ToolCallOperation,
 )
 from agent_sdk.runtime.session_lifecycle import (
     exact_run_precondition,
@@ -62,6 +71,7 @@ from agent_sdk.storage.base import (
     SnapshotWrite,
     StateStore,
 )
+from agent_sdk.tools.models import ToolRetryPolicy, thaw_json
 from agent_sdk.tools.registry import ToolRegistry
 
 
@@ -76,6 +86,7 @@ class RecoveryPlan:
         "resume",
         "reconcile",
         "provider_recovery",
+        "tool_recovery",
         "follow",
     ]
     run_id: str
@@ -161,8 +172,24 @@ class RunRecoveryService:
             await self._validated_pending_requests(run)
             return RecoveryPlan("detached", run_id)
         evidence = await self._load_evidence(run)
-        request = await self._validated_request(evidence)
         checkpoint = evidence.checkpoint
+        try:
+            request = await self._validated_request(evidence)
+        except AgentSDKError:
+            if (
+                run.status is RunStatus.INTERRUPTED
+                and checkpoint is not None
+                and checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT
+            ):
+                return RecoveryPlan(
+                    "reconcile",
+                    run_id,
+                    checkpoint=checkpoint,
+                    reason="recovery_state_invalid",
+                    operation_id=checkpoint.operation_id,
+                    details=(("checkpoint_phase", checkpoint.phase.value),),
+                )
+            raise
         if run.execution_compatibility == "legacy_unknown":
             return RecoveryPlan(
                 "reconcile",
@@ -237,6 +264,15 @@ class RunRecoveryService:
                     )
                 reason = "model_call_unknown_outcome"
             else:
+                assert isinstance(linked, ToolCallOperation)
+                if self._certified_tool_call(evidence, linked) is not None:
+                    return RecoveryPlan(
+                        "tool_recovery",
+                        run_id,
+                        request=request,
+                        checkpoint=checkpoint,
+                        operation_id=linked.operation_id,
+                    )
                 reason = "tool_call_unknown_outcome"
             return RecoveryPlan(
                 "reconcile",
@@ -310,7 +346,31 @@ class RunRecoveryService:
         ) from None
 
     async def execute(self, plan: RecoveryPlan) -> RunResult:
+        public_error: tuple[ErrorCode, str, bool] | None = None
+        try:
+            return await self._execute_private(plan)
+        except asyncio.CancelledError:
+            del self, plan
+            raise
+        except AgentSDKError as error:
+            public_error = (error.code, error.message, error.retryable)
+        except Exception:
+            public_error = (
+                ErrorCode.INTERNAL,
+                "failed to recover run",
+                False,
+            )
+        del self, plan
+        assert public_error is not None
+        raise AgentSDKError(
+            public_error[0],
+            public_error[1],
+            retryable=public_error[2],
+        ) from None
+
+    async def _execute_private(self, plan: RecoveryPlan) -> RunResult:
         follow = False
+        run_id = plan.run_id
         try:
             if plan.kind == "execute":
                 assert plan.request is not None
@@ -325,17 +385,26 @@ class RunRecoveryService:
                 )
             if plan.kind == "reconcile":
                 assert plan.reason is not None
+                reason = plan.reason
+                operation_id = plan.operation_id
+                details = dict(plan.details)
+                del plan
                 return await self._coordinate_reconciliation(
-                    plan.run_id,
-                    reason=plan.reason,
-                    operation_id=plan.operation_id,
-                    details=dict(plan.details),
+                    run_id,
+                    reason=reason,
+                    operation_id=operation_id,
+                    details=details,
                 )
             if plan.kind == "provider_recovery":
                 assert plan.request is not None
                 assert plan.checkpoint is not None
                 assert plan.operation_id is not None
                 return await self._coordinate_provider_recovery(plan)
+            if plan.kind == "tool_recovery":
+                assert plan.request is not None
+                assert plan.checkpoint is not None
+                assert plan.operation_id is not None
+                return await self._coordinate_tool_recovery(plan)
             if plan.kind == "follow":
                 return await self._follow_durable_run(plan.run_id)
             raise AgentSDKError(
@@ -353,7 +422,7 @@ class RunRecoveryService:
             else:
                 raise
         if follow:
-            return await self._follow_durable_run(plan.run_id)
+            return await self._follow_durable_run(run_id)
         raise AssertionError("unreachable")
 
     async def _follow_durable_run(self, run_id: str) -> RunResult:
@@ -855,6 +924,264 @@ class RunRecoveryService:
         except Exception:
             return None
 
+    def _certified_tool_call(
+        self,
+        evidence: _RecoveryEvidence,
+        operation: ToolCallOperation,
+    ) -> ToolCallCompleted | None:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if (
+            checkpoint is None
+            or descriptor is None
+            or evidence.pending
+            or checkpoint.phase is not RunCheckpointPhase.TOOL_IN_FLIGHT
+            or checkpoint.operation_id != operation.operation_id
+            or checkpoint.turn != operation.turn
+        ):
+            return None
+        try:
+            messages = checkpoint.model_dump(mode="json")["messages"]
+            assistant = messages[-1]
+            if set(assistant) != {"role", "content", "tool_calls"}:
+                return None
+            raw_calls = assistant["tool_calls"]
+            if assistant["role"] != "assistant" or len(raw_calls) != 1:
+                return None
+            raw_call = raw_calls[0]
+            if set(raw_call) != {"id", "type", "function"}:
+                return None
+            function = raw_call["function"]
+            if (
+                raw_call["type"] != "function"
+                or set(function) != {"name", "arguments"}
+            ):
+                return None
+            call = ToolCallCompleted(
+                index=0,
+                call_id=raw_call["id"],
+                name=function["name"],
+                arguments_json=function["arguments"],
+            )
+            registered = self._tools.get(call.name)
+            capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+            retry_policy = registered.spec.retry_policy
+            if retry_policy is ToolRetryPolicy.NEVER:
+                return None
+            if operation.tool_identity != capability.capability_hash:
+                return None
+            descriptor_capabilities = tuple(
+                item for item in descriptor.tools if item.spec.name == call.name
+            )
+            if descriptor_capabilities != (capability,):
+                return None
+            expected_metadata = {
+                "safe_retry": True,
+                "retry_class": retry_policy.value,
+            }
+            metadata = operation.recovery_metadata
+            if (
+                dict(metadata) != expected_metadata
+                or type(metadata.get("safe_retry")) is not bool
+            ):
+                return None
+            decoded = json.loads(
+                call.arguments_json,
+                parse_constant=_reject_json_constant,
+            )
+            if not isinstance(decoded, dict):
+                return None
+            Draft202012Validator(
+                thaw_json(registered.spec.input_schema)
+            ).validate(decoded)
+            if (
+                _tool_request_fingerprint(call, capability, decoded)
+                != operation.request_fingerprint
+            ):
+                return None
+        except (
+            AgentSDKError,
+            JSONSchemaValidationError,
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+        current = tuple(
+            item for item in evidence.operations if item.turn == checkpoint.turn
+        )
+        if (
+            len(current) != 2
+            or current[0].operation_kind is not ExternalOperationKind.MODEL_CALL
+            or current[1] != operation
+            or any(item.turn > checkpoint.turn for item in evidence.operations)
+        ):
+            return None
+        model_operation = current[0]
+        assert isinstance(model_operation, ModelCallOperation)
+        completed = self._completed_model_outcome(model_operation)
+        if completed is None:
+            return None
+        finish_reason, text, calls, _usage = completed
+        model_operations = tuple(
+            item
+            for item in evidence.operations
+            if isinstance(item, ModelCallOperation)
+        )
+        if tuple(item.turn for item in model_operations) != tuple(
+            range(checkpoint.turn + 1)
+        ):
+            return None
+        completed_outcomes = tuple(
+            self._completed_model_outcome(item) for item in model_operations
+        )
+        if any(outcome is None for outcome in completed_outcomes):
+            return None
+        exact_outcomes = tuple(
+            outcome for outcome in completed_outcomes if outcome is not None
+        )
+        cumulative: dict[str, int | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+        for _finish, _text, _calls, operation_usage in exact_outcomes:
+            if len(_calls) != 1:
+                return None
+            for field in cumulative:
+                value = getattr(operation_usage, field)
+                if value is not None:
+                    cumulative[field] = (cumulative[field] or 0) + value
+        if (
+            checkpoint.usage != TokenUsage(**cumulative)
+            or "".join(checkpoint.output_parts)
+            != "".join(outcome[1] for outcome in exact_outcomes)
+        ):
+            return None
+        if (
+            len(calls) != 1
+            or calls[0]
+            != {
+                "index": 0,
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments_json": call.arguments_json,
+            }
+            or assistant
+            != {
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": [
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments_json,
+                        },
+                    }
+                ],
+            }
+            or not "".join(checkpoint.output_parts).endswith(text)
+        ):
+            return None
+        model_completed = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "model.call.completed"
+        )
+        model_started = tuple(
+            event for event in evidence.run_events if event.type == "model.call.started"
+        )
+        model_failed = tuple(
+            event for event in evidence.run_events if event.type == "model.call.failed"
+        )
+        tool_started = tuple(
+            event for event in evidence.run_events if event.type == "tool.call.started"
+        )
+        tool_completed = tuple(
+            event for event in evidence.run_events if event.type == "tool.call.completed"
+        )
+        tool_operations = tuple(
+            item
+            for item in evidence.operations
+            if isinstance(item, ToolCallOperation)
+        )
+        if (
+            len(model_started) != len(model_operations)
+            or len(model_completed) != len(model_operations)
+            or model_failed
+            or model_completed[-1].payload != {"finish_reason": finish_reason}
+            or len(tool_started) != len(tool_operations)
+            or len(tool_completed)
+            != sum(
+                item.status is not ExternalOperationStatus.STARTED
+                for item in tool_operations
+            )
+            or tool_started[-1].payload
+            != {"call_id": call.call_id, "tool_name": call.name}
+        ):
+            return None
+        start_index = evidence.run_events.index(tool_started[-1])
+        if not self._is_valid_tool_recovery_tail(
+            evidence.run_events[start_index + 1 :],
+            operation=operation,
+            call=call,
+        ):
+            return None
+        return call
+
+    @staticmethod
+    def _is_valid_tool_recovery_tail(
+        events: tuple[EventEnvelope, ...],
+        *,
+        operation: ToolCallOperation,
+        call: ToolCallCompleted,
+    ) -> bool:
+        if not events or events[0].type != "run.interrupted":
+            return False
+        index = 1
+        expected_audit = {
+            "operation_id": operation.operation_id,
+            "call_id": call.call_id,
+            "tool_name": call.name,
+            "retry_class": operation.recovery_metadata["retry_class"],
+        }
+        while index < len(events):
+            audit = events[index]
+            if (
+                audit.type != "tool.recovery.retry.started"
+                or audit.payload != expected_audit
+            ):
+                return False
+            index += 1
+            if index == len(events):
+                return True
+            if index < len(events) and events[index].type == "run.recovery.started":
+                if events[index].payload != {"status": RunStatus.RUNNING.value}:
+                    return False
+                index += 1
+                if index < len(events) and events[index].type == "permission.requested":
+                    index += 1
+                    if (
+                        index < len(events)
+                        and events[index].type == "permission.resolved"
+                    ):
+                        index += 1
+                if index < len(events) and events[index].type == "tool.call.authorized":
+                    if events[index].payload != {
+                        "call_id": call.call_id,
+                        "tool_name": call.name,
+                    }:
+                        return False
+                    index += 1
+            if index >= len(events) or events[index].type != "run.interrupted":
+                return False
+            index += 1
+        return True
+
     async def _validated_pending_requests(
         self,
         run: RunSnapshot,
@@ -1122,6 +1449,135 @@ class RunRecoveryService:
                 operation_id=refenced.operation_id,
                 details=details,
                 checkpoint=checkpoint,
+            )
+        except asyncio.CancelledError:
+            if heartbeat_error is not None:
+                raise LeaseLostError from None
+            raise
+        finally:
+            active_error = sys.exception()
+            heartbeat.cancel()
+            heartbeat_cancellation = await _settle_task(heartbeat)
+            shutdown_cancellation = None
+            if shutdown is not None:
+                shutdown.cancel()
+                shutdown_cancellation = await _settle_task(shutdown)
+            release = asyncio.create_task(self._leases.release(lease))
+            cancellation = await _settle_task(release)
+            if cancellation is None:
+                cancellation = heartbeat_cancellation
+            if cancellation is None:
+                cancellation = shutdown_cancellation
+            if active_error is None and cancellation is not None:
+                raise cancellation from None
+
+    async def _coordinate_tool_recovery(
+        self,
+        plan: RecoveryPlan,
+    ) -> RunResult:
+        now = self._clock()
+        lease = await self._leases.acquire(plan.run_id, new_id("coord"), now=now)
+        owner = asyncio.current_task()
+        assert owner is not None
+        heartbeat_error: BaseException | None = None
+        heartbeat = asyncio.create_task(self._heartbeat(lease))
+        shutdown: asyncio.Future[object] | None = (
+            None
+            if self._wait_stopping is None
+            else asyncio.ensure_future(self._wait_stopping())
+        )
+
+        def heartbeat_finished(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception()
+            if heartbeat_error is not None and not owner.done():
+                owner.cancel()
+
+        heartbeat.add_done_callback(heartbeat_finished)
+
+        def shutdown_finished(task: asyncio.Future[object]) -> None:
+            if not task.cancelled() and task.exception() is None and not owner.done():
+                owner.cancel()
+
+        if shutdown is not None:
+            shutdown.add_done_callback(shutdown_finished)
+        try:
+            run = await self._load_run(plan.run_id)
+            if run.status is not RunStatus.INTERRUPTED:
+                raise RecoveryStateConflictError
+            evidence = await self._load_evidence(run)
+            base_request = await self._validated_request(evidence)
+            if base_request is None:
+                raise RecoveryStateConflictError
+            linked = self._matching_in_flight_operation(evidence)
+            checkpoint = plan.checkpoint
+            if (
+                not isinstance(linked, ToolCallOperation)
+                or linked.operation_id != plan.operation_id
+                or checkpoint is None
+                or evidence.checkpoint != checkpoint
+            ):
+                raise RecoveryStateConflictError
+            tool_call = self._certified_tool_call(evidence, linked)
+            if tool_call is None:
+                return await self._request_reconciliation_owned(
+                    lease,
+                    run,
+                    evidence.session,
+                    reason="recovery_state_invalid",
+                    operation_id=linked.operation_id,
+                    details={"checkpoint_phase": checkpoint.phase.value},
+                    checkpoint=checkpoint,
+                )
+            refenced = linked.model_copy(
+                update={"lease_generation": lease.generation}
+            )
+            sequence = await self._store.latest_run_event_sequence(run.run_id)
+            if sequence is None:
+                raise RecoveryStateConflictError
+            event = EventEnvelope(
+                event_id=new_id("evt"),
+                type="tool.recovery.retry.started",
+                session_id=run.session_id,
+                run_id=run.run_id,
+                sequence=sequence + 1,
+                payload={
+                    "operation_id": linked.operation_id,
+                    "call_id": tool_call.call_id,
+                    "tool_name": tool_call.name,
+                    "retry_class": linked.recovery_metadata["retry_class"],
+                },
+                occurred_at=self._clock(),
+            )
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=lease,
+                    now=self._clock(),
+                    events=(event,),
+                    preconditions=(
+                        exact_session_precondition(evidence.session),
+                        exact_run_precondition(run),
+                    ),
+                    operation=ExternalOperationWrite(linked, refenced),
+                    checkpoint_precondition=checkpoint,
+                ),
+            )
+            await self._leases.assert_current(lease, now=self._clock())
+            sequence = await self._store.latest_run_event_sequence(run.run_id)
+            if sequence is None:
+                raise RecoveryStateConflictError
+            return await self._engine.resume_recovered_tool(
+                run,
+                evidence.session,
+                checkpoint,
+                refenced,
+                tool_call,
+                base_request,
+                lease,
+                sequence=sequence + 1,
             )
         except asyncio.CancelledError:
             if heartbeat_error is not None:
@@ -1546,3 +2002,7 @@ async def _settle_task(
 
 async def _yield_once() -> None:
     await asyncio.sleep(0)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")

@@ -7,7 +7,14 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_serializer,
+)
 
 
 def freeze_json(value: Any) -> Any:
@@ -57,6 +64,12 @@ def bounded_text(value: str, *, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+class ToolRetryPolicy(StrEnum):
+    NEVER = "never"
+    IDEMPOTENT = "idempotent"
+    SAFE_RETRY = "safe_retry"
+
+
 class ToolSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", arbitrary_types_allowed=True)
 
@@ -71,6 +84,7 @@ class ToolSpec(BaseModel):
     source: str = Field(default="application", min_length=1)
     effects: tuple[str, ...] = ()
     timeout_seconds: float | None = Field(default=None, gt=0)
+    retry_policy: ToolRetryPolicy = ToolRetryPolicy.NEVER
 
     @field_validator("input_schema", mode="after")
     @classmethod
@@ -84,6 +98,14 @@ class ToolSpec(BaseModel):
         thawed = thaw_json(value)
         assert isinstance(thawed, dict)
         return thawed
+
+    @model_serializer(mode="wrap")
+    def _serialize_canonical(self, handler: Any) -> dict[str, Any]:
+        serialized = handler(self)
+        assert isinstance(serialized, dict)
+        if self.retry_policy is ToolRetryPolicy.NEVER:
+            serialized.pop("retry_policy", None)
+        return serialized
 
     def model_copy(
         self,

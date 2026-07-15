@@ -1,6 +1,12 @@
 from typing import TYPE_CHECKING, Any
 
-from agent_sdk.tools.models import ToolContext, ToolResult, ToolResultStatus, ToolSpec
+from agent_sdk.tools.models import (
+    ToolContext,
+    ToolResult,
+    ToolResultStatus,
+    ToolRetryPolicy,
+    ToolSpec,
+)
 from agent_sdk.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
@@ -20,5 +26,6 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "ToolResultStatus",
+    "ToolRetryPolicy",
     "ToolSpec",
 ]

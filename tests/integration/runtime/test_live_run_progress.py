@@ -41,7 +41,12 @@ from agent_sdk.storage.base import (
 )
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
-from agent_sdk.tools.models import ToolContext, ToolResultStatus, ToolSpec
+from agent_sdk.tools.models import (
+    ToolContext,
+    ToolResultStatus,
+    ToolRetryPolicy,
+    ToolSpec,
+)
 from agent_sdk.tools.registry import ToolRegistry
 
 
@@ -1304,6 +1309,94 @@ async def test_authorized_tool_start_and_outcome_fence_handler_io() -> None:
     assert outcome.checkpoint.updated.turn == 1
     assert len(outcome.checkpoint.updated.tool_results) == 1
     assert outcome.checkpoint.updated.messages[-1]["role"] == "tool"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_policy", "retry_class"),
+    [
+        (ToolRetryPolicy.IDEMPOTENT, "idempotent"),
+        (ToolRetryPolicy.SAFE_RETRY, "safe_retry"),
+    ],
+)
+async def test_certified_tool_start_stamps_policy_before_handler(
+    retry_policy: ToolRetryPolicy,
+    retry_class: str,
+) -> None:
+    store = _InitialBoundaryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="legacy:1",
+        user_input="use tool",
+    )
+    registry = ToolRegistry()
+    observed_metadata: list[dict[str, object]] = []
+
+    async def handler(_: ToolContext) -> str:
+        operations = await store.list_unresolved_external_operations(run.run_id)
+        observed_metadata.extend(dict(operation.recovery_metadata) for operation in operations)
+        return "ok"
+
+    registry.register(
+        ToolSpec(
+            name="target",
+            description="target",
+            input_schema={"type": "object", "additionalProperties": False},
+            retry_policy=retry_policy,
+        ),
+        handler,
+    )
+    provider_calls = 0
+
+    async def provider(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            if provider_calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_certified",
+                                        "function": {
+                                            "name": "target",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            else:
+                yield {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+
+        return chunks()
+
+    result = await RunEngine(
+        store,
+        LiteLLMGateway._for_test(provider),
+        tools=registry,
+        policy=PolicyEngine("allow"),
+    ).execute(
+        run.run_id,
+        ModelRequest(
+            model="fake/model",
+            messages=({"role": "user", "content": "use tool"},),
+            tools=registry.schemas(),
+        ),
+    )
+    assert result.tool_results[0].status is ToolResultStatus.SUCCEEDED
+    assert observed_metadata == [
+        {"safe_retry": True, "retry_class": retry_class}
+    ]
 
 
 @pytest.mark.asyncio

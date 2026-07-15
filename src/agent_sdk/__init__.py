@@ -80,7 +80,14 @@ from agent_sdk.runtime.provider_recovery import (
 )
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
 from agent_sdk.subagents import ChildResult, ChildUsage, SubagentService, TaskEnvelope
-from agent_sdk.tools import ToolContext, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec
+from agent_sdk.tools import (
+    ToolContext,
+    ToolRegistry,
+    ToolResult,
+    ToolResultStatus,
+    ToolRetryPolicy,
+    ToolSpec,
+)
 from agent_sdk.tools.executor import ToolExecutor
 from agent_sdk.workflow import (
     AgentNode,
@@ -179,6 +186,7 @@ __all__ = [
     "ToolRegistry",
     "ToolResult",
     "ToolResultStatus",
+    "ToolRetryPolicy",
     "ToolSpec",
     "AgentNode",
     "WorkflowAPI",

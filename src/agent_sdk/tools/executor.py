@@ -49,6 +49,7 @@ class ToolExecutor:
         on_permission_resolved: _PermissionTransition,
         on_before_handler: _BeforeHandler | None = None,
         on_call_completed: _CompleteCall | None = None,
+        sanitize_permission_denial: bool = False,
     ) -> ToolResult:
         try:
             registered = self._registry.get(call.name)
@@ -101,7 +102,11 @@ class ToolExecutor:
             return await self._complete_error(
                 call,
                 ToolResultStatus.DENIED,
-                decision.reason or "permission denied",
+                (
+                    "permission denied"
+                    if sanitize_permission_denial
+                    else decision.reason or "permission denied"
+                ),
                 emit,
                 on_call_completed,
             )

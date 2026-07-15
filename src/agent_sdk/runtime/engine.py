@@ -67,7 +67,12 @@ from agent_sdk.storage.base import (
     StateStore,
 )
 from agent_sdk.tools.executor import ToolExecutor
-from agent_sdk.tools.models import ToolContext, ToolResult, ToolResultStatus
+from agent_sdk.tools.models import (
+    ToolContext,
+    ToolResult,
+    ToolResultStatus,
+    ToolRetryPolicy,
+)
 from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
 
 _DELTA_FLUSH_SECONDS = 0.05
@@ -475,6 +480,7 @@ class _RunEmitter:
             self._ensure_lease_current()
             assert self._checkpoint is not None
             capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+            retry_policy = registered.spec.retry_policy
             operation = ToolCallOperation(
                 operation_id=new_id("op_tool"),
                 session_id=self._run.session_id,
@@ -484,7 +490,14 @@ class _RunEmitter:
                 lease_generation=self._lease.generation,
                 status=ExternalOperationStatus.STARTED,
                 tool_identity=capability.capability_hash,
-                recovery_metadata={"safe_retry": False, "retry_class": "unsafe"},
+                recovery_metadata=(
+                    {"safe_retry": False, "retry_class": "unsafe"}
+                    if retry_policy is ToolRetryPolicy.NEVER
+                    else {
+                        "safe_retry": True,
+                        "retry_class": retry_policy.value,
+                    }
+                ),
             )
             checkpoint = self._checkpoint.model_copy(
                 update={
@@ -645,6 +658,37 @@ class _RunEmitter:
             )
             self._run = snapshot
             self._checkpoint = checkpoint
+            self._sequence += 1
+
+    async def recovery_permission_transition(
+        self,
+        event_type: str,
+        status: RunStatus,
+        payload: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            self._ensure_lease_current()
+            assert self._checkpoint is not None
+            assert self._checkpoint.phase is RunCheckpointPhase.TOOL_IN_FLIGHT
+            snapshot = self._run.model_copy(
+                update={"status": status, "version": self._run.version + 1}
+            )
+            event = self._new_event(event_type, payload)
+            await _commit_progress(
+                self._store,
+                RunProgressBatch(
+                    lease=self._lease,
+                    now=self._clock(),
+                    events=(event,),
+                    snapshots=(self._run_write(snapshot),),
+                    preconditions=(
+                        SnapshotPrecondition("session", self._run.session_id),
+                        exact_run_precondition(self._run),
+                    ),
+                    checkpoint_precondition=self._checkpoint,
+                ),
+            )
+            self._run = snapshot
             self._sequence += 1
 
     async def add_delta(self, text: str) -> None:
@@ -1052,6 +1096,29 @@ class RunEngine:
             recovered_model=(operation, result),
         )
 
+    async def resume_recovered_tool(
+        self,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ToolCallOperation,
+        call: ToolCallCompleted,
+        request: ModelRequest,
+        lease: Lease,
+        *,
+        sequence: int,
+    ) -> RunResult:
+        return await self._execute_owned(
+            run,
+            request,
+            lease,
+            lambda: None,
+            checkpoint=checkpoint,
+            sequence=sequence,
+            recovery_session=session,
+            recovered_tool=(operation, call),
+        )
+
     async def fail_recovered_model(
         self,
         run: RunSnapshot,
@@ -1294,6 +1361,7 @@ class RunEngine:
         sequence: int = 2,
         recovery_session: SessionSnapshot | None = None,
         recovered_model: tuple[ModelCallOperation, ProviderRecoveryResult] | None = None,
+        recovered_tool: tuple[ToolCallOperation, ToolCallCompleted] | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1327,6 +1395,24 @@ class RunEngine:
             self._permission_bridge,
         )
         try:
+            if recovered_tool is not None:
+                recovered_operation, pending_call = recovered_tool
+                tool_result = await self._execute_recovered_tool_call(
+                    executor,
+                    emitter,
+                    pending_call,
+                    recovered_operation,
+                    lease,
+                    run_id=run_id,
+                    chunks=chunks,
+                    usage=usage,
+                    tool_results=tool_results,
+                )
+                tool_results.append(tool_result)
+                await emitter.emit("step.completed")
+                messages = list(
+                    emitter.current_checkpoint.model_dump(mode="json")["messages"]
+                )
             if current_checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
                 if len(tool_results) >= _MAX_TOOL_STEPS:
                     failure = AgentSDKError(
@@ -1633,6 +1719,108 @@ class RunEngine:
                 raise failure
             raise failure from cause
 
+    async def _execute_recovered_tool_call(
+        self,
+        executor: ToolExecutor,
+        emitter: _RunEmitter,
+        call: ToolCallCompleted,
+        operation: ToolCallOperation,
+        lease: Lease,
+        *,
+        run_id: str,
+        chunks: list[str],
+        usage: TokenUsage,
+        tool_results: list[ToolResult],
+    ) -> ToolResult:
+        async def before_handler(
+            hook_call: ToolCallCompleted,
+            registered: RegisteredTool,
+            arguments: Mapping[str, Any],
+        ) -> None:
+            del hook_call, arguments
+            current = self._tools.get(call.name)
+            if current is not registered:
+                raise RecoveryStateConflictError
+            capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+            expected_metadata = {
+                "safe_retry": True,
+                "retry_class": registered.spec.retry_policy.value,
+            }
+            if (
+                operation.tool_identity != capability.capability_hash
+                or dict(operation.recovery_metadata) != expected_metadata
+            ):
+                raise RecoveryStateConflictError
+            await self._leases.assert_current(lease, now=self._clock())
+
+        async def call_completed(
+            hook_call: ToolCallCompleted,
+            result: ToolResult,
+        ) -> None:
+            await emitter.complete_tool(hook_call, result, operation)
+
+        try:
+            return await executor.execute(
+                call,
+                ToolContext(
+                    run_id=run_id,
+                    session_id=emitter.current_snapshot.session_id,
+                ),
+                emit=emitter.emit,
+                on_permission_requested=lambda permission, decision: (
+                    self._recovery_permission_transition(
+                        emitter,
+                        "permission.requested",
+                        RunStatus.WAITING_PERMISSION,
+                        permission,
+                        decision,
+                    )
+                ),
+                on_permission_resolved=lambda permission, decision: (
+                    self._recovery_permission_transition(
+                        emitter,
+                        "permission.resolved",
+                        RunStatus.RUNNING,
+                        permission,
+                        decision,
+                    )
+                ),
+                on_before_handler=before_handler,
+                on_call_completed=call_completed,
+                sanitize_permission_denial=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (LeaseLostError, RecoveryStateConflictError, _RunProgressError):
+            raise
+        except Exception as cause:
+            failure = (
+                cause
+                if isinstance(cause, AgentSDKError)
+                else AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "tool execution failed",
+                    retryable=False,
+                )
+            )
+            try:
+                await self._fail_run(
+                    emitter,
+                    failure,
+                    chunks,
+                    usage,
+                    tool_results,
+                )
+            except Exception:
+                pass
+            try:
+                await emitter.close()
+            except Exception:
+                pass
+            if failure is cause:
+                raise failure
+            raise failure from cause
+
     def _tool_call_from_checkpoint(
         self,
         checkpoint: RunCheckpoint,
@@ -1684,6 +1872,22 @@ class RunEngine:
         if decision is not None:
             payload["decision"] = decision.model_dump(mode="json")
         await emitter.permission_transition(event_type, status, payload)
+
+    @staticmethod
+    async def _recovery_permission_transition(
+        emitter: _RunEmitter,
+        event_type: str,
+        status: RunStatus,
+        request: PermissionRequest,
+        decision: PermissionDecision | None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "request_id": request.request_id,
+            "tool_name": request.tool_name,
+        }
+        if decision is not None:
+            payload["allowed"] = decision.allowed
+        await emitter.recovery_permission_transition(event_type, status, payload)
 
     @staticmethod
     async def _fail_run(
