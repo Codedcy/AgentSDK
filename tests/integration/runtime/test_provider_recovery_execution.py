@@ -1912,11 +1912,13 @@ async def test_provider_recovery_to_interrupted_tool_can_cross_kind_recover(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("tool_outcome", ["success", "failed"])
 async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
     backend: str,
+    tool_outcome: str,
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / f"tool-to-provider-cycle-{backend}.sqlite3"
+    path = tmp_path / f"tool-to-provider-cycle-{backend}-{tool_outcome}.sqlite3"
     store: Any = (
         InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
     )
@@ -2011,6 +2013,8 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
 
     async def recovered_tool(_context: ToolContext, *, value: int) -> object:
         tool_calls.append(value)
+        if tool_outcome == "failed":
+            raise RuntimeError("private recovered Tool failure")
         return {"value": value + 1}
 
     async def interrupted_model(**_: object) -> Any:
@@ -2060,7 +2064,11 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
             for item in in_progress
         ) == (
             ("model_call", 0, "completed"),
-            ("tool_call", 0, "completed"),
+            (
+                "tool_call",
+                0,
+                "completed" if tool_outcome == "success" else "failed",
+            ),
             ("model_call", 1, "started"),
         )
         release_query.set()
@@ -2265,13 +2273,25 @@ async def test_provider_historical_permission_request_is_strictly_reconstructed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-@pytest.mark.parametrize("decision_action", ["allow", "deny"])
-async def test_provider_historical_permission_decision_remains_recoverable(
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allow",
+        "deny",
+        "handler_failed",
+        "handler_invalid",
+        "handler_timeout",
+        "forged_value",
+        "forged_status",
+        "forged_content",
+    ],
+)
+async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     backend: str,
-    decision_action: str,
+    scenario: str,
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / f"provider-permission-{backend}-{decision_action}.sqlite3"
+    path = tmp_path / f"provider-permission-{backend}-{scenario}.sqlite3"
     store: Any = (
         InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
     )
@@ -2286,6 +2306,7 @@ async def test_provider_historical_permission_decision_remains_recoverable(
             "additionalProperties": False,
         },
         effects=("network",),
+        timeout_seconds=0.01 if scenario == "handler_timeout" else None,
     )
     model_turn = 0
     current_model_started = asyncio.Event()
@@ -2305,7 +2326,7 @@ async def test_provider_historical_permission_decision_remains_recoverable(
                                 "tool_calls": [
                                     {
                                         "index": 0,
-                                        "id": f"call_permission_{decision_action}",
+                                        "id": f"call_permission_{scenario}",
                                         "function": {
                                             "name": "lookup",
                                             "arguments": '{"value":9}',
@@ -2328,10 +2349,19 @@ async def test_provider_historical_permission_decision_remains_recoverable(
 
     async def handler(_context: ToolContext, *, value: int) -> object:
         handler_calls.append(value)
+        if scenario == "handler_failed":
+            raise RuntimeError("private historical Tool failure")
+        if scenario == "handler_invalid":
+            return object()
+        if scenario == "handler_timeout":
+            await asyncio.Event().wait()
         return {"value": value}
 
     async def unused_query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
         raise AssertionError("seed run must not invoke recovery adapter")
+
+    async def unused_resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        raise AssertionError("seed run must not invoke recovery resend")
 
     seed = AgentSDK.for_test(
         store=store,
@@ -2339,7 +2369,7 @@ async def test_provider_historical_permission_decision_remains_recoverable(
         permission_default="ask",
     )
     seed.tools.register(tool_spec, handler)
-    seed.recovery.register_adapter(_adapter(unused_query, None))
+    seed.recovery.register_adapter(_adapter(unused_query, unused_resend))
     session = await seed.sessions.create(workspaces=[])
     seed_handle = await seed.runs.start(session.session_id, spec, "permission positive")
     permission = await asyncio.wait_for(
@@ -2348,7 +2378,7 @@ async def test_provider_historical_permission_decision_remains_recoverable(
     )
     decision = (
         PermissionDecision.allow_once()
-        if decision_action == "allow"
+        if scenario != "deny"
         else PermissionDecision.deny("operator denied")
     )
     await seed.permissions.resolve(permission.request_id, decision)
@@ -2366,7 +2396,29 @@ async def test_provider_historical_permission_decision_remains_recoverable(
     finally:
         await scanner.close()
 
+    if scenario.startswith("forged_"):
+        completed = next(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == seed_handle.run_id
+            and stored.event.type == "tool.call.completed"
+        )
+        forged_payload = dict(completed.payload)
+        if scenario == "forged_value":
+            forged_payload["value"] = {"value": 10}
+        elif scenario == "forged_status":
+            forged_payload["status"] = "failed"
+        else:
+            forged_payload["content"] = '{"value":10}'
+        await _replace_provider_run_event_payload(
+            store,
+            seed_handle.run_id,
+            "tool.call.completed",
+            forged_payload,
+        )
+
     query_calls = 0
+    resend_calls = 0
 
     async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
         nonlocal query_calls
@@ -2374,9 +2426,14 @@ async def test_provider_historical_permission_decision_remains_recoverable(
         return ProviderRecoveryResult(
             disposition=ProviderRecoveryDisposition.COMPLETED,
             finish_reason="stop",
-            text=f"recovered-{decision_action}",
+            text=f"recovered-{scenario}",
             usage=TokenUsage(total_tokens=1),
         )
+
+    async def resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError("authoritative query adapter must not resend")
 
     async def unexpected_completion(**_: object) -> Any:
         raise AssertionError("certified Provider recovery must not call LiteLLM")
@@ -2388,19 +2445,40 @@ async def test_provider_historical_permission_decision_remains_recoverable(
     )
     recovered.agents.define(spec)
     recovered.tools.register(tool_spec, handler)
-    recovered.recovery.register_adapter(_adapter(query, None))
+    recovered.recovery.register_adapter(_adapter(query, resend))
     try:
-        result = await (
-            await recovered.recovery.recover_run(seed_handle.run_id)
-        ).result()
-        assert result.output_text == f"recovered-{decision_action}"
-        assert query_calls == 1
-        assert handler_calls == ([9] if decision_action == "allow" else [])
-        assert not any(
-            stored.event.type == "reconciliation.requested"
-            for stored in await store.read_events(after_cursor=0)
-            if stored.event.run_id == seed_handle.run_id
-        )
+        handle = await recovered.recovery.recover_run(seed_handle.run_id)
+        if scenario.startswith("forged_"):
+            with pytest.raises(AgentSDKError, match="recovery required"):
+                await handle.result()
+            assert query_calls == 0
+            assert resend_calls == 0
+            assert handler_calls == [9]
+            pending = await recovered.recovery.pending_requests(seed_handle.run_id)
+            assert len(pending) == 1
+            assert pending[0].reason == "model_call_unknown_outcome"
+            run_events = [
+                stored.event
+                for stored in await store.read_events(after_cursor=0)
+                if stored.event.run_id == seed_handle.run_id
+            ]
+            assert sum(
+                event.type == "permission.requested" for event in run_events
+            ) == 1
+            assert sum(
+                event.type == "reconciliation.requested" for event in run_events
+            ) == 1
+        else:
+            result = await handle.result()
+            assert result.output_text == f"recovered-{scenario}"
+            assert query_calls == 1
+            assert resend_calls == 0
+            assert handler_calls == ([] if scenario == "deny" else [9])
+            assert not any(
+                stored.event.type == "reconciliation.requested"
+                for stored in await store.read_events(after_cursor=0)
+                if stored.event.run_id == seed_handle.run_id
+            )
     finally:
         await recovered.close()
         if isinstance(store, SQLiteStore):

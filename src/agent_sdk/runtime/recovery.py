@@ -806,6 +806,184 @@ class RunRecoveryService:
         )
 
     @staticmethod
+    def _is_authoritative_historical_tool_result(
+        evidence: _RecoveryEvidence,
+        *,
+        turn: int,
+        result_index: int,
+        call: ToolCallCompleted,
+        operation: ToolCallOperation | None,
+        result: ToolResult,
+        permission_decision: PermissionDecision | None,
+        permission_recovery: bool,
+        permission_allowed: bool | None,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if (
+            checkpoint is None
+            or descriptor is None
+            or result_index >= len(checkpoint.tool_results)
+            or checkpoint.tool_results[result_index] != result
+        ):
+            return False
+        tool_messages = tuple(
+            message
+            for message in checkpoint.messages
+            if message.get("role") == "tool"
+        )
+        if (
+            len(tool_messages) != len(checkpoint.tool_results)
+            or result_index >= len(tool_messages)
+            or tool_messages[result_index]
+            != {
+                "role": "tool",
+                "tool_call_id": call.call_id,
+                "name": call.name,
+                "content": result.content,
+            }
+        ):
+            return False
+
+        capabilities = tuple(
+            tool for tool in descriptor.tools if tool.spec.name == call.name
+        )
+        capability = capabilities[0] if len(capabilities) == 1 else None
+        arguments: dict[str, Any] | None = None
+        if capability is not None:
+            try:
+                candidate = json.loads(
+                    call.arguments_json,
+                    parse_constant=_reject_json_constant,
+                )
+                if not isinstance(candidate, dict):
+                    raise ValueError
+                Draft202012Validator(thaw_json(capability.spec.input_schema)).validate(
+                    candidate
+                )
+                arguments = candidate
+            except (
+                JSONSchemaValidationError,
+                TypeError,
+                ValueError,
+                json.JSONDecodeError,
+            ):
+                pass
+
+        if operation is not None:
+            if capability is None or arguments is None:
+                return False
+            expected_metadata = (
+                {"safe_retry": False, "retry_class": "unsafe"}
+                if capability.spec.retry_policy is ToolRetryPolicy.NEVER
+                else {
+                    "safe_retry": True,
+                    "retry_class": capability.spec.retry_policy.value,
+                }
+            )
+            expected_status = (
+                ExternalOperationStatus.COMPLETED
+                if result.status is ToolResultStatus.SUCCEEDED
+                else ExternalOperationStatus.FAILED
+            )
+            normalized_result: ToolResult | None = None
+            if result.status is ToolResultStatus.SUCCEEDED:
+                try:
+                    normalized_result = ToolResult.succeeded(
+                        call.call_id,
+                        call.name,
+                        thaw_json(result.value),
+                    )
+                except ValueError:
+                    return False
+            elif result.status is ToolResultStatus.FAILED:
+                candidates = (
+                    ToolResult.normalized_error(
+                        call.call_id,
+                        call.name,
+                        ToolResultStatus.FAILED,
+                        message,
+                    )
+                    for message in (
+                        "tool handler failed",
+                        "tool result is not JSON-compatible or exceeds size limit",
+                    )
+                )
+                if result not in candidates:
+                    return False
+                normalized_result = result
+            elif result.status is ToolResultStatus.TIMED_OUT:
+                normalized_result = ToolResult.normalized_error(
+                    call.call_id,
+                    call.name,
+                    ToolResultStatus.TIMED_OUT,
+                    "tool execution timed out",
+                )
+            elif (
+                result.status is ToolResultStatus.DENIED
+                and permission_recovery
+                and permission_allowed is False
+            ):
+                normalized_result = ToolResult.normalized_error(
+                    call.call_id,
+                    call.name,
+                    ToolResultStatus.DENIED,
+                    "permission denied",
+                )
+            if normalized_result != result:
+                return False
+            return (
+                operation.run_id == evidence.run.run_id
+                and operation.session_id == evidence.run.session_id
+                and operation.turn == turn
+                and operation.status is expected_status
+                and operation.tool_identity == capability.capability_hash
+                and dict(operation.recovery_metadata) == expected_metadata
+                and operation.request_fingerprint
+                == _tool_request_fingerprint(call, capability, arguments)
+                and operation.model_dump(mode="json")["outcome"]
+                == result.model_dump(mode="json")
+            )
+
+        if len(capabilities) > 1:
+            return False
+        if capability is None:
+            expected = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.FAILED,
+                "tool not found",
+            )
+        elif arguments is None:
+            expected = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.INVALID_ARGUMENTS,
+                "invalid tool arguments",
+            )
+        elif descriptor.policy.permission_default == "deny":
+            expected = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.DENIED,
+                "permission denied",
+            )
+        elif (
+            descriptor.policy.permission_default == "ask"
+            and permission_decision is not None
+            and not permission_decision.allowed
+        ):
+            expected = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.DENIED,
+                permission_decision.reason or "permission denied",
+            )
+        else:
+            return False
+        return result == expected
+
+    @staticmethod
     def _is_valid_certified_lifecycle_positions(
         evidence: _RecoveryEvidence,
         *,
@@ -845,6 +1023,7 @@ class RunRecoveryService:
         permission_decision: PermissionDecision | None = None
         permission_recovery = False
         permission_allowed: bool | None = None
+        completed_result_count = 0
 
         for event in evidence.run_events[2:]:
             event_type = event.type
@@ -1148,8 +1327,20 @@ class RunRecoveryService:
                             permission_decision.reason or "permission denied",
                         )
                     )
+                    or not RunRecoveryService._is_authoritative_historical_tool_result(
+                        evidence,
+                        turn=turn,
+                        result_index=completed_result_count,
+                        call=current_call,
+                        operation=current_tool,
+                        result=result,
+                        permission_decision=permission_decision,
+                        permission_recovery=permission_recovery,
+                        permission_allowed=permission_allowed,
+                    )
                 ):
                     return False
+                completed_result_count += 1
                 state = "tool_completed"
                 continue
             if event_type == "step.completed":
@@ -1159,7 +1350,11 @@ class RunRecoveryService:
                 continue
             return False
 
-        if state != "interrupted" or checkpoint.operation_id is None:
+        if (
+            state != "interrupted"
+            or checkpoint.operation_id is None
+            or completed_result_count != len(checkpoint.tool_results)
+        ):
             return False
         current = current_model if current_kind is ExternalOperationKind.MODEL_CALL else current_tool
         return current is not None and current.operation_id == checkpoint.operation_id

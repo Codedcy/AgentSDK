@@ -2,7 +2,7 @@
 
 ## Outcome
 
-SIXTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+SEVENTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -76,6 +76,20 @@ PermissionRequest/Decision parser is used for Provider and Tool admission.
 Legal historical ask-allow and ask-deny plus both cross-kind recovery directions
 remain executable.
 
+The seventh independent review confirmed all previous findings closed and
+reported the sole remaining Spec/Quality C0/I1/M0 issue. Provider history used
+the shared lifecycle FSM to validate a canonical historical
+`tool.call.completed` identity, but an ask-allow success result was not crossed
+against the corresponding terminal ToolCallOperation outcome or the ordered
+checkpoint ToolResult/message. Replacing only the event with another canonical
+success therefore still reached the Provider adapter. The fix adds one shared
+authoritative historical ToolResult reconstruction to the lifecycle FSM used
+by Provider and Tool certification. Every completion now maps to exactly one
+turn/call, ordered checkpoint result and Tool message. A real Tool operation
+must also have the exact terminal status, normalized outcome, capability,
+recovery metadata, and request fingerprint; operation-free history remains
+limited to the previously proven missing/invalid/denied normalized paths.
+
 ## Implemented contract
 
 - Added and root-exported strict `ToolRetryPolicy` values `never`,
@@ -147,6 +161,16 @@ remain executable.
   id, Run, Session, Tool, arguments, and effects are crossed against the
   descriptor and call, decision scope remains within its strict model, and the
   denial reason is crossed against the normalized Tool result.
+- Every historical `tool.call.completed` is canonically reconstructed once in
+  the shared lifecycle consumer. Its exact ToolResult must equal the ordered
+  checkpoint ToolResult and Tool message. When a ToolCallOperation exists, the
+  same result must equal its terminal outcome, its completed/failed status must
+  match the result, and capability identity, retry metadata, turn ownership,
+  and request fingerprint must match the original call. Success content/value,
+  normalized handler failure/non-JSON/timeout, and recovery-produced results
+  are checked by their exact SDK normalization. Without a Tool operation, only
+  an independently derived missing-Tool, invalid-arguments, or permission-deny
+  result is accepted.
 - A fresh lease atomically appends a bounded
   `tool.recovery.retry.started` event and re-fences the same STARTED Tool
   operation against the exact in-flight checkpoint. No new operation or
@@ -294,6 +318,17 @@ Production changes followed observable failing tests:
     all `6/6` reconcile before query, LiteLLM, or Tool work, with exactly one
     request. Four ask-allow/ask-deny Memory/SQLite positive cases remain
     certified and complete through Provider recovery.
+18. Seventh-review public ask-allow history replaced only the canonical
+    `tool.call.completed` value, status, or content while leaving its terminal
+    Tool operation and checkpoint unchanged. Provider recovery still completed
+    on Memory and SQLite (`6/6` RED). Shared authoritative ToolResult
+    reconstruction made all `6/6` green with zero query, resend, new permission,
+    handler, or LiteLLM work and exactly one reconciliation. The positive
+    matrix covers Memory/SQLite normal success, ask-deny, normalized handler
+    exception, non-JSON result, timeout, and Tool-recovery-produced success and
+    failure histories before Provider recovery. Existing operation-free
+    denied/invalid/missing histories and the complete Tool recovery suite remain
+    green.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -305,6 +340,20 @@ All commands used
 `C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` with
 Python 3.13.
 
+- Seventh-review exact plus expanded authoritative ToolResult matrix:
+  `28 passed in 6.97s`.
+- Complete Provider recovery file: `86 passed in 8.48s`; complete Tool recovery
+  file: `131 passed in 11.92s`.
+- Provider + Tool + RecoveryAPI: `306 passed in 78.45s`.
+- Provider/live/scanner/Store validation and reconciliation neighbors:
+  `255 passed in 14.42s`.
+- Phase 3C1/3B/3A, Phase 2, and Phase 1 + M02-T001 combined fresh gate:
+  `605 passed in 25.07s`.
+- Full Python 3.13 pytest on the seventh-review final tree:
+  `1529 passed in 116.02s`; zero skipped.
+- Ruff: `All checks passed!`; mypy:
+  `Success: no issues found in 75 source files`; diff/scope clean; SQLite
+  `_SCHEMA_VERSION` remains exactly 3.
 - Sixth-review exact cross-kind/strict-permission/legal-decision matrix:
   `14 passed in 7.53s`.
 - Complete Provider recovery file: `72 passed in 7.05s`.
@@ -354,6 +403,9 @@ close/reopen success, conservative SQLite default recovery, seven changed or
 missing capability variants, descriptor/checkpoint forgeries on both stores,
 both legal Provider-to-Tool and Tool-to-Provider repeated recovery directions,
 historical normal ask-allow and ask-deny Provider recovery on both stores,
+historical ToolResult value/status/content substitutions, normalized handler
+failure/non-JSON/timeout results, and Tool-recovery-produced completed/failed
+operations before Provider recovery,
 ten multi-turn historical evidence mutations, recovery permission-event
 mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
