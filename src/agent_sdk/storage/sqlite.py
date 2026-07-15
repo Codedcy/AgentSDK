@@ -673,6 +673,7 @@ class SQLiteStore:
                 self._validate_run_progress_write_shapes(batch)
                 self._validate_run_progress_internal_targets(batch)
                 await self._check_run_progress_checkpoint_operation(batch)
+                await self._check_run_progress_checkpoint_precondition(batch)
                 target_states = await self._run_progress_target_states(batch)
                 exact_targets = target_states.count("exact")
                 if "conflict" in target_states or (
@@ -788,6 +789,13 @@ class SQLiteStore:
                 raise RecoveryStateConflictError
         if batch.checkpoint is not None:
             checkpoint = batch.checkpoint.updated
+            if (
+                checkpoint.run_id != run.run_id
+                or checkpoint.session_id != run.session_id
+            ):
+                raise RecoveryStateConflictError
+        if batch.checkpoint_precondition is not None:
+            checkpoint = batch.checkpoint_precondition
             if (
                 checkpoint.run_id != run.run_id
                 or checkpoint.session_id != run.session_id
@@ -1076,6 +1084,17 @@ class SQLiteStore:
             if current is not None:
                 raise RecoveryStateConflictError
         elif current != batch.checkpoint.expected:
+            raise RecoveryStateConflictError
+
+    async def _check_run_progress_checkpoint_precondition(
+        self,
+        batch: RunProgressBatch,
+    ) -> None:
+        expected = batch.checkpoint_precondition
+        if expected is None:
+            return
+        current = await self._read_run_checkpoint(expected.run_id)
+        if current != expected:
             raise RecoveryStateConflictError
 
     async def _check_run_progress_reconciliation_target(
@@ -2225,6 +2244,45 @@ class SQLiteStore:
             except BaseException:
                 await self._rollback()
                 raise
+
+    @_context_free_recovery_errors
+    async def get_run_lease(self, run_id: str) -> Lease | None:
+        try:
+            async with self._lock:
+                self._ensure_open()
+                async with self._connection.execute(
+                    """
+                    SELECT run_id, owner, generation, acquired_at, renewed_at,
+                           expires_at, released
+                    FROM leases WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if row is None:
+                    return None
+                if (
+                    type(row[2]) is not int
+                    or type(row[6]) is not int
+                    or row[6] not in (0, 1)
+                ):
+                    raise RecoveryStateConflictError
+                lease = _lease_from_row(row)
+                if (
+                    row[0] != run_id
+                    or row[0] != lease.run_id
+                    or row[1] != lease.owner
+                    or row[2] != lease.generation
+                    or row[3] != canonical_lease_timestamp(lease.acquired_at)
+                    or row[4] != canonical_lease_timestamp(lease.renewed_at)
+                    or row[5] != canonical_lease_timestamp(lease.expires_at)
+                ):
+                    raise RecoveryStateConflictError
+                return None if row[6] == 1 else lease.model_copy()
+        except RecoveryStateConflictError:
+            raise
+        except Exception:
+            raise RecoveryStateConflictError from None
 
     async def delete_session(self, session_id: str) -> None:
         async with self._lock:

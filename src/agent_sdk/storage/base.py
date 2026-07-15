@@ -105,6 +105,7 @@ class RunProgressBatch(NamedTuple):
     operation: ExternalOperationWrite | None = None
     checkpoint: RunCheckpointWrite | None = None
     reconciliation: ReconciliationRequestWrite | None = None
+    checkpoint_precondition: RunCheckpoint | None = None
 
 
 _SIGNED_INT64_MIN = -(1 << 63)
@@ -154,6 +155,10 @@ def _valid_run_progress_int64_fields(batch: RunProgressBatch) -> bool:
                 checkpoint.turn
             ):
                 return False
+    if batch.checkpoint_precondition is not None:
+        checkpoint = batch.checkpoint_precondition
+        if not valid(checkpoint.checkpoint_version) or not valid(checkpoint.turn):
+            return False
     return True
 
 
@@ -203,6 +208,8 @@ class StateStore(Protocol):
     async def release_lease(self, lease: Lease) -> None: ...
 
     async def assert_current_lease(self, lease: Lease, *, now: datetime) -> None: ...
+
+    async def get_run_lease(self, run_id: str) -> Lease | None: ...
 
     async def list_abandoned_run_ids(self, *, now: datetime) -> tuple[str, ...]: ...
 

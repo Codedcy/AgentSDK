@@ -203,6 +203,8 @@ class InMemoryStore:
                     _canonical_record_json(batch.checkpoint.updated)
                     if batch.checkpoint.expected is not None:
                         _canonical_record_json(batch.checkpoint.expected)
+                if batch.checkpoint_precondition is not None:
+                    _canonical_record_json(batch.checkpoint_precondition)
                 if batch.reconciliation is not None:
                     _canonical_record_json(batch.reconciliation.updated)
                     if batch.reconciliation.expected is not None:
@@ -329,6 +331,15 @@ class InMemoryStore:
                 self._check_checkpoint_operation_in(
                     checkpoint, batch.lease, operations
                 )
+            checkpoint_precondition = batch.checkpoint_precondition
+            if checkpoint_precondition is not None:
+                if (
+                    checkpoint_precondition.run_id != run.run_id
+                    or checkpoint_precondition.session_id != run.session_id
+                    or self._run_checkpoints.get(checkpoint_precondition.run_id)
+                    != _canonical_record_json(checkpoint_precondition)
+                ):
+                    raise RecoveryStateConflictError
             if reconciliation_write is not None:
                 request = reconciliation_write.updated
                 if (
@@ -1292,6 +1303,25 @@ class InMemoryStore:
                 or current.expires_at <= now
             ):
                 raise LeaseLostError
+
+    @_context_free_recovery_errors
+    async def get_run_lease(self, run_id: str) -> Lease | None:
+        try:
+            async with self._lock:
+                current = self._leases.get(run_id)
+                if current is None:
+                    return None
+                lease = Lease.model_validate(current)
+                if (
+                    lease.run_id != run_id
+                    or self._lease_generations.get(run_id) != lease.generation
+                ):
+                    raise RecoveryStateConflictError
+                return lease.model_copy()
+        except RecoveryStateConflictError:
+            raise
+        except Exception:
+            raise RecoveryStateConflictError from None
 
     def _check_recovery_lease(
         self,

@@ -25,16 +25,19 @@ from agent_sdk.runtime.models import (
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
+    TokenUsage,
     mutable_model_params,
 )
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationKind,
     ExternalOperationStatus,
+    ModelCallOperation,
     ReconciliationRequest,
     RecoveryStateConflictError,
     RunCheckpoint,
     RunCheckpointPhase,
+    ToolCallOperation,
 )
 from agent_sdk.runtime.session_lifecycle import (
     exact_run_precondition,
@@ -86,6 +89,7 @@ class RunRecoveryService:
         lease_manager: LeaseManager | None = None,
         _clock: Callable[[], datetime] | None = None,
         _yield: Callable[[], Awaitable[None]] | None = None,
+        _stopping: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
         self._engine = engine
@@ -98,6 +102,7 @@ class RunRecoveryService:
         )
         self._clock = _clock or (lambda: datetime.now(UTC))
         self._yield = _yield or _yield_once
+        self._stopping = _stopping or (lambda: False)
 
     async def plan(self, run_id: str) -> RecoveryPlan:
         public_error: tuple[ErrorCode, str, bool] | None = None
@@ -199,6 +204,19 @@ class RunRecoveryService:
                 operation_id=linked.operation_id,
                 details=(("checkpoint_phase", checkpoint.phase.value),),
             )
+        completed_terminal_gap = self._completed_model_terminalization_gap(evidence)
+        if completed_terminal_gap is not None:
+            return RecoveryPlan(
+                "reconcile",
+                run_id,
+                checkpoint=checkpoint,
+                reason="model_call_completed_terminalization_unknown",
+                operation_id=completed_terminal_gap.operation_id,
+                details=(
+                    ("checkpoint_phase", checkpoint.phase.value),
+                    ("operation_status", completed_terminal_gap.status.value),
+                ),
+            )
         if self._is_safe_checkpoint(evidence):
             try:
                 self._engine.validate_resume_checkpoint(checkpoint)
@@ -251,7 +269,6 @@ class RunRecoveryService:
 
     async def execute(self, plan: RecoveryPlan) -> RunResult:
         follow = False
-        wait_through_interrupted = False
         try:
             if plan.kind == "execute":
                 assert plan.request is not None
@@ -281,7 +298,6 @@ class RunRecoveryService:
             ) from None
         except LeaseHeldError:
             follow = True
-            wait_through_interrupted = True
         except RecoveryStateConflictError:
             follow = True
         except AgentSDKError as error:
@@ -290,47 +306,60 @@ class RunRecoveryService:
             else:
                 raise
         if follow:
-            return await self._follow_durable_run(
-                plan.run_id,
-                wait_through_interrupted=wait_through_interrupted,
-            )
+            return await self._follow_durable_run(plan.run_id)
         raise AssertionError("unreachable")
 
-    async def _follow_durable_run(
-        self,
-        run_id: str,
-        *,
-        wait_through_interrupted: bool = False,
-    ) -> RunResult:
+    async def _follow_durable_run(self, run_id: str) -> RunResult:
         while True:
-            run = await self._load_run(run_id)
-            if run.status is RunStatus.COMPLETED:
-                assert run.output_text is not None
-                assert run.usage is not None
-                return RunResult(
-                    run_id=run.run_id,
-                    output_text=run.output_text,
-                    usage=run.usage,
-                    tool_results=run.tool_results,
-                )
-            if run.status is RunStatus.FAILED:
-                failure = run.error
-                assert failure is not None
-                try:
-                    code = ErrorCode(failure.code)
-                except ValueError:
-                    code = ErrorCode.INTERNAL
-                raise AgentSDKError(
-                    code,
-                    failure.message,
-                    retryable=failure.retryable,
-                ) from None
-            if run.status is RunStatus.WAITING_RECONCILIATION or (
-                run.status in {RunStatus.CREATED, RunStatus.INTERRUPTED}
-                and not wait_through_interrupted
-            ):
+            if self._stopping():
                 raise self._recovery_required() from None
+            run = await self._load_run(run_id)
+            terminal = self._terminal_result(run)
+            if terminal is not None:
+                return terminal
+            if run.status is RunStatus.WAITING_RECONCILIATION:
+                raise self._recovery_required() from None
+
+            lease = await self._store.get_run_lease(run_id)
+            if lease is None or lease.expires_at <= self._clock():
+                confirmed_run = await self._load_run(run_id)
+                terminal = self._terminal_result(confirmed_run)
+                if terminal is not None:
+                    return terminal
+                if confirmed_run.status is RunStatus.WAITING_RECONCILIATION:
+                    raise self._recovery_required() from None
+                confirmed_lease = await self._store.get_run_lease(run_id)
+                if (
+                    confirmed_lease is None
+                    or confirmed_lease.expires_at <= self._clock()
+                ):
+                    raise self._recovery_required() from None
             await self._yield()
+
+    @staticmethod
+    def _terminal_result(run: RunSnapshot) -> RunResult | None:
+        if run.status is RunStatus.COMPLETED:
+            assert run.output_text is not None
+            assert run.usage is not None
+            return RunResult(
+                run_id=run.run_id,
+                output_text=run.output_text,
+                usage=run.usage,
+                tool_results=run.tool_results,
+            )
+        if run.status is RunStatus.FAILED:
+            failure = run.error
+            assert failure is not None
+            try:
+                code = ErrorCode(failure.code)
+            except ValueError:
+                code = ErrorCode.INTERNAL
+            raise AgentSDKError(
+                code,
+                failure.message,
+                retryable=failure.retryable,
+            ) from None
+        return None
 
     async def _load_run(self, run_id: str) -> RunSnapshot:
         data = await self._store.get_snapshot("run", run_id)
@@ -456,7 +485,123 @@ class RunRecoveryService:
                 operation.status is ExternalOperationStatus.STARTED
                 for operation in evidence.operations
             )
+            and not RunRecoveryService._checkpoint_repeats_terminal_operation(
+                evidence
+            )
         )
+
+    @staticmethod
+    def _checkpoint_repeats_terminal_operation(evidence: _RecoveryEvidence) -> bool:
+        checkpoint = evidence.checkpoint
+        assert checkpoint is not None
+        if checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL:
+            return any(
+                operation.turn >= checkpoint.turn
+                for operation in evidence.operations
+            )
+        return any(
+            isinstance(operation, ToolCallOperation)
+            and operation.turn >= checkpoint.turn
+            for operation in evidence.operations
+        )
+
+    @staticmethod
+    def _completed_model_terminalization_gap(
+        evidence: _RecoveryEvidence,
+    ) -> ModelCallOperation | None:
+        checkpoint = evidence.checkpoint
+        if (
+            checkpoint is None
+            or checkpoint.phase is not RunCheckpointPhase.READY_FOR_MODEL
+            or checkpoint.operation_id is not None
+            or evidence.pending
+        ):
+            return None
+        current_operations = tuple(
+            operation
+            for operation in evidence.operations
+            if operation.turn == checkpoint.turn
+        )
+        if len(current_operations) != 1:
+            return None
+        operation = current_operations[0]
+        if (
+            not isinstance(operation, ModelCallOperation)
+            or operation.status is not ExternalOperationStatus.COMPLETED
+            or operation.outcome is None
+            or any(item.turn > checkpoint.turn for item in evidence.operations)
+        ):
+            return None
+        outcome = operation.outcome
+        if set(outcome) != {"finish_reason", "text", "tool_calls", "usage"}:
+            return None
+        finish_reason = outcome["finish_reason"]
+        text = outcome["text"]
+        if (
+            (finish_reason is not None and not isinstance(finish_reason, str))
+            or not isinstance(text, str)
+            or outcome["tool_calls"] != ()
+        ):
+            return None
+        try:
+            operation_usage = TokenUsage.model_validate(outcome["usage"])
+        except Exception:
+            return None
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            operation_value = getattr(operation_usage, field)
+            checkpoint_value = getattr(checkpoint.usage, field)
+            if operation_value is not None and (
+                checkpoint_value is None or checkpoint_value < operation_value
+            ):
+                return None
+        messages = checkpoint.model_dump(mode="json")["messages"]
+        if not messages or messages[-1] != {
+            "role": "assistant",
+            "content": text or None,
+        }:
+            return None
+        if not "".join(checkpoint.output_parts).endswith(text):
+            return None
+
+        model_operations = tuple(
+            item
+            for item in evidence.operations
+            if isinstance(item, ModelCallOperation)
+        )
+        started_events = tuple(
+            event for event in evidence.run_events if event.type == "model.call.started"
+        )
+        completed_events = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "model.call.completed"
+        )
+        failed_events = tuple(
+            event for event in evidence.run_events if event.type == "model.call.failed"
+        )
+        if (
+            len(started_events) != len(model_operations)
+            or len(completed_events)
+            != sum(
+                item.status is ExternalOperationStatus.COMPLETED
+                for item in model_operations
+            )
+            or len(failed_events)
+            != sum(
+                item.status is ExternalOperationStatus.FAILED
+                for item in model_operations
+            )
+            or not completed_events
+            or completed_events[-1].payload != {"finish_reason": finish_reason}
+        ):
+            return None
+        completion_index = evidence.run_events.index(completed_events[-1])
+        trailing_types = tuple(
+            event.type for event in evidence.run_events[completion_index + 1 :]
+        )
+        if trailing_types != ("step.completed", "run.interrupted"):
+            return None
+        return operation
 
     @staticmethod
     def _matching_in_flight_operation(

@@ -122,6 +122,45 @@ class _BlockingRecoveryReleaseStore(InMemoryStore):
         raise RuntimeError("recovery-release-secret")
 
 
+class _FailOwnerTerminalProgressStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject_failure = False
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if self.reject_failure and any(
+            event.type == "run.failed" for event in batch.events
+        ):
+            raise RuntimeError("owner-terminal-precommit-secret")
+        return await super().commit_run_progress(batch)
+
+
+class _RejectCompletedTerminalMemoryStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject_terminal = True
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if self.reject_terminal and any(
+            event.type == "run.completed" for event in batch.events
+        ):
+            raise RuntimeError("completed-terminal-precommit-secret")
+        return await super().commit_run_progress(batch)
+
+
+class _RejectCompletedTerminalSQLiteStore(SQLiteStore):
+    def __init__(self, connection: Any) -> None:
+        super().__init__(connection)
+        self.reject_terminal = True
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        if self.reject_terminal and any(
+            event.type == "run.completed" for event in batch.events
+        ):
+            raise RuntimeError("completed-terminal-precommit-secret")
+        return await super().commit_run_progress(batch)
+
+
 async def _seed_pristine_current_run(
     store: InMemoryStore,
     spec: AgentSpec,
@@ -1691,6 +1730,101 @@ async def test_recovery_start_commit_is_all_or_none_and_replay_safe(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("store_kind", ("memory", "sqlite"))
+async def test_recovery_start_cas_rejects_checkpoint_changed_after_engine_read(
+    store_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store: Any
+    if store_kind == "memory":
+        store = InMemoryStore()
+    else:
+        store = await SQLiteStore.open(tmp_path / "recovery-start-cas.db")
+    spec = AgentSpec(name=f"checkpoint-race-{store_kind}", model="fake/recovery")
+    run_id, checkpoint = await _seed_ready_model_interrupted(store, spec)
+    checkpoint_read = asyncio.Event()
+    allow_engine = asyncio.Event()
+    reads = 0
+    provider_calls = 0
+    original_get_checkpoint = store.get_run_checkpoint
+
+    async def controlled_get_checkpoint(target_run_id: str) -> RunCheckpoint | None:
+        nonlocal reads
+        durable = await original_get_checkpoint(target_run_id)
+        reads += 1
+        if reads == 1:
+            checkpoint_read.set()
+            await allow_engine.wait()
+        return durable
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _success_chunks()
+
+    monkeypatch.setattr(store, "get_run_checkpoint", controlled_get_checkpoint)
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    task = asyncio.create_task(
+        sdk.recovery._engine.resume(
+            run_id,
+            checkpoint,
+            ModelRequest(
+                model=spec.model,
+                messages=({"role": "user", "content": "resume me"},),
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(checkpoint_read.wait(), timeout=2)
+        now = datetime.now(UTC)
+        lease = await store.acquire_lease(
+            run_id=run_id,
+            owner="checkpoint-racer",
+            now=now,
+            expires_at=now + timedelta(seconds=30),
+        )
+        changed = checkpoint.model_copy(
+            update={
+                "checkpoint_version": checkpoint.checkpoint_version + 1,
+                "output_parts": (*checkpoint.output_parts, "changed "),
+            }
+        )
+        await store.put_run_checkpoint(
+            changed,
+            expected=checkpoint,
+            lease=lease,
+            now=now,
+        )
+        await store.release_lease(lease)
+        allow_engine.set()
+
+        with pytest.raises(AgentSDKError):
+            await task
+
+        assert provider_calls == 0
+        assert (await sdk.runs.get(run_id)).status is RunStatus.INTERRUPTED
+        assert await original_get_checkpoint(run_id) == changed
+        assert not any(
+            stored.event.type == "run.recovery.started"
+            for stored in await store.read_events(after_cursor=0)
+        )
+    finally:
+        allow_engine.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_recovery_start_is_scannable_and_resumable() -> None:
     store = _RecoveryProgressFaultStore("resume_cancel")
     spec = AgentSpec(name="resume-cancel", model="fake/recovery")
@@ -2179,3 +2313,326 @@ async def test_cross_sdk_follower_cancel_and_close_do_not_affect_owner() -> None
             await asyncio.gather(owner_handle.result(), return_exceptions=True)
         await owner.close()
         await follower.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_outcome", ("cancel", "terminal_precommit_failure"))
+async def test_cross_sdk_follower_stops_when_owner_disappears(
+    owner_outcome: str,
+) -> None:
+    store = _FailOwnerTerminalProgressStore()
+    spec = AgentSpec(name=f"cross-sdk-{owner_outcome}", model="fake/recovery")
+    run_id = await _seed_pristine_current_run(store, spec)
+    provider_started = asyncio.Event()
+    allow_provider = asyncio.Event()
+    follower_observed_owner = asyncio.Event()
+    allow_follower_poll = asyncio.Event()
+    follower_yields = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_started.set()
+        await allow_provider.wait()
+        if owner_outcome == "terminal_precommit_failure":
+            raise RuntimeError("provider-owner-secret")
+        return _success_chunks()
+
+    async def bounded_follower_yield() -> None:
+        nonlocal follower_yields
+        follower_yields += 1
+        if follower_yields > 1:
+            raise AssertionError("follower did not observe the released lease")
+        follower_observed_owner.set()
+        await allow_follower_poll.wait()
+
+    owner = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    follower = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    owner.agents.define(spec)
+    follower.agents.define(spec)
+    follower.recovery._service._yield = bounded_follower_yield
+    owner_handle = None
+    follower_handle = None
+    try:
+        owner_handle = await owner.recovery.recover_run(run_id)
+        await provider_started.wait()
+        follower_handle = await follower.recovery.recover_run(run_id)
+        await follower_observed_owner.wait()
+
+        owner_task = owner_handle._task
+        assert owner_task is not None
+        if owner_outcome == "cancel":
+            owner_task.cancel()
+            owner_task.cancel()
+        else:
+            store.reject_failure = True
+            allow_provider.set()
+        with pytest.raises(AgentSDKError):
+            await owner_handle.result()
+
+        allow_follower_poll.set()
+        with pytest.raises(AgentSDKError) as caught:
+            await follower_handle.result()
+
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery required"
+        assert caught.value.retryable is True
+    finally:
+        allow_provider.set()
+        allow_follower_poll.set()
+        if owner_handle is not None:
+            await asyncio.gather(owner_handle.result(), return_exceptions=True)
+        if follower_handle is not None:
+            task = follower_handle._task
+            if task is not None and not task.done():
+                task.cancel()
+            await asyncio.gather(follower_handle.result(), return_exceptions=True)
+        await owner.close()
+        await follower.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_outcome", ("expiry", "takeover"))
+async def test_cross_sdk_follower_observes_lease_expiry_and_takeover(
+    lease_outcome: str,
+) -> None:
+    store = InMemoryStore()
+    spec = AgentSpec(name=f"lease-{lease_outcome}", model="fake/recovery")
+    run_id = await _seed_pristine_current_run(store, spec)
+    now = datetime.now(UTC)
+    initial = await store.acquire_lease(
+        run_id=run_id,
+        owner="initial-owner",
+        now=now,
+        expires_at=now + timedelta(seconds=30),
+    )
+    clock = [now]
+    observed: asyncio.Queue[None] = asyncio.Queue()
+    resume_poll: asyncio.Queue[None] = asyncio.Queue()
+    max_active_yields = 1 if lease_outcome == "expiry" else 2
+    yield_count = 0
+
+    async def bounded_follower_yield() -> None:
+        nonlocal yield_count
+        yield_count += 1
+        if yield_count > max_active_yields:
+            raise AssertionError("follower did not converge after lease loss")
+        await observed.put(None)
+        await resume_poll.get()
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.recovery._service._clock = lambda: clock[0]
+    sdk.recovery._service._yield = bounded_follower_yield
+    handle = None
+    takeover = None
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        await observed.get()
+
+        clock[0] = initial.expires_at + timedelta(seconds=1)
+        if lease_outcome == "takeover":
+            takeover = await store.acquire_lease(
+                run_id=run_id,
+                owner="takeover-owner",
+                now=clock[0],
+                expires_at=clock[0] + timedelta(seconds=30),
+            )
+        await resume_poll.put(None)
+
+        if takeover is not None:
+            await observed.get()
+            task = handle._task
+            assert task is not None
+            assert not task.done()
+            await store.release_lease(takeover)
+            takeover = None
+            await resume_poll.put(None)
+
+        with pytest.raises(AgentSDKError) as caught:
+            await handle.result()
+
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery required"
+        assert caught.value.retryable is True
+    finally:
+        await resume_poll.put(None)
+        if takeover is not None:
+            await store.release_lease(takeover)
+        elif lease_outcome == "expiry":
+            await store.release_lease(initial)
+        if handle is not None:
+            task = handle._task
+            if task is not None and not task.done():
+                task.cancel()
+            await asyncio.gather(handle.result(), return_exceptions=True)
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_closing_follower_sdk_settles_without_stopping_owner() -> None:
+    store = InMemoryStore()
+    spec = AgentSpec(name="cross-sdk-close", model="fake/recovery")
+    run_id = await _seed_pristine_current_run(store, spec)
+    provider_started = asyncio.Event()
+    allow_provider = asyncio.Event()
+    follower_polling = asyncio.Event()
+    provider_calls = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        provider_started.set()
+        await allow_provider.wait()
+        return _success_chunks()
+
+    async def observable_yield() -> None:
+        follower_polling.set()
+        await asyncio.sleep(0)
+
+    owner = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    follower = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    owner.agents.define(spec)
+    follower.agents.define(spec)
+    follower.recovery._service._yield = observable_yield
+    owner_handle = None
+    follower_handle = None
+    close_task = None
+    try:
+        owner_handle = await owner.recovery.recover_run(run_id)
+        await provider_started.wait()
+        follower_handle = await follower.recovery.recover_run(run_id)
+        await follower_polling.wait()
+
+        close_task = asyncio.create_task(follower.close())
+        for _ in range(8):
+            await asyncio.sleep(0)
+
+        assert close_task.done()
+        await close_task
+        with pytest.raises(AgentSDKError) as caught:
+            await follower_handle.result()
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery required"
+
+        allow_provider.set()
+        result = await owner_handle.result()
+        assert result.output_text == "recovered"
+        assert provider_calls == 1
+    finally:
+        allow_provider.set()
+        if follower_handle is not None:
+            task = follower_handle._task
+            if task is not None and not task.done():
+                task.cancel()
+            await asyncio.gather(follower_handle.result(), return_exceptions=True)
+        if close_task is not None:
+            await asyncio.gather(close_task, return_exceptions=True)
+        if owner_handle is not None:
+            await asyncio.gather(owner_handle.result(), return_exceptions=True)
+        await owner.close()
+        await follower.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_completed_model_terminal_precommit_gap_reconciles_without_resend(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "completed-terminal-gap.db"
+    if backend == "memory":
+        initial: Any = _RejectCompletedTerminalMemoryStore()
+    else:
+        initial = await _RejectCompletedTerminalSQLiteStore.open(database_path)
+    spec = AgentSpec(name=f"terminal-gap-{backend}", model="fake/recovery")
+    run_id = await _seed_pristine_current_run(initial, spec)
+    provider_calls = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _success_chunks()
+
+    first = AgentSDK.for_test(
+        store=initial,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    first.agents.define(spec)
+    first_handle = await first.recovery.recover_run(run_id)
+    with pytest.raises(AgentSDKError) as failed_terminalization:
+        await first_handle.result()
+    assert failed_terminalization.value.code is ErrorCode.INTERNAL
+    assert provider_calls == 1
+
+    running = await first.runs.get(run_id)
+    assert running.status is RunStatus.RUNNING
+    checkpoint = await initial.get_run_checkpoint(run_id)
+    assert checkpoint is not None
+    assert checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
+    operations = await initial.list_external_operations(run_id)
+    assert len(operations) == 1
+    completed_model = operations[0]
+    assert isinstance(completed_model, ModelCallOperation)
+    assert completed_model.status is ExternalOperationStatus.COMPLETED
+    assert completed_model.outcome is not None
+    assert completed_model.outcome["tool_calls"] == ()
+    await first.close()
+
+    if backend == "memory":
+        initial.reject_terminal = False
+        reopened = initial
+    else:
+        await initial.close()
+        reopened = await SQLiteStore.open(database_path)
+
+    second = AgentSDK.for_test(
+        store=reopened,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    second.agents.define(spec)
+    try:
+        await second.recovery.scan()
+        assert (await second.runs.get(run_id)).status is RunStatus.INTERRUPTED
+
+        recovered = await second.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError) as caught:
+            await recovered.result()
+
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery required"
+        assert caught.value.retryable is True
+        assert provider_calls == 1
+        requests = await second.recovery.pending_requests(run_id)
+        assert len(requests) == 1
+        assert requests[0].operation_id == completed_model.operation_id
+        assert requests[0].reason == "model_call_completed_terminalization_unknown"
+        assert requests[0].details == {
+            "checkpoint_phase": RunCheckpointPhase.READY_FOR_MODEL.value,
+            "operation_status": ExternalOperationStatus.COMPLETED.value,
+        }
+        assert (await second.runs.get(run_id)).status is RunStatus.WAITING_RECONCILIATION
+    finally:
+        await second.close()
+        if backend == "sqlite":
+            await reopened.close()

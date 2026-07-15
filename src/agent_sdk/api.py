@@ -158,6 +158,10 @@ class _LazySQLiteStore:
         await (await self._get()).assert_current_lease(lease, now=now)
 
     @_context_free_recovery_errors
+    async def get_run_lease(self, run_id: str) -> Lease | None:
+        return await (await self._get()).get_run_lease(run_id)
+
+    @_context_free_recovery_errors
     async def list_abandoned_run_ids(self, *, now: datetime) -> tuple[str, ...]:
         return await (await self._get()).list_abandoned_run_ids(now=now)
 
@@ -662,6 +666,7 @@ class RecoveryAPI:
             agents,
             tools,
             policy,
+            _stopping=lifecycle.close_signal.is_set,
         )
 
     async def scan(self) -> None:

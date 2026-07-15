@@ -2,7 +2,8 @@
 
 ## Status
 
-IMPLEMENTED, pending the required independent read-only Spec and Quality reviews.
+IMPLEMENTED with the first independent review's three Important findings fixed;
+fresh independent read-only Spec and Quality re-review is pending.
 Phase 3C2 exposes explicit Run recovery after one coordinated startup scan,
 validates the exact registered execution capability before ownership or external
 work, resumes only exact safe checkpoints, and atomically routes every unsafe or
@@ -10,8 +11,32 @@ unknown boundary to durable reconciliation. Provider authoritative-status and
 same-operation-id resend adapters remain Phase 3D; Workflow recovery remains
 Phase 4.
 
-The implementation is based on
-`4e6c13879d1f5b57a997b837c637abc1c9b8f62d`.
+The original implementation was based on
+`4e6c13879d1f5b57a997b837c637abc1c9b8f62d`; this correction is based on the
+reviewed Phase 3C2 commit `9f7728e390d7541c657fe14088ebb4b41c450894`.
+
+## Post-review corrections
+
+- Recovery-start now carries the exact checkpoint read by the engine as a
+  read-only `RunProgressBatch` precondition. Memory and SQLite validate that
+  checkpoint in the same lock/transaction as the Run/Session CAS, before any
+  recovery-start target can apply. A two-backend barrier race proves a
+  concurrent checkpoint rewrite rejects the whole start with zero provider
+  calls and no `run.recovery.started` event.
+- A lease-losing recovery coordinator now follows both durable Run state and the
+  current unreleased Run lease. Missing/released/expired ownership is confirmed
+  twice before returning stable retryable `recovery required`; an active newer
+  generation remains followable. Owner cancellation, failed terminal commit,
+  expiry, takeover/release, and follower SDK close all settle without duplicate
+  external work or disturbing the owner. Memory, SQLite, and lazy SQLite have a
+  strict detached `get_run_lease` parity test.
+- A completed no-Tool Model operation at the checkpoint's current
+  READY_FOR_MODEL turn is never resendable. Exact operation outcome, assistant
+  checkpoint message/output/usage, and event-tail evidence route the terminal
+  commit gap to bounded
+  `model_call_completed_terminalization_unknown` reconciliation with the exact
+  operation id; any mismatch fails closed to generic reconciliation. Memory and
+  SQLite crash/close/reopen tests prove the provider remains at one call.
 
 ## Delivered behavior
 
@@ -62,12 +87,13 @@ The implementation is based on
   remove success, failure, and cancelled coordinators; tests require the tasks to
   become garbage-collectable.
 - RunEngine creates the fresh coordinator identity and owns the execution lease.
-  A cross-SDK loser follows yielded durable state and never invokes a duplicate
-  provider or Tool. CREATED and INTERRUPTED are waited through only after an
-  actual lease-loss race; other stale/conflict followers return recovery-required
-  instead of spinning.
+  A cross-SDK loser follows yielded durable Run and current-lease state and never
+  invokes a duplicate provider or Tool. Terminal states return normally;
+  reconciliation-owned, ownerless, released, or expired nonterminal states
+  return recovery-required instead of spinning, while an active takeover remains
+  followable.
 - Cross-SDK owner/follower cancellation and SDK close are isolated: cancelling
-  the follower neither cancels nor duplicates the owner operation.
+  or closing the follower neither cancels nor duplicates the owner operation.
 - COMPLETED/FAILED Runs return detached durable handles without capability,
   lease, or external work. WAITING_RECONCILIATION returns detached state after
   strict canonical pending-request validation.
@@ -80,7 +106,8 @@ The implementation is based on
   also runs inside the engine before lease acquisition.
 - Under a fresh lease, the first exact transaction writes the adjacent
   `run.recovery.started` event and INTERRUPTED-to-RUNNING snapshot while leaving
-  checkpoint contents unchanged.
+  checkpoint contents unchanged. The checkpoint is also an exact same-transaction
+  precondition, preventing a stale engine read from racing a concurrent rewrite.
 - READY_FOR_MODEL restores the checkpoint's exact detached messages, accumulated
   output, cumulative usage, ordered Tool results, and turn. It creates the next
   model operation only after the recovery-start transaction.
@@ -99,6 +126,9 @@ The implementation is based on
 - Legacy, non-pristine CREATED, missing checkpoint, model/tool in-flight,
   permission-wait-lost, and malformed checkpoint-operation relationships never
   retry an external call. They use bounded reasons and metadata only.
+- A completed no-Tool Model operation paired with the exact READY_FOR_MODEL
+  terminalization-gap evidence is reconciled with its operation id; incomplete
+  or mismatched relationships also reconcile and can never repeat the provider.
 - Admission acquires a fresh lease and submits one stable
   `RunProgressBatch` containing the exact Run/Session preconditions, one pending
   request, one `reconciliation.requested` event, and the
@@ -147,7 +177,18 @@ boundaries; no wall-clock sleeps were introduced in the new recovery tests.
   the loser follow durable state. A later lease-takeover fault test exposed an
   infinite CREATED follower; the follower now waits through CREATED/INTERRUPTED
   only for a real lease-held race.
-- The final new Phase 3C2 focused result is `56 passed in 4.81s`.
+- Review I1 RED: both Memory and SQLite allowed a concurrent checkpoint rewrite
+  after the engine read and still moved the Run to RUNNING. GREEN: exact
+  checkpoint CAS rejects both races, `2 passed in 3.38s`.
+- Review I2 RED: owner cancel and failed terminal commit, lease expiry and
+  takeover/release all exhausted deterministic bounded yields into INTERNAL;
+  follower close remained pending. GREEN: the five-case matrix is `5 passed`.
+- Review I3 RED: Memory and SQLite reopen both resumed a completed no-Tool Model
+  operation and called the provider twice (`2 failed`, `DID NOT RAISE`). GREEN:
+  both produce one reconciliation request with the original operation id and
+  keep provider calls at one, `2 passed`.
+- The final Phase 3C2 focused result is `65 passed in 65.71s`; the current-lease
+  Memory/SQLite/lazy parity addition is `3 passed`.
 
 ## Fresh final-code gates
 
@@ -156,22 +197,22 @@ All commands used
 Python 3.13.
 
 - Phase 3C2 focused (`test_recovery_api.py`):
-  `56 passed in 4.81s`.
+  `65 passed in 65.71s`.
 - Phase 3C1 focused (`test_recovery_scanner.py`, `test_abandoned_runs.py`,
   `test_run_progress_reconciliation.py`):
-  `115 passed in 6.52s`.
+  `115 passed in 7.07s`.
 - Phase 3B live progress:
-  `38 passed in 3.45s`.
+  `38 passed in 3.34s`.
 - Phase 3A Run-progress transaction:
-  `117 passed in 6.56s`.
+  `117 passed in 6.69s`.
 - Phase 2 recovery models/records/SQLite validation:
-  `136 passed in 7.59s`.
+  `139 passed in 7.55s`.
 - Phase 1 + M02-T001 regressions:
-  `188 passed in 13.38s`.
-- Session/Run/Tool/MCP/Workflow/child compatibility regressions:
-  `226 passed in 10.05s`.
+  `188 passed in 14.07s`.
+- Session/Run/Tool/MCP/Workflow recovery/child compatibility regressions:
+  `237 passed in 10.58s`.
 - Full Python 3.13 pytest after the last test change:
-  `1236 passed in 41.08s`.
+  `1248 passed in 104.91s`.
 - Public package import check: `RecoveryAPI` imports from `agent_sdk` and appears
   in `agent_sdk.__all__`.
 - Ruff: `All checks passed!`.
@@ -194,12 +235,17 @@ Production changes are limited to the brief's permitted files:
 - `src/agent_sdk/storage/sqlite.py`
 
 Focused tests are in `tests/integration/runtime/test_recovery_api.py`, with the
-all-operation parity assertion in
+all-operation and current-lease parity assertions in
 `tests/integration/storage/test_recovery_records.py` and one startup-scan
 compatibility adjustment in `tests/integration/runtime/test_text_agent_loop.py`.
 
-The durable follower intentionally polls with an injected cooperative yield
-rather than adding a new notification surface in this phase. Provider status
-queries/resend certification, reconciliation resolution actions, Tool retry
-metadata, Workflow recovery, and any schema/migration change remain explicitly
-out of scope for Phase 3C2.
+The durable follower intentionally polls strict Run and current-lease queries
+with an injected cooperative yield rather than adding a new notification surface
+in this phase. Provider status queries/resend certification, reconciliation
+resolution actions, Tool retry metadata, Workflow recovery, and any
+schema/migration change remain explicitly out of scope for Phase 3C2.
+
+The first independent review returned C0/I3/M0. This fix addresses all three
+Important findings with the RED/GREEN evidence and final gates above. No
+self-review conclusion substitutes for the required fresh independent Spec and
+Quality C0/I0 re-review of the fix commit.

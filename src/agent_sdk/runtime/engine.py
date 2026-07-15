@@ -197,6 +197,7 @@ class _RunEmitter:
                         exact_session_precondition(session),
                         exact_run_precondition(self._run),
                     ),
+                    checkpoint_precondition=self._checkpoint,
                 ),
             )
             self._run = snapshot

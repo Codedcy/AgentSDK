@@ -272,6 +272,29 @@ async def seeded_recovery_store(recovery_store: Any) -> Any:
     return recovery_store
 
 
+@pytest.mark.asyncio
+async def test_current_run_lease_query_tracks_release_and_takeover(
+    seeded_recovery_store: Any,
+) -> None:
+    store = seeded_recovery_store
+    first = await _lease(store)
+
+    observed = await store.get_run_lease("run_1")
+    assert observed == first
+    assert observed is not first
+
+    await store.release_lease(first)
+    assert await store.get_run_lease("run_1") is None
+
+    takeover = await store.acquire_lease(
+        run_id="run_1",
+        owner="worker_2",
+        now=first.expires_at,
+        expires_at=first.expires_at + timedelta(seconds=30),
+    )
+    assert await store.get_run_lease("run_1") == takeover
+
+
 async def _create_first_recovery_record(
     store: Any, record_kind: str, *, session_id: str
 ) -> Any:
