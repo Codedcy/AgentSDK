@@ -115,3 +115,8 @@ Phase 4 operational plan: .superpowers/sdd/M02-T002-phase4-plan.md
 Phase 4A: in progress - exact Workflow admission and single-coordinator recovery
 Phase 4A brief: .superpowers/sdd/M02-T002-phase4a-brief.md
 Phase 4B remains pending until Phase 4A independent Spec C0/I0 and Quality C0/I0 review
+Phase 4A implementation: a50b05017c90e19951d87fa3b836ea9f3dc4ce0a
+Phase 4A initial review: Not Approved; Spec C0/I3/M0 and Quality C0/I3/M0
+Phase 4A review findings: capability-admission TOCTOU allowed node CAS before failure; child creation did not authenticate the durable completed parent Run; normal-live and explicit recovery create/lease/projection races did not converge and could synthesize Workflow failure
+Phase 4A review-fix brief: .superpowers/sdd/M02-T002-phase4a-review-fix-brief.md
+Phase 4A review fix: in progress; Phase 4B remains blocked
