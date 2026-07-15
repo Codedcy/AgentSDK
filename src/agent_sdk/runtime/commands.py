@@ -26,6 +26,7 @@ from agent_sdk.runtime.session_lifecycle import (
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
+    SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
@@ -417,6 +418,7 @@ class RuntimeCommands:
         task_envelope: TaskEnvelope | None = None,
         execution_descriptor: ExecutionDescriptor | None = None,
         idempotency_key: str | None = None,
+        related_preconditions: tuple[SnapshotPrecondition, ...] = (),
     ) -> CommandOutcome[RunSnapshot]:
         if execution_descriptor is None and idempotency_key is not None:
             raise AgentSDKError(
@@ -502,7 +504,7 @@ class RuntimeCommands:
                 batch = CommitBatch(
                     events=(),
                     idempotency=request,
-                    replay_preconditions=(precondition,),
+                    replay_preconditions=(precondition, *related_preconditions),
                 )
                 snapshot = None
             else:
@@ -572,10 +574,12 @@ class RuntimeCommands:
                             run_data,
                         ),
                     ),
-                    preconditions=(session_precondition,),
+                    preconditions=(session_precondition, *related_preconditions),
                     idempotency=request,
                     replay_preconditions=(
-                        (session_precondition,) if request is not None else ()
+                        (session_precondition, *related_preconditions)
+                        if request is not None
+                        else ()
                     ),
                 )
 

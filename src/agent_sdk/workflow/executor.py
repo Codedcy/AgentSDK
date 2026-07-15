@@ -33,6 +33,7 @@ from agent_sdk.runtime.models import (
 )
 from agent_sdk.runtime.session_lifecycle import load_session
 from agent_sdk.storage.base import StateStore
+from agent_sdk.storage.base import SnapshotPrecondition
 from agent_sdk.storage.idempotency import IdempotencyError
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.subagents.service import SubagentService, render_task_envelope
@@ -338,6 +339,7 @@ class WorkflowExecutor:
                 "workflow recovery ownership unavailable",
                 retryable=False,
             ) from None
+        self._validate_recovery_descriptor(snapshot)
 
     async def _drive_recovery_public(
         self,
@@ -381,6 +383,7 @@ class WorkflowExecutor:
             index = _next_node_index(snapshot)
             if index is None:
                 try:
+                    self._validate_recovery_descriptor(snapshot)
                     completed = await self._state.complete_workflow(snapshot)
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
@@ -395,6 +398,7 @@ class WorkflowExecutor:
                     "workflow node failed"
                 )
                 try:
+                    self._validate_recovery_descriptor(snapshot)
                     failed = await self._state.fail_workflow(snapshot, failure)
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
@@ -404,6 +408,7 @@ class WorkflowExecutor:
 
             if node_snapshot.status is WorkflowNodeStatus.PENDING:
                 try:
+                    self._validate_recovery_descriptor(snapshot)
                     snapshot = await self._state.start_node(
                         snapshot,
                         index,
@@ -477,6 +482,7 @@ class WorkflowExecutor:
 
             if run.status is RunStatus.COMPLETED:
                 try:
+                    self._validate_recovery_descriptor(snapshot)
                     await self._state.complete_node(snapshot, index, _run_result(run))
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
@@ -487,11 +493,13 @@ class WorkflowExecutor:
             if run.status is RunStatus.FAILED:
                 failure = _run_workflow_failure(run)
                 try:
+                    self._validate_recovery_descriptor(snapshot)
                     node_failed = await self._state.fail_node(
                         snapshot,
                         index,
                         failure,
                     )
+                    self._validate_recovery_descriptor(node_failed)
                     failed = await self._state.fail_workflow(node_failed, failure)
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
@@ -533,6 +541,8 @@ class WorkflowExecutor:
             ) from None
         if loaded is _RunLoadFailure.MISSING:
             await self._validate_recovery_preflight(snapshot)
+            parent = await self._validated_child_parent(snapshot, index, node)
+            self._validate_recovery_descriptor(snapshot)
             envelope = _task_envelope(node) if node.run_as == "child" else None
             parent_run_id = (
                 _parent_run_id(snapshot, index)
@@ -544,23 +554,98 @@ class WorkflowExecutor:
                 if envelope is not None
                 else node.input
             )
-            await self._commands.start_run(
-                snapshot.session_id,
-                run_id=run_id,
-                agent_revision=node.agent_revision,
-                user_input=user_input,
-                parent_run_id=parent_run_id,
-                workflow_run_id=snapshot.workflow_run_id,
-                workflow_node_id=node.id,
-                task_envelope=envelope,
-                execution_descriptor=execution_descriptor,
-                idempotency_key=(
-                    f"workflow-node:{snapshot.workflow_run_id}:{node.id}"
-                    if use_idempotency
-                    else None
-                ),
+            creation_error: tuple[ErrorCode, str, bool] | None = None
+            try:
+                await self._commands.start_run(
+                    snapshot.session_id,
+                    run_id=run_id,
+                    agent_revision=node.agent_revision,
+                    user_input=user_input,
+                    parent_run_id=parent_run_id,
+                    workflow_run_id=snapshot.workflow_run_id,
+                    workflow_node_id=node.id,
+                    task_envelope=envelope,
+                    execution_descriptor=execution_descriptor,
+                    idempotency_key=(
+                        f"workflow-node:{snapshot.workflow_run_id}:{node.id}"
+                        if use_idempotency
+                        else None
+                    ),
+                    related_preconditions=(
+                        ()
+                        if parent is None
+                        else (_exact_run_precondition(parent),)
+                    ),
+                )
+            except AgentSDKError as error:
+                creation_error = (error.code, error.message, error.retryable)
+            except Exception:
+                creation_error = (
+                    ErrorCode.INTERNAL,
+                    "failed to start run",
+                    False,
+                )
+            if creation_error is not None:
+                authoritative = await _load_run(self._store, run_id)
+                if not (
+                    isinstance(authoritative, RunSnapshot)
+                    and _related_run_matches(
+                        snapshot,
+                        index,
+                        node,
+                        authoritative,
+                        expected_descriptor=execution_descriptor,
+                    )
+                ):
+                    raise AgentSDKError(
+                        creation_error[0],
+                        creation_error[1],
+                        retryable=creation_error[2],
+                    ) from None
+        selected = await self._load_selected_run(run_id)
+        await self._validated_child_parent(snapshot, index, node)
+        self._validate_recovery_descriptor(snapshot)
+        return selected
+
+    async def _validated_child_parent(
+        self,
+        snapshot: WorkflowRunSnapshot,
+        index: int,
+        node: AgentNode,
+    ) -> RunSnapshot | None:
+        if node.run_as != "child":
+            return None
+        if index == 0:
+            raise _invalid_parent_run()
+        previous_node = snapshot.workflow.nodes[index - 1]
+        previous_projection = snapshot.nodes[index - 1]
+        parent_run_id = previous_projection.run_id
+        if (
+            previous_projection.status is not WorkflowNodeStatus.COMPLETED
+            or parent_run_id is None
+        ):
+            raise _invalid_parent_run()
+        parent = await _load_run(self._store, parent_run_id)
+        expected_descriptor = self._node_execution_descriptor(previous_node)
+        if (
+            not isinstance(parent, RunSnapshot)
+            or parent.status is not RunStatus.COMPLETED
+            or not _related_run_matches(
+                snapshot,
+                index - 1,
+                previous_node,
+                parent,
+                expected_descriptor=expected_descriptor,
             )
-        return await self._load_selected_run(run_id)
+            or parent.output_text != previous_projection.output_text
+            or parent.usage != previous_projection.usage
+        ):
+            raise _invalid_parent_run()
+        try:
+            _run_result(parent)
+        except AgentSDKError:
+            raise _invalid_parent_run() from None
+        return parent
 
     async def _load_selected_run(self, run_id: str) -> RunSnapshot:
         loaded = await _load_run(self._store, run_id)
@@ -577,6 +662,16 @@ class WorkflowExecutor:
                 retryable=False,
             ) from None
         return loaded
+
+    async def _workflow_changed_after_conflict(
+        self,
+        previous: WorkflowRunSnapshot,
+        error: AgentSDKError,
+    ) -> bool:
+        if error.code is not ErrorCode.CONFLICT:
+            return False
+        current = await self._state.load(previous.workflow_run_id)
+        return current != previous
 
     def _task_finished(
         self,
@@ -637,22 +732,38 @@ class WorkflowExecutor:
 
             index = _next_node_index(snapshot)
             if index is None:
-                completed = await self._state.complete_workflow(snapshot)
+                try:
+                    completed = await self._state.complete_workflow(snapshot)
+                except AgentSDKError as error:
+                    if await self._workflow_changed_after_conflict(snapshot, error):
+                        continue
+                    raise
                 return _result(completed)
             node_snapshot = snapshot.nodes[index]
             node = snapshot.workflow.nodes[index]
             if node_snapshot.status is WorkflowNodeStatus.FAILED:
-                failed = await self._state.fail_workflow(
-                    snapshot,
-                    node_snapshot.error or _generic_failure("workflow node failed"),
-                )
+                try:
+                    failed = await self._state.fail_workflow(
+                        snapshot,
+                        node_snapshot.error
+                        or _generic_failure("workflow node failed"),
+                    )
+                except AgentSDKError as error:
+                    if await self._workflow_changed_after_conflict(snapshot, error):
+                        continue
+                    raise
                 raise _failure_error(failed.error)
             if node_snapshot.status is WorkflowNodeStatus.PENDING:
-                snapshot = await self._state.start_node(
-                    snapshot,
-                    index,
-                    new_id("run"),
-                )
+                try:
+                    snapshot = await self._state.start_node(
+                        snapshot,
+                        index,
+                        new_id("run"),
+                    )
+                except AgentSDKError as error:
+                    if await self._workflow_changed_after_conflict(snapshot, error):
+                        continue
+                    raise
                 node_snapshot = snapshot.nodes[index]
 
             run_id = node_snapshot.run_id
@@ -703,9 +814,19 @@ class WorkflowExecutor:
                     message=result.message,
                     retryable=False,
                 )
-                await self._persist_failure(snapshot, index, failure)
+                try:
+                    await self._persist_failure(snapshot, index, failure)
+                except AgentSDKError as error:
+                    if await self._workflow_changed_after_conflict(snapshot, error):
+                        continue
+                    raise
                 raise _failure_error(failure)
-            await self._state.complete_node(snapshot, index, result)
+            try:
+                await self._state.complete_node(snapshot, index, result)
+            except AgentSDKError as error:
+                if await self._workflow_changed_after_conflict(snapshot, error):
+                    continue
+                raise
 
     async def _create_and_execute(
         self,
@@ -1046,6 +1167,24 @@ def _run_workflow_failure(run: RunSnapshot) -> WorkflowFailure:
         code=failure.code,
         message=failure.message,
         retryable=failure.retryable,
+    )
+
+
+def _exact_run_precondition(run: RunSnapshot) -> SnapshotPrecondition:
+    return SnapshotPrecondition(
+        "run",
+        run.run_id,
+        run.version,
+        run.session_id,
+        run.model_dump(mode="json"),
+    )
+
+
+def _invalid_parent_run() -> AgentSDKError:
+    return AgentSDKError(
+        ErrorCode.INVALID_STATE,
+        "related parent run is invalid",
+        retryable=False,
     )
 
 

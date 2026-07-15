@@ -25,6 +25,7 @@ from agent_sdk.workflow import (
     WorkflowRunStatus,
 )
 from agent_sdk.workflow.state import WorkflowState
+import agent_sdk.workflow.executor as workflow_executor_module
 
 
 DEFINITION = {
@@ -169,6 +170,382 @@ async def _create_selected_run(sdk: AgentSDK, workflow: Any) -> RunSnapshot:
         idempotency_key=f"workflow-node:{workflow.workflow_run_id}:{node.id}",
     )
     return outcome.value
+
+
+class _HiddenRunStore:
+    def __init__(self) -> None:
+        self.delegate = InMemoryStore()
+        self.hidden_run_id: str | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        if kind == "run" and entity_id == self.hidden_run_id:
+            return None
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+
+class _RunReadBarrierStore:
+    def __init__(self, delegate: InMemoryStore, *, block_on_read: int) -> None:
+        self.delegate = delegate
+        self.block_on_read = block_on_read
+        self.run_reads = 0
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        value = await self.delegate.get_snapshot(kind, entity_id)
+        if kind == "run":
+            self.run_reads += 1
+            if self.run_reads == self.block_on_read:
+                self.blocked.set()
+                await self.release.wait()
+        return value
+
+
+class _ProjectionBarrier:
+    def __init__(self) -> None:
+        self.arrivals = 0
+        self.both_arrived = asyncio.Event()
+        self.recovery_committed = asyncio.Event()
+
+
+class _ProjectionBarrierStore:
+    def __init__(
+        self,
+        delegate: InMemoryStore,
+        barrier: _ProjectionBarrier,
+        *,
+        recovery_winner: bool,
+    ) -> None:
+        self.delegate = delegate
+        self.barrier = barrier
+        self.recovery_winner = recovery_winner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: CommitBatch) -> Any:
+        if any(event.type == "workflow.node.completed" for event in batch.events):
+            self.barrier.arrivals += 1
+            if self.barrier.arrivals == 2:
+                self.barrier.both_arrived.set()
+            await self.barrier.both_arrived.wait()
+            if self.recovery_winner:
+                result = await self.delegate.commit(batch)
+                self.barrier.recovery_committed.set()
+                return result
+            await self.barrier.recovery_committed.wait()
+        return await self.delegate.commit(batch)
+
+
+@pytest.mark.asyncio
+async def test_capability_mutation_during_session_admission_is_zero_mutation() -> None:
+    store = InMemoryStore()
+    completion = _CountingCompletion()
+    sdk, workflow = await _seed_current_workflow(
+        store,
+        completion,
+        tool=TOOL,
+    )
+    original_load_session = workflow_executor_module.load_session
+    load_count = 0
+    ownership_blocked = asyncio.Event()
+    release_ownership = asyncio.Event()
+
+    async def blocked_load_session(store_value: Any, session_id: str) -> Any:
+        nonlocal load_count
+        load_count += 1
+        if load_count == 2:
+            ownership_blocked.set()
+            await release_ownership.wait()
+        return await original_load_session(store_value, session_id)
+
+    workflow_executor_module.load_session = blocked_load_session
+    before_workflow = await sdk.workflows.get(workflow.workflow_run_id)
+    before_session = await sdk.sessions.get(workflow.session_id)
+    cursor_before = await store.latest_cursor()
+    try:
+        handle = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
+        await asyncio.wait_for(ownership_blocked.wait(), timeout=1)
+        assert sdk.tools.unregister(TOOL.name) is True
+        release_ownership.set()
+
+        with pytest.raises(AgentSDKError) as capability:
+            await handle.result()
+
+        assert capability.value.code is ErrorCode.INVALID_STATE
+        assert capability.value.message == "recovery capabilities unavailable"
+        assert await sdk.workflows.get(workflow.workflow_run_id) == before_workflow
+        assert await sdk.sessions.get(workflow.session_id) == before_session
+        assert await store.latest_cursor() == cursor_before
+        assert before_workflow.nodes[0].run_id is None
+        assert completion.calls == 0
+    finally:
+        workflow_executor_module.load_session = original_load_session
+        release_ownership.set()
+        await sdk.close()
+
+
+async def _seed_selected_child_boundary(
+    store: Any,
+    completion: _CountingCompletion,
+) -> tuple[AgentSDK, Any, RunSnapshot]:
+    sdk, workflow = await _seed_current_workflow(
+        store,
+        completion,
+        definition=CHILD_DEFINITION,
+        agents=(AGENT, WORKER),
+        tool=TOOL,
+    )
+    root_selected = await WorkflowState(store).start_node(
+        workflow,
+        0,
+        "run_parent_exact",
+    )
+    parent_created = await _create_selected_run(sdk, root_selected)
+    parent_result = await (await sdk.recovery.recover_run(parent_created.run_id)).result()
+    parent = await sdk.runs.get(parent_created.run_id)
+    root_completed = await WorkflowState(store).complete_node(
+        root_selected,
+        0,
+        parent_result,
+    )
+    child_selected = await WorkflowState(store).start_node(
+        root_completed,
+        1,
+        "run_child_selected",
+    )
+    completion.calls = 0
+    return sdk, child_selected, parent
+
+
+@pytest.mark.parametrize(
+    "parent_case",
+    [
+        "missing",
+        "foreign_session",
+        "wrong_workflow",
+        "wrong_node",
+        "wrong_agent",
+        "wrong_root_relation",
+        "legacy",
+        "descriptor",
+        "noncompleted",
+        "output_projection",
+        "usage_projection",
+    ],
+)
+@pytest.mark.asyncio
+async def test_child_recovery_rejects_unauthenticated_durable_parent(
+    parent_case: str,
+) -> None:
+    store = _HiddenRunStore()
+    completion = _CountingCompletion()
+    sdk, workflow, parent = await _seed_selected_child_boundary(store, completion)
+    if parent_case == "missing":
+        store.hidden_run_id = parent.run_id
+    else:
+        updates: dict[str, Any] = {"version": parent.version + 1}
+        executor = sdk.workflows._executor  # type: ignore[attr-defined]
+        parent_node = workflow.workflow.nodes[0]
+        if parent_case == "foreign_session":
+            updates["session_id"] = "ses_foreign"
+        elif parent_case == "wrong_workflow":
+            updates["workflow_run_id"] = "wfr_foreign"
+        elif parent_case == "wrong_node":
+            updates["workflow_node_id"] = "foreign-node"
+        elif parent_case == "wrong_agent":
+            updates["agent_revision"] = "worker:1"
+            updates["execution_descriptor"] = executor._execution_descriptor(
+                WORKER,
+                parent_node.input,
+            )
+        elif parent_case == "wrong_root_relation":
+            updates["parent_run_id"] = "run_foreign_parent"
+        elif parent_case == "legacy":
+            updates["execution_compatibility"] = "legacy_unknown"
+            updates["execution_descriptor"] = None
+        elif parent_case == "descriptor":
+            changed = AGENT.model_copy(
+                update={"model_params": {"temperature": 0.5}}
+            )
+            updates["execution_descriptor"] = executor._execution_descriptor(
+                changed,
+                parent_node.input,
+            )
+        elif parent_case == "noncompleted":
+            updates.update(
+                {
+                    "status": RunStatus.INTERRUPTED,
+                    "output_text": None,
+                    "usage": None,
+                    "error": None,
+                }
+            )
+        elif parent_case == "output_projection":
+            updates["output_text"] = "substituted output"
+        elif parent_case == "usage_projection":
+            assert parent.usage is not None
+            updates["usage"] = parent.usage.model_copy(
+                update={"total_tokens": (parent.usage.total_tokens or 0) + 100}
+            )
+        substituted = parent.model_copy(update=updates)
+        await store.delegate.commit(
+            CommitBatch(
+                events=(),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        substituted.run_id,
+                        substituted.session_id,
+                        substituted.version,
+                        substituted.model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+
+    cursor_before = await store.latest_cursor()
+    try:
+        handle = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
+        with pytest.raises(AgentSDKError) as invalid_parent:
+            await handle.result()
+
+        assert invalid_parent.value.code is ErrorCode.INVALID_STATE
+        assert invalid_parent.value.message == "related parent run is invalid"
+        assert await store.delegate.get_snapshot("run", "run_child_selected") is None
+        assert await store.latest_cursor() == cursor_before
+        assert completion.calls == 0
+    finally:
+        store.hidden_run_id = None
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_and_recovery_converge_when_selected_run_is_missing() -> None:
+    delegate = InMemoryStore()
+    normal_store = _RunReadBarrierStore(delegate, block_on_read=2)
+    recovery_store = _RunReadBarrierStore(delegate, block_on_read=1)
+    completion = _CountingCompletion(block=True)
+    normal = AgentSDK.for_test(store=normal_store, acompletion=completion)
+    normal.agents.define(AGENT)
+    session = await normal.sessions.create(workspaces=[])
+    normal_handle = await normal.workflows.start(session.session_id, _workflow_yaml())
+    recovery: AgentSDK | None = None
+    try:
+        await asyncio.wait_for(normal_store.blocked.wait(), timeout=1)
+        selected = await normal.workflows.get(normal_handle.workflow_run_id)
+        selected_run_id = selected.nodes[0].run_id
+        assert selected_run_id is not None
+        assert await delegate.get_snapshot("run", selected_run_id) is None
+
+        recovery = AgentSDK.for_test(store=recovery_store, acompletion=completion)
+        recovery.agents.define(AGENT)
+        recovery_handle = await recovery.recovery.recover_workflow(
+            normal_handle.workflow_run_id
+        )
+        await asyncio.wait_for(recovery_store.blocked.wait(), timeout=1)
+        normal_store.release.set()
+        recovery_store.release.set()
+        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        completion.release.set()
+
+        normal_result, recovery_result = await asyncio.wait_for(
+            asyncio.gather(normal_handle.result(), recovery_handle.result()),
+            timeout=2,
+        )
+        assert normal_result == recovery_result
+        assert normal_result.status is WorkflowRunStatus.COMPLETED
+        assert normal_result.nodes[0].run_id == selected_run_id
+        assert completion.calls == 1
+        run_created = [
+            stored
+            for stored in await delegate.read_events(after_cursor=0)
+            if stored.event.type == "run.created"
+            and stored.event.run_id == selected_run_id
+        ]
+        assert len(run_created) == 1
+    finally:
+        normal_store.release.set()
+        recovery_store.release.set()
+        completion.release.set()
+        if recovery is not None:
+            await recovery.close()
+        await normal.close()
+
+
+@pytest.mark.asyncio
+async def test_normal_and_recovery_converge_from_precreated_selected_run() -> None:
+    delegate = InMemoryStore()
+    projection = _ProjectionBarrier()
+    normal_store = _ProjectionBarrierStore(
+        delegate,
+        projection,
+        recovery_winner=False,
+    )
+    recovery_store = _ProjectionBarrierStore(
+        delegate,
+        projection,
+        recovery_winner=True,
+    )
+    completion = _CountingCompletion(block=True)
+    normal = AgentSDK.for_test(store=normal_store, acompletion=completion)
+    normal.agents.define(AGENT)
+    original_plan = normal.recovery._service.plan  # type: ignore[attr-defined]
+    plan_blocked = asyncio.Event()
+    release_plan = asyncio.Event()
+    block_once = True
+
+    async def blocked_plan(run_id: str) -> Any:
+        nonlocal block_once
+        if block_once:
+            block_once = False
+            plan_blocked.set()
+            await release_plan.wait()
+        return await original_plan(run_id)
+
+    normal.recovery._service.plan = blocked_plan  # type: ignore[attr-defined,method-assign]
+    session = await normal.sessions.create(workspaces=[])
+    normal_handle = await normal.workflows.start(session.session_id, _workflow_yaml())
+    recovery: AgentSDK | None = None
+    try:
+        await asyncio.wait_for(plan_blocked.wait(), timeout=1)
+        selected = await normal.workflows.get(normal_handle.workflow_run_id)
+        selected_run_id = selected.nodes[0].run_id
+        assert selected_run_id is not None
+        assert (await normal.runs.get(selected_run_id)).status is RunStatus.CREATED
+
+        recovery = AgentSDK.for_test(store=recovery_store, acompletion=completion)
+        recovery.agents.define(AGENT)
+        recovery_handle = await recovery.recovery.recover_workflow(
+            normal_handle.workflow_run_id
+        )
+        await asyncio.wait_for(completion.started.wait(), timeout=1)
+        release_plan.set()
+        completion.release.set()
+        await asyncio.wait_for(projection.both_arrived.wait(), timeout=1)
+
+        normal_result, recovery_result = await asyncio.wait_for(
+            asyncio.gather(normal_handle.result(), recovery_handle.result()),
+            timeout=2,
+        )
+        assert normal_result == recovery_result
+        assert normal_result.status is WorkflowRunStatus.COMPLETED
+        assert normal_result.nodes[0].run_id == selected_run_id
+        assert completion.calls == 1
+        assert (await normal.runs.get(selected_run_id)).status is RunStatus.COMPLETED
+    finally:
+        release_plan.set()
+        completion.release.set()
+        projection.recovery_committed.set()
+        if recovery is not None:
+            await recovery.close()
+        await normal.close()
 
 
 async def _completion(**_: Any) -> AsyncIterator[dict[str, object]]:
@@ -455,7 +832,7 @@ async def test_recovery_revalidates_capabilities_before_next_node_create() -> No
         assert capability.value.code is ErrorCode.INVALID_STATE
         assert capability.value.message == "recovery capabilities unavailable"
         durable = await sdk.workflows.get(workflow.workflow_run_id)
-        assert durable.nodes[0].status is WorkflowNodeStatus.COMPLETED
+        assert durable.nodes[0].status is WorkflowNodeStatus.RUNNING
         assert durable.nodes[1].status is WorkflowNodeStatus.PENDING
         assert durable.nodes[1].run_id is None
         assert calls == 1

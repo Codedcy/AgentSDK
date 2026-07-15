@@ -2,10 +2,10 @@
 
 ## Outcome
 
-Phase 4A implementation is complete and ready for independent review. This
-slice adds exact sequential Workflow recovery admission and coordination; it
-does not claim Phase 4 completion and does not begin Phase 4B cross-SDK fault
-hardening.
+Phase 4A implementation and its first independent-review fixes are complete and
+ready for re-review. This slice adds exact sequential Workflow recovery
+admission and coordination; it does not claim Phase 4 completion and does not
+begin Phase 4B cross-SDK fault hardening.
 
 ## Delivered behavior
 
@@ -30,6 +30,9 @@ hardening.
   idempotency record count.
 - Parent and child Runs are created without external work. Child parent id,
   rendered TaskEnvelope, input, and per-node ExecutionDescriptor are exact.
+  Child admission also authenticates the exact durable parent Run, its terminal
+  result, and its Workflow projection. Parent validation is part of the child
+  creation commit, so a concurrent parent mutation cannot create the child.
   Every nonterminal selected Run is then routed through the existing per-Run
   recovery registry and Run lease admission.
 - Exact related-Run validation covers session, Workflow, node, Agent, input,
@@ -39,6 +42,10 @@ hardening.
   preconditions. Projection conflicts reload and converge. A
   `recovery required` follower/no-owner/shutdown diagnostic leaves the Workflow
   active instead of persisting a synthetic failure.
+- Capability descriptors are synchronously revalidated after every awaited
+  Session admission and immediately before every explicit-recovery Workflow
+  mutation. Normal live execution and explicit recovery reload and converge
+  when they race on selected-Run creation or Workflow projection.
 - Explicit `RuntimeCommands.start_run(run_id=...)` idempotency now fingerprints
   and validates the exact selected id. Calls that omit `run_id` retain the
   established generated-id replay contract.
@@ -60,23 +67,35 @@ registry, and incorrect conversion of `recovery required` into durable Workflow
 failure. A full-suite RED also caught an extra normal-execution idempotency
 record; the fix confines deterministic node keys to explicit recovery repair.
 
-Final focused Phase 4A matrix: **40 passed**. It covers Memory/SQLite explicit
-Run-id behavior, terminal success/failure, legacy/current admission, every
-Agent/Tool/Policy mismatch requested by the brief, pending/missing/CREATED/
-COMPLETED/FAILED/waiting Run boundaries, child exactness, all related-Run
-substitutions, same-SDK attachment, cancellation shielding, registry cleanup,
-normal-live Run recovery routing, and active diagnostic preservation.
+Independent review then supplied three additional RED groups:
+
+- a capability mutation during the awaited Session load caused Workflow state
+  mutation before the mismatch was rejected;
+- eleven missing, foreign, mismatched, legacy, nonterminal, or projection-
+  inconsistent durable parent variants were accepted for child recovery;
+- normal live execution and explicit recovery did not converge at the
+  selected-Run-missing and precreated-Run projection race boundaries.
+
+All twelve capability/parent REDs and both concurrency REDs now pass. The final
+focused Phase 4A admission matrix is **51 passed**. It covers Memory/SQLite
+explicit Run-id behavior, terminal success/failure, legacy/current admission,
+every Agent/Tool/Policy mismatch requested by the brief, pending/missing/
+CREATED/COMPLETED/FAILED/waiting Run boundaries, durable child-parent
+authentication and projection exactness, all related-Run substitutions,
+same-SDK attachment, cancellation shielding, registry cleanup, normal-live Run
+recovery routing, race convergence, and active diagnostic preservation.
 
 ## Fresh verification
 
-- New Workflow recovery admission plus explicit Run-id tests: **40 passed**.
+- Workflow recovery admission: **51 passed**.
+- Independent-review capability/parent cases: **12 passed**; selected-Run and
+  projection race cases: **2 passed**.
+- Explicit Run-id idempotency contracts: **3 passed**.
 - Existing Workflow recovery/session ownership plus Run RecoveryAPI/session
-  ownership regression selection: **254 passed** before the final narrow normal
-  routing changes; the final full suite below reran all of them.
-- Phase 3 Provider/Tool recovery selection: **261 passed** before the final
-  narrow normal routing changes; the final full suite below reran all of them.
-- Final Python 3.13 full suite: **1617 passed**, zero failed, zero skipped, in
-  122.95 seconds.
+  ownership regression selection: **270 passed**.
+- Phase 3 Provider/Tool recovery selection: **261 passed**.
+- Final Python 3.13 full suite: **1631 passed**, zero failed, zero skipped, in
+  122.84 seconds.
 - Ruff: all `src` and `tests` checks passed.
 - mypy: 75 source files passed.
 - `git diff --check`: passed.
@@ -100,11 +119,15 @@ The Workflow `_start_lock` serializes local admission and `_active` provides one
 same-SDK coordinator. Caller cancellation cannot cancel coordinator admission or
 the shared Workflow task. Selected Run execution delegates to RecoveryAPI's
 existing `_tasks` registry, whose Run recovery service owns lease acquisition,
-follow/reload, reconciliation, shutdown, and context-free error behavior. The
-Workflow recovery task catches errors outside their original exception context
-and exposes only bounded SDK errors. Durable Run failures are projected from
-their sanitized snapshot; raw Store/Provider/Tool state is not included in
-public messages.
+follow/reload, reconciliation, shutdown, and context-free error behavior.
+Selected-Run create ambiguity is accepted only after the authoritative durable
+Run exactly matches the Workflow relation and descriptor. Child creation carries
+an exact, data-bearing parent precondition. Workflow CAS losers reload only when
+the durable Workflow itself changed, preserving Session-conflict semantics while
+allowing normal and recovery coordinators to converge. The Workflow recovery
+task catches errors outside their original exception context and exposes only
+bounded SDK errors. Durable Run failures are projected from their sanitized
+snapshot; raw Store/Provider/Tool state is not included in public messages.
 
 ## Explicit exclusions
 
@@ -115,4 +138,4 @@ public messages.
 - No Provider/Tool safety inference and no LiteLLM-only recovery certification.
 - No schema or migration change.
 
-Independent Spec and Quality C0/I0 review is required before Phase 4B.
+Independent Spec and Quality C0/I0 re-review is required before Phase 4B.
