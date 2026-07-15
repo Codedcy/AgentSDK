@@ -2,7 +2,9 @@
 
 ## Outcome
 
-IMPLEMENTED; NOT APPROVED PENDING FRESH RE-REVIEW. Phase 3D1 adds
+COMPLETE. The initial independent review found one Critical malformed-result
+cleanup gap. The fix passed fresh independent re-review with Spec C0/I0/M0 and
+Quality C0/I0/M0. Phase 3D1 adds
 application-certified provider recovery for an exact
 durable Model operation. Normal Model execution still routes only through
 LiteLLM. Recovery calls an application-registered adapter only when the
@@ -179,5 +181,5 @@ recovery behavior was added.
 - An unresolved or invalid certified response deliberately stops at the existing
   reconciliation boundary. Resolution actions, Tool retry certification, and
   Workflow recovery remain Phase 3D2 or later work.
-- No tests were weakened or skipped. A fresh independent reviewer must approve
-  Spec and Quality with C0/I0 before Phase 3D2 begins.
+- No tests were weakened or skipped. The final independent re-review approved
+  Spec and Quality at C0/I0/M0; Phase 3D2 may begin.

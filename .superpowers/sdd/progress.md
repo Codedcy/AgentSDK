@@ -54,7 +54,7 @@ Phase 3C2 final Minor: multi-turn READY_FOR_TOOL validates aggregate started/com
 Next action: execute Phase 3D provider authoritative-status and certified same-operation-id recovery adapters; Workflow recovery remains Phase 4
 Phase 3D: in progress
 Phase 3D operational plan: .superpowers/sdd/M02-T002-phase3d-plan.md
-Phase 3D1: in progress — certified provider recovery adapters
+Phase 3D1: complete - certified provider recovery adapters
 Phase 3D1 brief: .superpowers/sdd/M02-T002-phase3d1-brief.md
 Phase 3D1 implementation: da7282ea5e0f73630380e6c801092df35ae766a3
 Phase 3D1 report: .superpowers/sdd/M02-T002-phase3d1-report.md
@@ -62,5 +62,7 @@ Phase 3D1 implementation gates: focused/fault/e2e 182 passed; Phase3C2 89; Phase
 Phase 3D1 initial review: Not Approved; Spec C1/I0/M0 and Quality C1/I0/M0. Sole finding: forged exact-type ProviderRecoveryResult could raise strict revalidation outside the invalid-result sanitization boundary and retain secret result data in the coordinator task traceback without reconciliation
 Phase 3D1 review fix: strict RED reproduced the raw retained ValidationError; exact-type checking and strict detached reconstruction now share the invalid-result cleanup boundary, which deletes all sensitive references and admits one bounded reconciliation request
 Phase 3D1 review-fix gates: targeted 1 passed; invalid/timeout/secret 9; focused/fault/e2e 183; Phase3C2 89; Phase3C1 115; Phase3B 38; Phase3A 123; Phase2 139; Phase1+T001 188; compatibility 264; full 1338 passed with zero skips; Ruff clean; mypy clean across 74 source files; diff/scope/schema/public imports clean
-Phase 3D1 review: fix implemented; pending fresh independent Spec and Quality re-review at C0/I0. This implementation does not self-approve
-Next action: re-review Phase 3D1; do not begin Phase 3D2 until approval. Tool retry certification remains Phase 3D2 and Workflow recovery remains Phase 4
+Phase 3D1 final review: approved; Spec C0/I0/M0 and Quality C0/I0/M0. Fresh reviewer targeted 1, neighboring 11, focused 183, Phase3C2 89, Ruff/mypy/diff/scope/schema/public imports clean
+Phase 3D2: in progress - certified Tool retry and Phase 3 release gate
+Phase 3D2 brief: .superpowers/sdd/M02-T002-phase3d2-brief.md
+Next action: implement Phase 3D2 with strict TDD; Workflow recovery remains Phase 4
