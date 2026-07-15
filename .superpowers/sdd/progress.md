@@ -52,3 +52,8 @@ Phase 3C2 fixed review findings: recovery-start lacked checkpoint CAS; LeaseHeld
 Phase 3C2 final second-fix gates: focused 89 passed; Phase3C1 115; Phase3B 38; Phase3A 117; Phase2 139; Phase1+T001 188; Session/Run/Tool/MCP/Workflow recovery/child compatibility 237; full 1272 passed; Ruff clean; mypy clean across 73 source files; diff/scope/schema clean
 Phase 3C2 final Minor: multi-turn READY_FOR_TOOL validates aggregate started/completed counts and the final completed payload, but not every historical turn's event ordering and completed payload; add Memory/SQLite multi-turn reopen negative coverage during whole-branch triage
 Next action: execute Phase 3D provider authoritative-status and certified same-operation-id recovery adapters; Workflow recovery remains Phase 4
+Phase 3D: in progress
+Phase 3D operational plan: .superpowers/sdd/M02-T002-phase3d-plan.md
+Phase 3D1: in progress — certified provider recovery adapters
+Phase 3D1 brief: .superpowers/sdd/M02-T002-phase3d1-brief.md
+Next action: implement Phase 3D1 with strict TDD; Tool retry certification remains Phase 3D2 and Workflow recovery remains Phase 4
