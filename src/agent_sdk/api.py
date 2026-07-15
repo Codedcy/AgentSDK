@@ -654,6 +654,7 @@ class RecoveryAPI:
         ],
         provider_recovery: ProviderRecoveryRegistry,
         provider_recovery_timeout_seconds: float,
+        workflows: WorkflowExecutor,
     ) -> None:
         self._store = store
         self._scanner = scanner
@@ -665,6 +666,7 @@ class RecoveryAPI:
         self._lifecycle = lifecycle
         self._ensure_startup_scan = ensure_startup_scan
         self._provider_recovery = provider_recovery
+        self._workflows = workflows
         self._start_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[RunResult]] = {}
         self._service = RunRecoveryService(
@@ -678,6 +680,7 @@ class RecoveryAPI:
             _wait_stopping=lifecycle.close_signal.wait,
             _adapter_timeout=provider_recovery_timeout_seconds,
         )
+        self._workflows._set_run_recovery(self._recover_run_handle)
 
     def register_adapter(
         self,
@@ -714,18 +717,30 @@ class RecoveryAPI:
         async with self._lifecycle.admit():
             startup, _created = await self._ensure_startup_scan()
             await asyncio.shield(startup)
-            async with self._start_lock:
-                existing = self._tasks.get(run_id)
-                if existing is not None:
-                    return RunHandle(run_id, self._store, existing)
-                plan = await self._service.plan(run_id)
-                if plan.kind == "detached":
-                    return RunHandle(run_id, self._store, None)
-                task = asyncio.create_task(self._service.execute(plan))
-                self._tasks[run_id] = task
-                task.add_done_callback(partial(self._release_task, run_id))
-                self._track_task(task)
-                return RunHandle(run_id, self._store, task)
+            return await self._recover_run_handle(run_id)
+
+    async def recover_workflow(self, workflow_run_id: str) -> WorkflowHandle:
+        async with self._lifecycle.admit():
+            startup, _created = await self._ensure_startup_scan()
+            await asyncio.shield(startup)
+            return await self._workflows.recover(
+                workflow_run_id,
+                self._recover_run_handle,
+            )
+
+    async def _recover_run_handle(self, run_id: str) -> RunHandle:
+        async with self._start_lock:
+            existing = self._tasks.get(run_id)
+            if existing is not None:
+                return RunHandle(run_id, self._store, existing)
+            plan = await self._service.plan(run_id)
+            if plan.kind == "detached":
+                return RunHandle(run_id, self._store, None)
+            task = asyncio.create_task(self._service.execute(plan))
+            self._tasks[run_id] = task
+            task.add_done_callback(partial(self._release_task, run_id))
+            self._track_task(task)
+            return RunHandle(run_id, self._store, task)
 
     async def pending_requests(
         self,
@@ -1070,6 +1085,7 @@ class AgentSDK:
             self._ensure_startup_scan,
             provider_recovery,
             provider_recovery_timeout_seconds,
+            workflows,
         )
         try:
             loop = asyncio.get_running_loop()

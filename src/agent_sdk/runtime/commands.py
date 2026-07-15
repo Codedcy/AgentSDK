@@ -443,25 +443,28 @@ class RuntimeCommands:
         )
         fingerprint: str | None = None
         if idempotency_key is not None:
+            fingerprint_values: dict[str, Any] = {
+                "session_id": session_id,
+                "execution_descriptor": (
+                    None
+                    if execution_descriptor is None
+                    else execution_descriptor.model_dump(mode="json")
+                ),
+                "user_input": user_input,
+                "parent_run_id": parent_run_id,
+                "workflow_run_id": workflow_run_id,
+                "workflow_node_id": workflow_node_id,
+                "task_envelope": (
+                    None
+                    if task_envelope is None
+                    else task_envelope.model_dump(mode="json")
+                ),
+            }
+            if run_id is not None:
+                fingerprint_values["run_id"] = run_id
             fingerprint = fingerprint_command(
                 "run.start",
-                {
-                    "session_id": session_id,
-                    "execution_descriptor": (
-                        None
-                        if execution_descriptor is None
-                        else execution_descriptor.model_dump(mode="json")
-                    ),
-                    "user_input": user_input,
-                    "parent_run_id": parent_run_id,
-                    "workflow_run_id": workflow_run_id,
-                    "workflow_node_id": workflow_node_id,
-                    "task_envelope": (
-                        None
-                        if task_envelope is None
-                        else task_envelope.model_dump(mode="json")
-                    ),
-                },
+                fingerprint_values,
             )
 
         for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
@@ -605,6 +608,7 @@ class RuntimeCommands:
                 workflow_node_id=workflow_node_id,
                 task_envelope=task_envelope,
                 execution_descriptor=execution_descriptor,
+                expected_run_id=run_id,
             )
             result = None
             if validation_error is not None:
@@ -630,6 +634,7 @@ class RuntimeCommands:
         workflow_node_id: str | None,
         task_envelope: TaskEnvelope | None,
         execution_descriptor: ExecutionDescriptor | None,
+        expected_run_id: str | None,
     ) -> tuple[RunSnapshot | None, AgentSDKError | None]:
         record = result.idempotency
         if record is None:
@@ -664,6 +669,7 @@ class RuntimeCommands:
             or snapshot.task_envelope != task_envelope
             or snapshot.execution_compatibility != "current"
             or snapshot.execution_descriptor != execution_descriptor
+            or (expected_run_id is not None and snapshot.run_id != expected_run_id)
         ):
             snapshot = None
             del task_envelope

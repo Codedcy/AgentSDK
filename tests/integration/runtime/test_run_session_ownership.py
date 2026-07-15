@@ -1309,3 +1309,132 @@ async def test_legacy_run_start_rejects_idempotency_before_store_access() -> Non
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_id_idempotency_replays_only_the_exact_selected_id() -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    descriptor = ExecutionDescriptor.create(
+        agent=AGENT,
+        messages=({"role": "user", "content": "workflow input"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+
+    first = await commands.start_run(
+        session.session_id,
+        run_id="run_workflow_selected",
+        agent_revision="test:1",
+        user_input="workflow input",
+        execution_descriptor=descriptor,
+        idempotency_key="workflow-node",
+    )
+    replay = await commands.start_run(
+        session.session_id,
+        run_id="run_workflow_selected",
+        agent_revision="test:1",
+        user_input="workflow input",
+        execution_descriptor=descriptor,
+        idempotency_key="workflow-node",
+    )
+
+    assert first.replayed is False
+    assert replay.replayed is True
+    assert replay.run_id == "run_workflow_selected"
+
+    with pytest.raises(AgentSDKError) as conflict:
+        await commands.start_run(
+            session.session_id,
+            run_id="run_substituted",
+            agent_revision="test:1",
+            user_input="workflow input",
+            execution_descriptor=descriptor,
+            idempotency_key="workflow-node",
+        )
+
+    assert conflict.value.code is ErrorCode.CONFLICT
+    assert conflict.value.retryable is False
+    assert await store.get_snapshot("run", "run_substituted") is None
+
+
+@pytest.mark.asyncio
+async def test_omitted_run_id_idempotency_replay_keeps_generated_id_compatibility() -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    descriptor = ExecutionDescriptor.create(
+        agent=AGENT,
+        messages=({"role": "user", "content": "generated input"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+
+    first = await commands.start_run(
+        session.session_id,
+        agent_revision="test:1",
+        user_input="generated input",
+        execution_descriptor=descriptor,
+        idempotency_key="generated-run",
+    )
+    replay = await commands.start_run(
+        session.session_id,
+        agent_revision="test:1",
+        user_input="generated input",
+        execution_descriptor=descriptor,
+        idempotency_key="generated-run",
+    )
+
+    assert replay.replayed is True
+    assert replay.run_id == first.run_id
+
+
+@pytest.mark.asyncio
+async def test_sqlite_explicit_run_id_idempotency_rejects_substitution(
+    tmp_path: Path,
+) -> None:
+    from agent_sdk.storage.sqlite import SQLiteStore
+
+    store = await SQLiteStore.open(tmp_path / "explicit-run-id.db")
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    descriptor = ExecutionDescriptor.create(
+        agent=AGENT,
+        messages=({"role": "user", "content": "workflow input"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    try:
+        first = await commands.start_run(
+            session.session_id,
+            run_id="run_sqlite_selected",
+            agent_revision="test:1",
+            user_input="workflow input",
+            execution_descriptor=descriptor,
+            idempotency_key="workflow-node",
+        )
+        replay = await commands.start_run(
+            session.session_id,
+            run_id="run_sqlite_selected",
+            agent_revision="test:1",
+            user_input="workflow input",
+            execution_descriptor=descriptor,
+            idempotency_key="workflow-node",
+        )
+
+        assert replay.replayed is True
+        assert replay.run_id == first.run_id
+        with pytest.raises(AgentSDKError) as conflict:
+            await commands.start_run(
+                session.session_id,
+                run_id="run_sqlite_substituted",
+                agent_revision="test:1",
+                user_input="workflow input",
+                execution_descriptor=descriptor,
+                idempotency_key="workflow-node",
+            )
+        assert conflict.value.code is ErrorCode.CONFLICT
+        assert await store.get_snapshot("run", "run_sqlite_substituted") is None
+    finally:
+        await store.close()
