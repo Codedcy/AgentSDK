@@ -206,3 +206,91 @@ clean Workflow/recovery registries.
 
 The remediation is ready for a fresh whole-Phase-4 independent Spec/Quality
 review. Phase 5, M02-T003, and M02-T004 remain blocked pending that verdict.
+
+## First re-review authenticity remediation
+
+The first re-review's sole Spec Important finding was addressed by replacing
+the two synthetic lifecycle tests with production-reachable paths. This section
+supersedes the earlier expired/interrupted and delete-wins test descriptions.
+No production code, public API, state, or schema was changed, and this evidence
+does not claim independent approval.
+
+### Reachable scanner interruption and Workflow recovery
+
+The Memory/SQLite expired-ownership matrix now starts a real selected CREATED
+Run through Workflow recovery and blocks its real Provider call. Before any
+scanner action, the production Run engine has durably produced:
+
+- a RUNNING Run;
+- a `MODEL_IN_FLIGHT` checkpoint;
+- one STARTED `ModelCallOperation`; and
+- its generation-1 owner lease.
+
+The test then advances a controlled clock beyond that lease and invokes the
+public `RecoveryAPI.scan()` path. The production `RecoveryScanner` records the
+exact `run.interrupted` transition while acquiring and releasing a generation-2
+`coord_*` lease. The old lease is proven fenced; the checkpoint and operation
+remain exact. For SQLite, the scanner/owner SDK and its original connection are
+closed before two new independent connections to the same database construct
+the competing recovery SDKs.
+
+Both SDKs deterministically contend at lease admission. They converge on one
+reconciliation request and both return the bounded retryable
+`CONFLICT / recovery required` result. The Run moves from RUNNING to INTERRUPTED
+to WAITING_RECONCILIATION, the Workflow/node remain RUNNING, Session Run and
+Workflow ownership remain exact, and the complete Run event chain is:
+
+`run.created`, `run.started`, `step.started`, `model.call.started`,
+`run.interrupted`, `reconciliation.requested`.
+
+There is no new Provider, Tool, MCP, permission, terminal Run, node failure, or
+Workflow failure work. The one Provider call is the original deliberately
+blocked call, and all owner tasks are explicitly cancelled and settled during
+cleanup rather than waiting for a diagnostic timeout.
+
+### Public busy-delete lifecycle race
+
+The prior direct `StateStore.delete_session` race was removed completely. Its
+replacement covers ACTIVE and CLOSING Sessions on both Memory and SQLite:
+
+- a real selected CREATED Run makes the Session own both a Run and Workflow;
+- two SDK recovery tasks pause before their Run lease acquisition;
+- public `sessions.delete(...)` returns `SessionBusyError` for both ACTIVE and
+  public-`sessions.close(...)`-produced CLOSING state, without changing the
+  Session or event cursor;
+- after release, the SDKs converge on one Provider execution and the same
+  completed Workflow; ACTIVE remains ACTIVE and CLOSING closes naturally after
+  its owned work detaches;
+- the supported public close/delete sequence then removes Session, Run,
+  Workflow, node, events, idempotency, lease, checkpoint, external operation,
+  and reconciliation state; and
+- subsequent recovery attempts from both SDKs return NOT_FOUND without
+  recreating any state.
+
+No force-delete or delete-wins behavior was implemented; that remains deferred
+to M02-T004.
+
+### TDD and fresh verification
+
+- The first reachable-scanner Memory run was RED only because the new exact
+  event assertion omitted the production `step.started` event. Adding that
+  existing reachable event made the test GREEN; no production RED occurred.
+- Reachable scanner matrix: **2 passed**.
+- Public ACTIVE/CLOSING busy-delete matrix: **4 passed**.
+- Combined authenticity exact selection: **6 passed**.
+- Complete Phase 4A + Phase 4B Workflow admission file: **99 passed**.
+- Final Python 3.13 full suite: **1679 passed**, zero failed, zero skipped, in
+  127.60 seconds.
+- Ruff: all `src` and `tests` checks passed.
+- mypy: 75 source files passed.
+- `git diff --check`: passed.
+- Public import/signature smoke: 99 unique root exports; exact
+  `(self, workflow_run_id: str) -> WorkflowHandle` contract retained;
+  `WorkflowExecutor.recover` remains absent.
+- Scope/schema: implementation changes are limited to
+  `tests/integration/workflow/test_workflow_recovery_admission.py` plus this
+  ignored report; there is no production, migration, dependency, lockfile, or
+  progress change, and SQLite remains schema v3.
+
+The second-review authenticity remediation is ready for a fresh whole-Phase-4
+independent Spec/Quality review. Phase 5 remains blocked pending that verdict.

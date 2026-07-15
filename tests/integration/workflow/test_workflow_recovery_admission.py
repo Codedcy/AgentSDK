@@ -5,6 +5,7 @@ import inspect
 import traceback
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +22,18 @@ from agent_sdk import (
     RecoveryAPI,
     ToolContext,
 )
+from agent_sdk.errors import SessionBusyError
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.mcp import MCPManager, MCPServerConfig, StdioMCPTransport
 from agent_sdk.permissions.broker import InProcessPermissionBridge
+from agent_sdk.runtime.leases import Lease, LeaseLostError
 from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionStatus
 from agent_sdk.runtime.recovery import RecoveryPlan
-from agent_sdk.runtime.reconciliation import RunCheckpointPhase
+from agent_sdk.runtime.reconciliation import (
+    ExternalOperationStatus,
+    ModelCallOperation,
+    RunCheckpointPhase,
+)
 from agent_sdk.runtime.session_lifecycle import exact_session_precondition, session_write
 from agent_sdk.storage.base import CommitBatch, RunProgressBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
@@ -111,6 +118,14 @@ async def _wait_for_event(
         raise AssertionError(f"coordination timeout: {diagnostic()!r}") from None
 
 
+async def _cancel_sdk_active_tasks(sdk: AgentSDK) -> None:
+    tasks = tuple(sdk._active_tasks)  # type: ignore[attr-defined]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class _CountingCompletion:
     def __init__(self, *, block: bool = False, fail: bool = False) -> None:
         self.calls = 0
@@ -156,6 +171,7 @@ async def _seed_current_workflow(
     agents: tuple[AgentSpec, ...] = (AGENT,),
     tool: ToolSpec | None = None,
     permission_default: str = "ask",
+    idempotency_key: str | None = None,
 ) -> tuple[AgentSDK, Any]:
     sdk = AgentSDK.for_test(
         store=store,
@@ -176,6 +192,7 @@ async def _seed_current_workflow(
         session.session_id,
         workflow,
         execution_descriptor=descriptor,
+        idempotency_key=idempotency_key,
     )
     return sdk, created.value
 
@@ -354,44 +371,64 @@ class _LeaseBarrierStore:
         return await self.delegate.acquire_lease(**values)
 
 
-class _DeletionBarrier:
+class _LeaseRecordingStore:
+    def __init__(self, delegate: Any) -> None:
+        self.delegate = delegate
+        self.acquired: list[Lease] = []
+        self.released: list[Lease] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def acquire_lease(self, **values: Any) -> Lease:
+        lease = await self.delegate.acquire_lease(**values)
+        self.acquired.append(lease)
+        return lease
+
+    async def release_lease(self, lease: Lease) -> None:
+        await self.delegate.release_lease(lease)
+        self.released.append(lease)
+
+
+class _BusyDeleteBarrier:
     def __init__(self) -> None:
         self.arrivals = 0
         self.ready = asyncio.Event()
         self.release = asyncio.Event()
-        self.selected_run_ids: list[str] = []
+        self.run_ids: list[str] = []
+        self.operation_ids: set[str] = set()
 
 
-class _DeletionBarrierStore:
-    def __init__(self, delegate: Any, barrier: _DeletionBarrier) -> None:
+class _BusyDeleteBarrierStore:
+    def __init__(self, delegate: Any, barrier: _BusyDeleteBarrier) -> None:
         self.delegate = delegate
         self.barrier = barrier
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
 
-    async def commit(self, batch: CommitBatch) -> Any:
-        started = [
-            event
-            for event in batch.events
-            if event.type == "workflow.node.started"
-        ]
-        if started:
-            run_id = started[0].payload.get("run_id")
-            assert isinstance(run_id, str)
-            self.barrier.selected_run_ids.append(run_id)
-            self.barrier.arrivals += 1
-            if self.barrier.arrivals == 2:
-                self.barrier.ready.set()
-            await _wait_for_event(
-                self.barrier.release,
-                diagnostic=lambda: {
-                    "phase": "delete_race_release",
-                    "arrivals": self.barrier.arrivals,
-                    "selected_run_ids": tuple(self.barrier.selected_run_ids),
-                },
-            )
-        return await self.delegate.commit(batch)
+    async def acquire_lease(self, **values: Any) -> Lease:
+        run_id = values.get("run_id")
+        assert isinstance(run_id, str)
+        self.barrier.run_ids.append(run_id)
+        self.barrier.arrivals += 1
+        if self.barrier.arrivals == 2:
+            self.barrier.ready.set()
+        await _wait_for_event(
+            self.barrier.release,
+            diagnostic=lambda: {
+                "phase": "busy_delete_lease_release",
+                "arrivals": self.barrier.arrivals,
+                "run_ids": tuple(self.barrier.run_ids),
+            },
+        )
+        return await self.delegate.acquire_lease(**values)
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> Any:
+        result = await self.delegate.commit_run_progress(batch)
+        if batch.operation is not None:
+            self.barrier.operation_ids.add(batch.operation.updated.operation_id)
+        return result
 
 
 class _ToolCompletion:
@@ -1313,42 +1350,111 @@ async def test_two_sdks_expired_unreconciled_run_stays_active_and_bounded(
     backend: str,
     tmp_path: Path,
 ) -> None:
-    first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
-        backend,
-        tmp_path / "expired-unreconciled.db",
-    )
+    database = tmp_path / "expired-unreconciled.db"
+    sqlite_stores: list[SQLiteStore] = []
+    if backend == "memory":
+        initial_delegate: Any = InMemoryStore()
+    else:
+        initial_delegate = await SQLiteStore.open(database)
+        sqlite_stores.append(initial_delegate)
+    recording_store = _LeaseRecordingStore(initial_delegate)
     barrier = _LeaseBarrier()
-    first_store = _LeaseBarrierStore(first_delegate, barrier)
-    second_store = _LeaseBarrierStore(second_delegate, barrier)
-    completion = _CountingCompletion()
+    completion = _CountingCompletion(block=True)
+    owner: AgentSDK | None = None
     first: AgentSDK | None = None
     second: AgentSDK | None = None
+    owner_handle: Any = None
     try:
-        first, workflow = await _seed_current_workflow(  # type: ignore[arg-type]
-            first_store,
+        owner, workflow = await _seed_current_workflow(  # type: ignore[arg-type]
+            recording_store,
             completion,
         )
-        selected = await _select_root(first_store, workflow)  # type: ignore[arg-type]
-        created = await _create_selected_run(first, selected)
-        interrupted = created.model_copy(
-            update={"status": RunStatus.INTERRUPTED, "version": 3}
+        selected = await _select_root(recording_store, workflow)  # type: ignore[arg-type]
+        created = await _create_selected_run(owner, selected)
+        owner_handle = await owner.recovery.recover_workflow(
+            workflow.workflow_run_id
         )
-        await first_delegate.commit(
-            CommitBatch(
-                events=(),
-                snapshots=(
-                    SnapshotWrite(
-                        "run",
-                        interrupted.run_id,
-                        interrupted.session_id,
-                        interrupted.version,
-                        interrupted.model_dump(mode="json"),
-                    ),
-                ),
+        await _wait_for_event(
+            completion.started,
+            diagnostic=lambda: {
+                "phase": "real_running_provider",
+                "provider_calls": completion.calls,
+                "run_id": created.run_id,
+            },
+        )
+
+        running = await owner.runs.get(created.run_id)
+        checkpoint = await initial_delegate.get_run_checkpoint(created.run_id)
+        operations = await initial_delegate.list_external_operations(created.run_id)
+        initial_lease = await initial_delegate.get_run_lease(created.run_id)
+        assert running.status is RunStatus.RUNNING
+        assert running.version == 2
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT
+        assert len(operations) == 1
+        operation = operations[0]
+        assert isinstance(operation, ModelCallOperation)
+        assert operation.status is ExternalOperationStatus.STARTED
+        assert initial_lease is not None
+        assert operation.lease_generation == initial_lease.generation
+        assert recording_store.acquired == [initial_lease]
+
+        clock = [initial_lease.expires_at + timedelta(seconds=1)]
+        owner._recovery_scanner._clock = lambda: clock[0]  # type: ignore[attr-defined]
+        await owner.recovery.scan()
+
+        interrupted = await owner.runs.get(created.run_id)
+        scanner_lease = recording_store.acquired[-1]
+        assert interrupted.status is RunStatus.INTERRUPTED
+        assert interrupted.version == running.version + 1
+        assert len(recording_store.acquired) == 2
+        assert scanner_lease.generation == initial_lease.generation + 1
+        assert scanner_lease.owner.startswith("coord_")
+        assert scanner_lease.acquired_at == clock[0]
+        assert recording_store.released == [scanner_lease]
+        assert await initial_delegate.get_run_lease(created.run_id) is None
+        assert await initial_delegate.get_run_checkpoint(created.run_id) == checkpoint
+        assert await initial_delegate.list_external_operations(created.run_id) == operations
+        with pytest.raises(LeaseLostError):
+            await initial_delegate.assert_current_lease(initial_lease, now=clock[0])
+        events_after_scan = [
+            item.event
+            for item in await initial_delegate.read_events(
+                after_cursor=0,
+                session_id=workflow.session_id,
             )
-        )
+            if item.event.run_id == created.run_id
+        ]
+        assert [event.type for event in events_after_scan] == [
+            "run.created",
+            "run.started",
+            "step.started",
+            "model.call.started",
+            "run.interrupted",
+        ]
+        assert events_after_scan[-1].payload == {"status": "interrupted"}
+
+        await _cancel_sdk_active_tasks(owner)
+        await owner.close()
+        owner = None
+        await asyncio.gather(owner_handle.result(), return_exceptions=True)
+        owner_handle = None
+        if backend == "memory":
+            first_delegate = second_delegate = initial_delegate
+        else:
+            await initial_delegate.close()
+            sqlite_stores.remove(initial_delegate)
+            first_delegate = await SQLiteStore.open(database)
+            second_delegate = await SQLiteStore.open(database)
+            sqlite_stores.extend((first_delegate, second_delegate))
+        first_store = _LeaseBarrierStore(first_delegate, barrier)
+        second_store = _LeaseBarrierStore(second_delegate, barrier)
+        first = AgentSDK.for_test(store=first_store, acompletion=completion)
+        first.agents.define(AGENT)
         second = AgentSDK.for_test(store=second_store, acompletion=completion)
         second.agents.define(AGENT)
+        first.recovery._service._clock = lambda: clock[0]  # type: ignore[attr-defined]
+        second.recovery._service._clock = lambda: clock[0]  # type: ignore[attr-defined]
         first_handle, second_handle = await asyncio.gather(
             first.recovery.recover_workflow(workflow.workflow_run_id),
             second.recovery.recover_workflow(workflow.workflow_run_id),
@@ -1373,15 +1479,38 @@ async def test_two_sdks_expired_unreconciled_run_stays_active_and_bounded(
         durable_workflow = await first.workflows.get(workflow.workflow_run_id)
         session = await first.sessions.get(workflow.session_id)
         assert durable_run.status is RunStatus.WAITING_RECONCILIATION
+        assert durable_run.version == interrupted.version + 1
         assert durable_workflow.status is WorkflowRunStatus.RUNNING
         assert durable_workflow.nodes[0].status is WorkflowNodeStatus.RUNNING
-        assert created.run_id in session.active_run_ids
-        assert workflow.workflow_run_id in session.active_workflow_run_ids
-        assert completion.calls == 0
+        assert session.active_run_ids == (created.run_id,)
+        assert session.active_workflow_run_ids == (workflow.workflow_run_id,)
+        assert completion.calls == 1
+        assert await first_delegate.get_run_lease(created.run_id) is None
+        assert await first_delegate.get_run_checkpoint(created.run_id) == checkpoint
+        assert await first_delegate.list_external_operations(created.run_id) == operations
+        requests = await first_delegate.list_pending_reconciliation_requests(
+            created.run_id
+        )
+        assert len(requests) == 1
+        assert requests[0].operation_id == operation.operation_id
+        assert requests[0].reason == "model_call_unknown_outcome"
+        assert requests[0].details == {
+            "checkpoint_phase": RunCheckpointPhase.MODEL_IN_FLIGHT.value
+        }
         events = await first_delegate.read_events(
             after_cursor=0,
             session_id=workflow.session_id,
         )
+        run_events = [
+            item.event for item in events if item.event.run_id == created.run_id
+        ]
+        assert run_events[:-1] == events_after_scan
+        assert run_events[-1].type == "reconciliation.requested"
+        assert run_events[-1].payload == {
+            "request_id": requests[0].request_id,
+            "operation_id": operation.operation_id,
+            "reason": "model_call_unknown_outcome",
+        }
         assert not any(
             item.event.type
             in {
@@ -1394,8 +1523,19 @@ async def test_two_sdks_expired_unreconciled_run_stays_active_and_bounded(
             }
             for item in events
         )
+        await asyncio.sleep(0)
+        assert first.workflows._executor._active == {}  # type: ignore[attr-defined]
+        assert second.workflows._executor._active == {}  # type: ignore[attr-defined]
+        assert first.recovery._tasks == {}  # type: ignore[attr-defined]
+        assert second.recovery._tasks == {}  # type: ignore[attr-defined]
     finally:
         barrier.ready.set()
+        completion.release.set()
+        if owner is not None:
+            await _cancel_sdk_active_tasks(owner)
+            await owner.close()
+        if owner_handle is not None:
+            await asyncio.gather(owner_handle.result(), return_exceptions=True)
         await asyncio.gather(
             *(sdk.close() for sdk in (first, second) if sdk is not None)
         )
@@ -1404,39 +1544,35 @@ async def test_two_sdks_expired_unreconciled_run_stays_active_and_bounded(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["memory", "sqlite"])
-async def test_two_sdks_delete_winner_prevents_all_recovery_resurrection(
+@pytest.mark.parametrize("lifecycle", ["active", "closing"])
+async def test_two_sdks_public_busy_delete_races_recovery_without_resurrection(
     backend: str,
+    lifecycle: str,
     tmp_path: Path,
 ) -> None:
     first_delegate, second_delegate, sqlite_stores = await _open_backend_pair(
         backend,
-        tmp_path / "workflow-delete-race.db",
+        tmp_path / f"workflow-busy-delete-{lifecycle}.db",
     )
-    barrier = _DeletionBarrier()
-    first_store = _DeletionBarrierStore(first_delegate, barrier)
-    second_store = _DeletionBarrierStore(second_delegate, barrier)
+    barrier = _BusyDeleteBarrier()
+    first_store = _BusyDeleteBarrierStore(first_delegate, barrier)
+    second_store = _BusyDeleteBarrierStore(second_delegate, barrier)
     completion = _CountingCompletion()
     first: AgentSDK | None = None
     second: AgentSDK | None = None
-    workflow: Any = None
     try:
-        first = AgentSDK.for_test(store=first_store, acompletion=completion)
-        first.agents.define(AGENT)
-        session = await first.sessions.create(workspaces=[])
-        workflow_ir = WorkflowCompiler().compile_yaml(_workflow_yaml())
-        descriptor = (
-            first.workflows._executor._workflow_execution_descriptor(  # type: ignore[attr-defined]
-                workflow_ir
-            )
+        first, workflow = await _seed_current_workflow(  # type: ignore[arg-type]
+            first_store,
+            completion,
+            idempotency_key="phase4-public-busy-delete",
         )
-        workflow = (
-            await WorkflowState(first_store).create(
-                session.session_id,
-                workflow_ir,
-                execution_descriptor=descriptor,
-                idempotency_key="phase4-delete-race",
-            )
-        ).value
+        selected = await _select_root(first_store, workflow)  # type: ignore[arg-type]
+        created = await _create_selected_run(first, selected)
+        if lifecycle == "closing":
+            closing = await first.sessions.close(workflow.session_id)
+            assert closing.status is SessionStatus.CLOSING
+            assert closing.active_run_ids == (created.run_id,)
+            assert closing.active_workflow_run_ids == (workflow.workflow_run_id,)
         second = AgentSDK.for_test(store=second_store, acompletion=completion)
         second.agents.define(AGENT)
         first_handle, second_handle = await asyncio.gather(
@@ -1446,62 +1582,128 @@ async def test_two_sdks_delete_winner_prevents_all_recovery_resurrection(
         await _wait_for_event(
             barrier.ready,
             diagnostic=lambda: {
-                "phase": "delete_race_arrivals",
+                "phase": "busy_delete_arrivals",
                 "arrivals": barrier.arrivals,
-                "selected_run_ids": tuple(barrier.selected_run_ids),
+                "run_ids": tuple(barrier.run_ids),
+                "lifecycle": lifecycle,
             },
         )
         assert barrier.arrivals == 2
-        await first_delegate.delete_session(session.session_id)
+        assert barrier.run_ids == [created.run_id, created.run_id]
+        before_delete = await first.sessions.get(workflow.session_id)
+        assert before_delete.status is (
+            SessionStatus.CLOSING
+            if lifecycle == "closing"
+            else SessionStatus.ACTIVE
+        )
+        cursor_before_delete = await first_delegate.latest_cursor()
+        with pytest.raises(SessionBusyError) as busy:
+            await second.sessions.delete(workflow.session_id)
+
+        assert busy.value.code is ErrorCode.CONFLICT
+        assert busy.value.message == "session has active work"
+        assert busy.value.retryable is False
+        assert await first_delegate.latest_cursor() == cursor_before_delete
+        assert await first.sessions.get(workflow.session_id) == before_delete
         barrier.release.set()
-        outcomes = await asyncio.wait_for(
+        first_result, second_result = await asyncio.wait_for(
             asyncio.gather(
                 first_handle.result(),
                 second_handle.result(),
-                return_exceptions=True,
             ),
             timeout=_DIAGNOSTIC_TIMEOUT_SECONDS,
         )
 
-        assert len(outcomes) == 2
-        for outcome in outcomes:
-            assert isinstance(outcome, AgentSDKError)
-            assert outcome.code is ErrorCode.NOT_FOUND
-        assert await first_delegate.get_snapshot("session", session.session_id) is None
+        assert first_result == second_result
+        assert first_result.status is WorkflowRunStatus.COMPLETED
+        assert first_result.nodes[0].run_id == created.run_id
+        assert completion.calls == 1
+        assert (await first.runs.get(created.run_id)).status is RunStatus.COMPLETED
         assert (
-            await first_delegate.get_snapshot(
-                "workflow",
-                workflow.workflow_run_id,
-            )
+            await first.workflows.get(workflow.workflow_run_id)
+        ).status is WorkflowRunStatus.COMPLETED
+        settled_session = await first.sessions.get(workflow.session_id)
+        assert settled_session.active_run_ids == ()
+        assert settled_session.active_workflow_run_ids == ()
+        assert settled_session.status is (
+            SessionStatus.CLOSED
+            if lifecycle == "closing"
+            else SessionStatus.ACTIVE
+        )
+        events = await first_delegate.read_events(
+            after_cursor=0,
+            session_id=workflow.session_id,
+        )
+        assert sum(item.event.type == "run.created" for item in events) == 1
+        assert sum(item.event.type == "run.completed" for item in events) == 1
+        assert sum(
+            item.event.type == "workflow.completed" for item in events
+        ) == 1
+        assert not any(
+            item.event.type
+            in {
+                "permission.requested",
+                "reconciliation.requested",
+                "run.failed",
+                "workflow.node.failed",
+                "workflow.failed",
+            }
+            for item in events
+        )
+        assert len(barrier.operation_ids) == 1
+        operation_id = next(iter(barrier.operation_ids))
+        operation = await first_delegate.get_external_operation(operation_id)
+        assert isinstance(operation, ModelCallOperation)
+        assert operation.status is ExternalOperationStatus.COMPLETED
+
+        if settled_session.status is SessionStatus.ACTIVE:
+            closed = await first.sessions.close(workflow.session_id)
+            assert closed.status is SessionStatus.CLOSED
+        await second.sessions.delete(workflow.session_id)
+
+        assert await first_delegate.get_snapshot("session", workflow.session_id) is None
+        assert await first_delegate.get_snapshot("run", created.run_id) is None
+        assert (
+            await first_delegate.get_snapshot("workflow", workflow.workflow_run_id)
             is None
         )
         for node in workflow.nodes:
-            assert (
-                await first_delegate.get_snapshot("workflow_node", node.entity_id)
-                is None
+            assert await first_delegate.get_snapshot(
+                "workflow_node",
+                node.entity_id,
+            ) is None
+        assert await first_delegate.get_run_lease(created.run_id) is None
+        assert await first_delegate.get_run_checkpoint(created.run_id) is None
+        assert await first_delegate.get_external_operation(operation_id) is None
+        assert (
+            await first_delegate.list_unresolved_external_operations(created.run_id)
+            == ()
+        )
+        assert (
+            await first_delegate.list_pending_reconciliation_requests(created.run_id)
+            == ()
+        )
+        assert (
+            await first_delegate.read_events(
+                after_cursor=0,
+                session_id=workflow.session_id,
             )
-        assert len(barrier.selected_run_ids) == 2
-        for run_id in barrier.selected_run_ids:
-            assert await first_delegate.get_snapshot("run", run_id) is None
-            assert await first_delegate.get_run_lease(run_id) is None
-            assert await first_delegate.get_run_checkpoint(run_id) is None
-            assert (
-                await first_delegate.list_unresolved_external_operations(run_id)
-                == ()
-            )
-            assert (
-                await first_delegate.list_pending_reconciliation_requests(run_id)
-                == ()
-            )
-        assert await first_delegate.read_events(after_cursor=0) == []
+            == []
+        )
         assert (
             await first_delegate.get_idempotency(
-                f"session/{session.session_id}/workflow.start",
-                "phase4-delete-race",
+                f"session/{workflow.session_id}/workflow.start",
+                "phase4-public-busy-delete",
             )
             is None
         )
-        assert completion.calls == 0
+        for sdk in (first, second):
+            with pytest.raises(AgentSDKError) as deleted:
+                await sdk.recovery.recover_workflow(workflow.workflow_run_id)
+            assert deleted.value.code is ErrorCode.NOT_FOUND
+        assert await first_delegate.get_snapshot("session", workflow.session_id) is None
+        assert await first_delegate.read_events(after_cursor=0) == []
+        assert completion.calls == 1
         await asyncio.sleep(0)
         assert first.workflows._executor._active == {}  # type: ignore[attr-defined]
         assert second.workflows._executor._active == {}  # type: ignore[attr-defined]
