@@ -125,3 +125,9 @@ Phase 4A final re-review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
 Phase 4A: complete and independently approved
 Phase 4B: in progress - two-SDK concurrency, external-side-effect, crash-boundary, lifecycle, and sanitization hardening
 Phase 4B brief: .superpowers/sdd/M02-T002-phase4b-brief.md
+Phase 4B implementation: 39485e16c456ff83b2a4a7a41d44e7e33fa76450
+Phase 4B implementation gates: admission 86; Workflow combined 146; full Python3.13 1666 passed with zero skips; Ruff/mypy75/diff/import/scope/schema clean
+Phase 4 whole review: Not Approved; Spec C0/I3/M0 and Quality C0/I1/M0
+Phase 4 review findings: unintended public WorkflowExecutor.recover; incomplete two-backend two-SDK pending/missing/CREATED/live/interrupted/expired/delete matrix; ambiguous-commit tests omitted paired Session ownership assertions; barrier waits mixed brittle one-second and unbounded waits
+Phase 4 review-fix brief: .superpowers/sdd/M02-T002-phase4-review-fix-brief.md
+Phase 4 review fix: in progress; Phase 5 remains blocked

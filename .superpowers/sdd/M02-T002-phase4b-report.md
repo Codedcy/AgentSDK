@@ -101,3 +101,13 @@ needed for Phase 4B.
 
 Phase 4B implementation evidence is ready for independent Phase 4 Spec and
 Quality review.
+
+## First whole-Phase-4 review
+
+The independent review was **Not Approved**: Spec Compliance C0/I3/M0 and Task
+Quality C0/I1/M0. It found an unintended public `WorkflowExecutor.recover`
+entry, incomplete two-backend/two-SDK pending/missing/CREATED/live/ownership and
+Session-delete coverage, incomplete Session attach/detach assertions at
+ambiguous commit boundaries, and brittle mixed one-second/unbounded test
+barriers. The bounded remediation is recorded in
+`M02-T002-phase4-review-fix-brief.md`; Phase 5 remains blocked.
