@@ -131,3 +131,8 @@ Phase 4 whole review: Not Approved; Spec C0/I3/M0 and Quality C0/I1/M0
 Phase 4 review findings: unintended public WorkflowExecutor.recover; incomplete two-backend two-SDK pending/missing/CREATED/live/interrupted/expired/delete matrix; ambiguous-commit tests omitted paired Session ownership assertions; barrier waits mixed brittle one-second and unbounded waits
 Phase 4 review-fix brief: .superpowers/sdd/M02-T002-phase4-review-fix-brief.md
 Phase 4 review fix: in progress; Phase 5 remains blocked
+Phase 4 first review-fix implementation: 2f9ff7460c0b8aada5cb5716d10c2b6cea166a38
+Phase 4 first review-fix gates: admission97; full Python3.13 1677 passed with zero skips; Ruff/mypy75/diff/import/scope/schema clean
+Phase 4 first re-review: Not Approved; Spec C0/I1/M0 and Quality C0/I0/M0
+Phase 4 remaining finding: expired/interrupted test fabricated an unreachable Run snapshot instead of real lease-expiry scanner transition; delete race bypassed supported busy lifecycle through direct Store deletion
+Phase 4 second review fix: in progress - real scanner interruption and public busy-delete race; Phase 5 remains blocked

@@ -112,6 +112,15 @@ ambiguous commit boundaries, and brittle mixed one-second/unbounded test
 barriers. The bounded remediation is recorded in
 `M02-T002-phase4-review-fix-brief.md`; Phase 5 remains blocked.
 
+The first re-review after `2f9ff74` was also **Not Approved**: Spec Compliance
+C0/I1/M0 and Task Quality C0/I0/M0. The public-entry, ambiguous ownership, and
+bounded-barrier findings were confirmed closed. The remaining finding is test
+authenticity: the expired/interrupted case fabricated an unreachable Run
+snapshot, and the delete race bypassed the supported Session lifecycle by
+calling the Store directly. The fix brief now requires a real expired-lease
+`RecoveryScanner` transition and public busy-delete behavior; Phase 5 remains
+blocked.
+
 ## Whole-Phase-4 review remediation
 
 The first whole-Phase-4 review findings were remediated within the exact

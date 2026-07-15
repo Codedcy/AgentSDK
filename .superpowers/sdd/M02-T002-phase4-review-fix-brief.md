@@ -41,10 +41,33 @@ Cover both Memory and SQLite for:
    no synthetic terminal projection or external work.
 
 Add a deterministic Session deletion/recovery race. It must prove that after
-the authoritative delete wins, neither SDK recreates or appends Session, Run,
+the supported lifecycle decision, neither SDK creates unexpected Session, Run,
 Workflow, event, permission, idempotency, lease, checkpoint, operation, or
-reconciliation state. Use the existing supported storage/session deletion
-mechanism and do not add T004 force-delete behavior.
+reconciliation state. In the current M02-T002 contract, ACTIVE/CLOSING Sessions
+with owned work reject public deletion as busy. Prove that rejection races
+safely with recovery and that recovery remains correct. Do not directly invoke
+`StateStore.delete_session` on an ACTIVE/CLOSING Session and do not add the
+T004 force-delete path. A delete-wins/force-delete matrix remains deferred to
+T004 unless separately approved.
+
+## Second-review correction - use only reachable interruption state
+
+The first fix implementation's expired/unreconciled test directly rewrote a
+CREATED Run to an INTERRUPTED snapshot, which is not a legal lifecycle proof.
+Replace it completely:
+
+- Start from a real RUNNING or WAITING Run with a persisted checkpoint and real
+  lease.
+- Advance a controlled clock past the lease expiry.
+- Run the production `RecoveryScanner` path so it atomically records the real
+  `run.interrupted` transition and new lease generation/ownership evidence.
+- Then race Workflow recovery from two SDKs (and two independently opened
+  SQLite connections) over Memory and SQLite.
+- Assert bounded retryable `recovery required`, zero new Provider/Tool/MCP work,
+  no synthetic node/Workflow failure, retained Workflow/Session ownership, and
+  the exact interruption/reconciliation event/checkpoint/lease evidence.
+- The test may use existing public/test construction hooks and controlled clock;
+  it may not `model_copy` a Run into a state production cannot create.
 
 ## I3 - Prove paired ambiguous-commit ownership boundaries
 
