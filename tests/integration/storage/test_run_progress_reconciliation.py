@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -85,6 +86,24 @@ def _request(**updates: object) -> ReconciliationRequest:
     }
     values.update(updates)
     return ReconciliationRequest.model_validate(values)
+
+
+def _operation(
+    run: RunSnapshot,
+    lease: Lease,
+    *,
+    operation_id: str = "op_unknown",
+) -> ModelCallOperation:
+    return ModelCallOperation(
+        operation_id=operation_id,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        turn=0,
+        request_fingerprint="sha256:model",
+        lease_generation=lease.generation,
+        status=ExternalOperationStatus.STARTED,
+        provider_identity="provider:model",
+    )
 
 
 def _event(run: RunSnapshot, request: ReconciliationRequest) -> EventEnvelope:
@@ -622,6 +641,183 @@ def _sdk_traceback_locals(error: BaseException) -> tuple[dict[str, Any], ...]:
             frames.append(dict(traceback.tb_frame.f_locals))
         traceback = traceback.tb_next
     return tuple(frames)
+
+
+def _assert_constant_secret_free_conflict(
+    error: RecoveryStateConflictError,
+    secret: str,
+) -> None:
+    assert error.to_dict() == {
+        "code": "conflict",
+        "message": "recovery state conflict",
+        "retryable": True,
+    }
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    sdk_locals = _sdk_traceback_locals(error)
+    assert sdk_locals
+    assert all(secret not in repr(frame) for frame in sdk_locals)
+
+
+@pytest.mark.parametrize("invalidity", ("missing", "foreign_scope"))
+@pytest.mark.asyncio
+async def test_memory_exact_reconciliation_replay_validates_linked_operation(
+    invalidity: str,
+) -> None:
+    store = InMemoryStore()
+    run, lease = await _seed(store)
+    secret = f"memory-linked-operation-secret-{invalidity}-3c1"
+    operation = _operation(run, lease, operation_id="op_linked_secret")
+    await store.create_external_operation(operation, lease=lease, now=NOW)
+    request = _request(
+        operation_id=operation.operation_id,
+        details={"credential": secret},
+    )
+    batch, _, _ = _create_batch(run, lease, request)
+    await store.commit_run_progress(batch)
+
+    async with store._lock:
+        if invalidity == "missing":
+            del store._external_operations[operation.operation_id]
+        else:
+            operation_data = json.loads(
+                store._external_operations[operation.operation_id]
+            )
+            operation_data.update(
+                {"run_id": "run_foreign", "session_id": "ses_foreign"}
+            )
+            store._external_operations[operation.operation_id] = json.dumps(
+                operation_data,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+    await store.release_lease(lease)
+
+    with pytest.raises(RecoveryStateConflictError) as caught:
+        await store.commit_run_progress(batch)
+
+    _assert_constant_secret_free_conflict(caught.value, secret)
+    assert await store.latest_cursor() == 1
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    (
+        "request_id",
+        "session_id",
+        "run_id",
+        "status",
+        "operation_id",
+        "noncanonical_json",
+    ),
+)
+@pytest.mark.asyncio
+async def test_sqlite_exact_reconciliation_replay_validates_durable_wrapper(
+    tmp_path: Path,
+    invalidity: str,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / f"wrapper-{invalidity}.db")
+    try:
+        run, lease = await _seed(store)
+        secret = f"sqlite-wrapper-secret-{invalidity}-3c1"
+        request = _request(details={"credential": secret})
+        batch, _, _ = _create_batch(run, lease, request)
+        await store.commit_run_progress(batch)
+
+        async with store._lock:
+            await store._connection.execute(
+                "PRAGMA ignore_check_constraints = ON"
+            )
+            if invalidity == "noncanonical_json":
+                async with store._connection.execute(
+                    "SELECT data_json FROM reconciliation_requests "
+                    "WHERE request_id = ?",
+                    (request.request_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                assert row is not None
+                await store._connection.execute(
+                    "UPDATE reconciliation_requests SET data_json = ? "
+                    "WHERE request_id = ?",
+                    (json.dumps(json.loads(row[0]), indent=1), request.request_id),
+                )
+            else:
+                replacement: str | None = {
+                    "request_id": "rec_wrapper_foreign",
+                    "session_id": "ses_wrapper_foreign",
+                    "run_id": "run_wrapper_foreign",
+                    "status": "resolved",
+                    "operation_id": "op_wrapper_foreign",
+                }[invalidity]
+                if invalidity == "operation_id":
+                    await store._connection.execute("PRAGMA foreign_keys = OFF")
+                await store._connection.execute(
+                    f"UPDATE reconciliation_requests SET {invalidity} = ? "
+                    "WHERE request_id = ?",
+                    (replacement, request.request_id),
+                )
+            await store._connection.commit()
+
+        expired = batch._replace(now=lease.expires_at)
+        with pytest.raises(RecoveryStateConflictError) as caught:
+            await store.commit_run_progress(expired)
+
+        _assert_constant_secret_free_conflict(caught.value, secret)
+        assert await store.latest_cursor() == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_same_batch_operation_exact_replay_validates_exact_operation_target(
+    progress_store: Any,
+) -> None:
+    run, lease = await _seed(progress_store)
+    operation = _operation(run, lease)
+    request = _request(operation_id=operation.operation_id)
+    batch, _, _ = _create_batch(run, lease, request)
+    batch = batch._replace(operation=ExternalOperationWrite(None, operation))
+    await progress_store.commit_run_progress(batch)
+    await progress_store.release_lease(lease)
+
+    replay = await progress_store.commit_run_progress(batch)
+
+    assert replay == storage_base.CommitResult(last_cursor=1, applied=False)
+
+
+@pytest.mark.asyncio
+async def test_lazy_exact_replay_wrapper_conflict_discards_request_secret(
+    tmp_path: Path,
+) -> None:
+    store = _LazySQLiteStore(tmp_path / "lazy-wrapper-secret.db")
+    try:
+        run, lease = await _seed(store)
+        secret = "lazy-wrapper-replay-secret-3c1-91e2"
+        request = _request(details={"credential": secret})
+        batch, _, _ = _create_batch(run, lease, request)
+        await store.commit_run_progress(batch)
+        underlying = await store._get()
+        async with underlying._lock:
+            await underlying._connection.execute(
+                "PRAGMA ignore_check_constraints = ON"
+            )
+            await underlying._connection.execute(
+                "UPDATE reconciliation_requests SET run_id = ? "
+                "WHERE request_id = ?",
+                ("run_wrapper_foreign", request.request_id),
+            )
+            await underlying._connection.commit()
+        await store.release_lease(lease)
+
+        with pytest.raises(RecoveryStateConflictError) as caught:
+            await store.commit_run_progress(batch)
+
+        _assert_constant_secret_free_conflict(caught.value, secret)
+        assert await store.latest_cursor() == 1
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

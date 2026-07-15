@@ -45,6 +45,10 @@ behavior.
   authoritative Run fails closed.
 - Session deletion removes Run snapshots, events, and leases so abandoned
   discovery is empty and the event tail is `None`.
+- Event-tail reads enforce the ownership invariant in both directions:
+  `session_owns_run` is true exactly when the Run is nonterminal. A COMPLETED or
+  FAILED Run that remains in `active_run_ids` is therefore corruption, just as a
+  nonterminal Run missing from `active_run_ids` is corruption.
 - All corruption/conflict boundaries reconstruct constant context-free recovery
   errors. Lazy forwarding discards query arguments before rethrow, and tests
   require nonempty SDK traceback frames without injected secrets.
@@ -67,6 +71,12 @@ behavior.
   after release and update replay at expiry return `applied=False`; partial,
   different, illegal-shape, stale-CAS, cross-scope, foreign-operation, and
   oversized-event invocations are constant conflicts with zero mutation.
+- Before that lease-free exact return, Memory verifies the canonical durable
+  request and its map-key identity, while SQLite verifies request id, Session,
+  Run, operation, and status columns against canonical `data_json`. A linked
+  operation must still exist and own the same Run/Session. If the operation is
+  also a same-batch target, its current durable value must be the exact updated
+  target; the batch object alone is not treated as evidence.
 - Memory cancellation, SQLite precommit failure, cancellation/commit race,
   lazy exact-object forwarding, secret traceback sanitization, and Session
   deletion are covered. Standalone Phase 2 request APIs and schema are unchanged.
@@ -144,19 +154,36 @@ All commands used the worktree Python 3.13 environment.
    - RED: `5 failed, 1 passed, 33 deselected in 3.52s`; excluded-status Session
      ownership and SQLite/lazy lease corruption could be skipped.
    - GREEN: `6 passed, 33 deselected in 3.11s` after all-record validation.
+10. Review I1: bidirectional event-tail ownership
+   - Shared Memory/SQLite/lazy RED: `6 failed, 39 deselected in 3.58s`; COMPLETED
+     and FAILED Runs still owned by the Session returned a tail instead of a
+     constant conflict.
+   - GREEN: `6 passed, 39 deselected in 5.96s` with the exact bidirectional
+     terminal/nonterminal ownership invariant and secret-free tracebacks.
+11. Review I2: strict lease-free reconciliation replay
+   - RED matrix: `7 failed, 4 passed, 35 deselected in 4.58s`. The failures were
+     Memory missing/foreign linked operations, SQLite Run/status/operation
+     wrapper and noncanonical-JSON mismatches, and the lazy secret-bearing
+     wrapper mismatch. Request-id/Session mismatches and exact same-batch
+     operation replay were already rejected/accepted correctly and formed the
+     four baseline passes.
+   - GREEN: `11 passed, 35 deselected in 5.90s` after symmetric strict durable
+     request and operation validation before the exact replay return.
 
-Fresh final Phase 3C1 focused result: `98 passed in 6.31s`.
+Fresh final Phase 3C1 focused result: `115 passed in 7.31s`.
 
 ## Final-code gates
 
-- Phase 3C1 focused: `98 passed in 6.31s`.
-- Phase 3B live progress: `38 passed in 3.45s`.
-- Phase 3A Run-progress transaction: `117 passed in 6.86s`.
-- Phase 2 recovery models/records/SQLite validation: `136 passed in 7.21s`.
-- Phase 1 + M02-T001 regressions: `188 passed in 13.76s`.
+- Phase 3C1 focused: `115 passed in 7.31s`.
+- Phase 3B live progress: `38 passed in 4.63s`.
+- Phase 3A Run-progress transaction: `117 passed in 15.76s`.
+- Phase 2 recovery models/records/SQLite validation: `136 passed in 11.66s`.
+- Phase 1 + M02-T001 regressions: `188 passed in 19.94s`.
 - Session lifecycle and Run/Workflow ownership regressions:
-  `108 passed in 5.87s`.
-- Full Python 3.13 pytest: `1163 passed in 40.64s`.
+  `108 passed in 17.84s`.
+- Full Python 3.13 pytest: `1179 passed, 1 skipped in 53.41s`. The sole skip is
+  the pre-existing prompt integration check when the environment has no `uv`
+  executable; no test was weakened or marked skipped by Phase 3C1.
 - Ruff: `All checks passed!`.
 - Mypy: `Success: no issues found in 73 source files`.
 - `git diff --check`: exit 0; only Windows LF-to-CRLF informational warnings.
@@ -203,6 +230,8 @@ remains 3, and no migration, table, index, or schema SQL changed.
 - Provider authoritative-status and provider-enforced same-operation-id adapters
   remain Phase 3D; Workflow recovery remains out of scope.
 
-No known in-scope Critical or Important correctness concern remains. Phase 3C2
-must not begin until the required fresh read-only Spec and Quality review returns
+The first post-commit fresh review returned C0/I2/M0. Both Important findings are
+covered by the RED-to-GREEN evidence above and are resolved in this fix. No known
+in-scope Critical or Important correctness concern remains in self-audit. Phase
+3C2 must not begin until a fresh read-only re-review of the fix commit returns
 C0/I0.

@@ -599,7 +599,23 @@ class InMemoryStore:
                 request_target.request_id
             )
             target_json = _canonical_record_json(request_target)
+            current_request: ReconciliationRequest | None = None
+            if current_request_json is not None:
+                current_request = _reconciliation_request_from_json(
+                    current_request_json
+                )
+                if (
+                    current_request.request_id != request_target.request_id
+                    or _canonical_record_json(current_request)
+                    != current_request_json
+                ):
+                    states.append("conflict")
+                    return states
             if current_request_json == target_json:
+                assert current_request is not None
+                self._check_exact_reconciliation_operation(
+                    batch, current_request
+                )
                 states.append("exact")
             elif current_request_json is None or (
                 batch.reconciliation.expected is not None
@@ -610,6 +626,31 @@ class InMemoryStore:
             else:
                 states.append("conflict")
         return states
+
+    def _check_exact_reconciliation_operation(
+        self,
+        batch: RunProgressBatch,
+        request: ReconciliationRequest,
+    ) -> None:
+        if request.operation_id is None:
+            return
+        operation_json = self._external_operations.get(request.operation_id)
+        if operation_json is None:
+            raise RecoveryStateConflictError
+        if (
+            batch.operation is not None
+            and batch.operation.updated.operation_id == request.operation_id
+            and operation_json
+            != _canonical_record_json(batch.operation.updated)
+        ):
+            raise RecoveryStateConflictError
+        operation = _external_operation_from_json(operation_json)
+        if (
+            _canonical_record_json(operation) != operation_json
+            or operation.run_id != request.run_id
+            or operation.session_id != request.session_id
+        ):
+            raise RecoveryStateConflictError
 
     def _check_run_progress_preconditions(self, batch: RunProgressBatch) -> None:
         events_by_id = {
@@ -787,12 +828,9 @@ class InMemoryStore:
                     or session_write.session_id != session.session_id
                     or session_write.version != session.version
                     or session.session_id != run.session_id
-                    or (
-                        run.status not in {
-                            RunStatus.COMPLETED,
-                            RunStatus.FAILED,
-                        }
-                        and run.run_id not in session.active_run_ids
+                    or (run.run_id in session.active_run_ids) != (
+                        run.status
+                        not in {RunStatus.COMPLETED, RunStatus.FAILED}
                     )
                 ):
                     raise RecoveryStateConflictError

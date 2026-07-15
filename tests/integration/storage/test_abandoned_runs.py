@@ -425,6 +425,41 @@ async def test_latest_run_event_sequence_uses_exact_run_tail(
     )
 
 
+@pytest.mark.parametrize("status", (RunStatus.COMPLETED, RunStatus.FAILED))
+@pytest.mark.asyncio
+async def test_latest_run_event_sequence_rejects_final_run_still_owned_by_session(
+    abandoned_store: Any,
+    status: RunStatus,
+) -> None:
+    secret = f"run-final-active-secret-{status.value}-3c1"
+    run = _run(secret, status)
+    session = SessionSnapshot(
+        session_id=run.session_id,
+        workspaces=("workspace",),
+        active_run_ids=(run.run_id,),
+    )
+    await abandoned_store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(_snapshot_write(session), _snapshot_write(run)),
+        )
+    )
+
+    with pytest.raises(RecoveryStateConflictError) as caught:
+        await abandoned_store.latest_run_event_sequence(secret)
+
+    assert caught.value.to_dict() == {
+        "code": "conflict",
+        "message": "recovery state conflict",
+        "retryable": True,
+    }
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    sdk_locals = _sdk_traceback_locals(caught.value)
+    assert sdk_locals
+    assert all(secret not in repr(frame) for frame in sdk_locals)
+
+
 async def _corrupt_run_event(store: Any, invalidity: str) -> None:
     underlying = await store._get() if isinstance(store, _LazySQLiteStore) else store
     if isinstance(underlying, InMemoryStore):

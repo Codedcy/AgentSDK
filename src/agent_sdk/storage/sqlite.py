@@ -942,10 +942,13 @@ class SQLiteStore:
                 states.append("conflict")
         if batch.reconciliation is not None:
             request_target = batch.reconciliation.updated
-            current_request = await self._read_reconciliation_request(
+            current_request = await self._read_strict_reconciliation_request(
                 request_target.request_id
             )
             if current_request == request_target:
+                await self._check_exact_reconciliation_operation(
+                    batch, current_request
+                )
                 states.append("exact")
             elif current_request is None or (
                 batch.reconciliation.expected is not None
@@ -955,6 +958,28 @@ class SQLiteStore:
             else:
                 states.append("conflict")
         return states
+
+    async def _check_exact_reconciliation_operation(
+        self,
+        batch: RunProgressBatch,
+        request: ReconciliationRequest,
+    ) -> None:
+        if request.operation_id is None:
+            return
+        operation = await self._read_external_operation(request.operation_id)
+        if operation is None:
+            raise RecoveryStateConflictError
+        if (
+            batch.operation is not None
+            and batch.operation.updated.operation_id == request.operation_id
+            and operation != batch.operation.updated
+        ):
+            raise RecoveryStateConflictError
+        if (
+            operation.run_id != request.run_id
+            or operation.session_id != request.session_id
+        ):
+            raise RecoveryStateConflictError
 
     async def _check_run_progress_preconditions(
         self, batch: RunProgressBatch
@@ -1507,12 +1532,9 @@ class SQLiteStore:
                     or type(session_row[2]) is not int
                     or session_row[2] != session.version
                     or session.session_id != run.session_id
-                    or (
-                        run.status not in {
-                            RunStatus.COMPLETED,
-                            RunStatus.FAILED,
-                        }
-                        and run.run_id not in session.active_run_ids
+                    or (run.run_id in session.active_run_ids) != (
+                        run.status
+                        not in {RunStatus.COMPLETED, RunStatus.FAILED}
                     )
                 ):
                     raise RecoveryStateConflictError
@@ -2396,6 +2418,41 @@ class SQLiteStore:
         if row is None:
             return None
         return _reconciliation_request_from_json(cast(str, row[0]))
+
+    async def _read_strict_reconciliation_request(
+        self, request_id: str
+    ) -> ReconciliationRequest | None:
+        async with self._connection.execute(
+            """
+            SELECT request_id, session_id, run_id, operation_id, status, data_json
+            FROM reconciliation_requests WHERE request_id = ?
+            """,
+            (request_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        if (
+            not isinstance(row[0], str)
+            or not isinstance(row[1], str)
+            or not isinstance(row[2], str)
+            or (row[3] is not None and not isinstance(row[3], str))
+            or not isinstance(row[4], str)
+            or not isinstance(row[5], str)
+        ):
+            raise RecoveryStateConflictError
+        serialized = row[5]
+        request = _reconciliation_request_from_json(serialized)
+        if (
+            row[0] != request.request_id
+            or row[1] != request.session_id
+            or row[2] != request.run_id
+            or row[3] != request.operation_id
+            or row[4] != request.status.value
+            or _canonical_record_json(request) != serialized
+        ):
+            raise RecoveryStateConflictError
+        return request
 
     async def _read_event_by_id(self, event_id: str) -> EventEnvelope | None:
         async with self._connection.execute(
