@@ -56,4 +56,8 @@ Phase 3D: in progress
 Phase 3D operational plan: .superpowers/sdd/M02-T002-phase3d-plan.md
 Phase 3D1: in progress — certified provider recovery adapters
 Phase 3D1 brief: .superpowers/sdd/M02-T002-phase3d1-brief.md
-Next action: implement Phase 3D1 with strict TDD; Tool retry certification remains Phase 3D2 and Workflow recovery remains Phase 4
+Phase 3D1 implementation: da7282ea5e0f73630380e6c801092df35ae766a3
+Phase 3D1 report: .superpowers/sdd/M02-T002-phase3d1-report.md
+Phase 3D1 implementation gates: focused/fault/e2e 182 passed; Phase3C2 89; Phase3C1 115; Phase3B 38; Phase3A 123; Phase2 139; Phase1+T001 188; compatibility 264; full 1337 passed with zero skips; Ruff clean; mypy clean across 74 source files; diff/scope/schema/public imports clean
+Phase 3D1 review: pending fresh independent Spec and Quality approval at C0/I0
+Next action: review Phase 3D1; do not begin Phase 3D2 until approval. Tool retry certification remains Phase 3D2 and Workflow recovery remains Phase 4

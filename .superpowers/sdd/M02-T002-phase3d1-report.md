@@ -117,7 +117,8 @@ Production changes are limited to the brief's permitted surface:
 - `src/agent_sdk/storage/sqlite.py`
 
 Tests are limited to three provider recovery files plus the existing
-Run-progress Store contract. This report is the only documentation change.
+Run-progress Store contract. This report and the SDD progress ledger are the
+only documentation changes.
 
 The explicit forbidden-scope diff is empty for migrations, the LiteLLM gateway,
 Workflow production, roadmap, milestones, and task index. SQLite schema version
