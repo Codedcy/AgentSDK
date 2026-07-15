@@ -13,13 +13,18 @@ from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import ModelRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime.agents import AgentRegistry
-from agent_sdk.runtime.engine import RunEngine
+from agent_sdk.runtime.engine import RunEngine, _model_request_fingerprint
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
     ToolCapabilityDescriptor,
 )
-from agent_sdk.runtime.leases import Lease, LeaseHeldError, LeaseManager
+from agent_sdk.runtime.leases import (
+    Lease,
+    LeaseHeldError,
+    LeaseLostError,
+    LeaseManager,
+)
 from agent_sdk.runtime.models import (
     RunResult,
     RunSnapshot,
@@ -27,6 +32,13 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     TokenUsage,
     mutable_model_params,
+)
+from agent_sdk.runtime.provider_recovery import (
+    ProviderRecoveryAdapter,
+    ProviderRecoveryDisposition,
+    ProviderRecoveryRegistry,
+    ProviderRecoveryRequest,
+    ProviderRecoveryResult,
 )
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
@@ -44,6 +56,7 @@ from agent_sdk.runtime.session_lifecycle import (
 )
 from agent_sdk.storage.base import (
     CommitResult,
+    ExternalOperationWrite,
     ReconciliationRequestWrite,
     RunProgressBatch,
     SnapshotWrite,
@@ -57,7 +70,14 @@ _SCANNER_LEASE_TTL = timedelta(seconds=30)
 
 @dataclass(frozen=True)
 class RecoveryPlan:
-    kind: Literal["detached", "execute", "resume", "reconcile", "follow"]
+    kind: Literal[
+        "detached",
+        "execute",
+        "resume",
+        "reconcile",
+        "provider_recovery",
+        "follow",
+    ]
     run_id: str
     request: ModelRequest | None = None
     checkpoint: RunCheckpoint | None = None
@@ -84,17 +104,23 @@ class RunRecoveryService:
         agents: AgentRegistry,
         tools: ToolRegistry,
         policy: PolicyEngine,
+        provider_recovery: ProviderRecoveryRegistry | None = None,
         *,
         lease_manager: LeaseManager | None = None,
         _clock: Callable[[], datetime] | None = None,
         _yield: Callable[[], Awaitable[None]] | None = None,
         _stopping: Callable[[], bool] | None = None,
+        _wait_stopping: Callable[[], Awaitable[object]] | None = None,
+        _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        _heartbeat_interval: float = _SCANNER_LEASE_TTL.total_seconds() / 3,
+        _adapter_timeout: float = 30.0,
     ) -> None:
         self._store = store
         self._engine = engine
         self._agents = agents
         self._tools = tools
         self._policy = policy
+        self._provider_recovery = provider_recovery or ProviderRecoveryRegistry()
         self._leases = lease_manager or LeaseManager(
             store,
             ttl=_SCANNER_LEASE_TTL,
@@ -102,6 +128,10 @@ class RunRecoveryService:
         self._clock = _clock or (lambda: datetime.now(UTC))
         self._yield = _yield or _yield_once
         self._stopping = _stopping or (lambda: False)
+        self._wait_stopping = _wait_stopping
+        self._sleep = _sleep
+        self._heartbeat_interval = _heartbeat_interval
+        self._adapter_timeout = _adapter_timeout
 
     async def plan(self, run_id: str) -> RecoveryPlan:
         public_error: tuple[ErrorCode, str, bool] | None = None
@@ -190,11 +220,24 @@ class RunRecoveryService:
                     reason="recovery_state_invalid",
                     details=(("checkpoint_phase", checkpoint.phase.value),),
                 )
-            reason = (
-                "model_call_unknown_outcome"
-                if checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT
-                else "tool_call_unknown_outcome"
-            )
+            if checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT:
+                assert isinstance(linked, ModelCallOperation)
+                provider_request = self._certified_provider_request(
+                    evidence,
+                    request,
+                    linked,
+                )
+                if provider_request is not None:
+                    return RecoveryPlan(
+                        "provider_recovery",
+                        run_id,
+                        request=provider_request.model_request,
+                        checkpoint=checkpoint,
+                        operation_id=linked.operation_id,
+                    )
+                reason = "model_call_unknown_outcome"
+            else:
+                reason = "tool_call_unknown_outcome"
             return RecoveryPlan(
                 "reconcile",
                 run_id,
@@ -288,6 +331,11 @@ class RunRecoveryService:
                     operation_id=plan.operation_id,
                     details=dict(plan.details),
                 )
+            if plan.kind == "provider_recovery":
+                assert plan.request is not None
+                assert plan.checkpoint is not None
+                assert plan.operation_id is not None
+                return await self._coordinate_provider_recovery(plan)
             if plan.kind == "follow":
                 return await self._follow_durable_run(plan.run_id)
             raise AgentSDKError(
@@ -754,6 +802,59 @@ class RunRecoveryService:
             return None
         return operation
 
+    def _certified_provider_request(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        operation: ModelCallOperation,
+    ) -> ProviderRecoveryRequest | None:
+        checkpoint = evidence.checkpoint
+        if (
+            checkpoint is None
+            or evidence.pending
+            or operation.provider_identity != base_request.model
+        ):
+            return None
+        adapter = self._provider_recovery.resolve(operation.provider_identity)
+        if adapter is None:
+            return None
+        metadata = operation.recovery_metadata
+        expected_metadata = {
+            "adapter_id": adapter.adapter_id,
+            "adapter_version": adapter.version,
+            "authoritative_status": adapter.authoritative_status,
+            "same_operation_id_resend": adapter.same_operation_id_resend,
+        }
+        if (
+            dict(metadata) != expected_metadata
+            or type(metadata.get("authoritative_status")) is not bool
+            or type(metadata.get("same_operation_id_resend")) is not bool
+            or not (adapter.authoritative_status or adapter.same_operation_id_resend)
+        ):
+            return None
+        checkpoint_data = checkpoint.model_dump(mode="json")
+        reconstructed = ModelRequest(
+            model=base_request.model,
+            messages=tuple(checkpoint_data["messages"]),
+            tools=base_request.tools,
+            params=base_request.params,
+            purpose=base_request.purpose,
+        )
+        try:
+            if _model_request_fingerprint(reconstructed) != operation.request_fingerprint:
+                return None
+            return ProviderRecoveryRequest(
+                session_id=operation.session_id,
+                run_id=operation.run_id,
+                turn=operation.turn,
+                operation_id=operation.operation_id,
+                provider_identity=operation.provider_identity,
+                request_fingerprint=operation.request_fingerprint,
+                model_request=reconstructed,
+            )
+        except Exception:
+            return None
+
     async def _validated_pending_requests(
         self,
         run: RunSnapshot,
@@ -869,6 +970,354 @@ class RunRecoveryService:
             cancellation = await _settle_task(release)
             if active_error is None and cancellation is not None:
                 raise cancellation from None
+        raise self._recovery_required() from None
+
+    async def _coordinate_provider_recovery(
+        self,
+        plan: RecoveryPlan,
+    ) -> RunResult:
+        now = self._clock()
+        lease = await self._leases.acquire(plan.run_id, new_id("coord"), now=now)
+        owner = asyncio.current_task()
+        assert owner is not None
+        heartbeat_error: BaseException | None = None
+        heartbeat = asyncio.create_task(self._heartbeat(lease))
+        shutdown: asyncio.Future[object] | None = (
+            None
+            if self._wait_stopping is None
+            else asyncio.ensure_future(self._wait_stopping())
+        )
+
+        def heartbeat_finished(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception()
+            if heartbeat_error is not None and not owner.done():
+                owner.cancel()
+
+        heartbeat.add_done_callback(heartbeat_finished)
+
+        def shutdown_finished(task: asyncio.Future[object]) -> None:
+            if not task.cancelled() and task.exception() is None and not owner.done():
+                owner.cancel()
+
+        if shutdown is not None:
+            shutdown.add_done_callback(shutdown_finished)
+        try:
+            run = await self._load_run(plan.run_id)
+            if run.status is not RunStatus.INTERRUPTED:
+                raise RecoveryStateConflictError
+            evidence = await self._load_evidence(run)
+            base_request = await self._validated_request(evidence)
+            if base_request is None:
+                raise RecoveryStateConflictError
+            linked = self._matching_in_flight_operation(evidence)
+            checkpoint = plan.checkpoint
+            if (
+                not isinstance(linked, ModelCallOperation)
+                or linked.operation_id != plan.operation_id
+                or checkpoint is None
+                or evidence.checkpoint != checkpoint
+            ):
+                raise RecoveryStateConflictError
+            provider_request = self._certified_provider_request(
+                evidence,
+                base_request,
+                linked,
+            )
+            if provider_request is None:
+                raise RecoveryStateConflictError
+            adapter = self._provider_recovery.resolve(linked.provider_identity)
+            if adapter is None:
+                raise RecoveryStateConflictError
+            action: Literal["query", "resend"] = (
+                "query" if adapter.authoritative_status else "resend"
+            )
+            refenced = linked.model_copy(
+                update={"lease_generation": lease.generation}
+            )
+            sequence = await self._store.latest_run_event_sequence(run.run_id)
+            if sequence is None:
+                raise RecoveryStateConflictError
+            await self._commit_provider_audit_start(
+                lease=lease,
+                run=run,
+                session=evidence.session,
+                checkpoint=checkpoint,
+                expected_operation=linked,
+                refenced_operation=refenced,
+                adapter=adapter,
+                action=action,
+                sequence=sequence + 1,
+            )
+            await self._leases.assert_current(lease, now=self._clock())
+            result, error_category = await self._invoke_provider_adapter(
+                adapter,
+                provider_request,
+                action=action,
+            )
+            if (
+                action == "query"
+                and result is not None
+                and result.disposition is ProviderRecoveryDisposition.NOT_EXECUTED
+                and adapter.same_operation_id_resend
+            ):
+                sequence += 1
+                await self._commit_provider_audit_start(
+                    lease=lease,
+                    run=run,
+                    session=evidence.session,
+                    checkpoint=checkpoint,
+                    expected_operation=None,
+                    refenced_operation=None,
+                    adapter=adapter,
+                    action="resend",
+                    sequence=sequence + 1,
+                )
+                await self._leases.assert_current(lease, now=self._clock())
+                action = "resend"
+                result, error_category = await self._invoke_provider_adapter(
+                    adapter,
+                    provider_request,
+                    action=action,
+                )
+            if result is not None and result.disposition is ProviderRecoveryDisposition.COMPLETED:
+                sequence = await self._store.latest_run_event_sequence(run.run_id)
+                if sequence is None:
+                    raise RecoveryStateConflictError
+                return await self._engine.resume_recovered_model(
+                    run,
+                    evidence.session,
+                    checkpoint,
+                    refenced,
+                    provider_request.model_request,
+                    result,
+                    lease,
+                    sequence=sequence + 1,
+                )
+            if result is not None and result.disposition is ProviderRecoveryDisposition.FAILED:
+                sequence = await self._store.latest_run_event_sequence(run.run_id)
+                if sequence is None:
+                    raise RecoveryStateConflictError
+                return await self._engine.fail_recovered_model(
+                    run,
+                    checkpoint,
+                    refenced,
+                    result,
+                    lease,
+                    sequence=sequence + 1,
+                )
+            disposition = (
+                result.disposition.value if result is not None else "invalid"
+            )
+            details = {"action": action, "disposition": disposition}
+            if error_category is not None:
+                details["error_category"] = error_category
+            return await self._request_reconciliation_owned(
+                lease,
+                run,
+                evidence.session,
+                reason="provider_recovery_unresolved",
+                operation_id=refenced.operation_id,
+                details=details,
+                checkpoint=checkpoint,
+            )
+        except asyncio.CancelledError:
+            if heartbeat_error is not None:
+                raise LeaseLostError from None
+            raise
+        finally:
+            active_error = sys.exception()
+            heartbeat.cancel()
+            heartbeat_cancellation = await _settle_task(heartbeat)
+            shutdown_cancellation = None
+            if shutdown is not None:
+                shutdown.cancel()
+                shutdown_cancellation = await _settle_task(shutdown)
+            release = asyncio.create_task(self._leases.release(lease))
+            cancellation = await _settle_task(release)
+            if cancellation is None:
+                cancellation = heartbeat_cancellation
+            if cancellation is None:
+                cancellation = shutdown_cancellation
+            if active_error is None and cancellation is not None:
+                raise cancellation from None
+
+    async def _heartbeat(self, lease: Lease) -> None:
+        while True:
+            await self._sleep(self._heartbeat_interval)
+            lease = await self._leases.renew(lease, now=self._clock())
+
+    async def _commit_provider_audit_start(
+        self,
+        *,
+        lease: Lease,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        expected_operation: ModelCallOperation | None,
+        refenced_operation: ModelCallOperation | None,
+        adapter: ProviderRecoveryAdapter,
+        action: Literal["query", "resend"],
+        sequence: int,
+    ) -> None:
+        now = self._clock()
+        event = EventEnvelope(
+            event_id=new_id("evt"),
+            type=f"model.recovery.{action}.started",
+            session_id=run.session_id,
+            run_id=run.run_id,
+            sequence=sequence,
+            payload={
+                "adapter_id": adapter.adapter_id,
+                "adapter_version": adapter.version,
+                "operation_id": checkpoint.operation_id,
+                "action": action,
+            },
+            occurred_at=now,
+        )
+        operation_write = None
+        if expected_operation is not None and refenced_operation is not None:
+            operation_write = ExternalOperationWrite(
+                expected_operation,
+                refenced_operation,
+            )
+        await _commit_progress(
+            self._store,
+            RunProgressBatch(
+                lease=lease,
+                now=now,
+                events=(event,),
+                preconditions=(
+                    exact_session_precondition(session),
+                    exact_run_precondition(run),
+                ),
+                operation=operation_write,
+                checkpoint_precondition=checkpoint,
+            ),
+        )
+
+    async def _invoke_provider_adapter(
+        self,
+        adapter: ProviderRecoveryAdapter,
+        request: ProviderRecoveryRequest,
+        *,
+        action: Literal["query", "resend"],
+    ) -> tuple[ProviderRecoveryResult | None, str | None]:
+        callback = adapter.query_status if action == "query" else adapter.resend
+        assert callback is not None
+        value: object | None = None
+        failed = False
+        task: asyncio.Future[ProviderRecoveryResult] | None = None
+        try:
+            awaitable = callback(request)
+            task = asyncio.ensure_future(awaitable)
+            async with asyncio.timeout(self._adapter_timeout):
+                value = await asyncio.shield(task)
+        except asyncio.CancelledError as cancellation:
+            if task is not None:
+                task.cancel()
+                await _settle_task(task)
+            del callback, request, adapter, value, task
+            raise cancellation from None
+        except TimeoutError:
+            if task is not None:
+                task.cancel()
+                await _settle_task(task)
+            failed = True
+            error_category = "timeout"
+        except Exception:
+            if task is not None:
+                await _settle_task(task)
+            failed = True
+            error_category = "adapter_failure"
+        if failed:
+            del callback, request, adapter, value, task
+            return None, error_category
+        if type(value) is not ProviderRecoveryResult:
+            del callback, request, adapter, value, task
+            return None, "invalid_result"
+        result = value
+        detached = ProviderRecoveryResult(
+            disposition=result.disposition,
+            finish_reason=result.finish_reason,
+            text=result.text,
+            tool_call=result.tool_call,
+            usage=result.usage,
+            error_code=result.error_code,
+            retryable=result.retryable,
+        )
+        del callback, request, adapter, result, value, task
+        return detached, None
+
+    async def _request_reconciliation_owned(
+        self,
+        lease: Lease,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        *,
+        reason: str,
+        operation_id: str | None,
+        details: dict[str, str],
+        checkpoint: RunCheckpoint | None,
+    ) -> RunResult:
+        pending = await self._store.list_pending_reconciliation_requests(run.run_id)
+        if pending:
+            await self._validated_pending_requests(run)
+            raise self._recovery_required() from None
+        now = self._clock()
+        sequence = await self._store.latest_run_event_sequence(run.run_id) or 0
+        request = ReconciliationRequest(
+            request_id=new_id("rec"),
+            session_id=run.session_id,
+            run_id=run.run_id,
+            operation_id=operation_id,
+            reason=reason,
+            details=details,
+        )
+        waiting = run.model_copy(
+            update={
+                "status": RunStatus.WAITING_RECONCILIATION,
+                "version": max(run.version + 1, 3),
+            }
+        )
+        event = EventEnvelope(
+            event_id=new_id("evt"),
+            type="reconciliation.requested",
+            session_id=run.session_id,
+            run_id=run.run_id,
+            sequence=sequence + 1,
+            payload={
+                "request_id": request.request_id,
+                "operation_id": operation_id,
+                "reason": reason,
+            },
+            occurred_at=now,
+        )
+        await _commit_progress(
+            self._store,
+            RunProgressBatch(
+                lease=lease,
+                now=now,
+                events=(event,),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        waiting.run_id,
+                        waiting.session_id,
+                        waiting.version,
+                        waiting.model_dump(mode="json"),
+                    ),
+                ),
+                preconditions=(
+                    exact_session_precondition(session),
+                    exact_run_precondition(run),
+                ),
+                reconciliation=ReconciliationRequestWrite(None, request),
+                checkpoint_precondition=checkpoint,
+            ),
+        )
         raise self._recovery_required() from None
 
     @staticmethod
@@ -1070,7 +1519,7 @@ async def _commit_progress(
 
 
 async def _settle_task(
-    task: asyncio.Task[Any],
+    task: asyncio.Future[Any],
 ) -> asyncio.CancelledError | None:
     cancellation: asyncio.CancelledError | None = None
     while not task.done():

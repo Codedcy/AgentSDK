@@ -72,6 +72,12 @@ from agent_sdk.runtime.models import (
     SessionStatus,
     TokenUsage,
 )
+from agent_sdk.runtime.provider_recovery import (
+    ProviderRecoveryAdapter,
+    ProviderRecoveryDisposition,
+    ProviderRecoveryRequest,
+    ProviderRecoveryResult,
+)
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
 from agent_sdk.subagents import ChildResult, ChildUsage, SubagentService, TaskEnvelope
 from agent_sdk.tools import ToolContext, ToolRegistry, ToolResult, ToolResultStatus, ToolSpec
@@ -135,6 +141,10 @@ __all__ = [
     "PermissionDecision",
     "PermissionEffect",
     "PermissionRequest",
+    "ProviderRecoveryAdapter",
+    "ProviderRecoveryDisposition",
+    "ProviderRecoveryRequest",
+    "ProviderRecoveryResult",
     "ObservedEvent",
     "ObservedRun",
     "PromptComposer",

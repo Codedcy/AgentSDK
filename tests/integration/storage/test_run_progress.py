@@ -265,6 +265,134 @@ async def test_sqlite_commit_run_progress_atomically_starts_model(
 
 
 @pytest.mark.asyncio
+async def test_direct_operation_transition_cannot_refence_started_operation(
+    progress_store: Any,
+) -> None:
+    store, lease, _ = await _seed_store(progress_store)
+    started = _model_operation(lease_generation=lease.generation)
+    checkpoint = _checkpoint(
+        phase=RunCheckpointPhase.MODEL_IN_FLIGHT,
+        operation_id=started.operation_id,
+    )
+    await store.commit_run_progress(
+        RunProgressBatch(
+            lease=lease,
+            now=NOW,
+            operation=ExternalOperationWrite(None, started),
+            checkpoint=RunCheckpointWrite(None, checkpoint),
+        )
+    )
+    current = await store.acquire_lease(
+        run_id=started.run_id,
+        owner="worker_2",
+        now=lease.expires_at,
+        expires_at=lease.expires_at + timedelta(seconds=30),
+    )
+    refenced = started.model_copy(
+        update={"lease_generation": current.generation}
+    )
+
+    with pytest.raises(RecoveryStateConflictError):
+        await store.transition_external_operation(
+            expected=started,
+            updated=refenced,
+            lease=current,
+            now=current.acquired_at,
+        )
+
+    assert await store.get_external_operation(started.operation_id) == started
+    assert await store.get_run_checkpoint(started.run_id) == checkpoint
+
+
+@pytest.mark.asyncio
+async def test_composite_operation_refence_requires_exact_checkpoint_precondition(
+    progress_store: Any,
+) -> None:
+    store, lease, _ = await _seed_store(progress_store)
+    started = _model_operation(lease_generation=lease.generation)
+    checkpoint = _checkpoint(
+        phase=RunCheckpointPhase.MODEL_IN_FLIGHT,
+        operation_id=started.operation_id,
+    )
+    await store.commit_run_progress(
+        RunProgressBatch(
+            lease=lease,
+            now=NOW,
+            operation=ExternalOperationWrite(None, started),
+            checkpoint=RunCheckpointWrite(None, checkpoint),
+        )
+    )
+    current = await store.acquire_lease(
+        run_id=started.run_id,
+        owner="worker_2",
+        now=lease.expires_at,
+        expires_at=lease.expires_at + timedelta(seconds=30),
+    )
+    refenced = started.model_copy(
+        update={"lease_generation": current.generation}
+    )
+    audit = _event("evt_recovery_audit", 1, event_type="model.recovery.started")
+
+    with pytest.raises(RecoveryStateConflictError):
+        await store.commit_run_progress(
+            RunProgressBatch(
+                lease=current,
+                now=current.acquired_at,
+                events=(audit,),
+                operation=ExternalOperationWrite(started, refenced),
+            )
+        )
+
+    assert await store.latest_cursor() == 0
+    assert await store.get_external_operation(started.operation_id) == started
+    assert await store.get_run_checkpoint(started.run_id) == checkpoint
+
+
+@pytest.mark.asyncio
+async def test_composite_operation_refence_accepts_exact_checkpoint_precondition(
+    progress_store: Any,
+) -> None:
+    store, lease, _ = await _seed_store(progress_store)
+    started = _model_operation(lease_generation=lease.generation)
+    checkpoint = _checkpoint(
+        phase=RunCheckpointPhase.MODEL_IN_FLIGHT,
+        operation_id=started.operation_id,
+    )
+    await store.commit_run_progress(
+        RunProgressBatch(
+            lease=lease,
+            now=NOW,
+            operation=ExternalOperationWrite(None, started),
+            checkpoint=RunCheckpointWrite(None, checkpoint),
+        )
+    )
+    current = await store.acquire_lease(
+        run_id=started.run_id,
+        owner="worker_2",
+        now=lease.expires_at,
+        expires_at=lease.expires_at + timedelta(seconds=30),
+    )
+    refenced = started.model_copy(
+        update={"lease_generation": current.generation}
+    )
+    audit = _event("evt_recovery_audit", 1, event_type="model.recovery.started")
+
+    result = await store.commit_run_progress(
+        RunProgressBatch(
+            lease=current,
+            now=current.acquired_at,
+            events=(audit,),
+            operation=ExternalOperationWrite(started, refenced),
+            checkpoint_precondition=checkpoint,
+        )
+    )
+
+    assert result == storage_base.CommitResult(last_cursor=1, applied=True)
+    assert await store.get_external_operation(started.operation_id) == refenced
+    assert await store.get_run_checkpoint(started.run_id) == checkpoint
+
+
+@pytest.mark.asyncio
 async def test_commit_run_progress_atomically_records_model_outcome(
     progress_store: Any,
 ) -> None:

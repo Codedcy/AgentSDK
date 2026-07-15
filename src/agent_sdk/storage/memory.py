@@ -268,9 +268,13 @@ class InMemoryStore:
                     )
                 else:
                     legal_operation_shape = _valid_operation_transition(
-                        operation_write.expected, operation_write.updated
+                        operation_write.expected,
+                        operation_write.updated,
+                        allow_refence=True,
                     )
-                if not legal_operation_shape:
+                if not legal_operation_shape or not _valid_operation_refence_shape(
+                    batch
+                ):
                     raise RecoveryStateConflictError
             if checkpoint_write is not None and not _valid_checkpoint_replay_shape(
                 checkpoint_write.updated, checkpoint_write.expected
@@ -389,7 +393,9 @@ class InMemoryStore:
                     expected_operation = operation_write.expected
                     if (
                         not _valid_operation_transition(
-                            expected_operation, operation
+                            expected_operation,
+                            operation,
+                            allow_refence=True,
                         )
                         or existing_operation
                         != _canonical_record_json(expected_operation)
@@ -1434,11 +1440,13 @@ def _lease_matches(current: Lease | None, expected: Lease) -> bool:
 
 
 def _valid_operation_transition(
-    expected: ExternalOperation, updated: ExternalOperation
+    expected: ExternalOperation,
+    updated: ExternalOperation,
+    *,
+    allow_refence: bool = False,
 ) -> bool:
     if (
         expected.status is not ExternalOperationStatus.STARTED
-        or updated.status is ExternalOperationStatus.STARTED
         or type(expected) is not type(updated)
     ):
         return False
@@ -1449,14 +1457,43 @@ def _valid_operation_transition(
         "run_id",
         "turn",
         "request_fingerprint",
-        "lease_generation",
         "provider_identity",
         "tool_identity",
         "recovery_metadata",
     )
-    return all(
+    same_identity = all(
         getattr(expected, field) == getattr(updated, field)
         for field in immutable_fields
+    )
+    if not same_identity:
+        return False
+    if updated.status is ExternalOperationStatus.STARTED:
+        return allow_refence and updated.lease_generation > expected.lease_generation
+    return updated.lease_generation == expected.lease_generation
+
+
+def _valid_operation_refence_shape(batch: RunProgressBatch) -> bool:
+    operation_write = batch.operation
+    if operation_write is None or operation_write.expected is None:
+        return True
+    expected = operation_write.expected
+    updated = operation_write.updated
+    if updated.status is not ExternalOperationStatus.STARTED:
+        return True
+    checkpoint = batch.checkpoint_precondition
+    expected_phase = (
+        RunCheckpointPhase.MODEL_IN_FLIGHT
+        if isinstance(expected, ModelCallOperation)
+        else RunCheckpointPhase.TOOL_IN_FLIGHT
+    )
+    return (
+        checkpoint is not None
+        and batch.checkpoint is None
+        and checkpoint.run_id == expected.run_id
+        and checkpoint.session_id == expected.session_id
+        and checkpoint.turn == expected.turn
+        and checkpoint.phase is expected_phase
+        and checkpoint.operation_id == expected.operation_id
     )
 
 

@@ -476,11 +476,13 @@ def _lease_identity_matches(current: Lease | None, expected: Lease) -> bool:
 
 
 def _valid_operation_transition(
-    expected: ExternalOperation, updated: ExternalOperation
+    expected: ExternalOperation,
+    updated: ExternalOperation,
+    *,
+    allow_refence: bool = False,
 ) -> bool:
     if (
         expected.status is not ExternalOperationStatus.STARTED
-        or updated.status is ExternalOperationStatus.STARTED
         or type(expected) is not type(updated)
     ):
         return False
@@ -491,14 +493,43 @@ def _valid_operation_transition(
         "run_id",
         "turn",
         "request_fingerprint",
-        "lease_generation",
         "provider_identity",
         "tool_identity",
         "recovery_metadata",
     )
-    return all(
+    same_identity = all(
         getattr(expected, field) == getattr(updated, field)
         for field in immutable_fields
+    )
+    if not same_identity:
+        return False
+    if updated.status is ExternalOperationStatus.STARTED:
+        return allow_refence and updated.lease_generation > expected.lease_generation
+    return updated.lease_generation == expected.lease_generation
+
+
+def _valid_operation_refence_shape(batch: RunProgressBatch) -> bool:
+    operation_write = batch.operation
+    if operation_write is None or operation_write.expected is None:
+        return True
+    expected = operation_write.expected
+    updated = operation_write.updated
+    if updated.status is not ExternalOperationStatus.STARTED:
+        return True
+    checkpoint = batch.checkpoint_precondition
+    expected_phase = (
+        RunCheckpointPhase.MODEL_IN_FLIGHT
+        if isinstance(expected, ModelCallOperation)
+        else RunCheckpointPhase.TOOL_IN_FLIGHT
+    )
+    return (
+        checkpoint is not None
+        and batch.checkpoint is None
+        and checkpoint.run_id == expected.run_id
+        and checkpoint.session_id == expected.session_id
+        and checkpoint.turn == expected.turn
+        and checkpoint.phase is expected_phase
+        and checkpoint.operation_id == expected.operation_id
     )
 
 
@@ -819,9 +850,11 @@ class SQLiteStore:
                 )
             else:
                 legal_operation = _valid_operation_transition(
-                    batch.operation.expected, batch.operation.updated
+                    batch.operation.expected,
+                    batch.operation.updated,
+                    allow_refence=True,
                 )
-            if not legal_operation:
+            if not legal_operation or not _valid_operation_refence_shape(batch):
                 raise RecoveryStateConflictError
         if batch.checkpoint is not None and not _valid_checkpoint_replay_shape(
             batch.checkpoint.updated, batch.checkpoint.expected
@@ -1190,10 +1223,12 @@ class SQLiteStore:
         else:
             result = await self._connection.execute(
                 """
-                UPDATE external_operations SET status = ?, data_json = ?
+                UPDATE external_operations
+                SET lease_generation = ?, status = ?, data_json = ?
                 WHERE operation_id = ? AND data_json = ?
                 """,
                 (
+                    operation.lease_generation,
                     operation.status.value,
                     serialized,
                     operation.operation_id,
@@ -1813,7 +1848,7 @@ class SQLiteStore:
                     lease,
                     now=now,
                     run_id=expected.run_id,
-                    lease_generation=expected.lease_generation,
+                    lease_generation=updated.lease_generation,
                 )
                 if not _valid_operation_transition(expected, updated):
                     raise RecoveryStateConflictError
@@ -1830,10 +1865,12 @@ class SQLiteStore:
                     raise RecoveryStateConflictError
                 result = await self._connection.execute(
                     """
-                    UPDATE external_operations SET status = ?, data_json = ?
+                    UPDATE external_operations
+                    SET lease_generation = ?, status = ?, data_json = ?
                     WHERE operation_id = ? AND status = 'started' AND data_json = ?
                     """,
                     (
+                        updated.lease_generation,
                         updated.status.value,
                         updated_json,
                         expected.operation_id,

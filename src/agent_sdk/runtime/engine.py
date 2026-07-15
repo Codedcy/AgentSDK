@@ -37,6 +37,10 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     TokenUsage,
 )
+from agent_sdk.runtime.provider_recovery import (
+    ProviderRecoveryRegistry,
+    ProviderRecoveryResult,
+)
 from agent_sdk.runtime.session_lifecycle import (
     RUN_LIFECYCLE_FINAL_STATUSES,
     detach_run_transition,
@@ -106,6 +110,7 @@ class _RunEmitter:
         *,
         checkpoint: RunCheckpoint | None = None,
         sequence: int = 2,
+        provider_recovery: ProviderRecoveryRegistry | None = None,
     ) -> None:
         self._store = store
         self._run = run
@@ -114,6 +119,7 @@ class _RunEmitter:
         self._lease_error = lease_error
         self._checkpoint = checkpoint
         self._sequence = sequence
+        self._provider_recovery = provider_recovery or ProviderRecoveryRegistry()
         self._lock = asyncio.Lock()
         self._delta_parts: list[str] = []
         self._delta_bytes = 0
@@ -207,6 +213,20 @@ class _RunEmitter:
         async with self._lock:
             self._ensure_lease_current()
             assert self._checkpoint is not None
+            adapter = self._provider_recovery.resolve(request.model)
+            recovery_metadata: dict[str, object]
+            if adapter is None:
+                recovery_metadata = {
+                    "authoritative_status": False,
+                    "same_operation_id_resend": False,
+                }
+            else:
+                recovery_metadata = {
+                    "adapter_id": adapter.adapter_id,
+                    "adapter_version": adapter.version,
+                    "authoritative_status": adapter.authoritative_status,
+                    "same_operation_id_resend": adapter.same_operation_id_resend,
+                }
             operation = ModelCallOperation(
                 operation_id=new_id("op_model"),
                 session_id=self._run.session_id,
@@ -216,10 +236,7 @@ class _RunEmitter:
                 lease_generation=self._lease.generation,
                 status=ExternalOperationStatus.STARTED,
                 provider_identity=request.model,
-                recovery_metadata={
-                    "authoritative_status": False,
-                    "same_operation_id_resend": False,
-                },
+                recovery_metadata=recovery_metadata,
             )
             checkpoint = self._checkpoint.model_copy(
                 update={
@@ -956,6 +973,7 @@ class RunEngine:
         _clock: Callable[[], datetime] | None = None,
         _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         _heartbeat_interval: float = _RUN_LEASE_TTL.total_seconds() / 3,
+        provider_recovery: ProviderRecoveryRegistry | None = None,
     ) -> None:
         self._store = store
         self._models = models
@@ -966,6 +984,7 @@ class RunEngine:
         self._clock = _clock or (lambda: datetime.now(UTC))
         self._sleep = _sleep
         self._heartbeat_interval = _heartbeat_interval
+        self._provider_recovery = provider_recovery or ProviderRecoveryRegistry()
 
     async def execute(self, run_id: str, request: ModelRequest) -> RunResult:
         public_error: tuple[ErrorCode, str, bool] | None = None
@@ -1009,6 +1028,66 @@ class RunEngine:
             public_error[1],
             retryable=public_error[2],
         ) from None
+
+    async def resume_recovered_model(
+        self,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ModelCallOperation,
+        request: ModelRequest,
+        result: ProviderRecoveryResult,
+        lease: Lease,
+        *,
+        sequence: int,
+    ) -> RunResult:
+        return await self._execute_owned(
+            run,
+            request,
+            lease,
+            lambda: None,
+            checkpoint=checkpoint,
+            sequence=sequence,
+            recovery_session=session,
+            recovered_model=(operation, result),
+        )
+
+    async def fail_recovered_model(
+        self,
+        run: RunSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ModelCallOperation,
+        result: ProviderRecoveryResult,
+        lease: Lease,
+        *,
+        sequence: int,
+    ) -> RunResult:
+        assert result.error_code is not None
+        assert result.retryable is not None
+        emitter = _RunEmitter(
+            self._store,
+            run,
+            lease,
+            self._clock,
+            lambda: None,
+            checkpoint=checkpoint,
+            sequence=sequence,
+            provider_recovery=self._provider_recovery,
+        )
+        failure = AgentSDKError(
+            result.error_code,
+            "model call failed",
+            retryable=result.retryable,
+        )
+        await emitter.fail_model(
+            operation,
+            failure,
+            output_parts=list(checkpoint.output_parts),
+            usage=checkpoint.usage,
+            tool_results=list(checkpoint.tool_results),
+        )
+        await emitter.close()
+        raise failure from None
 
     def validate_resume_checkpoint(self, checkpoint: RunCheckpoint) -> None:
         """Validate recovery-only checkpoint content before lease admission."""
@@ -1214,6 +1293,7 @@ class RunEngine:
         checkpoint: RunCheckpoint | None = None,
         sequence: int = 2,
         recovery_session: SessionSnapshot | None = None,
+        recovered_model: tuple[ModelCallOperation, ProviderRecoveryResult] | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1224,6 +1304,7 @@ class RunEngine:
             lease_error,
             checkpoint=checkpoint,
             sequence=sequence,
+            provider_recovery=self._provider_recovery,
         )
         if checkpoint is None:
             initial_messages = request.messages
@@ -1281,53 +1362,67 @@ class RunEngine:
                 step_chunks: list[str] = []
                 step_usage = TokenUsage()
                 calls: list[ToolCallCompleted] = []
-                model_request = ModelRequest(
-                    model=request.model,
-                    messages=tuple(deepcopy(messages)),
-                    tools=request.tools,
-                    params=dict(request.params),
-                )
-                operation = await emitter.start_model(model_request)
                 model_completed: ModelCompleted | None = None
                 usage_payload: dict[str, int | None] | None = None
-                try:
-                    async for event in self._models.stream(model_request):
-                        if isinstance(event, TextDelta):
-                            chunks.append(event.text)
-                            step_chunks.append(event.text)
-                            await emitter.add_delta(event.text)
-                        elif isinstance(event, ToolCallCompleted):
-                            calls.append(event)
-                        elif isinstance(event, UsageReported):
-                            await emitter.flush_delta()
-                            reported_usage = event.to_usage()
-                            step_usage = _add_usage(step_usage, reported_usage)
-                            usage = _add_usage(usage, reported_usage)
-                            usage_payload = event.to_payload()
-                        elif isinstance(event, ModelCompleted):
-                            await emitter.flush_delta()
-                            model_completed = event
-                except asyncio.CancelledError:
-                    raise
-                except (LeaseLostError, _RunProgressError):
-                    raise
-                except Exception as cause:
-                    failure = AgentSDKError(
-                        ErrorCode.INTERNAL,
-                        "model call failed",
-                        retryable=False,
+                if recovered_model is not None:
+                    operation, recovered_result = recovered_model
+                    recovered_model = None
+                    assert recovered_result.text is not None
+                    assert recovered_result.usage is not None
+                    chunks.append(recovered_result.text)
+                    step_chunks.append(recovered_result.text)
+                    step_usage = recovered_result.usage
+                    usage = _add_usage(usage, step_usage)
+                    usage_payload = step_usage.model_dump(mode="json")
+                    if recovered_result.tool_call is not None:
+                        calls.append(recovered_result.tool_call)
+                    model_completed = ModelCompleted(recovered_result.finish_reason)
+                else:
+                    model_request = ModelRequest(
+                        model=request.model,
+                        messages=tuple(deepcopy(messages)),
+                        tools=request.tools,
+                        params=dict(request.params),
                     )
-                    await emitter.flush_delta()
-                    await emitter.fail_model(
-                        operation,
-                        failure,
-                        output_parts=chunks,
-                        usage=usage,
-                        tool_results=tool_results,
-                    )
-                    await emitter.close()
-                    del cause
-                    raise failure from None
+                    operation = await emitter.start_model(model_request)
+                    try:
+                        async for event in self._models.stream(model_request):
+                            if isinstance(event, TextDelta):
+                                chunks.append(event.text)
+                                step_chunks.append(event.text)
+                                await emitter.add_delta(event.text)
+                            elif isinstance(event, ToolCallCompleted):
+                                calls.append(event)
+                            elif isinstance(event, UsageReported):
+                                await emitter.flush_delta()
+                                reported_usage = event.to_usage()
+                                step_usage = _add_usage(step_usage, reported_usage)
+                                usage = _add_usage(usage, reported_usage)
+                                usage_payload = event.to_payload()
+                            elif isinstance(event, ModelCompleted):
+                                await emitter.flush_delta()
+                                model_completed = event
+                    except asyncio.CancelledError:
+                        raise
+                    except (LeaseLostError, _RunProgressError):
+                        raise
+                    except Exception as cause:
+                        failure = AgentSDKError(
+                            ErrorCode.INTERNAL,
+                            "model call failed",
+                            retryable=False,
+                        )
+                        await emitter.flush_delta()
+                        await emitter.fail_model(
+                            operation,
+                            failure,
+                            output_parts=chunks,
+                            usage=usage,
+                            tool_results=tool_results,
+                        )
+                        await emitter.close()
+                        del cause
+                        raise failure from None
 
                 if model_completed is None:
                     failure = AgentSDKError(

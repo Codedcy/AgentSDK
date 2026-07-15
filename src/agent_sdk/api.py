@@ -53,6 +53,10 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     mutable_model_params,
 )
+from agent_sdk.runtime.provider_recovery import (
+    ProviderRecoveryAdapter,
+    ProviderRecoveryRegistry,
+)
 from agent_sdk.runtime.recovery import (
     RecoveryScanner,
     RunRecoveryService,
@@ -648,6 +652,8 @@ class RecoveryAPI:
         ensure_startup_scan: Callable[
             [], Awaitable[tuple[asyncio.Task[None], bool]]
         ],
+        provider_recovery: ProviderRecoveryRegistry,
+        provider_recovery_timeout_seconds: float,
     ) -> None:
         self._store = store
         self._scanner = scanner
@@ -658,6 +664,7 @@ class RecoveryAPI:
         self._track_task = track_task
         self._lifecycle = lifecycle
         self._ensure_startup_scan = ensure_startup_scan
+        self._provider_recovery = provider_recovery
         self._start_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[RunResult]] = {}
         self._service = RunRecoveryService(
@@ -666,8 +673,34 @@ class RecoveryAPI:
             agents,
             tools,
             policy,
+            provider_recovery,
             _stopping=lifecycle.close_signal.is_set,
+            _wait_stopping=lifecycle.close_signal.wait,
+            _adapter_timeout=provider_recovery_timeout_seconds,
         )
+
+    def register_adapter(
+        self,
+        adapter: ProviderRecoveryAdapter,
+    ) -> ProviderRecoveryAdapter:
+        return self._provider_recovery.register(adapter)
+
+    def unregister_adapter(
+        self,
+        provider_identity: str,
+        *,
+        expected: ProviderRecoveryAdapter | None = None,
+    ) -> bool:
+        return self._provider_recovery.unregister(
+            provider_identity,
+            expected=expected,
+        )
+
+    def get_adapter(self, provider_identity: str) -> ProviderRecoveryAdapter:
+        return self._provider_recovery.get(provider_identity)
+
+    def list_adapters(self) -> tuple[ProviderRecoveryAdapter, ...]:
+        return self._provider_recovery.list()
 
     async def scan(self) -> None:
         async with self._lifecycle.admit():
@@ -915,6 +948,7 @@ class AgentSDK:
             permission_default=config.permission_default,
             permission_bridge=InProcessPermissionBridge(),
             owned_close=store.close,
+            provider_recovery_timeout_seconds=30.0,
         )
 
     @classmethod
@@ -928,6 +962,7 @@ class AgentSDK:
         permission_bridge: InProcessPermissionBridge | None | object = (
             _DEFAULT_PERMISSION_BRIDGE
         ),
+        provider_recovery_timeout_seconds: float = 30.0,
     ) -> AgentSDK:
         if (store is None) == (database_path is None):
             raise AgentSDKError(
@@ -957,6 +992,7 @@ class AgentSDK:
             permission_default=permission_default,
             permission_bridge=bridge,
             owned_close=owned_close,
+            provider_recovery_timeout_seconds=provider_recovery_timeout_seconds,
         )
         return sdk
 
@@ -968,6 +1004,7 @@ class AgentSDK:
         permission_default: _PermissionDefault,
         permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
+        provider_recovery_timeout_seconds: float,
     ) -> None:
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._owned_close = owned_close
@@ -976,6 +1013,7 @@ class AgentSDK:
         self._startup_scan_task: asyncio.Task[None] | None = None
         commands = RuntimeCommands(store)
         tools = ToolRegistry()
+        provider_recovery = ProviderRecoveryRegistry()
         policy = PolicyEngine(permission_default)
         engine = RunEngine(
             store,
@@ -983,6 +1021,7 @@ class AgentSDK:
             tools,
             policy,
             permission_bridge,
+            provider_recovery=provider_recovery,
         )
         agents = AgentRegistry()
         recovery_scanner = RecoveryScanner(store)
@@ -1029,6 +1068,8 @@ class AgentSDK:
             self._track_task,
             self._lifecycle,
             self._ensure_startup_scan,
+            provider_recovery,
+            provider_recovery_timeout_seconds,
         )
         try:
             loop = asyncio.get_running_loop()
