@@ -616,6 +616,271 @@ async def test_unknown_or_duplicate_provider_lifecycle_event_is_not_certified(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_provider_recovery_audit_before_initial_interrupt_is_not_certified(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"provider-audit-before-interrupt-{backend}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    spec, run_id, operation_id, _request = await _seed_model_in_flight(store)
+    await _insert_provider_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=False,
+        event_type="model.recovery.query.started",
+        payload={
+            "adapter_id": "application.adapter",
+            "adapter_version": "1",
+            "operation_id": operation_id,
+            "action": "query",
+        },
+    )
+
+    litellm_calls = 0
+    query_calls = 0
+    resend_calls = 0
+
+    async def completion(**_: object) -> Any:
+        nonlocal litellm_calls
+        litellm_calls += 1
+        raise AssertionError("pre-interrupt audit reached LiteLLM")
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text="must-not-complete",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError("pre-interrupt audit reached provider resend")
+
+    sdk = await _sdk(
+        store,
+        spec,
+        _adapter(query, resend),
+        acompletion=completion,
+    )
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert (litellm_calls, query_calls, resend_calls) == (0, 0, 0)
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        assert sum(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ) == 1
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+_RECOVERY_PERMISSION_REQUEST = {
+    "request": {"sha256": "1" * 64},
+    "tool": {"sha256": "2" * 64},
+}
+_RECOVERY_PERMISSION_RESOLUTION = {
+    **_RECOVERY_PERMISSION_REQUEST,
+    "allowed": True,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "usage_before_interrupt",
+        "permission_pair_before_interrupt",
+        "permission_pair_between_audit_and_recovery",
+        "audit_after_recovery_started",
+        "audit_between_permission_states",
+        "wrong_operation_after_interrupt",
+        "resend_before_interrupt",
+        "recovery_started_before_interrupt",
+        "completed_before_interrupt",
+        "failed_before_interrupt",
+        "authorized_before_interrupt",
+    ],
+)
+async def test_provider_known_lifecycle_token_in_unreachable_position_is_not_certified(
+    corruption: str,
+) -> None:
+    store = InMemoryStore()
+    spec, run_id, operation_id, _request = await _seed_model_in_flight(store)
+    audit = (
+        "model.recovery.query.started",
+        {
+            "adapter_id": "application.adapter",
+            "adapter_version": "1",
+            "operation_id": operation_id,
+            "action": "query",
+        },
+    )
+
+    if corruption == "usage_before_interrupt":
+        await _insert_provider_run_event(
+            store,
+            run_id,
+            anchor_type="run.interrupted",
+            after=False,
+            event_type="model.usage.reported",
+            payload={
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        )
+    elif corruption == "permission_pair_before_interrupt":
+        for event_type, payload in (
+            ("permission.requested", _RECOVERY_PERMISSION_REQUEST),
+            ("permission.resolved", _RECOVERY_PERMISSION_RESOLUTION),
+        ):
+            await _insert_provider_run_event(
+                store,
+                run_id,
+                anchor_type="run.interrupted",
+                after=False,
+                event_type=event_type,
+                payload=payload,
+            )
+    elif corruption in {
+        "wrong_operation_after_interrupt",
+        "resend_before_interrupt",
+        "recovery_started_before_interrupt",
+        "completed_before_interrupt",
+        "failed_before_interrupt",
+        "authorized_before_interrupt",
+    }:
+        if corruption == "wrong_operation_after_interrupt":
+            event_type = "model.recovery.query.started"
+            payload = {**audit[1], "operation_id": "op_model_wrong_turn"}
+            after = True
+        elif corruption == "resend_before_interrupt":
+            event_type = "model.recovery.resend.started"
+            payload = {**audit[1], "action": "resend"}
+            after = False
+        elif corruption == "recovery_started_before_interrupt":
+            event_type = "run.recovery.started"
+            payload = {"status": "running"}
+            after = False
+        elif corruption == "completed_before_interrupt":
+            event_type = "model.call.completed"
+            payload = {"finish_reason": "stop"}
+            after = False
+        elif corruption == "failed_before_interrupt":
+            event_type = "model.call.failed"
+            payload = {"code": "internal", "message": "bounded"}
+            after = False
+        else:
+            event_type = "tool.call.authorized"
+            payload = {"call_id": "call_impossible", "tool_name": "impossible"}
+            after = False
+        await _insert_provider_run_event(
+            store,
+            run_id,
+            anchor_type="run.interrupted",
+            after=after,
+            event_type=event_type,
+            payload=payload,
+        )
+    else:
+        middle: tuple[tuple[str, dict[str, Any]], ...]
+        if corruption == "permission_pair_between_audit_and_recovery":
+            middle = (
+                audit,
+                ("permission.requested", _RECOVERY_PERMISSION_REQUEST),
+                ("permission.resolved", _RECOVERY_PERMISSION_RESOLUTION),
+                ("run.recovery.started", {"status": "running"}),
+                ("run.interrupted", {"status": "interrupted"}),
+            )
+        elif corruption == "audit_after_recovery_started":
+            middle = (
+                audit,
+                ("run.recovery.started", {"status": "running"}),
+                audit,
+                ("run.interrupted", {"status": "interrupted"}),
+            )
+        else:
+            middle = (
+                audit,
+                ("run.recovery.started", {"status": "running"}),
+                ("permission.requested", _RECOVERY_PERMISSION_REQUEST),
+                audit,
+                ("permission.resolved", _RECOVERY_PERMISSION_RESOLUTION),
+                ("run.interrupted", {"status": "interrupted"}),
+            )
+        for event_type, payload in reversed(middle):
+            await _insert_provider_run_event(
+                store,
+                run_id,
+                anchor_type="run.interrupted",
+                after=True,
+                event_type=event_type,
+                payload=payload,
+            )
+
+    query_calls = 0
+    resend_calls = 0
+    litellm_calls = 0
+
+    async def completion(**_: object) -> Any:
+        nonlocal litellm_calls
+        litellm_calls += 1
+        raise AssertionError(f"{corruption} reached LiteLLM")
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text="must-not-complete",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError(f"{corruption} reached provider resend")
+
+    sdk = await _sdk(
+        store,
+        spec,
+        _adapter(query, resend),
+        acompletion=completion,
+    )
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert (query_calls, resend_calls, litellm_calls) == (0, 0, 0)
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        assert sum(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ) == 1
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
 async def test_authoritative_completed_text_finishes_same_operation_without_litellm() -> None:
     store = InMemoryStore()
     spec, run_id, operation_id, original_request = await _seed_model_in_flight(

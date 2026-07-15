@@ -723,6 +723,327 @@ class RunRecoveryService:
         )
 
     @staticmethod
+    def _is_valid_certified_lifecycle_positions(
+        evidence: _RecoveryEvidence,
+        *,
+        current_kind: ExternalOperationKind,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if checkpoint is None or descriptor is None:
+            return False
+        model_operations = {
+            operation.turn: operation
+            for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
+        }
+        tool_operations = {
+            operation.turn: operation
+            for operation in evidence.operations
+            if isinstance(operation, ToolCallOperation)
+        }
+        if len(model_operations) != sum(
+            isinstance(operation, ModelCallOperation)
+            for operation in evidence.operations
+        ) or len(tool_operations) != sum(
+            isinstance(operation, ToolCallOperation)
+            for operation in evidence.operations
+        ):
+            return False
+
+        state = "ready_for_step"
+        interrupted_state: str | None = None
+        audit_kind: ExternalOperationKind | None = None
+        turn = -1
+        current_model: ModelCallOperation | None = None
+        current_tool: ToolCallOperation | None = None
+        current_call: tuple[str, str] | None = None
+        pending_permission: Mapping[str, Any] | None = None
+        permission_recovery = False
+        permission_allowed: bool | None = None
+
+        for event in evidence.run_events[2:]:
+            event_type = event.type
+            payload = event.payload
+            if event_type == "run.interrupted":
+                if state not in {
+                    "ready_for_step",
+                    "model_in_flight",
+                    "model_completed",
+                    "tool_proposed",
+                    "permission_pending",
+                    "permission_resolved",
+                    "tool_authorized",
+                    "tool_in_flight",
+                    "tool_recovering",
+                    "tool_completed",
+                }:
+                    return False
+                interrupted_state = state
+                state = "interrupted"
+                audit_kind = None
+                continue
+            if event_type in {
+                "model.recovery.query.started",
+                "model.recovery.resend.started",
+            }:
+                if (
+                    state != "interrupted"
+                    or interrupted_state != "model_in_flight"
+                    or current_model is None
+                    or payload.get("operation_id") != current_model.operation_id
+                    or audit_kind not in {None, ExternalOperationKind.MODEL_CALL}
+                ):
+                    return False
+                audit_kind = ExternalOperationKind.MODEL_CALL
+                continue
+            if event_type == "tool.recovery.retry.started":
+                if (
+                    state != "interrupted"
+                    or current_tool is None
+                    or current_call is None
+                    or interrupted_state
+                    not in {
+                        "tool_in_flight",
+                        "tool_recovering",
+                        "permission_pending",
+                        "permission_resolved",
+                    }
+                    or payload.get("operation")
+                    != hashed_identity(current_tool.operation_id)
+                    or payload.get("call") != hashed_identity(current_call[0])
+                    or payload.get("tool") != hashed_identity(current_call[1])
+                    or audit_kind not in {None, ExternalOperationKind.TOOL_CALL}
+                ):
+                    return False
+                audit_kind = ExternalOperationKind.TOOL_CALL
+                continue
+            if event_type == "run.recovery.started":
+                if state != "interrupted" or interrupted_state is None:
+                    return False
+                if interrupted_state == "model_in_flight":
+                    if (
+                        current_model is None
+                        or current_model.status is not ExternalOperationStatus.STARTED
+                        or audit_kind is not ExternalOperationKind.MODEL_CALL
+                    ):
+                        return False
+                    state = "model_in_flight"
+                elif current_tool is not None and interrupted_state in {
+                    "tool_in_flight",
+                    "tool_recovering",
+                    "permission_pending",
+                    "permission_resolved",
+                }:
+                    if (
+                        current_tool.status is not ExternalOperationStatus.STARTED
+                        or audit_kind is not ExternalOperationKind.TOOL_CALL
+                    ):
+                        return False
+                    state = "tool_recovering"
+                    pending_permission = None
+                    permission_allowed = None
+                    permission_recovery = True
+                elif audit_kind is not None:
+                    return False
+                elif interrupted_state in {"ready_for_step", "tool_completed"}:
+                    state = "ready_for_step"
+                else:
+                    state = "model_completed"
+                    current_tool = None
+                interrupted_state = None
+                audit_kind = None
+                continue
+            if state == "interrupted":
+                return False
+
+            if event_type == "step.started":
+                if state != "ready_for_step" or payload != {}:
+                    return False
+                turn += 1
+                current_model = None
+                current_tool = None
+                current_call = None
+                state = "model_starting"
+                continue
+            if event_type == "model.call.started":
+                current_model = model_operations.get(turn)
+                if (
+                    state != "model_starting"
+                    or current_model is None
+                    or payload != {"model": descriptor.agent.model}
+                ):
+                    return False
+                state = "model_in_flight"
+                continue
+            if event_type == "model.text.delta":
+                if (
+                    state != "model_in_flight"
+                    or set(payload) != {"text"}
+                    or not isinstance(payload["text"], str)
+                ):
+                    return False
+                continue
+            if event_type == "model.usage.reported":
+                if state != "model_in_flight":
+                    return False
+                try:
+                    usage = TokenUsage.model_validate(payload)
+                except Exception:
+                    return False
+                if usage.model_dump(mode="json") != payload:
+                    return False
+                state = "model_usage_reported"
+                continue
+            if event_type == "model.call.completed":
+                if (
+                    state not in {"model_in_flight", "model_usage_reported"}
+                    or set(payload) != {"finish_reason"}
+                    or (
+                        payload["finish_reason"] is not None
+                        and not isinstance(payload["finish_reason"], str)
+                    )
+                    or current_model is None
+                    or current_model.status is not ExternalOperationStatus.COMPLETED
+                    or current_model.outcome is None
+                    or current_model.outcome.get("finish_reason")
+                    != payload["finish_reason"]
+                ):
+                    return False
+                state = "model_completed"
+                continue
+            if event_type == "tool.call.proposed":
+                if (
+                    state != "model_completed"
+                    or set(payload) != {"call_id", "tool_name"}
+                    or not all(
+                        isinstance(payload[field], str) and bool(payload[field])
+                        for field in ("call_id", "tool_name")
+                    )
+                ):
+                    return False
+                current_call = (payload["call_id"], payload["tool_name"])
+                current_tool = None
+                state = "tool_proposed"
+                continue
+            if event_type == "permission.requested":
+                if state not in {"tool_proposed", "tool_recovering"}:
+                    return False
+                permission_recovery = state == "tool_recovering"
+                if permission_recovery:
+                    if (
+                        current_call is None
+                        or set(payload) != {"request", "tool"}
+                        or not RunRecoveryService._is_hashed_identity(
+                            payload["request"]
+                        )
+                        or payload["tool"] != hashed_identity(current_call[1])
+                    ):
+                        return False
+                elif set(payload) != {"request"} or not isinstance(
+                    payload["request"], Mapping
+                ):
+                    return False
+                pending_permission = payload
+                permission_allowed = None
+                state = "permission_pending"
+                continue
+            if event_type == "permission.resolved":
+                if state != "permission_pending" or pending_permission is None:
+                    return False
+                if permission_recovery:
+                    if (
+                        set(payload) != {"request", "tool", "allowed"}
+                        or payload["request"] != pending_permission["request"]
+                        or payload["tool"] != pending_permission["tool"]
+                        or type(payload["allowed"]) is not bool
+                    ):
+                        return False
+                    permission_allowed = payload["allowed"]
+                else:
+                    if set(payload) != {"request", "decision"} or payload[
+                        "request"
+                    ] != pending_permission["request"]:
+                        return False
+                    try:
+                        decision = PermissionDecision.model_validate(payload["decision"])
+                    except Exception:
+                        return False
+                    if (
+                        decision.model_dump(mode="json") != payload["decision"]
+                        or decision.action not in {"allow", "deny"}
+                    ):
+                        return False
+                    permission_allowed = decision.allowed
+                state = "permission_resolved"
+                continue
+            if event_type == "tool.call.authorized":
+                recovering = state == "tool_recovering" or (
+                    state == "permission_resolved" and permission_recovery
+                )
+                if (
+                    current_call is None
+                    or state
+                    not in {"tool_proposed", "tool_recovering", "permission_resolved"}
+                    or (state == "permission_resolved" and permission_allowed is not True)
+                ):
+                    return False
+                expected = (
+                    {
+                        "call": hashed_identity(current_call[0]),
+                        "tool": hashed_identity(current_call[1]),
+                    }
+                    if recovering
+                    else {"call_id": current_call[0], "tool_name": current_call[1]}
+                )
+                if payload != expected:
+                    return False
+                state = "tool_in_flight" if recovering else "tool_authorized"
+                continue
+            if event_type == "tool.call.started":
+                current_tool = tool_operations.get(turn)
+                if (
+                    state != "tool_authorized"
+                    or current_call is None
+                    or current_tool is None
+                    or payload
+                    != {"call_id": current_call[0], "tool_name": current_call[1]}
+                ):
+                    return False
+                state = "tool_in_flight"
+                continue
+            if event_type == "tool.call.completed":
+                if state not in {
+                    "tool_proposed",
+                    "permission_resolved",
+                    "tool_in_flight",
+                } or (state == "permission_resolved" and permission_allowed is not False):
+                    return False
+                try:
+                    result = ToolResult.model_validate(payload)
+                except Exception:
+                    return False
+                if (
+                    result.model_dump(mode="json") != payload
+                    or current_call is None
+                    or (result.call_id, result.tool_name) != current_call
+                ):
+                    return False
+                state = "tool_completed"
+                continue
+            if event_type == "step.completed":
+                if state != "tool_completed" or payload != {}:
+                    return False
+                state = "ready_for_step"
+                continue
+            return False
+
+        if state != "interrupted" or checkpoint.operation_id is None:
+            return False
+        current = current_model if current_kind is ExternalOperationKind.MODEL_CALL else current_tool
+        return current is not None and current.operation_id == checkpoint.operation_id
+
+    @staticmethod
     def _is_valid_certified_provider_history(
         evidence: _RecoveryEvidence,
     ) -> bool:
@@ -730,7 +1051,26 @@ class RunRecoveryService:
         descriptor = evidence.run.execution_descriptor
         if checkpoint is None or descriptor is None:
             return False
+        if not RunRecoveryService._is_valid_certified_lifecycle_positions(
+            evidence,
+            current_kind=ExternalOperationKind.MODEL_CALL,
+        ):
+            return False
         events = evidence.run_events
+        first_interrupted = next(
+            index for index, event in enumerate(events) if event.type == "run.interrupted"
+        )
+        if any(
+            event.type
+            in {
+                "run.recovery.started",
+                "model.recovery.query.started",
+                "model.recovery.resend.started",
+                "tool.recovery.retry.started",
+            }
+            for event in events[:first_interrupted]
+        ):
+            return False
         model_operations = tuple(
             operation
             for operation in evidence.operations
@@ -1489,6 +1829,10 @@ class RunRecoveryService:
             or checkpoint.usage != TokenUsage(**cumulative)
             or "".join(checkpoint.output_parts) != "".join(reconstructed_output)
             or not self._is_valid_certified_tool_history(evidence, tuple(turns))
+            or not self._is_valid_certified_lifecycle_positions(
+                evidence,
+                current_kind=ExternalOperationKind.TOOL_CALL,
+            )
         ):
             return None
         initial_interrupt = next(
@@ -1526,6 +1870,22 @@ class RunRecoveryService:
         except StopIteration:
             return False
         events = evidence.run_events[:interrupted]
+        allowed_types = {
+            "run.created",
+            "run.started",
+            "step.started",
+            "model.call.started",
+            "model.text.delta",
+            "model.usage.reported",
+            "model.call.completed",
+            "tool.call.proposed",
+            "permission.requested",
+            "permission.resolved",
+            "tool.call.authorized",
+            "tool.call.started",
+            "tool.call.completed",
+            "step.completed",
+        }
         expected_operations = sum(turn.operation is not None for turn in turns)
         expected_permissions = sum(
             turn.permission_allowed is not None for turn in turns
@@ -1547,6 +1907,7 @@ class RunRecoveryService:
         if (
             len(run_started) != 1
             or run_started[0].payload != {"status": RunStatus.RUNNING.value}
+            or any(event.type not in allowed_types for event in events)
             or any(
                 sum(event.type == event_type for event in events) != expected
                 for event_type, expected in expected_counts.items()

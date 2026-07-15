@@ -2359,6 +2359,226 @@ async def test_unknown_or_duplicate_tool_lifecycle_event_is_not_certified(
         await sdk.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_tool_recovery_audit_before_initial_interrupt_is_not_certified(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"tool-audit-before-interrupt-{backend}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    run_id, spec, tool_spec, operation_id = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+        tool_source="mcp/audit-position",
+    )
+    await _insert_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=False,
+        event_type="tool.recovery.retry.started",
+        payload={
+            "operation": {
+                "sha256": hashlib.sha256(operation_id.encode()).hexdigest()
+            },
+            "call": {
+                "sha256": hashlib.sha256(b"call_recovery").hexdigest()
+            },
+            "tool": {"sha256": hashlib.sha256(b"recoverable").hexdigest()},
+            "retry_class": "idempotent",
+        },
+    )
+
+    permission_calls = 0
+    handler_calls = 0
+    mcp_calls = 0
+    model_calls: list[int] = []
+
+    async def mcp_transport(value: int) -> int:
+        nonlocal mcp_calls
+        mcp_calls += 1
+        return value
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return await mcp_transport(value)
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+
+    async def resolve_unexpected_permission() -> None:
+        nonlocal permission_calls
+        request = await sdk.permissions.next_request(run_id)
+        permission_calls += 1
+        await sdk.permissions.resolve(
+            request.request_id,
+            PermissionDecision.allow_once(),
+        )
+
+    permission_task = asyncio.create_task(resolve_unexpected_permission())
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert permission_calls == 0
+        assert handler_calls == 0
+        assert mcp_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        assert sum(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ) == 1
+    finally:
+        if not permission_task.done():
+            permission_task.cancel()
+        await asyncio.gather(permission_task, return_exceptions=True)
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    [
+        ("model.text.delta", {"text": "late-model-delta"}),
+        (
+            "model.usage.reported",
+            {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        ),
+    ],
+)
+async def test_tool_model_token_after_tool_start_is_not_certified(
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _operation_id = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        tool_source="mcp/model-token-position",
+    )
+    await _insert_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=False,
+        event_type=event_type,
+        payload=payload,
+    )
+
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        assert sum(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ) == 1
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_retry_audit_for_historical_turn_is_not_current_certification() -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec = await _seed_interrupted_second_tool_call(store)
+    operations = await store.list_external_operations(run_id)
+    historical = next(
+        operation
+        for operation in operations
+        if isinstance(operation, ToolCallOperation) and operation.turn == 0
+    )
+    await _insert_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=True,
+        event_type="tool.recovery.retry.started",
+        payload={
+            "operation": {
+                "sha256": hashlib.sha256(historical.operation_id.encode()).hexdigest()
+            },
+            "call": {
+                "sha256": hashlib.sha256(b"call_history_1").hexdigest()
+            },
+            "tool": {"sha256": hashlib.sha256(b"recoverable").hexdigest()},
+            "retry_class": "idempotent",
+        },
+    )
+
+    handler_calls = 0
+    model_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert handler_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        assert sum(
+            stored.event.type == "reconciliation.requested"
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ) == 1
+    finally:
+        await sdk.close()
+
+
 _DUAL_BACKEND_ENVELOPE_CORRUPTIONS = (
     "permission_action_ask",
     "permission_action_unknown",

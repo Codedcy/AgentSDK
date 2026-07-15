@@ -2,7 +2,7 @@
 
 ## Outcome
 
-FOURTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+FIFTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -45,6 +45,19 @@ both sides of the interrupt, an expanded duplicate/unknown lifecycle grammar
 matrix, and final-code closed-world admission. Valid repeated recovery audits,
 permission cancellation histories, and Provider recovery behavior remain
 accepted.
+
+The fifth independent review again confirmed every prior finding closed and
+reported Spec/Quality C0/I1/M0. Closed event types, exact payloads, and global
+counts were still insufficient because a known, fully valid recovery audit
+could be placed in an impossible position and remain unconsumed. A Provider
+query audit between `model.call.started` and the first `run.interrupted` still
+called the adapter; a Tool retry audit between `tool.call.started` and the
+first interrupt still called permission, the handler/MCP transport, and the
+following model. The final Important finding now has exact Memory/SQLite REDs,
+an expanded position/terminal/wrong-operation matrix, and a shared per-event
+lifecycle state machine. Every certified event is consumed exactly once by a
+valid transition; valid cancellation, audit-only retry, query-to-resend, and
+repeated recovery cycles remain accepted.
 
 ## Implemented contract
 
@@ -89,6 +102,17 @@ accepted.
   metadata. Repeated query/resend or Tool retry audits remain valid when they
   are complete audit attempts rather than being rejected by a naive global
   duplicate count.
+- Tool and Provider certification additionally share an ordered lifecycle
+  consumer. It follows ready-for-step, Model in-flight/completed, Tool
+  proposed/permission/authorized/in-flight/completed, interrupted, and
+  recovery states. A recovery audit is legal only while interrupted and must
+  identify the exact current operation, turn, call, and Tool represented by
+  the checkpoint; `run.recovery.started` must consume the corresponding audit
+  before resuming that phase. Provider audits cannot appear before the first
+  interrupt, after recovery has started, or inside Tool permission states;
+  Model delta/usage tokens cannot appear after Tool execution starts. Each
+  transition validates its bounded payload shape and crosses current
+  operation/checkpoint/descriptor identity before advancing.
 - Historical permission evidence is reconstructed through strict
   `PermissionRequest` and `PermissionDecision` validation with canonical exact
   round trips and forbidden extras. Requested/resolved requests must match;
@@ -216,6 +240,19 @@ Production changes followed observable failing tests:
     and audit-to-operation checks were added after three new RED cases proved
     that a known duplicate or malformed audit could otherwise bypass the
     simple type allow-list.
+16. Fifth-review exact RED inserted a fully valid Provider query audit before
+    the initial interrupt and a fully valid Tool retry audit before its initial
+    interrupt across Memory and SQLite. All four reached external work. The
+    shared per-event state machine made all four reconcile with zero query,
+    resend, permission, handler, MCP, or LiteLLM calls. Seven additional REDs
+    proved that pre-interrupt usage/permission pairs, permission tokens between
+    audit and recovery, an audit after recovery start or between permission
+    states, and late Model delta/usage after Tool start were also ignored by
+    count/selective validation. The final eighteen-case position matrix adds
+    resend, recovery-start, completed/failed/authorized tokens plus wrong and
+    historical operation/turn identities. All are green with exactly one
+    reconciliation, while twelve focused positive cancellation/retry/repeated
+    cycle cases and both complete recovery files remain green.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -239,13 +276,20 @@ Python 3.13.
 - Session/Run/Tool/MCP/permission/Workflow/child compatibility:
   `150 passed in 7.91s`, plus ownership `87 passed in 5.68s` = 237.
 - Full Python 3.13 pytest on the final tree:
-  `1483 passed in 115.28s`; zero skipped.
+  `1501 passed in 114.10s`; zero skipped.
+- Fifth-review exact and expanded lifecycle position/terminal/wrong-operation
+  matrix: `18 passed`; selected legal cancellation/retry cycles: `12 passed`.
 - Exact duplicate creation matrix: `8 passed`; expanded duplicate/unknown
   lifecycle matrix with the exact cases: `19 passed`.
-- Complete Tool recovery file: `126 passed in 12.13s`.
-- Complete Provider recovery file: `45 passed in 5.70s`.
+- Complete Tool recovery file: `131 passed in 13.64s`.
+- Complete Provider recovery file: `58 passed in 6.05s`.
 - Expanded Provider/Store/RecoveryAPI neighbor gate (strict superset of the
-  prior 195-case gate): `246 passed in 70.14s`.
+  prior 195/246-case gates): `259 passed in 70.90s`.
+- Phase 3C2 recovery API: `89 passed`; Phase 3C1 scanner/admission: `115`;
+  Phase 3B live progress: `40`; Phase 3A Run progress: `123`; Phase 2 recovery
+  records: `139`; Phase 1 + M02-T001: `188`.
+- Session/Run/Tool/MCP/permission/Workflow/child compatibility:
+  `150 passed`, plus ownership `87 passed` = `237`.
 - Ruff: `All checks passed!`.
 - Mypy: `Success: no issues found in 75 source files`.
 - Public import/default canonical smoke: passed.
@@ -264,7 +308,8 @@ Memory/SQLite close-reopen historical permission-deny/invalid-arguments/
 missing-Tool safe rejections, four no-operation ToolResult/permission forgery
 cases, forty-four strict permission and complete Run-envelope corruptions,
 eight exact duplicate-creation cases, eleven duplicate/unknown lifecycle
-grammar cases, the
+grammar cases, eighteen exact lifecycle-position/terminal/wrong-operation
+cases, twelve selected valid repeated audit/cancellation/recovery cycles, the
 final handler-preflight lease barrier,
 handler and SDK-close cancellation, repeated cancellation, 20 same-SDK callers,
 two SDK instances, audit and Tool-outcome precommit/ambiguous replay, Run CAS,
