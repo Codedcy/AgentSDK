@@ -2,7 +2,7 @@
 
 ## Outcome
 
-SECOND REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+THIRD REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -24,6 +24,15 @@ changed, malformed, or internally inconsistent Tool
 evidence performs no permission, handler, MCP, or LiteLLM work and creates one
 bounded reconciliation request. Workflow recovery, reconciliation resolution,
 provider behavior, SQLite schema, and migrations are unchanged.
+
+The third independent review explicitly confirmed every prior Critical,
+Important, and Minor finding closed, then found Spec/Quality C0/I1/M0: the
+safe no-operation replay validated critical event payload/order but did not
+fail closed on the complete EventEnvelope sequence, and a resolved permission
+action other than `allow` was treated as denial. The final Important finding
+now has exact Memory/SQLite reviewer REDs, a forty-four-case malformed
+permission/envelope matrix, and final-code fixes. Valid provider recovery
+behavior is unchanged.
 
 ## Implemented contract
 
@@ -49,6 +58,21 @@ provider behavior, SQLite schema, and migrations are unchanged.
   event, crossed against the assistant call, descriptor/schema or missing
   capability, permission evidence, Tool message, and checkpoint. All other
   missing-operation shapes remain reconciliation-only.
+- Before either certified provider or Tool work, recovery validates the complete
+  authoritative Run event envelope at both planning and coordination: globally
+  unique event ids, strictly increasing positive target cursors, exact Run and
+  Session ownership, schema version and timezone-aware timestamps, contiguous
+  SDK Run sequence `1..N`, and an exact reconstructed `run.created` payload
+  including agent ownership and execution descriptor. Global cursors are not
+  required to be contiguous because unrelated events and deletion leave valid
+  holes.
+- Historical permission evidence is reconstructed through strict
+  `PermissionRequest` and `PermissionDecision` validation with canonical exact
+  round trips and forbidden extras. Requested/resolved requests must match;
+  only broker-valid resolution actions `allow` or `deny` are admitted; request
+  id, Run, Session, Tool, arguments, and effects are crossed against the
+  descriptor and call, decision scope remains within its strict model, and the
+  denial reason is crossed against the normalized Tool result.
 - A fresh lease atomically appends a bounded
   `tool.recovery.retry.started` event and re-fences the same STARTED Tool
   operation against the exact in-flight checkpoint. No new operation or
@@ -79,6 +103,12 @@ provider behavior, SQLite schema, and migrations are unchanged.
   after deleting the service and RecoveryPlan references, so retained task
   tracebacks do not keep checkpoint arguments, registered handler closures, or
   arbitrary internal failures.
+- If malformed authoritative evidence makes the normal Store sequence query
+  fail closed, only the already-selected reconciliation path may derive the
+  maximum positive target-Run sequence from the fixed cursor high-water and
+  append `max+1`. The bounded reconciliation event, WAITING_RECONCILIATION Run
+  snapshot, and single request still use the original atomic
+  `commit_run_progress`; external-work paths never use this fallback.
 
 ## TDD RED-to-GREEN evidence
 
@@ -140,6 +170,17 @@ Production changes followed observable failing tests:
     all six recover the same current operation and resume the model. Four
     dedicated ToolResult/permission modification/insertion cases remain
     zero-external reconciliation paths, as do all earlier forgery regressions.
+14. Third-review exact RED changed a historical resolved action from `deny` to
+    `ask`, and separately changed a historical `tool.call.completed` sequence
+    from its contiguous value to `+1000` while preserving cursor order. Both
+    Memory and SQLite incorrectly reached permission, the MCP-style handler,
+    transport, and LiteLLM (`4/4` RED). Shared envelope admission and strict
+    permission reconstruction made those `4/4` green. The expanded matrix
+    covers forty-four Memory/SQLite request/decision extra, malformed,
+    mismatch, action/scope/reason, sequence gap/backward/duplicate/out-of-order,
+    cursor, event-id, Run/Session/agent ownership, and historical/current
+    Tool/Model critical-event mutations; all perform zero external work and
+    atomically create exactly one bounded reconciliation request.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -152,18 +193,18 @@ All commands used
 Python 3.13.
 
 - Phase 3D2 policy/recovery plus complete live progress:
-  `120 passed in 6.93s`.
+  `164 passed in 12.18s`.
 - Phase 3D1 provider recovery, Store reconciliation, and recovery API neighbor
-  group: `195 passed in 69.35s`.
-- Phase 3C1 scanner/admission: `115 passed in 6.88s`.
-- Phase 3B live progress: `40 passed in 3.52s`.
-- Phase 3A Run-progress transaction: `123 passed in 6.99s`.
-- Phase 2 recovery records/SQLite validation: `139 passed in 8.56s`.
-- Phase 1 + M02-T001 regressions: `188 passed in 13.39s`.
+  group: `195 passed in 69.34s`.
+- Phase 3C1 scanner/admission: `115 passed in 6.79s`.
+- Phase 3B live progress: `40 passed` as part of the Phase 3D2 group.
+- Phase 3A Run-progress transaction: `123 passed in 6.95s`.
+- Phase 2 recovery records/SQLite validation: `139 passed in 7.75s`.
+- Phase 1 + M02-T001 regressions: `188 passed in 14.46s`.
 - Session/Run/Tool/MCP/permission/Workflow/child compatibility:
-  `150 passed in 7.74s`, plus ownership `87 passed in 5.46s` = 237.
+  `150 passed in 7.91s`, plus ownership `87 passed in 5.68s` = 237.
 - Full Python 3.13 pytest on the final tree:
-  `1420 passed in 107.58s`; zero skipped.
+  `1464 passed in 116.21s`; zero skipped.
 - Ruff: `All checks passed!`.
 - Mypy: `Success: no issues found in 75 source files`.
 - Public import/default canonical smoke: passed.
@@ -180,7 +221,8 @@ mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
 Memory/SQLite close-reopen historical permission-deny/invalid-arguments/
 missing-Tool safe rejections, four no-operation ToolResult/permission forgery
-cases, the final handler-preflight lease barrier,
+cases, forty-four strict permission and complete Run-envelope corruptions, the
+final handler-preflight lease barrier,
 handler and SDK-close cancellation, repeated cancellation, 20 same-SDK callers,
 two SDK instances, audit and Tool-outcome precommit/ambiguous replay, Run CAS,
 audit-time lease loss and takeover, same-operation retry after interrupted

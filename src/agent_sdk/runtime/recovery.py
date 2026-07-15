@@ -15,6 +15,7 @@ from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
+from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.runtime._recovery_observability import hashed_identity
 from agent_sdk.runtime.agents import AgentRegistry
@@ -106,6 +107,8 @@ class _RecoveryEvidence:
     operations: tuple[ExternalOperation, ...]
     pending: tuple[ReconciliationRequest, ...]
     run_events: tuple[EventEnvelope, ...]
+    run_event_cursors: tuple[int, ...]
+    run_event_ids_unique: bool
 
 
 @dataclass(frozen=True)
@@ -533,19 +536,71 @@ class RunRecoveryService:
         up_to_cursor = await self._store.latest_cursor()
         events = await self._store.read_events(
             after_cursor=0,
-            session_id=run.session_id,
             up_to_cursor=up_to_cursor,
         )
-        run_events = tuple(
-            stored.event for stored in events if stored.event.run_id == run.run_id
+        run_records = tuple(
+            stored for stored in events if stored.event.run_id == run.run_id
         )
+        event_ids = tuple(stored.event.event_id for stored in events)
         return _RecoveryEvidence(
             run=run,
             session=session,
             checkpoint=checkpoint,
             operations=operations,
             pending=pending,
-            run_events=run_events,
+            run_events=tuple(stored.event for stored in run_records),
+            run_event_cursors=tuple(stored.cursor for stored in run_records),
+            run_event_ids_unique=len(event_ids) == len(set(event_ids)),
+        )
+
+    @staticmethod
+    def _is_valid_run_event_envelope(evidence: _RecoveryEvidence) -> bool:
+        events = evidence.run_events
+        cursors = evidence.run_event_cursors
+        run = evidence.run
+        if (
+            not events
+            or len(events) != len(cursors)
+            or not evidence.run_event_ids_unique
+            or any(type(cursor) is not int or cursor <= 0 for cursor in cursors)
+            or any(left >= right for left, right in zip(cursors, cursors[1:]))
+            or tuple(event.sequence for event in events)
+            != tuple(range(1, len(events) + 1))
+        ):
+            return False
+        if any(
+            not isinstance(event.event_id, str)
+            or not event.event_id.strip()
+            or type(event.schema_version) is not int
+            or event.schema_version != 1
+            or not isinstance(event.type, str)
+            or not event.type.strip()
+            or event.session_id != run.session_id
+            or event.run_id != run.run_id
+            or type(event.sequence) is not int
+            or not isinstance(event.payload, dict)
+            or not isinstance(event.occurred_at, datetime)
+            or event.occurred_at.tzinfo is None
+            or event.occurred_at.utcoffset() is None
+            for event in events
+        ):
+            return False
+        created = RunSnapshot(
+            run_id=run.run_id,
+            session_id=run.session_id,
+            agent_revision=run.agent_revision,
+            status=RunStatus.CREATED,
+            user_input=run.user_input,
+            parent_run_id=run.parent_run_id,
+            workflow_run_id=run.workflow_run_id,
+            workflow_node_id=run.workflow_node_id,
+            task_envelope=run.task_envelope,
+            execution_compatibility=run.execution_compatibility,
+            execution_descriptor=run.execution_descriptor,
+        )
+        return (
+            events[0].type == "run.created"
+            and events[0].payload == created.model_dump(mode="json")
         )
 
     async def _validated_request(
@@ -897,7 +952,8 @@ class RunRecoveryService:
     ) -> ProviderRecoveryRequest | None:
         checkpoint = evidence.checkpoint
         if (
-            checkpoint is None
+            not self._is_valid_run_event_envelope(evidence)
+            or checkpoint is None
             or evidence.pending
             or operation.provider_identity != base_request.model
         ):
@@ -951,7 +1007,8 @@ class RunRecoveryService:
         checkpoint = evidence.checkpoint
         descriptor = evidence.run.execution_descriptor
         if (
-            checkpoint is None
+            not self._is_valid_run_event_envelope(evidence)
+            or checkpoint is None
             or descriptor is None
             or evidence.pending
             or checkpoint.phase is not RunCheckpointPhase.TOOL_IN_FLIGHT
@@ -1424,15 +1481,20 @@ class RunRecoveryService:
                         return False
                     if requested_payload["request"] != resolved_payload["request"]:
                         return False
-                    request = requested_payload["request"]
-                    decision = resolved_payload["decision"]
+                    request_payload = requested_payload["request"]
+                    decision_payload = resolved_payload["decision"]
+                    request = PermissionRequest.model_validate(request_payload)
+                    decision = PermissionDecision.model_validate(decision_payload)
                     if (
-                        request["run_id"] != evidence.run.run_id
-                        or request["session_id"] != evidence.run.session_id
-                        or request["tool_name"] != turn.call.name
-                        or request["arguments"]
+                        request.model_dump(mode="json") != request_payload
+                        or decision.model_dump(mode="json") != decision_payload
+                        or not request.request_id.strip()
+                        or request.run_id != evidence.run.run_id
+                        or request.session_id != evidence.run.session_id
+                        or request.tool_name != turn.call.name
+                        or request.arguments
                         != json.loads(turn.call.arguments_json)
-                        or tuple(request["effects"])
+                        or request.effects
                         != descriptor.tools[
                             next(
                                 tool_index
@@ -1440,13 +1502,13 @@ class RunRecoveryService:
                                 if tool.spec.name == turn.call.name
                             )
                         ].spec.effects
-                        or (decision["action"] == "allow")
-                        is not turn.permission_allowed
+                        or decision.action not in {"allow", "deny"}
+                        or decision.allowed is not turn.permission_allowed
                     ):
                         return False
                     if not turn.permission_allowed:
                         assert turn.result is not None
-                        denial = decision.get("reason") or "permission denied"
+                        denial = decision.reason or "permission denied"
                         if turn.result != ToolResult.normalized_error(
                             turn.call.call_id,
                             turn.call.name,
@@ -1628,7 +1690,7 @@ class RunRecoveryService:
             if pending:
                 await self._validated_pending_requests(run)
                 raise self._recovery_required() from None
-            sequence = await self._store.latest_run_event_sequence(run_id) or 0
+            sequence = await self._latest_reconciliation_sequence(run_id)
             request = ReconciliationRequest(
                 request_id=new_id("rec"),
                 session_id=run.session_id,
@@ -2186,7 +2248,7 @@ class RunRecoveryService:
             await self._validated_pending_requests(run)
             raise self._recovery_required() from None
         now = self._clock()
-        sequence = await self._store.latest_run_event_sequence(run.run_id) or 0
+        sequence = await self._latest_reconciliation_sequence(run.run_id)
         request = ReconciliationRequest(
             request_id=new_id("rec"),
             session_id=run.session_id,
@@ -2238,6 +2300,26 @@ class RunRecoveryService:
             ),
         )
         raise self._recovery_required() from None
+
+    async def _latest_reconciliation_sequence(self, run_id: str) -> int:
+        try:
+            return await self._store.latest_run_event_sequence(run_id) or 0
+        except RecoveryStateConflictError:
+            up_to_cursor = await self._store.latest_cursor()
+            events = await self._store.read_events(
+                after_cursor=0,
+                up_to_cursor=up_to_cursor,
+            )
+            return max(
+                (
+                    stored.event.sequence
+                    for stored in events
+                    if stored.event.run_id == run_id
+                    and type(stored.event.sequence) is int
+                    and stored.event.sequence > 0
+                ),
+                default=0,
+            )
 
     @staticmethod
     def _capability_error() -> AgentSDKError:

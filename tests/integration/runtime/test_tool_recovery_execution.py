@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -308,6 +308,7 @@ async def _seed_safe_pre_handler_history(
     store: StateStore,
     *,
     history: str,
+    tool_source: str = "application",
 ) -> tuple[str, AgentSpec, ToolSpec, ToolResultStatus, str]:
     handler_started = asyncio.Event()
     handler_cancelled = asyncio.Event()
@@ -371,7 +372,7 @@ async def _seed_safe_pre_handler_history(
         "tool_not_found": ToolResultStatus.FAILED,
     }[history]
     spec = AgentSpec(name="safe-pre-handler-history", model="fake/tool-recovery")
-    tool_spec = _tool_spec(ToolRetryPolicy.IDEMPOTENT)
+    tool_spec = _tool_spec(ToolRetryPolicy.IDEMPOTENT, source=tool_source)
     sdk = AgentSDK.for_test(
         store=store,
         acompletion=completion,
@@ -425,6 +426,317 @@ async def _seed_safe_pre_handler_history(
     finally:
         await scanner.close()
     return handle.run_id, spec, tool_spec, expected_status, operation_id
+
+
+async def _replace_run_event(
+    store: StateStore,
+    run_id: str,
+    event_type: str,
+    update: dict[str, Any],
+    *,
+    predicate: Callable[[EventEnvelope], bool] | None = None,
+    last: bool = False,
+) -> None:
+    matches = [
+        stored
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id
+        and stored.event.type == event_type
+        and (predicate is None or predicate(stored.event))
+    ]
+    assert matches
+    selected = matches[-1] if last else matches[0]
+    changed = selected.event.model_copy(update=update)
+    if isinstance(store, InMemoryStore):
+        index = next(
+            index
+            for index, stored in enumerate(store._events)
+            if stored.cursor == selected.cursor
+        )
+        store._events[index] = type(selected)(selected.cursor, changed)
+        return
+    assert isinstance(store, SQLiteStore)
+    columns: list[str] = []
+    parameters: list[object] = []
+    for field, value in update.items():
+        if field == "payload":
+            columns.append("payload_json = ?")
+            parameters.append(
+                json.dumps(
+                    changed.payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        elif field in {
+            "event_id",
+            "session_id",
+            "run_id",
+            "sequence",
+            "type",
+            "schema_version",
+        }:
+            columns.append(f"{field} = ?")
+            parameters.append(value)
+        else:
+            raise AssertionError(f"unsupported event mutation: {field}")
+    parameters.append(selected.cursor)
+    await store._connection.execute(  # type: ignore[attr-defined]
+        f"UPDATE events SET {', '.join(columns)} WHERE cursor = ?",
+        tuple(parameters),
+    )
+    await store._connection.commit()  # type: ignore[attr-defined]
+
+
+async def _corrupt_certified_tool_evidence(
+    store: StateStore,
+    run_id: str,
+    corruption: str,
+    secret: str,
+) -> None:
+    def denied(event: EventEnvelope) -> bool:
+        return event.payload.get("decision", {}).get("action") == "deny"
+
+    if corruption.startswith("permission_"):
+        resolved = next(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "permission.resolved"
+            and denied(stored.event)
+        )
+        payload = json.loads(json.dumps(resolved.payload))
+        request = payload["request"]
+        decision = payload["decision"]
+        if corruption == "permission_action_ask":
+            decision["action"] = "ask"
+        elif corruption == "permission_action_unknown":
+            decision.update(action=secret)
+        elif corruption == "permission_request_extra":
+            request["forged"] = secret
+        elif corruption == "permission_decision_extra":
+            decision["forged"] = secret
+        elif corruption == "permission_request_malformed":
+            request.pop("request_id")
+            request["tool_name"] = secret
+        elif corruption == "permission_decision_malformed":
+            payload["decision"] = ["deny", secret]
+        elif corruption == "permission_request_mismatch":
+            request["request_id"] = secret
+        elif corruption == "permission_scope_invalid":
+            decision["scope"] = secret
+        elif corruption == "permission_reason_mismatch":
+            decision["reason"] = secret
+        elif corruption == "permission_payload_extra":
+            payload["forged"] = secret
+        else:
+            raise AssertionError(f"unknown permission corruption: {corruption}")
+        await _replace_run_event(
+            store,
+            run_id,
+            "permission.resolved",
+            {"payload": payload},
+            predicate=denied,
+        )
+        if corruption == "permission_request_extra":
+            requested = next(
+                stored.event
+                for stored in await store.read_events(after_cursor=0)
+                if stored.event.run_id == run_id
+                and stored.event.type == "permission.requested"
+            )
+            requested_payload = json.loads(json.dumps(requested.payload))
+            requested_payload["request"]["forged"] = secret
+            await _replace_run_event(
+                store,
+                run_id,
+                "permission.requested",
+                {"payload": requested_payload},
+            )
+        return
+
+    events = [
+        stored
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id
+    ]
+    if corruption == "historical_sequence_gap":
+        target = next(
+            stored for stored in events if stored.event.type == "tool.call.completed"
+        )
+        await _replace_run_event(
+            store,
+            run_id,
+            target.event.type,
+            {"sequence": target.event.sequence + 1_000},
+        )
+    elif corruption == "current_sequence_backward":
+        await _replace_run_event(
+            store,
+            run_id,
+            "tool.call.started",
+            {"sequence": -1},
+            last=True,
+        )
+    elif corruption == "current_model_sequence_gap":
+        target = next(
+            stored
+            for stored in reversed(events)
+            if stored.event.type == "model.call.completed"
+        )
+        await _replace_run_event(
+            store,
+            run_id,
+            target.event.type,
+            {"sequence": target.event.sequence + 2_000},
+            last=True,
+        )
+    elif corruption == "current_sequence_out_of_order":
+        completed = next(
+            stored
+            for stored in reversed(events)
+            if stored.event.type == "model.call.completed"
+        )
+        proposed = next(
+            stored
+            for stored in reversed(events)
+            if stored.event.type == "tool.call.proposed"
+        )
+        if isinstance(store, InMemoryStore):
+            completed_index = next(
+                index
+                for index, stored in enumerate(store._events)
+                if stored.cursor == completed.cursor
+            )
+            proposed_index = next(
+                index
+                for index, stored in enumerate(store._events)
+                if stored.cursor == proposed.cursor
+            )
+            store._events[completed_index] = type(completed)(
+                completed.cursor,
+                completed.event.model_copy(
+                    update={"sequence": proposed.event.sequence}
+                ),
+            )
+            store._events[proposed_index] = type(proposed)(
+                proposed.cursor,
+                proposed.event.model_copy(
+                    update={"sequence": completed.event.sequence}
+                ),
+            )
+        else:
+            assert isinstance(store, SQLiteStore)
+            await store._connection.execute(  # type: ignore[attr-defined]
+                "UPDATE events SET sequence = -10000 WHERE cursor = ?",
+                (completed.cursor,),
+            )
+            await store._connection.execute(  # type: ignore[attr-defined]
+                "UPDATE events SET sequence = ? WHERE cursor = ?",
+                (completed.event.sequence, proposed.cursor),
+            )
+            await store._connection.execute(  # type: ignore[attr-defined]
+                "UPDATE events SET sequence = ? WHERE cursor = ?",
+                (proposed.event.sequence, completed.cursor),
+            )
+            await store._connection.commit()  # type: ignore[attr-defined]
+    elif corruption == "current_sequence_duplicate":
+        target = next(
+            stored
+            for stored in reversed(events)
+            if stored.event.type == "tool.call.started"
+        )
+        previous = events[events.index(target) - 1]
+        await _replace_run_event(
+            store,
+            run_id,
+            target.event.type,
+            {"sequence": previous.event.sequence},
+            last=True,
+        )
+    elif corruption == "current_event_id_duplicate":
+        duplicate = events[0].event.event_id
+        await _replace_run_event(
+            store,
+            run_id,
+            "tool.call.started",
+            {"event_id": duplicate},
+            last=True,
+        )
+    elif corruption == "current_model_event_id_duplicate":
+        duplicate = events[0].event.event_id
+        await _replace_run_event(
+            store,
+            run_id,
+            "model.call.completed",
+            {"event_id": duplicate},
+            last=True,
+        )
+    elif corruption == "run_owner_missing":
+        await _replace_run_event(
+            store,
+            run_id,
+            "run.created",
+            {"run_id": f"run_{secret}"},
+        )
+    elif corruption == "session_owner_missing":
+        await _replace_run_event(
+            store,
+            run_id,
+            "run.created",
+            {"session_id": f"ses_{secret}"},
+        )
+    elif corruption == "agent_owner_mismatch":
+        created = events[0].event
+        payload = dict(created.payload)
+        payload["agent_revision"] = secret
+        await _replace_run_event(
+            store,
+            run_id,
+            "run.created",
+            {"payload": payload},
+        )
+    elif corruption == "current_session_owner_mismatch":
+        await _replace_run_event(
+            store,
+            run_id,
+            "tool.call.started",
+            {"session_id": f"ses_{secret}"},
+            last=True,
+        )
+    elif corruption == "current_model_session_owner_mismatch":
+        await _replace_run_event(
+            store,
+            run_id,
+            "model.call.completed",
+            {"session_id": f"ses_{secret}"},
+            last=True,
+        )
+    elif corruption == "current_run_owner_mismatch":
+        await _replace_run_event(
+            store,
+            run_id,
+            "tool.call.started",
+            {"run_id": f"run_{secret}"},
+            last=True,
+        )
+    elif corruption == "current_cursor_duplicate":
+        assert isinstance(store, InMemoryStore)
+        target_index = next(
+            index
+            for index in range(len(store._events) - 1, -1, -1)
+            if store._events[index].event.run_id == run_id
+            and store._events[index].event.type == "tool.call.started"
+        )
+        target = store._events[target_index]
+        store._events[target_index] = type(target)(
+            store._events[target_index - 1].cursor,
+            target.event,
+        )
+    else:
+        raise AssertionError(f"unknown event corruption: {corruption}")
 
 
 async def _final_completion(counter: list[int]) -> AsyncIterator[dict[str, object]]:
@@ -1761,6 +2073,142 @@ async def test_safe_pre_handler_history_allows_certified_current_retry(
         if permission_task is not None and not permission_task.done():
             permission_task.cancel()
             await asyncio.gather(permission_task, return_exceptions=True)
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+_DUAL_BACKEND_ENVELOPE_CORRUPTIONS = (
+    "permission_action_ask",
+    "permission_action_unknown",
+    "permission_request_extra",
+    "permission_decision_extra",
+    "permission_request_malformed",
+    "permission_decision_malformed",
+    "permission_request_mismatch",
+    "permission_scope_invalid",
+    "permission_reason_mismatch",
+    "permission_payload_extra",
+    "historical_sequence_gap",
+    "current_sequence_backward",
+    "current_model_sequence_gap",
+    "current_sequence_out_of_order",
+    "run_owner_missing",
+    "session_owner_missing",
+    "agent_owner_mismatch",
+    "current_session_owner_mismatch",
+    "current_model_session_owner_mismatch",
+    "current_run_owner_mismatch",
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "corruption"),
+    [
+        pytest.param(backend, corruption, id=f"{backend}-{corruption}")
+        for backend in ("memory", "sqlite")
+        for corruption in _DUAL_BACKEND_ENVELOPE_CORRUPTIONS
+    ]
+    + [
+        pytest.param("memory", corruption, id=f"memory-{corruption}")
+        for corruption in (
+            "current_sequence_duplicate",
+            "current_event_id_duplicate",
+            "current_model_event_id_duplicate",
+            "current_cursor_duplicate",
+        )
+    ],
+)
+async def test_malformed_permission_or_event_envelope_never_reaches_external_work(
+    backend: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"forged-envelope-{backend}-{corruption}"
+    path = tmp_path / f"envelope-{backend}-{corruption}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    run_id, spec, tool_spec, _, _ = await _seed_safe_pre_handler_history(
+        store,
+        history="permission_denied",
+        tool_source="mcp/reviewer-envelope",
+    )
+    await _corrupt_certified_tool_evidence(store, run_id, corruption, secret)
+
+    permission_calls = 0
+    handler_calls = 0
+    mcp_calls = 0
+    model_calls: list[int] = []
+
+    async def mcp_transport(value: int) -> int:
+        nonlocal mcp_calls
+        mcp_calls += 1
+        return value
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return await mcp_transport(value)
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+
+    async def resolve_unexpected_permission() -> None:
+        nonlocal permission_calls
+        request = await sdk.permissions.next_request(run_id)
+        permission_calls += 1
+        await sdk.permissions.resolve(
+            request.request_id,
+            PermissionDecision.allow_once(),
+        )
+
+    permission_task = asyncio.create_task(resolve_unexpected_permission())
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required") as caught:
+            await handle.result()
+        assert permission_calls == 0
+        assert handler_calls == 0
+        assert mcp_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        task = handle._task  # type: ignore[attr-defined]
+        assert task is not None
+        task_error = task.exception()
+        assert isinstance(task_error, AgentSDKError)
+        public = repr(caught.value.to_dict()) + repr(task_error.to_dict())
+        assert secret not in public
+        assert all(
+            secret not in repr(frame)
+            for frame in _sdk_traceback_locals(task_error)
+        )
+        reconciliation_events = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert len(reconciliation_events) == 1
+        serialized = json.dumps(
+            reconciliation_events,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        assert secret not in serialized
+        assert len(serialized.encode("utf-8")) < 2_048
+    finally:
+        if not permission_task.done():
+            permission_task.cancel()
+        await asyncio.gather(permission_task, return_exceptions=True)
         await sdk.close()
         if isinstance(store, SQLiteStore):
             await store.close()
