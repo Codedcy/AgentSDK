@@ -79,6 +79,30 @@ from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
 
 _SCANNER_LEASE_TTL = timedelta(seconds=30)
 
+_CERTIFIED_RUN_EVENT_TYPES = frozenset(
+    {
+        "run.created",
+        "run.started",
+        "run.recovery.started",
+        "run.interrupted",
+        "step.started",
+        "step.completed",
+        "model.call.started",
+        "model.text.delta",
+        "model.usage.reported",
+        "model.call.completed",
+        "tool.call.proposed",
+        "permission.requested",
+        "permission.resolved",
+        "tool.call.authorized",
+        "tool.call.started",
+        "tool.call.completed",
+        "model.recovery.query.started",
+        "model.recovery.resend.started",
+        "tool.recovery.retry.started",
+    }
+)
+
 
 @dataclass(frozen=True)
 class RecoveryPlan:
@@ -566,6 +590,9 @@ class RunRecoveryService:
             or any(left >= right for left, right in zip(cursors, cursors[1:]))
             or tuple(event.sequence for event in events)
             != tuple(range(1, len(events) + 1))
+            or any(event.type not in _CERTIFIED_RUN_EVENT_TYPES for event in events)
+            or sum(event.type == "run.created" for event in events) != 1
+            or sum(event.type == "run.started" for event in events) != 1
         ):
             return False
         if any(
@@ -585,6 +612,40 @@ class RunRecoveryService:
             for event in events
         ):
             return False
+        recovery_started = tuple(
+            event for event in events if event.type == "run.recovery.started"
+        )
+        interrupted = tuple(
+            event for event in events if event.type == "run.interrupted"
+        )
+        if (
+            len(interrupted) != len(recovery_started) + 1
+            or any(
+                event.payload != {"status": RunStatus.RUNNING.value}
+                for event in recovery_started
+            )
+            or any(
+                event.payload != {"status": RunStatus.INTERRUPTED.value}
+                for event in interrupted
+            )
+            or any(
+                not RunRecoveryService._is_valid_model_recovery_audit(
+                    event,
+                    evidence.operations,
+                )
+                for event in events
+                if event.type.startswith("model.recovery.")
+            )
+            or any(
+                not RunRecoveryService._is_valid_tool_recovery_audit(
+                    event,
+                    evidence.operations,
+                )
+                for event in events
+                if event.type == "tool.recovery.retry.started"
+            )
+        ):
+            return False
         created = RunSnapshot(
             run_id=run.run_id,
             session_id=run.session_id,
@@ -601,6 +662,125 @@ class RunRecoveryService:
         return (
             events[0].type == "run.created"
             and events[0].payload == created.model_dump(mode="json")
+            and events[1].type == "run.started"
+            and events[1].payload == {"status": RunStatus.RUNNING.value}
+        )
+
+    @staticmethod
+    def _is_valid_model_recovery_audit(
+        event: EventEnvelope,
+        operations: tuple[ExternalOperation, ...],
+    ) -> bool:
+        action = event.type.removeprefix("model.recovery.").removesuffix(".started")
+        payload = event.payload
+        if action not in {"query", "resend"} or set(payload) != {
+            "adapter_id",
+            "adapter_version",
+            "operation_id",
+            "action",
+        }:
+            return False
+        operation = next(
+            (
+                item
+                for item in operations
+                if isinstance(item, ModelCallOperation)
+                and item.operation_id == payload["operation_id"]
+            ),
+            None,
+        )
+        if operation is None:
+            return False
+        metadata = operation.recovery_metadata
+        capability = (
+            "authoritative_status" if action == "query" else "same_operation_id_resend"
+        )
+        return (
+            payload["action"] == action
+            and payload["adapter_id"] == metadata.get("adapter_id")
+            and payload["adapter_version"] == metadata.get("adapter_version")
+            and metadata.get(capability) is True
+        )
+
+    @staticmethod
+    def _is_valid_tool_recovery_audit(
+        event: EventEnvelope,
+        operations: tuple[ExternalOperation, ...],
+    ) -> bool:
+        payload = event.payload
+        if set(payload) != {"operation", "call", "tool", "retry_class"}:
+            return False
+        return (
+            RunRecoveryService._is_hashed_identity(payload["call"])
+            and RunRecoveryService._is_hashed_identity(payload["tool"])
+            and any(
+                isinstance(operation, ToolCallOperation)
+                and payload["operation"] == hashed_identity(operation.operation_id)
+                and payload["retry_class"]
+                == operation.recovery_metadata.get("retry_class")
+                for operation in operations
+            )
+        )
+
+    @staticmethod
+    def _is_valid_certified_provider_history(
+        evidence: _RecoveryEvidence,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if checkpoint is None or descriptor is None:
+            return False
+        events = evidence.run_events
+        model_operations = tuple(
+            operation
+            for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
+        )
+        tool_operations = tuple(
+            operation
+            for operation in evidence.operations
+            if isinstance(operation, ToolCallOperation)
+        )
+        if tuple(sorted(operation.turn for operation in model_operations)) != tuple(
+            range(checkpoint.turn + 1)
+        ):
+            return False
+        expected_counts = {
+            "step.started": len(model_operations),
+            "model.call.started": len(model_operations),
+            "model.call.completed": sum(
+                operation.status is ExternalOperationStatus.COMPLETED
+                for operation in model_operations
+            ),
+            "tool.call.proposed": len(checkpoint.tool_results),
+            "tool.call.authorized": len(tool_operations),
+            "tool.call.started": len(tool_operations),
+            "tool.call.completed": len(checkpoint.tool_results),
+            "step.completed": checkpoint.turn,
+        }
+        if any(
+            sum(event.type == event_type for event in events) != expected
+            for event_type, expected in expected_counts.items()
+        ):
+            return False
+        if (
+            any(event.payload != {} for event in events if event.type == "step.started")
+            or any(
+                event.payload != {"model": descriptor.agent.model}
+                for event in events
+                if event.type == "model.call.started"
+            )
+            or sum(event.type == "permission.requested" for event in events)
+            != sum(event.type == "permission.resolved" for event in events)
+        ):
+            return False
+        last_interrupted = max(
+            index for index, event in enumerate(events) if event.type == "run.interrupted"
+        )
+        return all(
+            event.type
+            in {"model.recovery.query.started", "model.recovery.resend.started"}
+            for event in events[last_interrupted + 1 :]
         )
 
     async def _validated_request(
@@ -953,6 +1133,7 @@ class RunRecoveryService:
         checkpoint = evidence.checkpoint
         if (
             not self._is_valid_run_event_envelope(evidence)
+            or not self._is_valid_certified_provider_history(evidence)
             or checkpoint is None
             or evidence.pending
             or operation.provider_identity != base_request.model

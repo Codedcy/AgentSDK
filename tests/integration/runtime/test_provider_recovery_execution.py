@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -295,6 +296,97 @@ async def _seed_model_in_flight(
     return spec, running.run_id, operation_id, request
 
 
+async def _insert_provider_run_event(
+    store: Any,
+    run_id: str,
+    *,
+    anchor_type: str,
+    after: bool,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    all_events = await store.read_events(after_cursor=0)
+    anchor = next(
+        stored
+        for stored in all_events
+        if stored.event.run_id == run_id and stored.event.type == anchor_type
+    )
+    cursor = anchor.cursor + (1 if after else 0)
+    sequence = anchor.event.sequence + (1 if after else 0)
+    inserted = EventEnvelope.new(
+        type=event_type,
+        session_id=anchor.event.session_id,
+        run_id=run_id,
+        sequence=sequence,
+        payload=payload,
+    )
+    if isinstance(store, InMemoryStore):
+        shifted = []
+        for stored in store._events:
+            event = stored.event
+            if event.run_id == run_id and event.sequence >= sequence:
+                event = event.model_copy(update={"sequence": event.sequence + 1})
+            shifted.append(
+                type(stored)(
+                    stored.cursor + (stored.cursor >= cursor),
+                    event,
+                )
+            )
+        shifted.append(type(anchor)(cursor, inserted))
+        store._events = sorted(shifted, key=lambda stored: stored.cursor)
+        store._last_cursor += 1
+        return
+    assert isinstance(store, SQLiteStore)
+    offset = (await store.latest_cursor()) + 10_000
+    await store._connection.execute(
+        "UPDATE events SET cursor = cursor + ? WHERE cursor >= ?",
+        (offset, cursor),
+    )
+    await store._connection.execute(
+        "UPDATE events SET cursor = cursor - ? + 1 WHERE cursor >= ?",
+        (offset, cursor + offset),
+    )
+    await store._connection.execute(
+        "UPDATE events SET sequence = sequence + ? WHERE run_id = ? AND sequence >= ?",
+        (offset, run_id, sequence),
+    )
+    await store._connection.execute(
+        "UPDATE events SET sequence = sequence - ? + 1 "
+        "WHERE run_id = ? AND sequence >= ?",
+        (offset, run_id, sequence + offset),
+    )
+    await store._connection.execute(
+        """
+        INSERT INTO events(
+            cursor, event_id, session_id, run_id, sequence, type,
+            schema_version, occurred_at, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cursor,
+            inserted.event_id,
+            inserted.session_id,
+            inserted.run_id,
+            inserted.sequence,
+            inserted.type,
+            inserted.schema_version,
+            inserted.occurred_at.isoformat(),
+            json.dumps(
+                inserted.payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    )
+    await store._connection.execute(
+        "UPDATE sqlite_sequence SET seq = (SELECT MAX(cursor) FROM events) "
+        "WHERE name = 'events'"
+    )
+    await store._connection.commit()
+
+
 def _adapter(
     query: _AdapterCallable | None,
     resend: _AdapterCallable | None,
@@ -329,6 +421,198 @@ async def _sdk(
     sdk.agents.define(spec)
     sdk.recovery.register_adapter(adapter)
     return sdk
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("position", ["before_interrupt", "after_interrupt"])
+async def test_duplicate_run_created_never_reaches_certified_provider_work(
+    backend: str,
+    position: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"duplicate-provider-created-{backend}-{position}"
+    path = tmp_path / f"duplicate-provider-created-{backend}-{position}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    metadata = {
+        "adapter_id": "application.adapter",
+        "adapter_version": "1",
+        "authoritative_status": True,
+        "same_operation_id_resend": True,
+    }
+    spec, run_id, _operation_id, _request = await _seed_model_in_flight(
+        store,
+        metadata=metadata,
+    )
+    created = next(
+        stored.event
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id and stored.event.type == "run.created"
+    )
+    payload = dict(created.payload)
+    payload["agent_revision"] = secret
+    await _insert_provider_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=position == "after_interrupt",
+        event_type="run.created",
+        payload=payload,
+    )
+
+    permission_calls = 0
+    handler_calls = 0
+    mcp_calls = 0
+    litellm_calls = 0
+    query_calls = 0
+    resend_calls = 0
+
+    async def completion(**_: object) -> Any:
+        nonlocal litellm_calls
+        litellm_calls += 1
+        raise AssertionError("duplicate creation reached LiteLLM")
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text="must-not-complete",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError("duplicate creation reached provider resend")
+
+    sdk = await _sdk(
+        store,
+        spec,
+        _adapter(query, resend),
+        acompletion=completion,
+    )
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert permission_calls == 0
+        assert handler_calls == 0
+        assert mcp_calls == 0
+        assert litellm_calls == 0
+        assert query_calls == 0
+        assert resend_calls == 0
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        reconciliation = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert len(reconciliation) == 1
+        assert secret not in repr(reconciliation)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("corruption", "event_type", "payload", "after_interrupt"),
+    [
+        ("unknown", "application.lifecycle.note", {"secret": "unknown"}, False),
+        ("run_started", "run.started", {"status": "running"}, False),
+        (
+            "model_started",
+            "model.call.started",
+            {"model": "provider/model"},
+            False,
+        ),
+        (
+            "run_interrupted",
+            "run.interrupted",
+            {"status": "interrupted"},
+            True,
+        ),
+        (
+            "malformed_audit",
+            "model.recovery.query.started",
+            {"secret": "malformed-audit"},
+            True,
+        ),
+    ],
+)
+async def test_unknown_or_duplicate_provider_lifecycle_event_is_not_certified(
+    corruption: str,
+    event_type: str,
+    payload: dict[str, Any],
+    after_interrupt: bool,
+) -> None:
+    store = InMemoryStore()
+    spec, run_id, _operation_id, _request = await _seed_model_in_flight(store)
+    await _insert_provider_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=after_interrupt,
+        event_type=event_type,
+        payload=payload,
+    )
+
+    litellm_calls = 0
+    query_calls = 0
+    resend_calls = 0
+
+    async def completion(**_: object) -> Any:
+        nonlocal litellm_calls
+        litellm_calls += 1
+        raise AssertionError(f"{corruption} reached LiteLLM")
+
+    async def query(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        return ProviderRecoveryResult(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text="must-not-complete",
+            usage=TokenUsage(total_tokens=1),
+        )
+
+    async def resend(_: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError(f"{corruption} reached provider resend")
+
+    sdk = await _sdk(
+        store,
+        spec,
+        _adapter(query, resend),
+        acompletion=completion,
+    )
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert (litellm_calls, query_calls, resend_calls) == (0, 0, 0)
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        reconciliation = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert len(reconciliation) == 1
+        assert "secret" not in repr(reconciliation)
+    finally:
+        await sdk.close()
 
 
 @pytest.mark.asyncio

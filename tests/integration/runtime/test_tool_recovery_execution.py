@@ -490,6 +490,97 @@ async def _replace_run_event(
     await store._connection.commit()  # type: ignore[attr-defined]
 
 
+async def _insert_run_event(
+    store: StateStore,
+    run_id: str,
+    *,
+    anchor_type: str,
+    after: bool,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    all_events = await store.read_events(after_cursor=0)
+    anchor = next(
+        stored
+        for stored in all_events
+        if stored.event.run_id == run_id and stored.event.type == anchor_type
+    )
+    cursor = anchor.cursor + (1 if after else 0)
+    sequence = anchor.event.sequence + (1 if after else 0)
+    inserted = EventEnvelope.new(
+        type=event_type,
+        session_id=anchor.event.session_id,
+        run_id=run_id,
+        sequence=sequence,
+        payload=payload,
+    )
+    if isinstance(store, InMemoryStore):
+        shifted = []
+        for stored in store._events:
+            event = stored.event
+            if event.run_id == run_id and event.sequence >= sequence:
+                event = event.model_copy(update={"sequence": event.sequence + 1})
+            shifted.append(
+                type(stored)(
+                    stored.cursor + (stored.cursor >= cursor),
+                    event,
+                )
+            )
+        shifted.append(type(anchor)(cursor, inserted))
+        store._events = sorted(shifted, key=lambda stored: stored.cursor)
+        store._last_cursor += 1
+        return
+    assert isinstance(store, SQLiteStore)
+    offset = (await store.latest_cursor()) + 10_000
+    await store._connection.execute(  # type: ignore[attr-defined]
+        "UPDATE events SET cursor = cursor + ? WHERE cursor >= ?",
+        (offset, cursor),
+    )
+    await store._connection.execute(  # type: ignore[attr-defined]
+        "UPDATE events SET cursor = cursor - ? + 1 WHERE cursor >= ?",
+        (offset, cursor + offset),
+    )
+    await store._connection.execute(  # type: ignore[attr-defined]
+        "UPDATE events SET sequence = sequence + ? WHERE run_id = ? AND sequence >= ?",
+        (offset, run_id, sequence),
+    )
+    await store._connection.execute(  # type: ignore[attr-defined]
+        "UPDATE events SET sequence = sequence - ? + 1 "
+        "WHERE run_id = ? AND sequence >= ?",
+        (offset, run_id, sequence + offset),
+    )
+    await store._connection.execute(  # type: ignore[attr-defined]
+        """
+        INSERT INTO events(
+            cursor, event_id, session_id, run_id, sequence, type,
+            schema_version, occurred_at, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            cursor,
+            inserted.event_id,
+            inserted.session_id,
+            inserted.run_id,
+            inserted.sequence,
+            inserted.type,
+            inserted.schema_version,
+            inserted.occurred_at.isoformat(),
+            json.dumps(
+                inserted.payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        ),
+    )
+    await store._connection.execute(  # type: ignore[attr-defined]
+        "UPDATE sqlite_sequence SET seq = (SELECT MAX(cursor) FROM events) "
+        "WHERE name = 'events'"
+    )
+    await store._connection.commit()  # type: ignore[attr-defined]
+
+
 async def _corrupt_certified_tool_evidence(
     store: StateStore,
     run_id: str,
@@ -2076,6 +2167,196 @@ async def test_safe_pre_handler_history_allows_certified_current_retry(
         await sdk.close()
         if isinstance(store, SQLiteStore):
             await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize("position", ["before_interrupt", "after_interrupt"])
+async def test_duplicate_run_created_never_reaches_certified_tool_work(
+    backend: str,
+    position: str,
+    tmp_path: Path,
+) -> None:
+    secret = f"duplicate-tool-created-{backend}-{position}"
+    path = tmp_path / f"duplicate-tool-created-{backend}-{position}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+        tool_source="mcp/duplicate-created",
+    )
+    created = next(
+        stored.event
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id and stored.event.type == "run.created"
+    )
+    payload = dict(created.payload)
+    payload["agent_revision"] = secret
+    await _insert_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=position == "after_interrupt",
+        event_type="run.created",
+        payload=payload,
+    )
+
+    permission_calls = 0
+    handler_calls = 0
+    mcp_calls = 0
+    model_calls: list[int] = []
+
+    async def mcp_transport(value: int) -> int:
+        nonlocal mcp_calls
+        mcp_calls += 1
+        return value
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return await mcp_transport(value)
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+
+    async def resolve_unexpected_permission() -> None:
+        nonlocal permission_calls
+        request = await sdk.permissions.next_request(run_id)
+        permission_calls += 1
+        await sdk.permissions.resolve(
+            request.request_id,
+            PermissionDecision.allow_once(),
+        )
+
+    permission_task = asyncio.create_task(resolve_unexpected_permission())
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert permission_calls == 0
+        assert handler_calls == 0
+        assert mcp_calls == 0
+        assert model_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        reconciliation = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert len(reconciliation) == 1
+        assert secret not in repr(reconciliation)
+    finally:
+        if not permission_task.done():
+            permission_task.cancel()
+        await asyncio.gather(permission_task, return_exceptions=True)
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("corruption", "event_type", "payload", "after_interrupt"),
+    [
+        ("unknown", "application.lifecycle.note", {"secret": "unknown"}, False),
+        ("run_started", "run.started", {"status": "running"}, False),
+        (
+            "model_started",
+            "model.call.started",
+            {"model": "fake/tool-recovery"},
+            False,
+        ),
+        (
+            "tool_started",
+            "tool.call.started",
+            {"call_id": "call_recovery", "tool_name": "recoverable"},
+            False,
+        ),
+        (
+            "run_interrupted",
+            "run.interrupted",
+            {"status": "interrupted"},
+            True,
+        ),
+        (
+            "malformed_audit",
+            "tool.recovery.retry.started",
+            {"secret": "malformed-audit"},
+            True,
+        ),
+    ],
+)
+async def test_unknown_or_duplicate_tool_lifecycle_event_is_not_certified(
+    corruption: str,
+    event_type: str,
+    payload: dict[str, Any],
+    after_interrupt: bool,
+) -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _operation_id = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        tool_source="mcp/lifecycle-corruption",
+    )
+    await _insert_run_event(
+        store,
+        run_id,
+        anchor_type="run.interrupted",
+        after=after_interrupt,
+        event_type=event_type,
+        payload=payload,
+    )
+
+    handler_calls = 0
+    mcp_calls = 0
+    model_calls: list[int] = []
+
+    async def mcp_transport(value: int) -> int:
+        nonlocal mcp_calls
+        mcp_calls += 1
+        return value
+
+    async def handler(_: ToolContext, value: int) -> int:
+        nonlocal handler_calls
+        handler_calls += 1
+        return await mcp_transport(value)
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await handle.result()
+        assert (handler_calls, mcp_calls, model_calls) == (0, 0, [])
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "tool_call_unknown_outcome"
+        reconciliation = [
+            stored.event.model_dump(mode="json")
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        ]
+        assert len(reconciliation) == 1
+        assert "secret" not in repr(reconciliation)
+    finally:
+        await sdk.close()
 
 
 _DUAL_BACKEND_ENVELOPE_CORRUPTIONS = (

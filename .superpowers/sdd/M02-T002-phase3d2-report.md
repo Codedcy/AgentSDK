@@ -2,7 +2,7 @@
 
 ## Outcome
 
-THIRD REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
+FOURTH REVIEW FIX COMPLETE; PENDING FRESH INDEPENDENT RE-REVIEW. Phase 3D2 adds an
 application-owned Tool retry certification boundary. `ToolRetryPolicy.NEVER`
 remains the conservative default and is omitted from canonical ToolSpec JSON,
 so the pre-3D2 JSON shape and capability hash remain unchanged. Only exact
@@ -33,6 +33,18 @@ action other than `allow` was treated as denial. The final Important finding
 now has exact Memory/SQLite reviewer REDs, a forty-four-case malformed
 permission/envelope matrix, and final-code fixes. Valid provider recovery
 behavior is unchanged.
+
+The fourth independent review again confirmed every prior finding closed and
+reported Spec/Quality C0/I1/M0. A second `run.created` with a unique id,
+continuous sequence, and changed ownership payload could be inserted before
+the Tool interrupt or anywhere in the Provider history because envelope
+admission authenticated only index zero. That allowed the duplicate lifecycle
+record to be ignored while certified external work proceeded. The final
+Important finding now has exact Tool/Provider x Memory/SQLite RED coverage at
+both sides of the interrupt, an expanded duplicate/unknown lifecycle grammar
+matrix, and final-code closed-world admission. Valid repeated recovery audits,
+permission cancellation histories, and Provider recovery behavior remain
+accepted.
 
 ## Implemented contract
 
@@ -66,6 +78,17 @@ behavior is unchanged.
   including agent ownership and execution descriptor. Global cursors are not
   required to be contiguous because unrelated events and deletion leave valid
   holes.
+- Certified recovery treats the SDK Run lifecycle grammar as closed-world.
+  There is exactly one `run.created` at index zero and one exact `run.started`
+  at index one; unknown application events cannot be smuggled into the
+  authoritative Run history because the public SDK exposes no custom Run-event
+  registration or emission surface. Interrupt and recovery-start counts and
+  payloads must form a complete lifecycle, Provider Model/Tool/step counts must
+  match durable operations and the checkpoint, and every recovery audit must
+  reference a compatible durable operation with its exact action/capability
+  metadata. Repeated query/resend or Tool retry audits remain valid when they
+  are complete audit attempts rather than being rejected by a naive global
+  duplicate count.
 - Historical permission evidence is reconstructed through strict
   `PermissionRequest` and `PermissionDecision` validation with canonical exact
   round trips and forbidden extras. Requested/resolved requests must match;
@@ -181,6 +204,18 @@ Production changes followed observable failing tests:
     cursor, event-id, Run/Session/agent ownership, and historical/current
     Tool/Model critical-event mutations; all perform zero external work and
     atomically create exactly one bounded reconciliation request.
+15. Fourth-review exact RED inserted a second syntactically valid
+    `run.created`, with a different agent revision, before and after the
+    interrupt across Tool/Provider and Memory/SQLite. Six of eight cases
+    reached certified work; Tool's existing strict post-interrupt tail already
+    rejected the other two. Exact singleton/position/payload admission made all
+    eight green with zero permission, handler, MCP, LiteLLM, query, or resend
+    calls and exactly one reconciliation. An additional eleven-case Tool and
+    Provider matrix rejects unknown Run events, duplicate start/model/tool/
+    interrupt events, and malformed recovery audits. Provider lifecycle counts
+    and audit-to-operation checks were added after three new RED cases proved
+    that a known duplicate or malformed audit could otherwise bypass the
+    simple type allow-list.
 
 No tests were weakened or skipped. Fake barriers and Store fault injection were
 used for concurrency, cancellation, CAS, precommit, ambiguous commit, and lease
@@ -204,7 +239,13 @@ Python 3.13.
 - Session/Run/Tool/MCP/permission/Workflow/child compatibility:
   `150 passed in 7.91s`, plus ownership `87 passed in 5.68s` = 237.
 - Full Python 3.13 pytest on the final tree:
-  `1464 passed in 116.21s`; zero skipped.
+  `1483 passed in 115.28s`; zero skipped.
+- Exact duplicate creation matrix: `8 passed`; expanded duplicate/unknown
+  lifecycle matrix with the exact cases: `19 passed`.
+- Complete Tool recovery file: `126 passed in 12.13s`.
+- Complete Provider recovery file: `45 passed in 5.70s`.
+- Expanded Provider/Store/RecoveryAPI neighbor gate (strict superset of the
+  prior 195-case gate): `246 passed in 70.14s`.
 - Ruff: `All checks passed!`.
 - Mypy: `Success: no issues found in 75 source files`.
 - Public import/default canonical smoke: passed.
@@ -221,7 +262,9 @@ mutation, post-audit missing plus seven registration replacements, allow/ask
 allow/ask deny/cancel, normalized handler exception/non-JSON result/timeout,
 Memory/SQLite close-reopen historical permission-deny/invalid-arguments/
 missing-Tool safe rejections, four no-operation ToolResult/permission forgery
-cases, forty-four strict permission and complete Run-envelope corruptions, the
+cases, forty-four strict permission and complete Run-envelope corruptions,
+eight exact duplicate-creation cases, eleven duplicate/unknown lifecycle
+grammar cases, the
 final handler-preflight lease barrier,
 handler and SDK-close cancellation, repeated cancellation, 20 same-SDK callers,
 two SDK instances, audit and Tool-outcome precommit/ambiguous replay, Run CAS,
