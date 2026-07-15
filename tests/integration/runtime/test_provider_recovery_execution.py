@@ -657,6 +657,133 @@ async def test_nonterminal_invalid_or_failed_adapter_result_reconciles_once(
 
 
 @pytest.mark.asyncio
+async def test_constructed_invalid_exact_result_is_sanitized_and_reconciled() -> None:
+    secret = "constructed-provider-result-secret-7ac1"
+    store = InMemoryStore()
+    spec, run_id, operation_id, _request = await _seed_model_in_flight(
+        store,
+        metadata={
+            "adapter_id": "application.adapter",
+            "adapter_version": "1",
+            "authoritative_status": True,
+            "same_operation_id_resend": True,
+        },
+    )
+    model_calls = 0
+    query_calls = 0
+    resend_calls = 0
+
+    async def acompletion(**kwargs: Any) -> Any:
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError(f"unexpected LiteLLM call: {kwargs}")
+
+    async def query(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal query_calls
+        query_calls += 1
+        assert request.operation_id == operation_id
+        return ProviderRecoveryResult.model_construct(
+            disposition=ProviderRecoveryDisposition.COMPLETED,
+            finish_reason="stop",
+            text=secret,
+            usage=None,
+        )
+
+    async def resend(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
+        nonlocal resend_calls
+        resend_calls += 1
+        raise AssertionError(f"unexpected resend: {request.operation_id}")
+
+    sdk = await _sdk(
+        store,
+        spec,
+        _adapter(query, resend),
+        acompletion=acompletion,
+    )
+    handle = await sdk.recovery.recover_run(run_id)
+    try:
+        with pytest.raises(AgentSDKError) as caught:
+            await handle.result()
+        pending = await sdk.recovery.pending_requests(run_id)
+        operation = await store.get_external_operation(operation_id)
+        run = RunSnapshot.model_validate(await store.get_snapshot("run", run_id))
+        recovery_events = [
+            item.event
+            for item in await store.read_events(after_cursor=0)
+            if item.event.run_id == run_id
+            and (
+                item.event.type.startswith("model.recovery.")
+                or item.event.type == "reconciliation.requested"
+            )
+        ]
+        task = handle._task
+        assert task is not None
+        assert task.done()
+        task_error = task.exception()
+        assert isinstance(task_error, AgentSDKError)
+
+        expected_error = {
+            "code": "conflict",
+            "message": "recovery required",
+            "retryable": True,
+        }
+        assert caught.value.to_dict() == expected_error
+        assert task_error.to_dict() == expected_error
+        for error in (caught.value, task_error):
+            frames = _sdk_traceback_locals(error)
+            assert frames
+            assert all(secret not in repr(frame) for frame in frames)
+            assert secret not in repr(error.to_dict())
+            assert error.__cause__ is None
+            assert error.__context__ is None
+
+        assert model_calls == 0
+        assert query_calls == 1
+        assert resend_calls == 0
+        assert len(pending) == 1
+        assert pending[0].operation_id == operation_id
+        assert pending[0].details == {
+            "action": "query",
+            "disposition": "invalid",
+            "error_category": "invalid_result",
+        }
+        assert operation is not None
+        assert operation.status is ExternalOperationStatus.STARTED
+        assert operation.lease_generation == 2
+        assert run.status is RunStatus.WAITING_RECONCILIATION
+        assert [event.type for event in recovery_events] == [
+            "model.recovery.query.started",
+            "reconciliation.requested",
+        ]
+        assert set(recovery_events[0].payload) == {
+            "adapter_id",
+            "adapter_version",
+            "operation_id",
+            "action",
+        }
+        assert set(recovery_events[1].payload) == {
+            "request_id",
+            "operation_id",
+            "reason",
+        }
+        assert secret not in repr(
+            [event.model_dump(mode="json") for event in recovery_events]
+        )
+    finally:
+        await sdk.close()
+
+    assert sdk._active_tasks == set()
+    assert not any(
+        task is not asyncio.current_task()
+        and (
+            "_coordinate_provider_recovery" in repr(task.get_coro())
+            or "constructed_invalid_exact_result" in repr(task.get_coro())
+        )
+        for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
 async def test_injected_real_timeout_cancels_adapter_task_and_reconciles() -> None:
     store = InMemoryStore()
     spec, run_id, operation_id, _request = await _seed_model_in_flight(

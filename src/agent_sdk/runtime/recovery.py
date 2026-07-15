@@ -1207,6 +1207,7 @@ class RunRecoveryService:
     ) -> tuple[ProviderRecoveryResult | None, str | None]:
         callback = adapter.query_status if action == "query" else adapter.resend
         assert callback is not None
+        awaitable: Awaitable[ProviderRecoveryResult] | None = None
         value: object | None = None
         failed = False
         task: asyncio.Future[ProviderRecoveryResult] | None = None
@@ -1219,7 +1220,7 @@ class RunRecoveryService:
             if task is not None:
                 task.cancel()
                 await _settle_task(task)
-            del callback, request, adapter, value, task
+            del callback, request, adapter, awaitable, value, task
             raise cancellation from None
         except TimeoutError:
             if task is not None:
@@ -1233,22 +1234,28 @@ class RunRecoveryService:
             failed = True
             error_category = "adapter_failure"
         if failed:
-            del callback, request, adapter, value, task
+            del callback, request, adapter, awaitable, value, task
             return None, error_category
-        if type(value) is not ProviderRecoveryResult:
-            del callback, request, adapter, value, task
+        result: ProviderRecoveryResult | None = None
+        detached: ProviderRecoveryResult | None = None
+        try:
+            if type(value) is not ProviderRecoveryResult:
+                raise ValueError("provider recovery result is invalid")
+            result = value
+            detached = ProviderRecoveryResult(
+                disposition=result.disposition,
+                finish_reason=result.finish_reason,
+                text=result.text,
+                tool_call=result.tool_call,
+                usage=result.usage,
+                error_code=result.error_code,
+                retryable=result.retryable,
+            )
+        except Exception:
+            del callback, request, adapter, awaitable, value, result, detached, task
             return None, "invalid_result"
-        result = value
-        detached = ProviderRecoveryResult(
-            disposition=result.disposition,
-            finish_reason=result.finish_reason,
-            text=result.text,
-            tool_call=result.tool_call,
-            usage=result.usage,
-            error_code=result.error_code,
-            retryable=result.retryable,
-        )
-        del callback, request, adapter, result, value, task
+        assert detached is not None
+        del callback, request, adapter, awaitable, result, value, task
         return detached, None
 
     async def _request_reconciliation_owned(

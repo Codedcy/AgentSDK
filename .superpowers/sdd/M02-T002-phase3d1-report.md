@@ -2,7 +2,8 @@
 
 ## Outcome
 
-PASS. Phase 3D1 adds application-certified provider recovery for an exact
+IMPLEMENTED; NOT APPROVED PENDING FRESH RE-REVIEW. Phase 3D1 adds
+application-certified provider recovery for an exact
 durable Model operation. Normal Model execution still routes only through
 LiteLLM. Recovery calls an application-registered adapter only when the
 operation's pre-call adapter stamp, current registry entry, reconstructed
@@ -79,7 +80,7 @@ precommit and ambiguous commit; lease loss and takeover; Session delete; caller
 cancellation; SDK close during query and resend; exact crash retry; and
 secret/traceback/task-retention checks.
 
-## Fresh final-code gates
+## Initial implementation gates
 
 All commands used
 `C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` with
@@ -103,6 +104,49 @@ Python 3.13.
 - Public import smoke: all four public provider recovery types import from
   `agent_sdk` and appear in `agent_sdk.__all__`.
 - `git diff --check`: exit 0; only Windows LF-to-CRLF informational warnings.
+
+## Initial review finding and fix
+
+The initial independent review returned Not Approved for both Spec and Quality
+at C1/I0/M0. Its sole finding was that an adapter could bypass Pydantic
+validation with `ProviderRecoveryResult.model_construct`. The exact-type check
+accepted that object, but the subsequent strict detached reconstruction occurred
+outside the invalid-result cleanup boundary. Its `ValidationError` therefore
+escaped after the query audit and operation re-fence, created no reconciliation
+request, and retained arbitrary result text in the coordinator task traceback.
+
+Strict review-fix TDD reproduced the defect first: the new exact-type forged
+result test failed because the retained handle task exception was the raw
+Pydantic validation error. The minimal fix moved exact-type checking and all
+strict result reconstruction into one `invalid_result` exception boundary. On
+failure it deletes callback, request, adapter, awaitable, raw value, result,
+detached result, and task references before returning the existing bounded
+invalid-result category. No other recovery decision changed.
+
+Fresh review-fix gates on Python 3.13:
+
+- Forged exact-type regression: `1 passed in 2.98s`.
+- Invalid-result/timeout/secret neighborhood: `9 passed in 3.12s`.
+- Phase 3D1 focused/fault/e2e plus Store re-fence:
+  `183 passed in 7.61s`.
+- Phase 3C2 focused: `89 passed in 67.15s`.
+- Phase 3C1 scanner/admission: `115 passed in 8.20s`.
+- Phase 3B live progress: `38 passed in 3.46s`.
+- Phase 3A Run-progress transaction: `123 passed in 6.72s`.
+- Phase 2 recovery models/records/SQLite validation:
+  `139 passed in 7.60s`.
+- Phase 1 + M02-T001 regressions: `188 passed in 13.49s`.
+- Session/Run/Tool/MCP/permission/Workflow/child compatibility:
+  `225 passed in 9.29s`, plus Run/Session ownership
+  `39 passed in 5.20s`.
+- Full Python 3.13 pytest: `1338 passed in 107.80s`; zero skipped.
+- Ruff: `All checks passed!`.
+- Mypy: `Success: no issues found in 74 source files`.
+- Public imports: 4/4; forbidden-scope diff clean; SQLite schema remains v3;
+  `git diff --check` clean apart from Windows line-ending information.
+
+This report records the fix and gate evidence only. It does not self-approve the
+review; fresh independent Spec and Quality approval at C0/I0 remains required.
 
 ## Scope audit
 
