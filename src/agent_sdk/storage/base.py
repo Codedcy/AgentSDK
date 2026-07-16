@@ -259,6 +259,10 @@ class StateStore(Protocol):
         self, request_id: str
     ) -> ReconciliationRequest | None: ...
 
+    async def list_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]: ...
+
     async def list_pending_reconciliation_requests(
         self, run_id: str
     ) -> tuple[ReconciliationRequest, ...]: ...

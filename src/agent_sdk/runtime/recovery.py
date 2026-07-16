@@ -413,6 +413,7 @@ class RunRecoveryService:
         evidence: Mapping[str, Any],
     ) -> ReconciliationRequest:
         public_error: tuple[ErrorCode, str, bool] | None = None
+        cancelled = False
         try:
             return await self._resolve_private(
                 request_id,
@@ -421,8 +422,7 @@ class RunRecoveryService:
                 evidence=evidence,
             )
         except asyncio.CancelledError:
-            del self, request_id, action, actor, evidence
-            raise
+            cancelled = True
         except AgentSDKError as error:
             public_error = (error.code, error.message, error.retryable)
         except Exception:
@@ -432,6 +432,8 @@ class RunRecoveryService:
                 False,
             )
         del self, request_id, action, actor, evidence
+        if cancelled:
+            raise asyncio.CancelledError from None
         assert public_error is not None
         raise AgentSDKError(
             public_error[0],
@@ -584,7 +586,8 @@ class RunRecoveryService:
             ):
                 raise RecoveryStateConflictError
             effective_evidence = self._effective_resolved_evidence(
-                recovery_evidence
+                recovery_evidence,
+                base_request,
             )
             if effective_evidence is None:
                 raise RecoveryStateConflictError
@@ -764,12 +767,20 @@ class RunRecoveryService:
         )
         run = await self._load_run(request.run_id)
         recovery_evidence = await self._load_evidence(run)
+        base_request = await self._validated_request(recovery_evidence)
         matching = tuple(
             item
             for item in recovery_evidence.reconciliations
             if item.request_id == request.request_id
         )
-        effective = self._effective_resolved_evidence(recovery_evidence)
+        effective = (
+            None
+            if base_request is None
+            else self._effective_resolved_evidence(
+                recovery_evidence,
+                base_request,
+            )
+        )
         resolution = request.resolution
         operation = next(
             (
@@ -1055,7 +1066,12 @@ class RunRecoveryService:
             raise self._state_error() from None
         checkpoint = await self._store.get_run_checkpoint(run.run_id)
         operations = await self._store.list_external_operations(run.run_id)
-        pending = await self._store.list_pending_reconciliation_requests(run.run_id)
+        reconciliations = await self._store.list_reconciliation_requests(run.run_id)
+        pending = tuple(
+            request
+            for request in reconciliations
+            if request.status is ReconciliationStatus.PENDING
+        )
         up_to_cursor = await self._store.latest_cursor()
         events = await self._store.read_events(
             after_cursor=0,
@@ -1064,21 +1080,6 @@ class RunRecoveryService:
         run_records = tuple(
             stored for stored in events if stored.event.run_id == run.run_id
         )
-        request_ids = {
-            request.request_id for request in pending
-        } | {
-            str(stored.event.payload.get("request_id"))
-            for stored in run_records
-            if stored.event.type
-            in {"reconciliation.requested", "reconciliation.resolved"}
-            and isinstance(stored.event.payload.get("request_id"), str)
-        }
-        reconciliations: list[ReconciliationRequest] = []
-        for request_id in sorted(request_ids):
-            request = await self._store.get_reconciliation_request(request_id)
-            if request is None:
-                raise self._state_error() from None
-            reconciliations.append(request)
         event_ids = tuple(stored.event.event_id for stored in events)
         return _RecoveryEvidence(
             run=run,
@@ -1086,7 +1087,7 @@ class RunRecoveryService:
             checkpoint=checkpoint,
             operations=operations,
             pending=pending,
-            reconciliations=tuple(reconciliations),
+            reconciliations=reconciliations,
             run_events=tuple(stored.event for stored in run_records),
             run_event_cursors=tuple(stored.cursor for stored in run_records),
             run_event_ids_unique=len(event_ids) == len(set(event_ids)),
@@ -2147,6 +2148,7 @@ class RunRecoveryService:
     @staticmethod
     def _effective_resolved_evidence(
         evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
     ) -> _RecoveryEvidence | None:
         resolved = tuple(
             request
@@ -2255,6 +2257,14 @@ class RunRecoveryService:
             if not starts:
                 return None
             attempt_start = starts[-1]
+            if not RunRecoveryService._is_exact_resolved_attempt(
+                evidence,
+                base_request,
+                request,
+                operation,
+                attempt_start=attempt_start,
+            ):
+                return None
             removed_event_indexes.update(range(attempt_start, interrupt_index))
             removed_event_indexes.update(requested_indexes)
             removed_event_indexes.update(resolved_indexes)
@@ -2289,11 +2299,268 @@ class RunRecoveryService:
         )
 
     @staticmethod
+    def _is_exact_resolved_attempt(
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        request: ReconciliationRequest,
+        operation: ExternalOperation,
+        *,
+        attempt_start: int,
+    ) -> bool:
+        resolution = request.resolution
+        checkpoint = evidence.checkpoint
+        if resolution is None or checkpoint is None:
+            return False
+        expected_resolution_evidence: dict[str, object]
+        if resolution.action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
+            expected_resolution_evidence = {"disposition": "not_executed"}
+        elif resolution.action is ReconciliationAction.RETRY:
+            expected_resolution_evidence = {
+                "acknowledge_duplicate_side_effect_risk": True
+            }
+        else:
+            return False
+        is_model = isinstance(operation, ModelCallOperation)
+        expected_reason = (
+            "model_call_unknown_outcome"
+            if is_model
+            else "tool_call_unknown_outcome"
+        )
+        expected_phase = (
+            RunCheckpointPhase.MODEL_IN_FLIGHT
+            if is_model
+            else RunCheckpointPhase.TOOL_IN_FLIGHT
+        )
+        expected_turn = (
+            sum(
+                event.type == "step.completed"
+                for event in evidence.run_events[:attempt_start]
+            )
+        )
+        if (
+            request.run_id != evidence.run.run_id
+            or request.session_id != evidence.run.session_id
+            or operation.run_id != evidence.run.run_id
+            or operation.session_id != evidence.run.session_id
+            or operation.turn != expected_turn
+            or operation.operation_id != request.operation_id
+            or request.reason != expected_reason
+            or dict(request.details)
+            != {"checkpoint_phase": expected_phase.value}
+            or thaw_json(resolution.evidence) != expected_resolution_evidence
+        ):
+            return False
+        messages = RunRecoveryService._messages_before_turn(
+            evidence,
+            base_request,
+            expected_turn,
+        )
+        if messages is None:
+            return False
+        if is_model:
+            assert isinstance(operation, ModelCallOperation)
+            metadata = dict(operation.recovery_metadata)
+            metadata_valid = metadata == {
+                "authoritative_status": False,
+                "same_operation_id_resend": False,
+            } or (
+                set(metadata)
+                == {
+                    "adapter_id",
+                    "adapter_version",
+                    "authoritative_status",
+                    "same_operation_id_resend",
+                }
+                and all(
+                    isinstance(metadata[field], str) and bool(metadata[field])
+                    for field in ("adapter_id", "adapter_version")
+                )
+                and type(metadata["authoritative_status"]) is bool
+                and type(metadata["same_operation_id_resend"]) is bool
+            )
+            try:
+                expected_fingerprint = _model_request_fingerprint(
+                    ModelRequest(
+                        model=base_request.model,
+                        messages=messages,
+                        tools=base_request.tools,
+                        params=dict(base_request.params),
+                        purpose=base_request.purpose,
+                    )
+                )
+            except Exception:
+                return False
+            return (
+                metadata_valid
+                and operation.provider_identity == base_request.model
+                and operation.request_fingerprint == expected_fingerprint
+            )
+
+        assert isinstance(operation, ToolCallOperation)
+        proposed = evidence.run_events[attempt_start]
+        if (
+            proposed.type != "tool.call.proposed"
+            or set(proposed.payload) != {"call_id", "tool_name"}
+        ):
+            return False
+        model_operations = tuple(
+            item
+            for item in evidence.operations
+            if isinstance(item, ModelCallOperation)
+            and item.turn == expected_turn
+            and item.status is ExternalOperationStatus.COMPLETED
+        )
+        if len(model_operations) != 1:
+            return False
+        completed = RunRecoveryService._completed_model_outcome(model_operations[0])
+        if completed is None:
+            return False
+        raw_calls = tuple(
+            call
+            for call in completed[2]
+            if call["call_id"] == proposed.payload["call_id"]
+            and call["name"] == proposed.payload["tool_name"]
+        )
+        if len(raw_calls) != 1:
+            return False
+        raw_call = raw_calls[0]
+        capabilities = tuple(
+            capability
+            for capability in evidence.run.execution_descriptor.tools
+            if capability.spec.name == raw_call["name"]
+        ) if evidence.run.execution_descriptor is not None else ()
+        if len(capabilities) != 1:
+            return False
+        capability = capabilities[0]
+        try:
+            arguments = json.loads(
+                str(raw_call["arguments_json"]),
+                parse_constant=_reject_json_constant,
+            )
+            if not isinstance(arguments, dict):
+                return False
+            Draft202012Validator(
+                thaw_json(capability.spec.input_schema)
+            ).validate(arguments)
+            raw_index = raw_call["index"]
+            if type(raw_index) is not int:
+                return False
+            call = ToolCallCompleted(
+                index=raw_index,
+                call_id=str(raw_call["call_id"]),
+                name=str(raw_call["name"]),
+                arguments_json=str(raw_call["arguments_json"]),
+            )
+        except (
+            JSONSchemaValidationError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return False
+        expected_metadata = (
+            {"safe_retry": False, "retry_class": "unsafe"}
+            if capability.spec.retry_policy is ToolRetryPolicy.NEVER
+            else {
+                "safe_retry": True,
+                "retry_class": capability.spec.retry_policy.value,
+            }
+        )
+        return (
+            operation.tool_identity == capability.capability_hash
+            and dict(operation.recovery_metadata) == expected_metadata
+            and operation.request_fingerprint
+            == _tool_request_fingerprint(call, capability, arguments)
+        )
+
+    @staticmethod
+    def _messages_before_turn(
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        target_turn: int,
+    ) -> tuple[dict[str, Any], ...] | None:
+        descriptor = evidence.run.execution_descriptor
+        checkpoint = evidence.checkpoint
+        if descriptor is None or checkpoint is None or target_turn > checkpoint.turn:
+            return None
+        messages: list[dict[str, Any]] = list(
+            descriptor.model_dump(mode="json")["messages"]
+        )
+        try:
+            for turn in range(target_turn):
+                completed_operations = tuple(
+                    operation
+                    for operation in evidence.operations
+                    if isinstance(operation, ModelCallOperation)
+                    and operation.turn == turn
+                    and operation.status is ExternalOperationStatus.COMPLETED
+                )
+                if len(completed_operations) != 1:
+                    return None
+                operation = completed_operations[0]
+                request = ModelRequest(
+                    model=base_request.model,
+                    messages=tuple(messages),
+                    tools=base_request.tools,
+                    params=dict(base_request.params),
+                    purpose=base_request.purpose,
+                )
+                if (
+                    operation.provider_identity != base_request.model
+                    or operation.request_fingerprint
+                    != _model_request_fingerprint(request)
+                ):
+                    return None
+                completed = RunRecoveryService._completed_model_outcome(operation)
+                if completed is None or len(completed[2]) != 1:
+                    return None
+                _finish_reason, text, calls, _usage = completed
+                call = calls[0]
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": text or None,
+                        "tool_calls": [
+                            {
+                                "id": call["call_id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["name"],
+                                    "arguments": call["arguments_json"],
+                                },
+                            }
+                        ],
+                    }
+                )
+                if turn >= len(checkpoint.tool_results):
+                    return None
+                result = checkpoint.tool_results[turn]
+                if (result.call_id, result.tool_name) != (
+                    call["call_id"],
+                    call["name"],
+                ):
+                    return None
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result.call_id,
+                        "name": result.tool_name,
+                        "content": result.content,
+                    }
+                )
+        except (KeyError, TypeError, ValueError):
+            return None
+        return tuple(messages)
+
+    @staticmethod
     def _is_safe_checkpoint(
         evidence: _RecoveryEvidence,
         base_request: ModelRequest,
     ) -> bool:
-        effective = RunRecoveryService._effective_resolved_evidence(evidence)
+        effective = RunRecoveryService._effective_resolved_evidence(
+            evidence,
+            base_request,
+        )
         if effective is None:
             return False
         evidence = effective

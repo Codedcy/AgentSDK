@@ -911,6 +911,9 @@ async def test_reconciliation_target_rejects_illegal_replay_shapes_and_int64(
 
 async def _seed_retry_resolution_batch(
     store: Any,
+    *,
+    request_reason: str = "model_call_unknown_outcome",
+    request_details: dict[str, object] | None = None,
 ) -> tuple[
     RunProgressBatch,
     ReconciliationRequest,
@@ -919,6 +922,9 @@ async def _seed_retry_resolution_batch(
     RunCheckpoint,
 ]:
     run, first_lease = await _seed(store)
+    session_data = await store.get_snapshot("session", run.session_id)
+    assert session_data is not None
+    session = SessionSnapshot.model_validate(session_data)
     operation = _operation(run, first_lease)
     checkpoint = RunCheckpoint(
         run_id=run.run_id,
@@ -931,8 +937,12 @@ async def _seed_retry_resolution_batch(
     )
     request = _request(
         operation_id=operation.operation_id,
-        reason="model_call_unknown_outcome",
-        details={"checkpoint_phase": "model_in_flight"},
+        reason=request_reason,
+        details=(
+            {"checkpoint_phase": "model_in_flight"}
+            if request_details is None
+            else request_details
+        ),
     )
     waiting = run.model_copy(
         update={"status": RunStatus.WAITING_RECONCILIATION, "version": 3}
@@ -1036,9 +1046,10 @@ async def _seed_retry_resolution_batch(
             preconditions=(
                 SnapshotPrecondition(
                     "session",
-                    run.session_id,
-                    1,
-                    run.session_id,
+                    session.session_id,
+                    session.version,
+                    session.session_id,
+                    session.model_dump(mode="json"),
                 ),
                 SnapshotPrecondition(
                     "run",
@@ -1089,6 +1100,121 @@ async def test_retry_resolution_batch_terminalizes_old_generation_atomically(
     assert await progress_store.get_reconciliation_request(request.request_id) == resolved
     assert await progress_store.get_external_operation(operation.operation_id) == operation
     assert await progress_store.get_run_checkpoint(operation.run_id) == checkpoint
+
+
+@pytest.mark.parametrize("missing_kind", ("session", "run"))
+@pytest.mark.asyncio
+async def test_retry_resolution_batch_requires_both_snapshot_preconditions(
+    progress_store: Any,
+    missing_kind: str,
+) -> None:
+    batch, request, _resolved, _operation, _checkpoint = (
+        await _seed_retry_resolution_batch(progress_store)
+    )
+    assert batch.operation is not None
+    assert batch.operation.expected is not None
+    corrupted = batch._replace(
+        preconditions=tuple(
+            precondition
+            for precondition in batch.preconditions
+            if precondition.kind != missing_kind
+        )
+    )
+    before = (
+        await progress_store.latest_cursor(),
+        await progress_store.get_snapshot("session", request.session_id),
+        await progress_store.get_snapshot("run", request.run_id),
+        await progress_store.get_external_operation(
+            batch.operation.expected.operation_id
+        ),
+        await progress_store.get_run_checkpoint(request.run_id),
+        await progress_store.get_reconciliation_request(request.request_id),
+    )
+
+    with pytest.raises(RecoveryStateConflictError):
+        await progress_store.commit_run_progress(corrupted)
+
+    assert (
+        await progress_store.latest_cursor(),
+        await progress_store.get_snapshot("session", request.session_id),
+        await progress_store.get_snapshot("run", request.run_id),
+        await progress_store.get_external_operation(
+            batch.operation.expected.operation_id
+        ),
+        await progress_store.get_run_checkpoint(request.run_id),
+        await progress_store.get_reconciliation_request(request.request_id),
+    ) == before
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    (
+        "inexact_session_precondition",
+        "inexact_run_precondition",
+        "noncanonical_request_reason",
+        "noncanonical_request_details",
+        "unrelated_run_field",
+    ),
+)
+@pytest.mark.asyncio
+async def test_retry_resolution_batch_rejects_inexact_admission_relations(
+    progress_store: Any,
+    invalidity: str,
+) -> None:
+    request_reason = (
+        "unexpected_unknown_outcome"
+        if invalidity == "noncanonical_request_reason"
+        else "model_call_unknown_outcome"
+    )
+    request_details = (
+        {"checkpoint_phase": "model_in_flight", "extra": "unexpected"}
+        if invalidity == "noncanonical_request_details"
+        else None
+    )
+    batch, request, _resolved, _operation, _checkpoint = (
+        await _seed_retry_resolution_batch(
+            progress_store,
+            request_reason=request_reason,
+            request_details=request_details,
+        )
+    )
+    assert batch.operation is not None
+    assert batch.operation.expected is not None
+    if invalidity == "inexact_session_precondition":
+        session, run = batch.preconditions
+        batch = batch._replace(preconditions=(session._replace(data=None), run))
+    elif invalidity == "inexact_run_precondition":
+        session, run = batch.preconditions
+        batch = batch._replace(preconditions=(session, run._replace(data=None)))
+    elif invalidity == "unrelated_run_field":
+        target = RunSnapshot.model_validate(batch.snapshots[0].data).model_copy(
+            update={"parent_run_id": "run_unrelated"}
+        )
+        batch = batch._replace(snapshots=(_run_write(target),))
+    before = (
+        await progress_store.latest_cursor(),
+        await progress_store.get_snapshot("session", request.session_id),
+        await progress_store.get_snapshot("run", request.run_id),
+        await progress_store.get_external_operation(
+            batch.operation.expected.operation_id
+        ),
+        await progress_store.get_run_checkpoint(request.run_id),
+        await progress_store.get_reconciliation_request(request.request_id),
+    )
+
+    with pytest.raises(RecoveryStateConflictError):
+        await progress_store.commit_run_progress(batch)
+
+    assert (
+        await progress_store.latest_cursor(),
+        await progress_store.get_snapshot("session", request.session_id),
+        await progress_store.get_snapshot("run", request.run_id),
+        await progress_store.get_external_operation(
+            batch.operation.expected.operation_id
+        ),
+        await progress_store.get_run_checkpoint(request.run_id),
+        await progress_store.get_reconciliation_request(request.request_id),
+    ) == before
 
 
 @pytest.mark.asyncio

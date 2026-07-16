@@ -33,6 +33,15 @@ from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools import ToolContext, ToolRetryPolicy, ToolSpec
 
 
+class _SecretMapping(dict[str, object]):
+    def __init__(self, value: dict[str, object], secret: str) -> None:
+        super().__init__(value)
+        self._secret = secret
+
+    def __repr__(self) -> str:
+        return f"{super().__repr__()}<{self._secret}>"
+
+
 class _ResolutionBarrierMemoryStore(InMemoryStore):
     def __init__(self) -> None:
         super().__init__()
@@ -713,6 +722,254 @@ async def test_resolution_replay_and_unsupported_actions_are_zero_mutation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_resolution_replay_rejects_orphan_resolved_request_without_event(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "orphan-resolution.sqlite3")
+    )
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_model_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+
+    async def forbidden_completion(**_: object) -> Any:
+        provider_calls.append(1)
+        raise AssertionError("resolution replay must not call the provider")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=forbidden_completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_NOT_EXECUTED,
+            actor={"type": "operator"},
+            evidence={"disposition": "not_executed"},
+        )
+        assert resolved.resolution is not None
+        orphan = resolved.model_copy(
+            update={
+                "request_id": "rec_orphan_resolved",
+                "resolution": resolved.resolution.model_copy(
+                    update={"event_id": "evt_orphan_resolved"}
+                ),
+            }
+        )
+        orphan_json = _canonical_record_json(orphan)
+        if isinstance(store, InMemoryStore):
+            store._reconciliation_requests[orphan.request_id] = orphan_json
+        else:
+            await store._connection.execute(
+                """
+                INSERT INTO reconciliation_requests(
+                    request_id, session_id, run_id, operation_id, status, data_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    orphan.request_id,
+                    orphan.session_id,
+                    orphan.run_id,
+                    orphan.operation_id,
+                    orphan.status.value,
+                    orphan_json,
+                ),
+            )
+            await store._connection.commit()
+        before = await _resolution_domain_state(store)
+
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_NOT_EXECUTED,
+                actor={"type": "operator"},
+                evidence={"disposition": "not_executed"},
+            )
+
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert provider_calls == []
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "wrong_action_evidence",
+        "noncanonical_reason",
+        "noncanonical_details",
+        "operation_fingerprint",
+    ),
+)
+async def test_recovery_rejects_lockstep_corrupt_resolved_history_before_external_work(
+    backend: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"corrupt-resolved-history-{corruption}.sqlite3"
+        )
+    )
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_model_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_NOT_EXECUTED,
+            actor={"type": "operator"},
+            evidence={"disposition": "not_executed"},
+        )
+        assert resolved.resolution is not None
+        operation = await store.get_external_operation(resolved.operation_id)
+        assert operation is not None
+        requested_event = next(
+            stored
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.requested"
+        )
+        resolved_event = next(
+            stored
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type == "reconciliation.resolved"
+        )
+        corrupted = resolved
+        corrupted_operation = operation
+        event_updates: list[tuple[Any, dict[str, Any]]] = []
+        if corruption == "wrong_action_evidence":
+            wrong_evidence = {"acknowledge_duplicate_side_effect_risk": True}
+            corrupted = resolved.model_copy(
+                update={
+                    "resolution": resolved.resolution.model_copy(
+                        update={"evidence": wrong_evidence}
+                    )
+                }
+            )
+            event_updates.append(
+                (
+                    resolved_event,
+                    {**resolved_event.event.payload, "evidence": wrong_evidence},
+                )
+            )
+        elif corruption == "noncanonical_reason":
+            corrupted = resolved.model_copy(
+                update={"reason": "tool_call_unknown_outcome"}
+            )
+            event_updates.append(
+                (
+                    requested_event,
+                    {
+                        **requested_event.event.payload,
+                        "reason": corrupted.reason,
+                    },
+                )
+            )
+        elif corruption == "noncanonical_details":
+            corrupted = resolved.model_copy(
+                update={
+                    "details": {
+                        "checkpoint_phase": RunCheckpointPhase.READY_FOR_MODEL.value
+                    }
+                }
+            )
+        else:
+            assert corruption == "operation_fingerprint"
+            corrupted_operation = operation.model_copy(
+                update={"request_fingerprint": "sha256:wrong-attempt-fingerprint"}
+            )
+        if isinstance(store, InMemoryStore):
+            store._reconciliation_requests[corrupted.request_id] = (
+                _canonical_record_json(corrupted)
+            )
+            store._external_operations[corrupted_operation.operation_id] = (
+                _canonical_record_json(corrupted_operation)
+            )
+            for stored_event, payload in event_updates:
+                event_index = store._events.index(stored_event)
+                store._events[event_index] = stored_event._replace(
+                    event=stored_event.event.model_copy(
+                        update={"payload": payload}
+                    )
+                )
+        else:
+            await store._connection.execute(
+                "UPDATE reconciliation_requests SET data_json = ? "
+                "WHERE request_id = ?",
+                (_canonical_record_json(corrupted), corrupted.request_id),
+            )
+            await store._connection.execute(
+                "UPDATE external_operations "
+                "SET request_fingerprint = ?, data_json = ? "
+                "WHERE operation_id = ?",
+                (
+                    corrupted_operation.request_fingerprint,
+                    _canonical_record_json(corrupted_operation),
+                    corrupted_operation.operation_id,
+                ),
+            )
+            for stored_event, payload in event_updates:
+                await store._connection.execute(
+                    "UPDATE events SET payload_json = ? WHERE cursor = ?",
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        stored_event.cursor,
+                    ),
+                )
+            await store._connection.commit()
+
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await (await sdk.recovery.recover_run(run_id)).result()
+
+        assert provider_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].operation_id is None
+        assert pending[0].reason == "recovery_state_invalid"
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        assert not any(event.type == "run.recovery.started" for event in events)
+        assert not any(event.type == "permission.requested" for event in events)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
 @pytest.mark.parametrize("same_decision", (True, False))
 async def test_two_sdk_resolution_owner_and_follower_converge_or_conflict(
     backend: str,
@@ -812,6 +1069,13 @@ async def test_public_resolution_cancellation_at_memory_precommit_is_atomic() ->
     store = _ResolutionBarrierMemoryStore()
     run_id, spec, operation_id = await _seed_real_model_in_flight(store)
     model_calls: list[int] = []
+    actor_secret = "cancelled-resolution-actor-secret"
+    evidence_secret = "cancelled-resolution-evidence-secret"
+    actor = {"type": "operator", "id": actor_secret}
+    evidence = _SecretMapping(
+        {"disposition": "not_executed"},
+        evidence_secret,
+    )
 
     async def forbidden_completion(**_: object) -> Any:
         model_calls.append(1)
@@ -840,8 +1104,8 @@ async def test_public_resolution_cancellation_at_memory_precommit_is_atomic() ->
             sdk.recovery.resolve(
                 request.request_id,
                 ReconciliationAction.CONFIRM_NOT_EXECUTED,
-                actor={"type": "operator"},
-                evidence={"disposition": "not_executed"},
+                actor=actor,
+                evidence=evidence,
             )
         )
         await asyncio.wait_for(store.resolution_reached.wait(), timeout=10)
@@ -857,8 +1121,9 @@ async def test_public_resolution_cancellation_at_memory_precommit_is_atomic() ->
         assert model_calls == []
 
         store.allow_resolution.set()
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError) as cancelled:
             await asyncio.wait_for(resolve_task, timeout=10)
+        _assert_secret_free(cancelled.value, actor_secret, evidence_secret)
 
         resolved = await store.get_reconciliation_request(request.request_id)
         assert resolved is not None
@@ -878,8 +1143,8 @@ async def test_public_resolution_cancellation_at_memory_precommit_is_atomic() ->
             sdk.recovery.resolve(
                 request.request_id,
                 ReconciliationAction.CONFIRM_NOT_EXECUTED,
-                actor={"type": "operator"},
-                evidence={"disposition": "not_executed"},
+                actor=actor,
+                evidence=evidence,
             ),
             timeout=10,
         )

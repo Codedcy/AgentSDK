@@ -1180,6 +1180,21 @@ class InMemoryStore:
                 else _reconciliation_request_from_json(serialized)
             )
 
+    async def list_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]:
+        async with self._lock:
+            requests = (
+                _reconciliation_request_from_json(serialized)
+                for serialized in self._reconciliation_requests.values()
+            )
+            return tuple(
+                sorted(
+                    (request for request in requests if request.run_id == run_id),
+                    key=lambda request: request.request_id,
+                )
+            )
+
     async def list_pending_reconciliation_requests(
         self, run_id: str
     ) -> tuple[ReconciliationRequest, ...]:
@@ -1594,6 +1609,7 @@ def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
         or request_write.expected is None
         or len(batch.events) != 1
         or len(batch.snapshots) != 1
+        or len(batch.preconditions) != 2
         or len(batch.event_preconditions) != 1
         or batch.checkpoint_precondition is not None
     ):
@@ -1607,6 +1623,15 @@ def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
     resolution = resolved.resolution
     event = batch.events[0]
     run_write = batch.snapshots[0]
+    preconditions = {
+        precondition.kind: precondition for precondition in batch.preconditions
+    }
+    if set(preconditions) != {"session", "run"}:
+        return False
+    session_precondition = preconditions["session"]
+    run_precondition = preconditions["run"]
+    if session_precondition.data is None or run_precondition.data is None:
+        return False
     if resolution is None:
         return False
     expected_evidence: dict[str, object]
@@ -1621,12 +1646,51 @@ def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
         if isinstance(operation, ModelCallOperation)
         else RunCheckpointPhase.READY_FOR_TOOL
     )
+    operation_phase = (
+        RunCheckpointPhase.MODEL_IN_FLIGHT
+        if isinstance(operation, ModelCallOperation)
+        else RunCheckpointPhase.TOOL_IN_FLIGHT
+    )
+    expected_reason = (
+        "model_call_unknown_outcome"
+        if isinstance(operation, ModelCallOperation)
+        else "tool_call_unknown_outcome"
+    )
     try:
+        session = SessionSnapshot.model_validate(session_precondition.data)
+        current_run = RunSnapshot.model_validate(run_precondition.data)
         target_run = RunSnapshot.model_validate(run_write.data)
     except ValueError:
         return False
     return (
-        operation.status is ExternalOperationStatus.STARTED
+        session_precondition
+        == SnapshotPrecondition(
+            "session",
+            session.session_id,
+            session.version,
+            session.session_id,
+            session.model_dump(mode="json"),
+        )
+        and run_precondition
+        == SnapshotPrecondition(
+            "run",
+            current_run.run_id,
+            current_run.version,
+            current_run.session_id,
+            current_run.model_dump(mode="json"),
+        )
+        and operation.run_id == current_run.run_id
+        and operation.run_id in session.active_run_ids
+        and operation.session_id == current_run.session_id == session.session_id
+        and current_run.status is RunStatus.WAITING_RECONCILIATION
+        and target_run
+        == current_run.model_copy(
+            update={
+                "status": RunStatus.INTERRUPTED,
+                "version": current_run.version + 1,
+            }
+        )
+        and operation.status is ExternalOperationStatus.STARTED
         and terminalized.status is ExternalOperationStatus.FAILED
         and terminalized.lease_generation == operation.lease_generation
         and terminalized.model_dump(mode="json")["outcome"]
@@ -1637,14 +1701,11 @@ def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
             }
         }
         and request.operation_id == operation.operation_id
+        and request.reason == expected_reason
+        and dict(request.details) == {"checkpoint_phase": operation_phase.value}
         and checkpoint.operation_id == operation.operation_id
         and checkpoint.turn == operation.turn
-        and checkpoint.phase
-        is (
-            RunCheckpointPhase.MODEL_IN_FLIGHT
-            if isinstance(operation, ModelCallOperation)
-            else RunCheckpointPhase.TOOL_IN_FLIGHT
-        )
+        and checkpoint.phase is operation_phase
         and safe_checkpoint
         == checkpoint.model_copy(
             update={
@@ -1658,7 +1719,6 @@ def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
         and run_write.kind == "run"
         and target_run.run_id == operation.run_id
         and target_run.session_id == operation.session_id
-        and target_run.status is RunStatus.INTERRUPTED
         and event.sequence == batch.event_preconditions[0].sequence + 1
         and batch.event_preconditions[0].type == "reconciliation.requested"
     )

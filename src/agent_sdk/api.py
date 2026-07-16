@@ -245,6 +245,11 @@ class _LazySQLiteStore:
     ) -> ReconciliationRequest | None:
         return await (await self._get()).get_reconciliation_request(request_id)
 
+    async def list_reconciliation_requests(
+        self, run_id: str
+    ) -> tuple[ReconciliationRequest, ...]:
+        return await (await self._get()).list_reconciliation_requests(run_id)
+
     async def list_pending_reconciliation_requests(
         self, run_id: str
     ) -> tuple[ReconciliationRequest, ...]:
