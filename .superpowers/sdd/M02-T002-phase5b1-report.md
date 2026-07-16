@@ -384,3 +384,158 @@ No known Phase 5B1 implementation or verification concern remains after the
 review fixes. Confirmed Tool outcomes and Workflow projection remain Phase
 5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
 or push was performed.
+
+## Second independent review closure addendum
+
+The second independent Phase 5B1 review returned C0/I2/M0. Both Important
+findings were reproduced on Memory and SQLite before changing production code,
+then closed in commit `85856f4` (`fix(recovery): close confirmed replay
+history`). This addendum supersedes the preceding post-review risk statement.
+
+### I1: terminal replay coupled historical Session evidence to current state
+
+Terminal replay required the historical `session.run.detached` or
+`session.closed` event sequence and status to equal the current Session version
+and status. After a confirmed terminal outcome, a later legal Run on the same
+active Session increments the Session version; exact replay of the earlier
+decision then conflicted even though its atomic history remained intact.
+
+The new production-path matrix confirms a completed or failed Model outcome,
+starts and completes a later Run on the same Session, then replays the original
+decision on both backends. The existing terminalization-gap test now performs
+the same later Session evolution before replay.
+
+RED and GREEN:
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_confirmed_terminal_replay_accepts_later_session_run_evolution \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_confirm_completed_terminalization_gap_preserves_model_outcome
+6 failed in 4.47s
+
+same command after fix:
+6 passed in 3.54s
+```
+
+The terminal certifier now validates the historical Session event as its own
+projection: exact type, payload, sequence, cursor adjacency, timestamp, and
+projected status. The current Session may be that exact projection or a legal
+monotonic successor. A detached active Session may later be active, closing,
+or closed; a closing projection may later be closing or closed. A historical
+closed projection cannot acquire a later successor. A separate corruption case
+also confirms that substituting `deleting` as the historical projected status
+is rejected as a conflict.
+
+### I2: confirmed replay admitted orphan durable records
+
+Exact confirmed replay authenticated the expected resolution slice but did not
+prove a closed world around reconciliation records and Model operations. An
+orphan pending reconciliation, orphan resolved reconciliation, or extra
+completed Model operation could therefore coexist with a successful replay.
+For the supported Tool-call history with one later pending Model
+reconciliation, replay checked only the pending envelope and not the complete
+current Model lifecycle.
+
+Two adversarial matrices first create real durable history through public SDK
+paths, then inject exactly one otherwise-valid orphan record into Memory or
+SQLite and require exact replay to conflict without mutation. The terminal
+matrix crosses both backends with all three orphan kinds. The later-pending
+matrix preserves the canonical success case and crosses the same three orphan
+kinds.
+
+RED:
+
+```text
+test_confirmed_terminal_replay_rejects_orphan_closed_world_records
+6 failed in 3.98s; every orphan replay was incorrectly accepted
+
+test_confirmed_tool_call_later_pending_history_is_closed_world
+6 failed, 2 passed in 4.94s; canonical histories passed and every orphan was
+incorrectly accepted
+```
+
+Confirmed replay now enforces a closed reconciliation grammar: unique request
+IDs, a one-to-one exact requested marker for every record, a one-to-one exact
+resolved marker for every resolved record, and no resolution marker for a
+pending record. Model-operation turns must be unique and exactly cover every
+turn through the current checkpoint. Terminal histories permit only the
+original resolved request. The single supported later-pending shape permits
+only the original resolved request plus the unique current pending request,
+requires the pending marker to be the final event, validates the exact current
+started Model operation, removes reconciliation markers only for normalized
+certification, resequences the retained event stream, and passes the existing
+full operation/lifecycle/provider FSM certifier.
+
+GREEN:
+
+```text
+test_confirmed_terminal_replay_rejects_orphan_closed_world_records
+6 passed in 3.70s
+
+test_confirmed_tool_call_later_pending_history_is_closed_world
+8 passed in 4.20s
+```
+
+## Second-review verification
+
+All commands used the explicit executable
+`C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe`.
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+248 passed in 15.96s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+626 passed in 92.31s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/unit/runtime/test_reconciliation_models.py \
+  tests/integration/storage/test_recovery_records.py \
+  tests/integration/storage/test_sqlite_recovery_validation.py \
+  tests/integration/runtime/test_recovery_scanner.py \
+  tests/integration/runtime/test_live_run_progress.py \
+  tests/integration/runtime/test_leases.py \
+  tests/integration/runtime/test_session_lifecycle.py \
+  tests/integration/runtime/test_run_session_ownership.py \
+  tests/contract/test_memory_store_contract.py \
+  tests/contract/test_idempotency_store_contract.py \
+  tests/e2e/test_session_lifecycle_idempotency.py \
+  tests/integration/workflow/test_workflow_recovery.py \
+  tests/integration/workflow/test_workflow_recovery_admission.py \
+  tests/integration/workflow/test_workflow_session_ownership.py
+543 passed in 18.43s
+
+uv.exe run --python 3.13 pytest -q
+1883 passed in 123.40s; zero skipped, zero failed
+
+uv.exe run --python 3.13 ruff check src tests
+All checks passed!
+
+uv.exe run --python 3.13 mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The fresh import/signature/schema smoke again passed with 103 unique root
+exports, the exact unchanged `RecoveryAPI.resolve` and
+`ReconciliationService.resolve` contracts, and SQLite schema version 3. The
+implementation commit touched only
+`src/agent_sdk/runtime/recovery.py` and
+`tests/integration/runtime/test_reconciliation_resolution.py`; this report is
+the only documentation change.
+
+No known Phase 5B1 implementation or verification concern remains after the
+second review. Confirmed Tool outcomes and Workflow projection remain Phase
+5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
+or push was performed.
