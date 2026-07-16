@@ -683,6 +683,26 @@ class RunRecoveryService:
                     operation,
                 ):
                     raise RecoveryStateConflictError
+                if (
+                    confirm_model
+                    and provider_result is not None
+                    and provider_result.disposition
+                    is ProviderRecoveryDisposition.COMPLETED
+                ):
+                    assert isinstance(operation, ModelCallOperation)
+                    assert provider_result.text is not None
+                    durable_deltas = self._current_model_deltas_before_interrupt(
+                        certified,
+                        operation,
+                    )
+                    if (
+                        durable_deltas is None
+                        or not self._is_exact_durable_text_prefix(
+                            durable_deltas,
+                            provider_result.text,
+                        )
+                    ):
+                        raise RecoveryStateConflictError
 
             now = self._clock()
             resolution = ReconciliationResolution(
@@ -3155,7 +3175,13 @@ class RunRecoveryService:
                         ).values()
                     )
                     if (
-                        (recovered and model_deltas)
+                        (
+                            recovered
+                            and not RunRecoveryService._is_exact_durable_text_prefix(
+                                tuple(model_deltas),
+                                completed[1],
+                            )
+                        )
                         or (not recovered and "".join(model_deltas) != completed[1])
                         or usage_required != (model_usage is not None)
                         or (
@@ -4448,6 +4474,58 @@ class RunRecoveryService:
             return None
         return tuple(messages)
 
+    @staticmethod
+    def _is_exact_durable_text_prefix(
+        deltas: tuple[str, ...],
+        full_text: str,
+    ) -> bool:
+        return full_text.startswith("".join(deltas))
+
+    @staticmethod
+    def _current_model_deltas_before_interrupt(
+        evidence: _RecoveryEvidence,
+        operation: ModelCallOperation,
+    ) -> tuple[str, ...] | None:
+        checkpoint = evidence.checkpoint
+        events = evidence.run_events
+        if (
+            checkpoint is None
+            or operation.status is not ExternalOperationStatus.STARTED
+            or checkpoint.operation_id != operation.operation_id
+            or not events
+            or events[-1].type != "run.interrupted"
+        ):
+            return None
+        starts = tuple(
+            index
+            for index, event in enumerate(events[:-1])
+            if event.type == "model.call.started"
+        )
+        if not starts:
+            return None
+        segment = events[starts[-1] + 1 : -1]
+        if any(
+            event.type
+            in {
+                "step.started",
+                "model.call.started",
+                "model.call.completed",
+                "model.call.failed",
+            }
+            for event in segment
+        ):
+            return None
+        deltas = tuple(
+            event.payload.get("text")
+            for event in segment
+            if event.type == "model.text.delta"
+        )
+        return (
+            tuple(delta for delta in deltas if isinstance(delta, str))
+            if all(isinstance(delta, str) for delta in deltas)
+            else None
+        )
+
     def _is_safe_checkpoint(
         self,
         evidence: _RecoveryEvidence,
@@ -4685,16 +4763,18 @@ class RunRecoveryService:
                 and event.payload.get("operation_id") == operation.operation_id
                 for event in segment
             )
-            if any(not isinstance(delta, str) for delta in deltas) or (
-                (recovered and bool(deltas))
-                or (
-                    not recovered
-                    and "".join(
-                        delta for delta in deltas if isinstance(delta, str)
-                    )
-                    != text
+            if any(not isinstance(delta, str) for delta in deltas):
+                return False
+            text_deltas = tuple(
+                delta for delta in deltas if isinstance(delta, str)
+            )
+            if (
+                recovered
+                and not RunRecoveryService._is_exact_durable_text_prefix(
+                    text_deltas,
+                    text,
                 )
-            ):
+            ) or (not recovered and "".join(text_deltas) != text):
                 return False
             usage_events = tuple(
                 event for event in between if event.type == "model.usage.reported"
@@ -5347,6 +5427,13 @@ class RunRecoveryService:
             for event in evidence.run_events[:history_end]
             if event.type
             in {"model.recovery.query.started", "model.recovery.resend.started"}
+        ) | frozenset(
+            request.operation_id
+            for request in evidence.reconciliations
+            if request.operation_id is not None
+            and request.resolution is not None
+            and request.resolution.action
+            is ReconciliationAction.CONFIRM_COMPLETED
         )
         allowed_types = {
             "run.created",
@@ -5481,16 +5568,18 @@ class RunRecoveryService:
                 model_operation is not None
                 and model_operation.operation_id in recovered_model_operation_ids
             )
-            if any(not isinstance(delta, str) for delta in deltas) or (
-                (recovered_model and bool(deltas))
-                or (
-                    not recovered_model
-                    and "".join(
-                        delta for delta in deltas if isinstance(delta, str)
-                    )
-                    != turn.text
+            if any(not isinstance(delta, str) for delta in deltas):
+                return False
+            text_deltas = tuple(
+                delta for delta in deltas if isinstance(delta, str)
+            )
+            if (
+                recovered_model
+                and not self._is_exact_durable_text_prefix(
+                    text_deltas,
+                    turn.text,
                 )
-            ):
+            ) or (not recovered_model and "".join(text_deltas) != turn.text):
                 return False
             usage_events = tuple(
                 event
@@ -5499,7 +5588,10 @@ class RunRecoveryService:
             )
             expected_usage = turn.usage.model_dump(mode="json")
             if (
-                (any(value is not None for value in expected_usage.values()))
+                (
+                    recovered_model
+                    or any(value is not None for value in expected_usage.values())
+                )
                 != (len(usage_events) == 1)
                 or (usage_events and usage_events[0].payload != expected_usage)
             ):

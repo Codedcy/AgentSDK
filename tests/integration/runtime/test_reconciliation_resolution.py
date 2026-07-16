@@ -357,13 +357,17 @@ async def _seed_real_model_in_flight(
 
 async def _seed_partial_model_in_flight(
     store: Any,
+    *,
+    deltas: tuple[str, ...] = ("partial",),
+    tool_spec: ToolSpec | None = None,
 ) -> tuple[str, AgentSpec, str]:
     entered = asyncio.Event()
     cancelled = asyncio.Event()
 
     async def partial_completion(**_: object) -> AsyncIterator[dict[str, object]]:
         async def chunks() -> AsyncIterator[dict[str, object]]:
-            yield {"choices": [{"delta": {"content": "partial"}}]}
+            for delta in deltas:
+                yield {"choices": [{"delta": {"content": delta}}]}
             entered.set()
             try:
                 await asyncio.Event().wait()
@@ -379,6 +383,12 @@ async def _seed_partial_model_in_flight(
         acompletion=partial_completion,
         permission_default="allow",
     )
+    if tool_spec is not None:
+
+        async def unused_tool(_: ToolContext, value: int) -> int:
+            return value
+
+        seed.tools.register(tool_spec, unused_tool)
     session = await seed.sessions.create(workspaces=[])
     handle = await seed.runs.start(session.session_id, spec, "resolve partial model")
     await asyncio.wait_for(entered.wait(), timeout=10)
@@ -649,14 +659,27 @@ async def _seed_pending_model_reconciliation(
 
 async def _seed_pending_partial_model_reconciliation(
     store: Any,
+    *,
+    deltas: tuple[str, ...] = ("partial",),
+    tool_spec: ToolSpec | None = None,
 ) -> tuple[str, AgentSpec, str, Any]:
-    run_id, spec, operation_id = await _seed_partial_model_in_flight(store)
+    run_id, spec, operation_id = await _seed_partial_model_in_flight(
+        store,
+        deltas=deltas,
+        tool_spec=tool_spec,
+    )
     admitter = AgentSDK.for_test(
         store=store,
         acompletion=lambda **_: _final_completion([]),
         permission_default="allow",
     )
     admitter.agents.define(spec)
+    if tool_spec is not None:
+
+        async def unused_tool(_: ToolContext, value: int) -> int:
+            return value
+
+        admitter.tools.register(tool_spec, unused_tool)
     try:
         waiting = await admitter.recovery.recover_run(run_id)
         with pytest.raises(AgentSDKError, match="recovery required"):
@@ -982,6 +1005,42 @@ async def _replace_resolution_event_log(
         (max((stored.cursor for stored in stored_events), default=0),),
     )
     await store._connection.commit()
+
+
+async def _corrupt_partial_model_deltas(
+    store: Any,
+    *,
+    run_id: str,
+    corruption: str,
+) -> None:
+    stored_events = list(await store.read_events(after_cursor=0))
+    deltas = tuple(
+        stored
+        for stored in stored_events
+        if stored.event.run_id == run_id
+        and stored.event.type == "model.text.delta"
+    )
+    if corruption == "moved":
+        assert len(deltas) == 1
+        text = deltas[0].event.payload["text"]
+        assert isinstance(text, str) and len(text) > 1
+        split = len(text) // 2
+        index = stored_events.index(deltas[0])
+        stored_events[index] = deltas[0]._replace(
+            event=deltas[0].event.model_copy(
+                update={"payload": {"text": text[split:] + text[:split]}}
+            )
+        )
+    else:
+        assert corruption == "corrupt"
+        assert deltas
+        index = stored_events.index(deltas[0])
+        stored_events[index] = deltas[0]._replace(
+            event=deltas[0].event.model_copy(
+                update={"payload": {"text": "corrupt"}}
+            )
+        )
+    await _replace_resolution_event_log(store, stored_events)
 
 
 async def _corrupt_confirmed_terminal_history(
@@ -1334,6 +1393,198 @@ async def test_confirmed_terminal_replay_authenticates_complete_lifecycle_histor
                 ReconciliationAction.CONFIRM_COMPLETED,
                 actor={"operator": "terminal-lifecycle"},
                 evidence=resolution_evidence,
+            )
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_terminal_partial_text_resolves_and_replays(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-partial-text.db")
+    )
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_partial_model_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("confirmed resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    evidence = {
+        "provider_result": _confirmed_provider_result(text="partial-confirmed")
+    }
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "partial-text"},
+            evidence=evidence,
+        )
+        assert (await sdk.runs.get(run_id)).status is RunStatus.COMPLETED
+
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "partial-text"},
+            evidence=evidence,
+        )
+        assert replay == resolved
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_partial_tool_call_recovers_and_replays(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-partial-tool.db")
+    )
+    tool_spec = _unsafe_tool_spec()
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_partial_model_reconciliation(
+            store,
+            tool_spec=tool_spec,
+        )
+    )
+    evidence = {
+        "provider_result": _confirmed_provider_result(
+            text="partial-confirmed",
+            tool_call={
+                "index": 0,
+                "call_id": "call_partial_confirmed",
+                "name": tool_spec.name,
+                "arguments_json": '{"value":7}',
+            },
+        )
+    }
+    resolver = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("confirmed resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    resolver.agents.define(spec)
+
+    async def resolver_tool(_: ToolContext, value: int) -> int:
+        return value
+
+    resolver.tools.register(tool_spec, resolver_tool)
+    resolved = await resolver.recovery.resolve(
+        request.request_id,
+        ReconciliationAction.CONFIRM_COMPLETED,
+        actor={"operator": "partial-tool"},
+        evidence=evidence,
+    )
+    await resolver.close()
+
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def handler(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        return value + 1
+
+    recovery = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    recovery.agents.define(spec)
+    recovery.tools.register(tool_spec, handler)
+    try:
+        result = await (await recovery.recovery.recover_run(run_id)).result()
+        assert result.output_text == "partial-confirmeddone"
+        assert tool_calls == [7]
+        assert provider_calls == [1]
+
+        replay = await recovery.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "partial-tool"},
+            evidence=evidence,
+        )
+        assert replay == resolved
+    finally:
+        await recovery.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    ("corruption", "deltas", "confirmed_text"),
+    (
+        ("non_prefix", ("partial",), "different"),
+        ("overlong", ("partial-too-long",), "partial"),
+        ("moved", ("par", "tial"), "partial-confirmed"),
+        ("corrupt", ("partial",), "partial-confirmed"),
+    ),
+)
+async def test_confirmed_partial_text_rejects_non_prefix_history_before_commit(
+    backend: str,
+    corruption: str,
+    deltas: tuple[str, ...],
+    confirmed_text: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / f"partial-prefix-{corruption}.db")
+    )
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_partial_model_reconciliation(store, deltas=deltas)
+    )
+    if corruption in {"moved", "corrupt"}:
+        await _corrupt_partial_model_deltas(
+            store,
+            run_id=run_id,
+            corruption=corruption,
+        )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("invalid confirmation must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    before = await _resolution_domain_state(store)
+    try:
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "partial-prefix"},
+                evidence={
+                    "provider_result": _confirmed_provider_result(
+                        text=confirmed_text
+                    )
+                },
             )
         assert caught.value.code is ErrorCode.CONFLICT
         assert caught.value.message == "recovery state conflict"
