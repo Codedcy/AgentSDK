@@ -690,3 +690,140 @@ No known Phase 5B1 implementation or verification concern remains after the
 third review. Confirmed Tool outcomes and Workflow projection remain Phase
 5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
 or push was performed.
+
+## Fourth independent review closure addendum
+
+The fourth independent Phase 5B1 review returned C0/I1/M0. The remaining
+Important finding was reproduced on Memory and SQLite before production code
+changed, then closed in commit `54b31ba` (`fix(recovery): preserve confirmed
+partial streams`). This addendum supersedes the preceding post-review risk
+statement.
+
+### I1: confirmed partial Model streams resolved once but failed exact replay
+
+A Run could durably record `model.call.started`, a `model.text.delta`, and
+`run.interrupted`, then accept an operator `CONFIRM_COMPLETED` decision whose
+full text extended that partial stream. The first resolution committed the
+correct terminal projection, but the terminal-history and Tool-history
+certifiers still required recovered Model calls to have no durable deltas.
+Exact replay therefore conflicted, and a confirmed partial Tool call could not
+continue through explicit recovery.
+
+The new Memory/SQLite matrices cover terminal text resolution followed by
+exact replay, confirmed Tool-call resolution followed by explicit recovery
+and exact replay, and fail-closed admission for non-prefix, overlong,
+reordered, and corrupted durable text. The negative cases compare the complete
+resolution domain before and after the rejected call, proving the conflict is
+raised before any durable mutation.
+
+RED:
+
+```text
+confirmed partial terminal text and Tool-call recovery/replay:
+4 failed in 4.60s
+The first resolution succeeded, but exact replay or explicit recovery
+conflicted.
+
+non-prefix, overlong, reordered, and corrupted durable text on both Stores:
+8 failed in 5.88s
+All invalid confirmations were incorrectly admitted and committed.
+```
+
+### One shared prefix relation and admission boundary
+
+`_is_exact_durable_text_prefix` now defines the single relation used by first
+admission, terminal lifecycle certification, READY Tool relation
+certification, and complete Tool-history certification: the concatenated
+durable deltas must be an exact prefix of the authoritative full text. An empty
+stream remains valid. This preserves every byte and the original delta order;
+non-prefix, overlong, reordered, or payload-corrupted histories fail closed.
+
+The first-admission check reconstructs only the current started Model segment
+ending at the certified `run.interrupted` marker and runs before the resolution
+batch is built or written. Exact replay and later explicit recovery use the
+same relation. Operator-confirmed Model operation IDs are added to the existing
+authoritative provider-recovery ID set solely for historical certification.
+Recovered usage remains exact and mandatory, including the all-null usage
+projection.
+
+Ordinary non-recovered provider calls still require concatenated deltas to
+equal the full text exactly. The existing lifecycle FSM continues to reject
+missing, duplicate, or moved lifecycle markers, and the earlier terminal
+closed-world validation remains intact. No store contract, durable schema,
+public API, Workflow projection, or Phase 5B2 behavior changed.
+
+GREEN and compatibility:
+
+```text
+new Memory/SQLite positive and negative matrices:
+12 passed in 4.19s
+
+new matrices plus third-review terminal-history matrix, confirmed Tool
+later-terminal path, direct completed/failed projection, terminalization gap,
+and moved-attempt compatibility:
+52 passed in 7.31s
+```
+
+## Fourth-review verification
+
+All commands used the explicit executable
+`C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe`.
+
+```text
+uv.exe run pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+288 passed in 17.35s
+
+uv.exe run pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+666 passed in 95.23s
+
+uv.exe run pytest -q \
+  tests/unit/runtime/test_reconciliation_models.py \
+  tests/integration/storage/test_recovery_records.py \
+  tests/integration/storage/test_sqlite_recovery_validation.py \
+  tests/integration/runtime/test_recovery_scanner.py \
+  tests/integration/runtime/test_live_run_progress.py \
+  tests/integration/runtime/test_leases.py \
+  tests/integration/runtime/test_session_lifecycle.py \
+  tests/integration/runtime/test_run_session_ownership.py \
+  tests/contract/test_memory_store_contract.py \
+  tests/contract/test_idempotency_store_contract.py \
+  tests/e2e/test_session_lifecycle_idempotency.py \
+  tests/integration/workflow/test_workflow_recovery.py \
+  tests/integration/workflow/test_workflow_recovery_admission.py \
+  tests/integration/workflow/test_workflow_session_ownership.py
+543 passed in 20.72s
+
+uv.exe run pytest -q
+1921 passed in 127.83s; zero skipped, zero failed
+
+uv.exe run ruff check src tests
+All checks passed!
+
+uv.exe run mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The fresh import/signature/schema smoke again passed with 103 unique root
+exports, exact unchanged `RecoveryAPI.resolve` and
+`ReconciliationService.resolve` signatures, and SQLite schema version 3. The
+implementation commit touched only
+`src/agent_sdk/runtime/recovery.py` and
+`tests/integration/runtime/test_reconciliation_resolution.py`; this report is
+the only documentation change.
+
+No known Phase 5B1 implementation or verification concern remains after the
+fourth review. Confirmed Tool outcomes and Workflow projection remain Phase
+5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
+or push was performed.
