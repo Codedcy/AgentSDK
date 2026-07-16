@@ -26,6 +26,7 @@ from agent_sdk import (
 )
 from agent_sdk.runtime.reconciliation import RunCheckpointPhase
 from agent_sdk.storage.base import CommitResult, RunProgressBatch
+from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.models import ToolResult
 from agent_sdk.workflow import WorkflowNodeStatus, WorkflowRunStatus
@@ -119,6 +120,23 @@ class _BoundaryObservingStore:
         return result
 
 
+class _PauseAfterSafeToolStore:
+    def __init__(self) -> None:
+        self._delegate = InMemoryStore()
+        self.reached = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        result = await self._delegate.commit_run_progress(batch)
+        if any(event.type == "tool.call.completed" for event in batch.events):
+            self.reached.set()
+            await self.release.wait()
+        return result
+
+
 async def _tool_call_completion(
     gate: asyncio.Event,
 ) -> AsyncIterator[dict[str, object]]:
@@ -165,7 +183,7 @@ async def _child_main(
         delegate,
         control_path,
         effect_path,
-        exit_after_safe_tool=scenario == "safe_tool",
+        exit_after_safe_tool=scenario in {"safe_tool", "safe_tool_workflow"},
     )
 
     if scenario == "provider_unknown":
@@ -198,7 +216,7 @@ async def _child_main(
 
     sdk.tools.register(tool, handler)
     session = await sdk.sessions.create(workspaces=[])
-    if scenario == "tool_workflow_unknown":
+    if scenario in {"tool_workflow_unknown", "safe_tool_workflow"}:
         handle = await sdk.workflows.start(
             session.session_id,
             yaml.safe_dump(_WORKFLOW, sort_keys=False),
@@ -277,6 +295,62 @@ async def _final_completion(effect_path: Path, label: str) -> Any:
 
 
 @pytest.mark.asyncio
+async def test_interrupted_after_safe_tool_batch_resumes_without_step_marker() -> None:
+    store = _PauseAfterSafeToolStore()
+    calls = 0
+
+    async def initial_completion(**_: object) -> Any:
+        gate = asyncio.Event()
+        gate.set()
+        return await _tool_call_completion(gate)
+
+    async def handler(_: ToolContext, value: int) -> object:
+        nonlocal calls
+        calls += 1
+        return value + 1
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=initial_completion,
+        permission_default="allow",
+    )
+    sdk.tools.register(_tool(), handler)
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.runs.start(session.session_id, _AGENT, "safe batch")
+    await asyncio.wait_for(store.reached.wait(), timeout=1)
+    handle._task.cancel()  # type: ignore[attr-defined]
+    store.release.set()
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await sdk.close()
+
+    async def final_completion(**_: object) -> Any:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "recovered"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    reopened = AgentSDK.for_test(
+        store=store,
+        acompletion=final_completion,
+        permission_default="allow",
+    )
+    reopened.agents.define(_AGENT)
+    reopened.tools.register(_tool(), handler)
+    try:
+        await reopened.recovery.scan()
+        result = await (await reopened.recovery.recover_run(handle.run_id)).result()
+        assert result.output_text == "recovered"
+        assert calls == 1
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_provider_accept_hard_exit_requires_explicit_decision_without_replay(
     tmp_path: Path,
 ) -> None:
@@ -292,7 +366,11 @@ async def test_provider_accept_hard_exit_requires_explicit_decision_without_repl
         permission_default="allow",
     )
     sdk.agents.define(_AGENT)
-    sdk.tools.register(_tool(), lambda *_args, **_kwargs: None)
+
+    async def unused_tool(_: ToolContext, value: int) -> object:
+        raise AssertionError(f"Provider-only recovery invoked Tool with {value}")
+
+    sdk.tools.register(_tool(), unused_tool)
     _advance_scanner(sdk)
     try:
         await sdk.recovery.scan()
@@ -391,12 +469,72 @@ async def test_tool_side_effect_hard_exit_projects_workflow_without_replay(
 
 
 @pytest.mark.asyncio
+async def test_mcp_side_effect_hard_exit_waits_for_explicit_retry(
+    tmp_path: Path,
+) -> None:
+    database_path, effects, control, _child = _launch_child(
+        tmp_path,
+        "mcp_unknown",
+    )
+    run_id = str(control["run_id"])
+
+    async def explicit_mcp_retry(_: ToolContext, value: int) -> object:
+        _append_record(effects, effect="mcp/fault-server:explicit_retry")
+        return value + 1
+
+    sdk = AgentSDK.for_test(
+        database_path=database_path,
+        acompletion=lambda **_: _final_completion(effects, "mcp_final_model"),
+        permission_default="allow",
+    )
+    sdk.agents.define(_AGENT)
+    sdk.tools.register(_tool(source="mcp/fault-server"), explicit_mcp_retry)
+    _advance_scanner(sdk)
+    try:
+        await sdk.recovery.scan()
+        waiting = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        request = (await sdk.recovery.pending_requests(run_id))[0]
+        assert _record_values(effects, "effect") == [
+            "mcp/fault-server:side_effect"
+        ]
+
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.RETRY,
+            actor={"type": "operator", "id": "fault-test"},
+            evidence={"acknowledge_duplicate_side_effect_risk": True},
+        )
+        assert _record_values(effects, "effect") == [
+            "mcp/fault-server:side_effect"
+        ]
+
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+        assert result.output_text == "recovered"
+        assert _record_values(effects, "effect") == [
+            "mcp/fault-server:side_effect",
+            "mcp/fault-server:explicit_retry",
+            "mcp_final_model",
+        ]
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
 async def test_safe_tool_commit_hard_exit_resumes_without_repeating_tool(
     tmp_path: Path,
 ) -> None:
     database_path, effects, control, _child = _launch_child(tmp_path, "safe_tool")
     run_id = str(control["run_id"])
     tool_calls = 0
+    inspection = await SQLiteStore.open(database_path)
+    try:
+        checkpoint = await inspection.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
+    finally:
+        await inspection.close()
 
     async def duplicate_tool(_: ToolContext, value: int) -> object:
         nonlocal tool_calls
@@ -414,9 +552,6 @@ async def test_safe_tool_commit_hard_exit_resumes_without_repeating_tool(
     try:
         await sdk.recovery.scan()
         assert (await sdk.runs.get(run_id)).status is RunStatus.INTERRUPTED
-        checkpoint = await sdk.recovery._store.get_run_checkpoint(run_id)  # type: ignore[attr-defined]
-        assert checkpoint is not None
-        assert checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
 
         result = await (await sdk.recovery.recover_run(run_id)).result()
         assert result.output_text == "recovered"
@@ -424,6 +559,47 @@ async def test_safe_tool_commit_hard_exit_resumes_without_repeating_tool(
         assert _record_values(effects, "effect") == [
             "safe_tool_outcome_committed",
             "safe_resume_model",
+        ]
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_safe_tool_commit_hard_exit_completes_workflow_projection(
+    tmp_path: Path,
+) -> None:
+    database_path, effects, control, _child = _launch_child(
+        tmp_path,
+        "safe_tool_workflow",
+    )
+    workflow_run_id = str(control["workflow_run_id"])
+    tool_calls = 0
+
+    async def duplicate_tool(_: ToolContext, value: int) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        return value + 1
+
+    sdk = AgentSDK.for_test(
+        database_path=database_path,
+        acompletion=lambda **_: _final_completion(effects, "safe_workflow_model"),
+        permission_default="allow",
+    )
+    sdk.agents.define(_AGENT)
+    sdk.tools.register(_tool(), duplicate_tool)
+    _advance_scanner(sdk)
+    try:
+        await sdk.recovery.scan()
+        result = await (
+            await sdk.recovery.recover_workflow(workflow_run_id)
+        ).result()
+        assert result.status is WorkflowRunStatus.COMPLETED
+        assert result.nodes[0].status is WorkflowNodeStatus.COMPLETED
+        assert result.output_text == "recovered"
+        assert tool_calls == 0
+        assert _record_values(effects, "effect") == [
+            "safe_tool_outcome_committed",
+            "safe_workflow_model",
         ]
     finally:
         await sdk.close()

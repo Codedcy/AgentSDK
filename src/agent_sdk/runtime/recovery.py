@@ -4117,7 +4117,7 @@ class RunRecoveryService:
                 )
             return (
                 checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
-                and interrupted_state == "ready_for_step"
+                and interrupted_state in {"ready_for_step", "tool_completed"}
                 and turn == checkpoint.turn - 1
                 and (
                     (checkpoint.turn == 0 and current_model is None)
