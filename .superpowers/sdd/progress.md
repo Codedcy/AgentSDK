@@ -177,3 +177,12 @@ Phase 5B2B final gates: projection+admission 147 passed; Workflow recovery/admis
 Phase 5B2B final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
 Phase 5B2B: complete - explicit Workflow projection of certified terminal/interrupted Run outcomes, exact atomic node preconditions, stable cumulative decisions, Session lifecycle, and zero repeated side effects
 Phase 5B whole review: in progress - fresh read-only review across Phase 5B1, 5B2A, and 5B2B
+Phase 5B whole-review initial result: Not Approved; Spec C0/I4/M0 and Quality C0/I4/M0
+Phase 5B whole-review fix brief: .superpowers/sdd/M02-T002-phase5b-whole-review-fix-brief.md
+Phase 5B whole-review fix commits: d605adb, 74fcb16, 532839a, 9102544
+Phase 5B whole-review fix report: .superpowers/sdd/M02-T002-phase5b-whole-review-fix-report.md
+Phase 5B whole-review fixes: total bounded strict Tool evidence; exact shared READY_FOR_MODEL relation; cumulative terminal-decision normalization; atomic Workflow binding of complete checkpoint/operation/reconciliation/event recovery evidence on Memory and SQLite
+Phase 5B final gates: full Python3.13 2147 passed with zero skips/failures; Ruff clean; mypy clean across 75 source files; 53 module imports; 103 unique root exports; exact public signatures; SQLite schema3; diff/scope clean
+Phase 5B final independent whole re-review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; no Critical/Important/Minor findings
+Phase 5B: complete - strict confirmed Model/Tool outcomes, stable closed-world multi-resolution replay, exact safe recovery, and certified atomic Workflow projection
+Phase 5C: in progress - subprocess hard-exit E2E and dual-Python/package release gate
