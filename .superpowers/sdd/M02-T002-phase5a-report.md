@@ -396,6 +396,116 @@ was Windows LF-to-CRLF informational warnings.
 No implementation or verification concerns remain. The worktree is preserved;
 no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.
 
+## Final-final lifecycle-order closure addendum
+
+The final-final re-review returned C0/I1/M0. Resolved-history
+normalization authenticated the selected marker and operation relation, but it
+did not authenticate the order of the complete attempt slice before removing
+it. A sole model `step.started` could be moved after `model.call.started` and
+stream deltas, or a sole `tool.call.proposed` could be moved after tool
+authorization/start. The suffix-only removal then left the real attempt events
+behind, and envelope-only normalized validation accepted the history.
+
+### Moved-marker RED
+
+The public regression matrix rewrites canonical durable event history in both
+Memory and SQLite while retaining event IDs, payloads, timestamps, schema
+versions, and canonical cursor/sequence sets. The model case uses a real
+partial stream so `model.call.started` and `model.text.delta` remain before the
+moved `step.started`. The tool case leaves real authorization and start events
+before the moved proposal. Recovery and exact replay must fail closed before
+Provider, Tool/MCP, permission, or recovery-audit callbacks.
+
+```text
+uv.exe run --python 3.13 pytest \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  -k moved_model_attempt_start_fails_closed_before_external_work -q
+2 failed, 92 deselected in 3.87s; both stores reached Provider completion
+
+uv.exe run --python 3.13 pytest \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  -k moved_tool_attempt_start_fails_closed_before_external_work -q
+2 failed, 94 deselected in 3.60s; both exact replays returned successfully
+```
+
+### Complete pre-resolution lifecycle projection GREEN
+
+Resolved requests are now ordered by their unique durable request event. Before
+an attempt slice is normalized away, the recovery service reconstructs its
+original STARTED operation, historical in-flight checkpoint, transcript,
+output, usage, prior tool results, and canonical event prefix through the
+paired interrupt. Previously authenticated resolved slices are excluded from
+that projection. The reconstructed evidence is passed through the existing
+closed resolution certifier, including the Provider/Tool lifecycle FSM and
+permission/history validators. Only a fully certified attempt is removed.
+
+This preserves later-turn histories, legal repeated same-turn cycles, partial
+model streams, permission histories, and safe tool histories while rejecting
+moved or duplicated lifecycle markers.
+
+```text
+uv.exe run --python 3.13 pytest \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  -k "moved_model_attempt_start_fails_closed_before_external_work or moved_tool_attempt_start_fails_closed_before_external_work" -q
+4 passed, 92 deselected in 3.71s
+
+uv.exe run --python 3.13 pytest \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  -k "moved_model_attempt_start_fails_closed_before_external_work or moved_tool_attempt_start_fails_closed_before_external_work or duplicate_attempt_start_fails_closed_before_external_work or later_turn_canonical_resolution_replays_and_recovers_once or resolved_model_attempt_is_excluded_from_next_same_turn_attempt or resolved_tool_attempt_is_excluded_from_next_same_turn_attempt" -q
+14 passed, 82 deselected in 4.69s
+```
+
+The relevant Provider and Tool lifecycle, permission, historical transcript,
+duplicate-event, unreachable-position, and recovery-audit matrices also passed:
+
+```text
+uv.exe run --python 3.13 pytest \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  -k "duplicate_run_created or unknown_or_duplicate_provider_lifecycle_event or provider_recovery_audit_before_initial_interrupt or provider_known_lifecycle_token_in_unreachable_position or provider_historical_permission_request or provider_historical_tool_result or historical_recovery_evidence_is_reconstructed_exactly or safe_pre_handler_history or unknown_or_duplicate_tool_lifecycle_event or tool_recovery_audit_before_initial_interrupt or tool_model_token_after_tool_start or tool_retry_audit_for_historical_turn or malformed_permission_or_event_envelope or forged_safe_pre_handler_history or modified_recovery_permission_evidence" -q
+132 passed, 105 deselected in 12.33s
+```
+
+### Final-final verification
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+168 passed in 12.78s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+546 passed in 87.21s
+
+uv.exe run --python 3.13 pytest -q
+1801 passed in 120.75s; zero skipped, zero failed
+
+uv.exe run --python 3.13 ruff check src tests
+All checks passed!
+
+uv.exe run --python 3.13 mypy src
+Success: no issues found in 75 source files
+```
+
+The import/signature/schema smoke remains at 103 unique root exports, exact
+`RecoveryAPI.resolve`, `ReconciliationService.resolve`,
+`StateStore.list_reconciliation_requests`, and `RecoveryAPI.recover_workflow`
+contracts, and SQLite schema version 3. The final-final scope contains only
+`src/agent_sdk/runtime/recovery.py`, its integration test file, and this
+report. There is no dependency, lockfile, docs, roadmap, progress-ledger,
+migration, or schema-version change. `git diff --check` passed with only
+Windows LF-to-CRLF informational warnings.
+
+No implementation or verification concerns remain. The worktree is preserved;
+no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.
+
 ## Final narrow-review closure addendum
 
 The final narrow review returned C0/I1/M0 because the preceding exact-slice

@@ -321,6 +321,46 @@ async def _seed_real_model_in_flight(
     return handle.run_id, spec, operation_id
 
 
+async def _seed_partial_model_in_flight(
+    store: Any,
+) -> tuple[str, AgentSpec, str]:
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def partial_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {"choices": [{"delta": {"content": "partial"}}]}
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        return chunks()
+
+    spec = AgentSpec(name="resolution-partial", model="fake/resolution-partial")
+    seed = AgentSDK.for_test(
+        store=store,
+        acompletion=partial_completion,
+        permission_default="allow",
+    )
+    session = await seed.sessions.create(workspaces=[])
+    handle = await seed.runs.start(session.session_id, spec, "resolve partial model")
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    unresolved = await store.list_unresolved_external_operations(handle.run_id)
+    assert len(unresolved) == 1
+    operation_id = unresolved[0].operation_id
+    assert handle._task is not None
+    handle._task.cancel()
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await asyncio.wait_for(cancelled.wait(), timeout=10)
+    await seed.close()
+    await _mark_interrupted(store)
+    return handle.run_id, spec, operation_id
+
+
 def _unsafe_tool_spec() -> ToolSpec:
     return ToolSpec(
         name="resolution_tool",
@@ -525,6 +565,26 @@ async def _seed_pending_model_reconciliation(
         await admitter.close()
 
 
+async def _seed_pending_partial_model_reconciliation(
+    store: Any,
+) -> tuple[str, AgentSpec, str, Any]:
+    run_id, spec, operation_id = await _seed_partial_model_in_flight(store)
+    admitter = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion([]),
+        permission_default="allow",
+    )
+    admitter.agents.define(spec)
+    try:
+        waiting = await admitter.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        request = (await admitter.recovery.pending_requests(run_id))[0]
+        return run_id, spec, operation_id, request
+    finally:
+        await admitter.close()
+
+
 async def _seed_pending_tool_reconciliation(
     store: Any,
 ) -> tuple[str, AgentSpec, ToolSpec, str, Any]:
@@ -702,6 +762,125 @@ async def _insert_duplicate_run_event_before_paired_interrupt(
     )
     await store._connection.execute(
         "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'events'"
+    )
+    await store._connection.commit()
+
+
+async def _move_run_event_before_paired_interrupt(
+    store: Any,
+    *,
+    run_id: str,
+    request_id: str,
+    event_type: str,
+) -> None:
+    stored_events = list(await store.read_events(after_cursor=0))
+    run_events = tuple(
+        stored for stored in stored_events if stored.event.run_id == run_id
+    )
+    requested_index = next(
+        index
+        for index, stored in enumerate(run_events)
+        if stored.event.type == "reconciliation.requested"
+        and stored.event.payload.get("request_id") == request_id
+    )
+    assert requested_index > 0
+    interrupt = run_events[requested_index - 1]
+    assert interrupt.event.type == "run.interrupted"
+    source = next(
+        stored
+        for stored in reversed(run_events[: requested_index - 1])
+        if stored.event.type == event_type
+    )
+    original_identity = (
+        source.event.event_id,
+        source.event.payload,
+        source.event.schema_version,
+        source.event.occurred_at,
+    )
+    original_cursors = tuple(stored.cursor for stored in stored_events)
+    original_sequences = tuple(
+        stored.event.sequence
+        for stored in stored_events
+        if stored.event.run_id == run_id
+    )
+    source_index = stored_events.index(source)
+    interrupt_index = stored_events.index(interrupt)
+    assert source_index < interrupt_index
+    moved = stored_events.pop(source_index)
+    interrupt_index = stored_events.index(interrupt)
+    stored_events.insert(interrupt_index, moved)
+
+    run_sequence = iter(original_sequences)
+    rewritten: list[Any] = []
+    for cursor_value, stored in zip(original_cursors, stored_events, strict=True):
+        event = stored.event
+        if event.run_id == run_id:
+            event = event.model_copy(update={"sequence": next(run_sequence)})
+        rewritten.append(stored._replace(cursor=cursor_value, event=event))
+
+    moved_event = next(
+        stored.event
+        for stored in rewritten
+        if stored.event.event_id == source.event.event_id
+    )
+    assert (
+        moved_event.event_id,
+        moved_event.payload,
+        moved_event.schema_version,
+        moved_event.occurred_at,
+    ) == original_identity
+    rewritten_run_events = tuple(
+        stored for stored in rewritten if stored.event.run_id == run_id
+    )
+    rewritten_interrupt_index = next(
+        index
+        for index, stored in enumerate(rewritten_run_events)
+        if stored.event.event_id == interrupt.event.event_id
+    )
+    assert rewritten_run_events[rewritten_interrupt_index - 1].event.event_id == (
+        source.event.event_id
+    )
+    assert tuple(stored.cursor for stored in rewritten) == original_cursors
+    assert tuple(stored.event.sequence for stored in rewritten_run_events) == (
+        original_sequences
+    )
+
+    if isinstance(store, InMemoryStore):
+        store._events = rewritten
+        return
+
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute("DELETE FROM events")
+    for stored in rewritten:
+        event = stored.event
+        await store._connection.execute(
+            """
+            INSERT INTO events(
+                cursor, event_id, session_id, run_id, sequence, type,
+                schema_version, occurred_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stored.cursor,
+                event.event_id,
+                event.session_id,
+                event.run_id,
+                event.sequence,
+                event.type,
+                event.schema_version,
+                event.occurred_at.isoformat(),
+                json.dumps(
+                    event.payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    await store._connection.execute(
+        "UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'",
+        (max(original_cursors, default=0),),
     )
     await store._connection.commit()
 
@@ -1191,6 +1370,215 @@ async def test_recovery_rejects_lockstep_corrupt_resolved_history_before_externa
         )
         assert not any(event.type == "run.recovery.started" for event in events)
         assert not any(event.type == "permission.requested" for event in events)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_moved_model_attempt_start_fails_closed_before_external_work(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "moved-model-start.sqlite3")
+    )
+    run_id, spec, _operation_id, request = (
+        await _seed_pending_partial_model_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+    action = ReconciliationAction.CONFIRM_NOT_EXECUTED
+    decision_evidence = {"disposition": "not_executed"}
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        await sdk.recovery.resolve(
+            request.request_id,
+            action,
+            actor={"type": "operator"},
+            evidence=decision_evidence,
+        )
+        await _move_run_event_before_paired_interrupt(
+            store,
+            run_id=run_id,
+            request_id=request.request_id,
+            event_type="step.started",
+        )
+        before_events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        interrupt_index = next(
+            index
+            for index, event in enumerate(before_events)
+            if event.type == "run.interrupted"
+            and before_events[index + 1].type == "reconciliation.requested"
+            and before_events[index + 1].payload.get("request_id")
+            == request.request_id
+        )
+        assert before_events[interrupt_index - 1].type == "step.started"
+        assert any(
+            event.type == "model.call.started"
+            for event in before_events[: interrupt_index - 1]
+        )
+        assert any(
+            event.type == "model.text.delta"
+            for event in before_events[: interrupt_index - 1]
+        )
+
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await (await sdk.recovery.recover_run(run_id)).result()
+
+        assert provider_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].operation_id is None
+        assert pending[0].reason == "recovery_state_invalid"
+        after_events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        for external_event_type in (
+            "run.recovery.started",
+            "permission.requested",
+            "tool.recovery.retry.started",
+        ):
+            assert sum(
+                event.type == external_event_type for event in after_events
+            ) == sum(
+                event.type == external_event_type for event in before_events
+            )
+        before_replay = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as replay_conflict:
+            await sdk.recovery.resolve(
+                request.request_id,
+                action,
+                actor={"type": "operator"},
+                evidence=decision_evidence,
+            )
+        assert replay_conflict.value.code is ErrorCode.CONFLICT
+        assert replay_conflict.value.message == "recovery state conflict"
+        assert provider_calls == []
+        assert await _resolution_domain_state(store) == before_replay
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_moved_tool_attempt_start_fails_closed_before_external_work(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "moved-tool-start.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+    action = ReconciliationAction.RETRY
+    decision_evidence = {"acknowledge_duplicate_side_effect_risk": True}
+
+    async def forbidden_tool_handler(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        raise AssertionError("corrupt resolved history must not call the tool")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool_handler)
+    try:
+        await sdk.recovery.resolve(
+            request.request_id,
+            action,
+            actor={"type": "operator"},
+            evidence=decision_evidence,
+        )
+        await _move_run_event_before_paired_interrupt(
+            store,
+            run_id=run_id,
+            request_id=request.request_id,
+            event_type="tool.call.proposed",
+        )
+        before_events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        interrupt_index = next(
+            index
+            for index, event in enumerate(before_events)
+            if event.type == "run.interrupted"
+            and before_events[index + 1].type == "reconciliation.requested"
+            and before_events[index + 1].payload.get("request_id")
+            == request.request_id
+        )
+        assert before_events[interrupt_index - 1].type == "tool.call.proposed"
+        assert any(
+            event.type == "tool.call.authorized"
+            for event in before_events[: interrupt_index - 1]
+        )
+        assert any(
+            event.type == "tool.call.started"
+            for event in before_events[: interrupt_index - 1]
+        )
+
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await (await sdk.recovery.recover_run(run_id)).result()
+
+        assert provider_calls == []
+        assert tool_calls == []
+        pending = await sdk.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].operation_id is None
+        assert pending[0].reason == "recovery_state_invalid"
+        after_events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        for external_event_type in (
+            "run.recovery.started",
+            "permission.requested",
+            "tool.recovery.retry.started",
+        ):
+            assert sum(
+                event.type == external_event_type for event in after_events
+            ) == sum(
+                event.type == external_event_type for event in before_events
+            )
+        before_replay = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as replay_conflict:
+            await sdk.recovery.resolve(
+                request.request_id,
+                action,
+                actor={"type": "operator"},
+                evidence=decision_evidence,
+            )
+        assert replay_conflict.value.code is ErrorCode.CONFLICT
+        assert replay_conflict.value.message == "recovery state conflict"
+        assert provider_calls == []
+        assert tool_calls == []
+        assert await _resolution_domain_state(store) == before_replay
     finally:
         await sdk.close()
         if isinstance(store, SQLiteStore):

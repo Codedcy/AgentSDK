@@ -2145,8 +2145,8 @@ class RunRecoveryService:
             and evidence.run_events[0].payload == run.model_dump(mode="json")
         )
 
-    @staticmethod
     def _effective_resolved_evidence(
+        self,
         evidence: _RecoveryEvidence,
         base_request: ModelRequest,
     ) -> _RecoveryEvidence | None:
@@ -2164,9 +2164,32 @@ class RunRecoveryService:
             return evidence if not resolution_events else None
         if (
             len(resolved) != len(resolution_events)
-            or not RunRecoveryService._is_valid_run_event_envelope(evidence)
+            or not self._is_valid_run_event_envelope(evidence)
         ):
             return None
+
+        requested_positions = {
+            request.request_id: tuple(
+                index
+                for index, event in enumerate(evidence.run_events)
+                if event.type == "reconciliation.requested"
+                and event.payload.get("request_id") == request.request_id
+            )
+            for request in resolved
+        }
+        if any(len(indexes) != 1 for indexes in requested_positions.values()):
+            return None
+        resolved = tuple(
+            sorted(
+                resolved,
+                key=lambda request: requested_positions[request.request_id][0],
+            )
+        )
+        resolved_operation_ids = frozenset(
+            request.operation_id
+            for request in resolved
+            if request.operation_id is not None
+        )
 
         removed_event_indexes: set[int] = set()
         removed_operation_ids: set[str] = set()
@@ -2267,12 +2290,21 @@ class RunRecoveryService:
             if len(starts) != 1:
                 return None
             attempt_start = starts[0]
-            if not RunRecoveryService._is_exact_resolved_attempt(
+            if not self._is_exact_resolved_attempt(
                 evidence,
                 base_request,
                 request,
                 operation,
                 attempt_start=attempt_start,
+            ):
+                return None
+            if not self._is_valid_resolved_attempt_lifecycle(
+                evidence,
+                base_request,
+                operation,
+                interrupt_index=interrupt_index,
+                removed_event_indexes=removed_event_indexes,
+                resolved_operation_ids=resolved_operation_ids,
             ):
                 return None
             removed_event_indexes.update(range(attempt_start, interrupt_index))
@@ -2304,8 +2336,152 @@ class RunRecoveryService:
         )
         return (
             normalized
-            if RunRecoveryService._is_valid_run_event_envelope(normalized)
+            if self._is_valid_run_event_envelope(normalized)
             else None
+        )
+
+    def _is_valid_resolved_attempt_lifecycle(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        operation: ExternalOperation,
+        *,
+        interrupt_index: int,
+        removed_event_indexes: set[int],
+        resolved_operation_ids: frozenset[str],
+    ) -> bool:
+        retained = tuple(
+            (cursor, event)
+            for index, (cursor, event) in enumerate(
+                zip(evidence.run_event_cursors, evidence.run_events)
+            )
+            if index <= interrupt_index and index not in removed_event_indexes
+        )
+        projected_events = tuple(
+            event.model_copy(update={"sequence": index})
+            for index, (_, event) in enumerate(retained, start=1)
+        )
+        started_operation = operation.model_copy(
+            update={
+                "status": ExternalOperationStatus.STARTED,
+                "outcome": None,
+            }
+        )
+        projected_operations = tuple(
+            started_operation
+            if item.operation_id == operation.operation_id
+            else item
+            for item in evidence.operations
+            if item.operation_id == operation.operation_id
+            or (
+                item.operation_id not in resolved_operation_ids
+                and (
+                    item.turn < operation.turn
+                    or (
+                        isinstance(operation, ToolCallOperation)
+                        and item.turn == operation.turn
+                        and isinstance(item, ModelCallOperation)
+                        and item.status is ExternalOperationStatus.COMPLETED
+                    )
+                )
+            )
+        )
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        messages = self._messages_before_turn(
+            evidence,
+            base_request,
+            operation.turn,
+        )
+        if checkpoint is None or descriptor is None or messages is None:
+            return False
+
+        completed_turns = operation.turn + (
+            1 if isinstance(operation, ToolCallOperation) else 0
+        )
+        output_parts: list[str] = []
+        cumulative: dict[str, int | None] = {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+        current_completed: tuple[
+            str | None,
+            str,
+            tuple[Mapping[str, object], ...],
+            TokenUsage,
+        ] | None = None
+        for turn in range(completed_turns):
+            matches = tuple(
+                item
+                for item in projected_operations
+                if isinstance(item, ModelCallOperation)
+                and item.turn == turn
+                and item.status is ExternalOperationStatus.COMPLETED
+            )
+            if len(matches) != 1:
+                return False
+            completed = self._completed_model_outcome(matches[0])
+            if completed is None:
+                return False
+            current_completed = completed
+            output_parts.append(completed[1])
+            usage = completed[3]
+            for field in cumulative:
+                value = getattr(usage, field)
+                if value is not None:
+                    cumulative[field] = (cumulative[field] or 0) + value
+
+        projected_messages = list(messages)
+        if isinstance(operation, ToolCallOperation):
+            if current_completed is None or len(current_completed[2]) != 1:
+                return False
+            raw_call = current_completed[2][0]
+            projected_messages.append(
+                {
+                    "role": "assistant",
+                    "content": current_completed[1] or None,
+                    "tool_calls": [
+                        {
+                            "id": raw_call["call_id"],
+                            "type": "function",
+                            "function": {
+                                "name": raw_call["name"],
+                                "arguments": raw_call["arguments_json"],
+                            },
+                        }
+                    ],
+                }
+            )
+
+        projected_checkpoint = checkpoint.model_copy(
+            update={
+                "turn": operation.turn,
+                "phase": (
+                    RunCheckpointPhase.MODEL_IN_FLIGHT
+                    if isinstance(operation, ModelCallOperation)
+                    else RunCheckpointPhase.TOOL_IN_FLIGHT
+                ),
+                "operation_id": operation.operation_id,
+                "messages": tuple(projected_messages),
+                "output_parts": tuple(output_parts),
+                "usage": TokenUsage(**cumulative),
+                "tool_results": checkpoint.tool_results[: operation.turn],
+            }
+        )
+        projected = replace(
+            evidence,
+            checkpoint=projected_checkpoint,
+            operations=projected_operations,
+            pending=(),
+            reconciliations=(),
+            run_events=projected_events,
+            run_event_cursors=tuple(cursor for cursor, _ in retained),
+        )
+        return self._is_resolution_operation_certified(
+            projected,
+            base_request,
+            started_operation,
         )
 
     @staticmethod
@@ -2562,12 +2738,12 @@ class RunRecoveryService:
             return None
         return tuple(messages)
 
-    @staticmethod
     def _is_safe_checkpoint(
+        self,
         evidence: _RecoveryEvidence,
         base_request: ModelRequest,
     ) -> bool:
-        effective = RunRecoveryService._effective_resolved_evidence(
+        effective = self._effective_resolved_evidence(
             evidence,
             base_request,
         )
