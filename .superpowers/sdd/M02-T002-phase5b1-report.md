@@ -539,3 +539,154 @@ No known Phase 5B1 implementation or verification concern remains after the
 second review. Confirmed Tool outcomes and Workflow projection remain Phase
 5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
 or push was performed.
+
+## Third independent review closure addendum
+
+The third independent Phase 5B1 review returned C0/I1/M0. The remaining
+Important finding was reproduced on Memory and SQLite before production code
+changed, then closed in commit `f1b9ba0` (`fix(recovery): certify confirmed
+terminal history`). This addendum supersedes the preceding post-review risk
+statement.
+
+### I1: terminal confirmed replay did not certify its complete history
+
+The terminal branch of `_is_confirmed_replay_closed_world` proved the closed
+reconciliation grammar, unique Model-operation turns, exact confirmed decision
+slice, terminal batch, and final snapshot fields, but never submitted the
+complete historical event stream to the lifecycle/provider certifier. A real
+confirmed text terminal Run could therefore retain a valid envelope and exact
+terminal batch while an earlier `step.started`, `model.call.started`,
+`model.usage.reported`, or `model.call.completed` marker was missing,
+duplicated, or moved. Exact replay still succeeded.
+
+The new adversarial matrix creates a real two-turn Run: turn 0 produces text,
+usage, a Tool call, and an executed Tool result; turn 1 is interrupted in
+Model flight and resolved with confirmed terminal text. It changes only one
+turn-0 lifecycle marker, preserving event IDs, sequences, global cursors, the
+confirmed atomic suffix, and the final Session transition. It crosses four
+marker kinds, three corruptions, and both Stores. Each replay must conflict
+without durable mutation. A separate positive matrix retains the complete
+multi-turn Tool history and requires exact replay to succeed on both Stores.
+
+RED:
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_confirmed_terminal_replay_authenticates_complete_lifecycle_history
+24 failed in 6.94s
+All 24 missing/duplicate/moved corruptions were incorrectly accepted.
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_confirmed_terminal_replay_accepts_complete_multiturn_tool_history
+2 passed in 3.37s
+```
+
+### Single-FSM implementation and scope boundary
+
+The fix does not add a second lifecycle state machine.
+`_is_valid_certified_lifecycle_positions` remains the single event-order FSM.
+Its existing non-terminal path and default arguments are unchanged. An
+optional terminal mode adds only the completed/failed terminal states and
+collects per-Model delta/usage evidence while the same FSM continues to
+authenticate step, Model, Tool, permission, recovery-control, and failure
+ordering and payloads. Recovered Model IDs distinguish authoritative or
+operator-confirmed outcomes, which require exact usage and no fabricated text
+deltas.
+
+`_is_exact_confirmed_terminal_history` constructs a certification-only view.
+For a direct terminal confirmation it removes exactly the current
+`run.interrupted`, requested marker, and resolved marker. For an earlier
+confirmed Tool call followed by later normal completion it reuses
+`_effective_resolved_evidence`, including its established rule that moves the
+interruption behind the confirmed Model terminal markers and before the later
+recovery. The durable history is never rewritten.
+
+After the lifecycle FSM succeeds, the terminal provider helper performs no
+state transitions. It reuses `_messages_before_turn` to authenticate every
+prior Model request fingerprint and Tool-result/message relation, validates the
+final Model request, and compares the reconstructed output, usage, messages,
+Tool results, terminal event payload, Run, and checkpoint projection. Thus the
+new helper is a projection certifier layered after the one lifecycle FSM, not a
+duplicate FSM.
+
+The optional terminal arguments are supplied only by confirmed terminal exact
+replay. Phase 5A reconciliation and the supported unique later-pending path
+continue to call `_is_resolution_operation_certified` and
+`_is_valid_certified_provider_history` with their original defaults. Store
+contracts and durable schemas are unchanged. Phase 5B2 behavior is not
+admitted.
+
+GREEN and compatibility:
+
+```text
+new positive and corruption matrices:
+26 passed in 4.64s
+
+new matrices plus confirmed Tool later-terminal compatibility, direct
+completed/failed projection, and terminalization-gap compatibility:
+38 passed in 6.28s
+```
+
+## Third-review verification
+
+All commands used the explicit executable
+`C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe`.
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+276 passed in 18.67s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+654 passed in 92.05s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/unit/runtime/test_reconciliation_models.py \
+  tests/integration/storage/test_recovery_records.py \
+  tests/integration/storage/test_sqlite_recovery_validation.py \
+  tests/integration/runtime/test_recovery_scanner.py \
+  tests/integration/runtime/test_live_run_progress.py \
+  tests/integration/runtime/test_leases.py \
+  tests/integration/runtime/test_session_lifecycle.py \
+  tests/integration/runtime/test_run_session_ownership.py \
+  tests/contract/test_memory_store_contract.py \
+  tests/contract/test_idempotency_store_contract.py \
+  tests/e2e/test_session_lifecycle_idempotency.py \
+  tests/integration/workflow/test_workflow_recovery.py \
+  tests/integration/workflow/test_workflow_recovery_admission.py \
+  tests/integration/workflow/test_workflow_session_ownership.py
+543 passed in 18.46s
+
+uv.exe run --python 3.13 pytest -q
+1909 passed in 126.26s; zero skipped, zero failed
+
+uv.exe run --python 3.13 ruff check src tests
+All checks passed!
+
+uv.exe run --python 3.13 mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The fresh import/signature/schema smoke again passed with 103 unique root
+exports, exact unchanged `RecoveryAPI.resolve` and
+`ReconciliationService.resolve` signatures, and SQLite schema version 3. The
+implementation commit touched only
+`src/agent_sdk/runtime/recovery.py` and
+`tests/integration/runtime/test_reconciliation_resolution.py`; this report is
+the only documentation change.
+
+No known Phase 5B1 implementation or verification concern remains after the
+third review. Confirmed Tool outcomes and Workflow projection remain Phase
+5B2; Phase 5C, M02-T003, M02-T004, and `TERMINATE` remain untouched. No merge
+or push was performed.
