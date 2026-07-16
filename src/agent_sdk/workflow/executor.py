@@ -102,12 +102,17 @@ class WorkflowExecutor:
         self._active: dict[str, asyncio.Task[WorkflowResult]] = {}
         self._start_lock = asyncio.Lock()
         self._recover_run: Callable[[str], Awaitable[RunHandle]] | None = None
+        self._certify_terminal_run: (
+            Callable[[str], Awaitable[RunSnapshot]] | None
+        ) = None
 
     def _set_run_recovery(
         self,
         recover_run: Callable[[str], Awaitable[RunHandle]],
+        certify_terminal_run: Callable[[str], Awaitable[RunSnapshot]],
     ) -> None:
         self._recover_run = recover_run
+        self._certify_terminal_run = certify_terminal_run
 
     async def start(
         self,
@@ -481,6 +486,13 @@ class WorkflowExecutor:
                     ) from None
 
             if run.status is RunStatus.COMPLETED:
+                run = await self._certified_terminal_selected_run(
+                    snapshot,
+                    index,
+                    node,
+                    run_id,
+                    expected_descriptor,
+                )
                 try:
                     self._validate_recovery_descriptor(snapshot)
                     await self._state.complete_node(snapshot, index, _run_result(run))
@@ -491,6 +503,13 @@ class WorkflowExecutor:
                 continue
 
             if run.status is RunStatus.FAILED:
+                run = await self._certified_terminal_selected_run(
+                    snapshot,
+                    index,
+                    node,
+                    run_id,
+                    expected_descriptor,
+                )
                 failure = _run_workflow_failure(run)
                 try:
                     self._validate_recovery_descriptor(snapshot)
@@ -662,6 +681,35 @@ class WorkflowExecutor:
                 retryable=False,
             ) from None
         return loaded
+
+    async def _certified_terminal_selected_run(
+        self,
+        workflow: WorkflowRunSnapshot,
+        index: int,
+        node: AgentNode,
+        run_id: str,
+        expected_descriptor: ExecutionDescriptor,
+    ) -> RunSnapshot:
+        if self._certify_terminal_run is None:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "terminal run certification is unavailable",
+                retryable=False,
+            ) from None
+        run = await self._certify_terminal_run(run_id)
+        if not _related_run_matches(
+            workflow,
+            index,
+            node,
+            run,
+            expected_descriptor=expected_descriptor,
+        ):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "related run does not match workflow node",
+                retryable=False,
+            ) from None
+        return run
 
     async def _workflow_changed_after_conflict(
         self,

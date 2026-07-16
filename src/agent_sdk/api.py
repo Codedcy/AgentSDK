@@ -688,7 +688,10 @@ class RecoveryAPI:
             _adapter_timeout=provider_recovery_timeout_seconds,
         )
         self._reconciliation = ReconciliationService(self._service)
-        self._workflows._set_run_recovery(self._recover_run_handle)
+        self._workflows._set_run_recovery(
+            self._recover_run_handle,
+            self._service._certify_terminal_run_for_workflow,
+        )
 
     def register_adapter(
         self,

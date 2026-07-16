@@ -391,6 +391,108 @@ class RunRecoveryService:
             details=(("checkpoint_phase", checkpoint.phase.value),),
         )
 
+    async def _certify_terminal_run_for_workflow(self, run_id: str) -> RunSnapshot:
+        public_error: tuple[ErrorCode, str, bool] | None = None
+        try:
+            run = await self._load_run(run_id)
+            if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
+                raise self._state_error() from None
+            evidence = await self._load_evidence(
+                run,
+                allow_terminal_detached=True,
+            )
+            checkpoint = evidence.checkpoint
+            base_request = await self._validated_request(evidence)
+            effective = (
+                None
+                if base_request is None
+                else self._effective_resolved_evidence(evidence, base_request)
+            )
+            confirmed_requests = tuple(
+                request
+                for request in evidence.reconciliations
+                if request.resolution is not None
+                and request.resolution.action
+                is ReconciliationAction.CONFIRM_COMPLETED
+            )
+            operations_by_id = {
+                operation.operation_id: operation for operation in evidence.operations
+            }
+
+            def confirmed_request_is_certified(
+                request: ReconciliationRequest,
+            ) -> bool:
+                if base_request is None:
+                    return False
+                operation_id = request.operation_id
+                if operation_id is None:
+                    return False
+                operation = operations_by_id.get(operation_id)
+                if isinstance(operation, ModelCallOperation):
+                    return self._is_exact_confirmed_model_replay(
+                        evidence,
+                        base_request,
+                        request,
+                        operation,
+                    ) and self._is_confirmed_replay_closed_world(
+                        evidence,
+                        base_request,
+                        request,
+                        operation,
+                    )
+                if isinstance(operation, ToolCallOperation):
+                    return self._is_confirmed_tool_replay_closed_world(
+                        evidence,
+                        base_request,
+                        request,
+                        operation,
+                    )
+                return False
+
+            confirmed_history = (
+                base_request is not None
+                and bool(confirmed_requests)
+                and any(map(confirmed_request_is_certified, confirmed_requests))
+            )
+            ordinary_history = (
+                not confirmed_requests
+                and base_request is not None
+                and effective is not None
+                and self._is_valid_certified_provider_history(
+                    effective,
+                    base_request=base_request,
+                    terminal_status=run.status,
+                )
+            )
+            if (
+                checkpoint is None
+                or checkpoint.phase is not RunCheckpointPhase.TERMINAL
+                or checkpoint.operation_id is not None
+                or evidence.pending
+                or base_request is None
+                or any(
+                    operation.status is ExternalOperationStatus.STARTED
+                    for operation in evidence.operations
+                )
+                or not (confirmed_history or ordinary_history)
+            ):
+                raise self._state_error() from None
+            return run
+        except AgentSDKError as error:
+            public_error = (error.code, error.message, error.retryable)
+        except Exception:
+            public_error = (
+                ErrorCode.INTERNAL,
+                "recovery state is invalid",
+                False,
+            )
+        assert public_error is not None
+        raise AgentSDKError(
+            public_error[0],
+            public_error[1],
+            retryable=public_error[2],
+        ) from None
+
     async def pending_requests(
         self,
         run_id: str,
