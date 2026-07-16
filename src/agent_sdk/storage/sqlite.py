@@ -71,10 +71,11 @@ from agent_sdk.storage.idempotency import (
 )
 from agent_sdk.tools.models import thaw_json
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 _MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"
 _OPEN_BUSY_TIMEOUT_MS = 50
 _OPEN_RETRY_SECONDS = 2.0
+_SCHEMA_GENERATION_ATTRIBUTE = "_agent_sdk_schema_generation"
 _EXPECTED_TABLE_INFO: dict[str, tuple[tuple[str, str, bool, int], ...]] = {
     "schema_migrations": (
         ("version", "INTEGER", False, 1),
@@ -737,17 +738,83 @@ async def _execute_script_statements(
 class SQLiteStore:
     def __init__(self, connection: aiosqlite.Connection) -> None:
         self._connection = connection
+        generation = getattr(connection, _SCHEMA_GENERATION_ATTRIBUTE, None)
+        if not isinstance(generation, tuple):
+            raise RuntimeError("SQLite connection has no opened schema generation")
+        self._opened_schema_generation = cast(tuple[tuple[int, str], ...], generation)
         self._lock = asyncio.Lock()
         self._closed = False
 
     @classmethod
     async def open(cls, path: str | Path) -> SQLiteStore:
+        import agent_sdk.storage.migrations as migration_storage
+
         database_path = Path(path)
-        database_path.parent.mkdir(parents=True, exist_ok=True)
+        runner = await migration_storage.MigrationRunner.open(database_path)
+        migrations = migration_storage._packaged_migrations()
+        async with migration_storage._coordinator(runner.database_identity):
+            connection = await runner._apply_locked(migrations, keep_open=True)
+            if connection is None:  # pragma: no cover - guarded by keep_open
+                raise RuntimeError("migration runner did not return its connection")
+            return await cls._from_configured_connection(connection, migrations)
+
+    @classmethod
+    async def _open_existing(cls, path: str | Path) -> SQLiteStore:
+        import agent_sdk.storage.migrations as migration_storage
+
+        runner = await migration_storage.MigrationRunner.open(path)
+        migrations = migration_storage._packaged_migrations()
+        async with migration_storage._coordinator(runner.database_identity):
+            return await cls._open_existing_locked(runner.path, migrations)
+
+    @classmethod
+    async def _open_existing_locked(
+        cls,
+        database_path: Path,
+        migrations: tuple[Any, ...],
+    ) -> SQLiteStore:
+        import agent_sdk.storage.migrations as migration_storage
+
+        if not database_path.exists():
+            raise migration_storage.MigrationSchemaError(
+                "database schema does not exist"
+            )
         connection = await aiosqlite.connect(database_path)
         try:
             await cls._configure_connection(connection)
-            await cls._migrate(connection)
+        except BaseException:
+            close_task = asyncio.create_task(connection.close())
+            await cls._await_cleanup(close_task)
+            raise
+        return await cls._from_configured_connection(connection, migrations)
+
+    @classmethod
+    async def _from_configured_connection(
+        cls,
+        connection: aiosqlite.Connection,
+        migrations: tuple[Any, ...],
+    ) -> SQLiteStore:
+        import agent_sdk.storage.migrations as migration_storage
+
+        try:
+            applied = await migration_storage._inspect_connection_applied(
+                connection, migrations
+            )
+            if len(applied) not in (3, 4):
+                raise migration_storage.MigrationSchemaError(
+                    "SQLiteStore requires schema version 3 or later"
+                )
+            generation = await migration_storage._schema_generation(
+                connection, migrations
+            )
+            expected_generation = tuple(
+                (item.version, item.checksum) for item in applied
+            )
+            if generation != expected_generation:
+                raise migration_storage.MigrationSchemaError(
+                    "incompatible database migration history"
+                )
+            setattr(connection, _SCHEMA_GENERATION_ATTRIBUTE, generation)
         except BaseException:
             close_task = asyncio.create_task(connection.close())
             await cls._await_cleanup(close_task)
@@ -779,7 +846,7 @@ class SQLiteStore:
         async with self._lock:
             self._ensure_open()
             try:
-                await self._connection.execute("BEGIN IMMEDIATE")
+                await self._begin_immediate("SQLite commit conflict")
                 if request is not None:
                     existing = await self._read_idempotency(request.scope, request.key)
                     if existing is not None:
@@ -812,7 +879,7 @@ class SQLiteStore:
                 if isinstance(incoming, IdempotencyRecord):
                     await self._insert_idempotency(incoming)
                 cursor = await self._last_cursor()
-                await self._connection.commit()
+                await self._commit_transaction()
                 return CommitResult(last_cursor=cursor, idempotency=incoming)
             except BaseException:
                 await self._rollback()
@@ -2674,7 +2741,7 @@ class SQLiteStore:
         async with self._lock:
             self._ensure_open()
             try:
-                await self._connection.execute("BEGIN IMMEDIATE")
+                await self._begin_immediate("SQLite Session deletion conflict")
                 await self._connection.execute(
                     "DELETE FROM reconciliation_requests WHERE session_id = ?",
                     (session_id,),
@@ -2708,7 +2775,7 @@ class SQLiteStore:
                     "DELETE FROM idempotency_records WHERE session_id = ?",
                     (session_id,),
                 )
-                await self._connection.commit()
+                await self._commit_transaction()
             except BaseException:
                 await self._rollback()
                 raise
@@ -2726,6 +2793,8 @@ class SQLiteStore:
         await self._await_cleanup(commit)
 
     async def _begin_immediate(self, message: str) -> None:
+        import agent_sdk.storage.migrations as migration_storage
+
         async def begin() -> None:
             await self._connection.execute("BEGIN IMMEDIATE")
 
@@ -2734,6 +2803,18 @@ class SQLiteStore:
             deadline=monotonic() + _OPEN_RETRY_SECONDS,
             message=message,
         )
+        try:
+            current_generation = await migration_storage._schema_generation(
+                self._connection
+            )
+        except (sqlite3.Error, migration_storage.MigrationError):
+            raise migration_storage.SchemaGenerationChangedError(
+                "SQLite schema generation changed"
+            ) from None
+        if current_generation != self._opened_schema_generation:
+            raise migration_storage.SchemaGenerationChangedError(
+                "SQLite schema generation changed"
+            )
 
     @staticmethod
     async def _await_cleanup(cleanup: asyncio.Task[None]) -> None:

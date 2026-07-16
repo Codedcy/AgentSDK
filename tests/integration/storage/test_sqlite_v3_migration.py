@@ -40,6 +40,20 @@ _V3_INDEXES = {
     "run_checkpoints_session",
     "snapshots_session",
 }
+_CURRENT_VERSIONS = (1, 2, 3, 4)
+_CURRENT_TABLES = _V3_TABLES | {
+    "artifact_generations",
+    "artifact_heads",
+    "artifact_owners",
+    "artifact_cleanup_jobs",
+}
+_CURRENT_INDEXES = _V3_INDEXES | {
+    "artifact_generations_state_claim",
+    "artifact_owners_session",
+    "artifact_owners_generation",
+    "artifact_cleanup_jobs_state_claim",
+}
+_CURRENT_SCHEMA_STATE = (_CURRENT_VERSIONS, _CURRENT_TABLES, _CURRENT_INDEXES)
 
 
 def _migration(name: str) -> str:
@@ -98,16 +112,16 @@ def _assert_exact_v2(path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_empty_database_is_created_as_complete_v3(tmp_path: Path) -> None:
+async def test_empty_database_is_created_as_complete_current_schema(tmp_path: Path) -> None:
     path = tmp_path / "empty.db"
 
     store = await SQLiteStore.open(path)
     await store.close()
 
     versions, tables, indexes = _schema_state(path)
-    assert versions == (1, 2, 3)
-    assert tables == _V3_TABLES
-    assert indexes == _V3_INDEXES
+    assert versions == _CURRENT_VERSIONS
+    assert tables == _CURRENT_TABLES
+    assert indexes == _CURRENT_INDEXES
     with sqlite3.connect(path) as connection:
         checkpoint_foreign_keys = connection.execute(
             "PRAGMA foreign_key_list(run_checkpoints)"
@@ -128,7 +142,9 @@ async def test_empty_database_is_created_as_complete_v3(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_exact_v2_database_upgrades_to_complete_v3(tmp_path: Path) -> None:
+async def test_exact_v2_database_upgrades_to_complete_current_schema(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "v2.db"
     _create_v2_database(path)
 
@@ -136,9 +152,9 @@ async def test_exact_v2_database_upgrades_to_complete_v3(tmp_path: Path) -> None
     await store.close()
 
     versions, tables, indexes = _schema_state(path)
-    assert versions == (1, 2, 3)
-    assert tables == _V3_TABLES
-    assert indexes == _V3_INDEXES
+    assert versions == _CURRENT_VERSIONS
+    assert tables == _CURRENT_TABLES
+    assert indexes == _CURRENT_INDEXES
 
 
 @pytest.mark.asyncio
@@ -150,17 +166,17 @@ async def test_two_concurrent_v2_opens_migrate_once(tmp_path: Path) -> None:
         asyncio.gather(SQLiteStore.open(path), SQLiteStore.open(path)), timeout=3
     )
     try:
-        assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+        assert _schema_state(path) == _CURRENT_SCHEMA_STATE
     finally:
         await asyncio.gather(first.close(), second.close())
 
 
 @pytest.mark.asyncio
-async def test_exact_v3_open_validates_without_replaying_migration(
+async def test_exact_v4_open_validates_without_replaying_legacy_migration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-    path = tmp_path / "v3.db"
+    path = tmp_path / "v4.db"
     initial = await SQLiteStore.open(path)
     await initial.close()
     checkpoints: list[str] = []
@@ -172,7 +188,9 @@ async def test_exact_v3_open_validates_without_replaying_migration(
     reopened = await SQLiteStore.open(path)
     await reopened.close()
 
-    assert "migration-schema-discovered-v3" in checkpoints
+    assert not any(
+        stage.startswith("migration-schema-discovered-") for stage in checkpoints
+    )
     assert not any(stage.startswith("migration-3-statement-") for stage in checkpoints)
     assert "migration-3-version-inserted" not in checkpoints
 
@@ -207,7 +225,7 @@ async def test_v3_migration_fault_rolls_back_to_exact_v2_and_reopens(
     assert _schema_state(path) == before
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.parametrize(
@@ -241,7 +259,7 @@ async def test_v2_shape_with_invalid_version_history_is_rejected_then_repairable
     _assert_exact_v2(path)
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.asyncio
@@ -264,7 +282,7 @@ async def test_v3_commit_failure_rolls_back_to_exact_v2_and_reopens(
     _assert_exact_v2(path)
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.asyncio
@@ -296,7 +314,7 @@ async def test_cancellation_after_v3_ddl_rolls_back_to_exact_v2_and_reopens(
     _assert_exact_v2(path)
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.asyncio
@@ -319,7 +337,7 @@ async def test_real_write_lock_busy_exhaustion_leaves_exact_v2_and_reopens(
 
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.parametrize("corruption", ["table-ddl", "index-ddl"])
@@ -724,7 +742,7 @@ async def test_cancel_racing_v3_migration_commit_observes_complete_v3(
 
     reopened = await SQLiteStore.open(path)
     await reopened.close()
-    assert _schema_state(path) == ((1, 2, 3), _V3_TABLES, _V3_INDEXES)
+    assert _schema_state(path) == _CURRENT_SCHEMA_STATE
 
 
 @pytest.mark.parametrize("child_table", ["run_checkpoints", "reconciliation_requests"])

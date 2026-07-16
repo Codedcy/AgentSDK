@@ -313,7 +313,7 @@ async def test_v1_upgrade_backfills_only_nonterminal_execution_ownership(tmp_pat
         async with store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cursor:
-            assert await cursor.fetchall() == [(1,), (2,), (3,)]
+            assert await cursor.fetchall() == [(1,), (2,), (3,), (4,)]
         await sdk.close()
     finally:
         await store.close()
@@ -353,7 +353,6 @@ async def test_concurrent_v1_open_serializes_discovery_and_migration(
     _create_v1_database(path)
     first_v1_discovered = asyncio.Event()
     release_first = asyncio.Event()
-    second_is_competing = asyncio.Event()
     requested = 0
     discoveries: list[str] = []
 
@@ -361,8 +360,6 @@ async def test_concurrent_v1_open_serializes_discovery_and_migration(
         nonlocal requested
         if stage == "migration-lock-requested":
             requested += 1
-            if requested == 2:
-                second_is_competing.set()
         elif stage.startswith("migration-schema-discovered-"):
             discoveries.append(stage.removeprefix("migration-schema-discovered-"))
             if stage == "migration-schema-discovered-v1":
@@ -377,19 +374,21 @@ async def test_concurrent_v1_open_serializes_discovery_and_migration(
         await asyncio.wait_for(first_v1_discovered.wait(), timeout=1)
         second_task = asyncio.create_task(SQLiteStore.open(path))
         tasks.append(second_task)
-        await asyncio.wait_for(second_is_competing.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not second_task.done()
+        assert requested == 1
         assert discoveries == ["v1"]
         release_first.set()
         first, second = await asyncio.wait_for(
             asyncio.gather(first_task, second_task),
             timeout=2,
         )
-        assert discoveries == ["v1", "v3"]
+        assert discoveries == ["v1"]
         for store in (first, second):
             async with store._connection.execute(
                 "SELECT version FROM schema_migrations ORDER BY version"
             ) as cursor:
-                assert await cursor.fetchall() == [(1,), (2,), (3,)]
+                assert await cursor.fetchall() == [(1,), (2,), (3,), (4,)]
     finally:
         release_first.set()
         for task in tasks:
@@ -520,7 +519,7 @@ async def test_cancel_racing_migration_commit_observes_only_complete_v3(
         async with reopened._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ) as cursor:
-            assert await cursor.fetchall() == [(1,), (2,), (3,)]
+            assert await cursor.fetchall() == [(1,), (2,), (3,), (4,)]
         assert (await reopened.get_snapshot("session", "ses_v1"))["active_run_ids"] == [
             "run_active"
         ]
