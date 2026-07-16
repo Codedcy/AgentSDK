@@ -395,3 +395,108 @@ was Windows LF-to-CRLF informational warnings.
 
 No implementation or verification concerns remain. The worktree is preserved;
 no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.
+
+## Independent re-review closure addendum
+
+The Phase 5A re-review returned C0/I1/M0. The remaining important finding was
+an exact-slice ambiguity in resolved-history normalization: inside the current
+recovery/interrupt interval, `_effective_resolved_evidence` collected every
+operation-kind start marker and selected the last one. A duplicate marker
+immediately before `run.interrupted` could therefore be selected and removed
+while the real attempt slice remained.
+
+### Duplicate model start RED
+
+The public Memory/SQLite test inserts a second canonically sequenced
+`step.started` immediately before the paired interrupt, while preserving the
+canonical resolved row, requested/resolved events, operation, checkpoint, and
+Run. Public recovery has a successful Provider callback installed and must
+instead admit only bounded `recovery_state_invalid`; exact replay must then
+conflict without mutation.
+
+```text
+uv.exe run --python 3.13 pytest -q tests/integration/runtime/test_reconciliation_resolution.py::test_duplicate_model_attempt_start_fails_closed_before_external_work
+2 failed in 3.95s; Memory and SQLite both reached Provider completion
+```
+
+### Duplicate tool proposal RED
+
+The matching unsafe-tool case inserts a second canonical
+`tool.call.proposed`. Recovery already admitted only bounded reconciliation
+with zero Provider, Tool/MCP, recovery-audit, and permission work, but the
+subsequent exact replay accepted the old resolution.
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_duplicate_attempt_start_fails_closed_before_external_work \
+  -k tool
+2 failed, 2 deselected in 3.46s; both exact replays returned successfully
+```
+
+### Canonical-slice uniqueness GREEN
+
+Within the already scoped prior-interrupt/`run.recovery.started` to paired
+interrupt boundary, resolved model and tool operations now require exactly one
+operation-kind marker (`step.started` or `tool.call.proposed`) and bind the
+removed slice to that sole marker. The implementation no longer chooses the
+last candidate. It does not reject starts from completed turns or earlier
+same-turn attempts: each legitimate retry cycle has its own durable recovery
+and interrupt boundary.
+
+A new repeated same-turn unsafe-tool resolution/retry test was added alongside
+the existing model test. It was characterization-green before the production
+change:
+
+```text
+uv.exe run --python 3.13 pytest -q tests/integration/runtime/test_reconciliation_resolution.py::test_resolved_tool_attempt_is_excluded_from_next_same_turn_attempt
+1 passed in 2.92s
+```
+
+The combined corruption and legal-cycle gate passed after the one-relation
+production fix:
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_duplicate_attempt_start_fails_closed_before_external_work \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_resolved_model_attempt_is_excluded_from_next_same_turn_attempt \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_resolved_tool_attempt_is_excluded_from_next_same_turn_attempt
+6 passed in 3.27s
+```
+
+### Re-review verification
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+160 passed in 9.01s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+538 passed in 84.64s
+
+uv.exe run --python 3.13 pytest -q
+1793 passed in 119.44s; zero skipped, zero failed
+
+uv.exe run --python 3.13 ruff check src tests
+All checks passed!
+
+uv.exe run --python 3.13 mypy src
+Success: no issues found in 75 source files
+```
+
+The import/signature/schema smoke remains at 103 unique root exports and
+SQLite schema version 3. The re-review scope contains only
+`src/agent_sdk/runtime/recovery.py`, its integration test file, and this
+report. There is no dependency, lockfile, docs, roadmap, progress-ledger,
+migration, or schema-version change. `git diff --check` passed with only
+Windows LF-to-CRLF informational warnings.
+
+No implementation or verification concerns remain. The worktree is preserved;
+no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.

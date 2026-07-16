@@ -2254,9 +2254,9 @@ class RunRecoveryService:
                     for index in range(lower_bound + 1, interrupt_index)
                     if evidence.run_events[index].type == "tool.call.proposed"
                 )
-            if not starts:
+            if len(starts) != 1:
                 return None
-            attempt_start = starts[-1]
+            attempt_start = starts[0]
             if not RunRecoveryService._is_exact_resolved_attempt(
                 evidence,
                 base_request,
