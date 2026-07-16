@@ -2247,12 +2247,22 @@ class RunRecoveryService:
                     index
                     for index in range(lower_bound + 1, interrupt_index)
                     if evidence.run_events[index].type == "step.started"
+                    and sum(
+                        event.type == "step.completed"
+                        for event in evidence.run_events[:index]
+                    )
+                    == operation.turn
                 )
             else:
                 starts = tuple(
                     index
                     for index in range(lower_bound + 1, interrupt_index)
                     if evidence.run_events[index].type == "tool.call.proposed"
+                    and sum(
+                        event.type == "step.completed"
+                        for event in evidence.run_events[:index]
+                    )
+                    == operation.turn
                 )
             if len(starts) != 1:
                 return None

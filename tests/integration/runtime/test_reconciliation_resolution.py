@@ -401,6 +401,97 @@ async def _seed_real_tool_in_flight(
     return handle.run_id, spec, tool_spec, operation_id
 
 
+async def _seed_later_turn_in_flight(
+    store: Any,
+    *,
+    operation_kind: str,
+) -> tuple[str, AgentSpec, ToolSpec, str]:
+    target_entered = asyncio.Event()
+    target_cancelled = asyncio.Event()
+    provider_attempts: list[int] = []
+    historical_tool_calls: list[int] = []
+
+    async def completion(**_: object) -> Any:
+        provider_attempts.append(1)
+        attempt = len(provider_attempts)
+        if attempt == 1 or (attempt == 2 and operation_kind == "tool"):
+            value = attempt
+
+            async def tool_chunks() -> AsyncIterator[dict[str, object]]:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": f"call_later_turn_{value}",
+                                        "function": {
+                                            "name": "resolution_tool",
+                                            "arguments": json.dumps({"value": value}),
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+
+            return tool_chunks()
+        assert attempt == 2 and operation_kind == "model"
+        target_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            target_cancelled.set()
+            raise
+
+    async def handler(_: ToolContext, value: int) -> int:
+        if value == 1:
+            historical_tool_calls.append(value)
+            return value + 1
+        assert operation_kind == "tool" and value == 2
+        target_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            target_cancelled.set()
+            raise
+
+    spec = AgentSpec(
+        name=f"later-turn-{operation_kind}",
+        model=f"fake/later-turn-{operation_kind}",
+    )
+    tool_spec = _unsafe_tool_spec()
+    seed = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    seed.tools.register(tool_spec, handler)
+    session = await seed.sessions.create(workspaces=[])
+    handle = await seed.runs.start(
+        session.session_id,
+        spec,
+        f"resolve later-turn {operation_kind}",
+    )
+    await asyncio.wait_for(target_entered.wait(), timeout=10)
+    unresolved = await store.list_unresolved_external_operations(handle.run_id)
+    assert len(unresolved) == 1
+    operation_id = unresolved[0].operation_id
+    assert handle._task is not None
+    handle._task.cancel()
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await asyncio.wait_for(target_cancelled.wait(), timeout=10)
+    await seed.close()
+    assert len(provider_attempts) == 2
+    assert historical_tool_calls == [1]
+    await _mark_interrupted(store)
+    return handle.run_id, spec, tool_spec, operation_id
+
+
 async def _final_completion(
     calls: list[int],
 ) -> AsyncIterator[dict[str, object]]:
@@ -1208,6 +1299,86 @@ async def test_duplicate_attempt_start_fails_closed_before_external_work(
         assert provider_calls == []
         assert tool_calls == []
         assert await _resolution_domain_state(store) == before_replay
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("operation_kind", ("model", "tool"))
+async def test_later_turn_canonical_resolution_replays_and_recovers_once(
+    backend: str,
+    operation_kind: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"later-turn-{operation_kind}-resolution.sqlite3"
+        )
+    )
+    run_id, spec, tool_spec, operation_id = await _seed_later_turn_in_flight(
+        store,
+        operation_kind=operation_kind,
+    )
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def final_handler(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        return value + 1
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, final_handler)
+    try:
+        waiting = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        request = (await sdk.recovery.pending_requests(run_id))[0]
+        assert request.operation_id == operation_id
+        action = (
+            ReconciliationAction.CONFIRM_NOT_EXECUTED
+            if operation_kind == "model"
+            else ReconciliationAction.RETRY
+        )
+        decision_evidence = (
+            {"disposition": "not_executed"}
+            if operation_kind == "model"
+            else {"acknowledge_duplicate_side_effect_risk": True}
+        )
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            action,
+            actor={"type": "operator"},
+            evidence=decision_evidence,
+        )
+        before_replay = await _resolution_domain_state(store)
+
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            action,
+            actor={"type": "operator"},
+            evidence=decision_evidence,
+        )
+
+        assert replay == resolved
+        assert provider_calls == []
+        assert tool_calls == []
+        assert await _resolution_domain_state(store) == before_replay
+
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+
+        assert result.output_text == "done"
+        assert provider_calls == [1]
+        assert tool_calls == ([] if operation_kind == "model" else [2])
     finally:
         await sdk.close()
         if isinstance(store, SQLiteStore):

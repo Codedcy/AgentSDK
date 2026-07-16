@@ -396,6 +396,88 @@ was Windows LF-to-CRLF informational warnings.
 No implementation or verification concerns remain. The worktree is preserved;
 no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.
 
+## Final narrow-review closure addendum
+
+The final narrow review returned C0/I1/M0 because the preceding exact-slice
+uniqueness fix over-rejected canonical first-interruption histories. With no
+prior recovery control event, the recovery interval includes markers from
+fully completed earlier turns; requiring one marker across that entire
+interval incorrectly made later-turn resolution replay conflict.
+
+### Canonical later-turn positive RED
+
+The new public positive matrix is crossed with Memory/SQLite and Model/Tool.
+Each case completes turn 0 through a real model call and unsafe tool execution,
+then interrupts a canonical turn-1 model or tool attempt during the same
+initial execution boundary. After canonical resolution, exact replay must be
+zero-mutation and callback-free, and one later explicit recovery must invoke
+only the target Provider or Tool callback once.
+
+```text
+uv.exe run --python 3.13 pytest -q tests/integration/runtime/test_reconciliation_resolution.py::test_later_turn_canonical_resolution_replays_and_recovers_once
+4 failed in 5.03s; Model/Tool on Memory/SQLite all conflicted at exact replay
+```
+
+### Turn-filtered slice GREEN
+
+Within the existing recovery/interrupt boundary, candidate
+`step.started`/`tool.call.proposed` markers are now first filtered to those
+whose logical turn—defined by the number of completed steps before the
+marker—equals the resolved operation's durable turn. The unchanged exactly-one
+rule and exact attempt authenticator then apply. Canonical prior-turn markers
+are ignored, duplicate markers at the target turn remain rejected, and
+legitimate repeated same-turn retry cycles remain separated by their control
+boundaries.
+
+The combined positive, duplicate-negative, and repeated-cycle gate passed:
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_later_turn_canonical_resolution_replays_and_recovers_once \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_duplicate_attempt_start_fails_closed_before_external_work \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_resolved_model_attempt_is_excluded_from_next_same_turn_attempt \
+  tests/integration/runtime/test_reconciliation_resolution.py::test_resolved_tool_attempt_is_excluded_from_next_same_turn_attempt
+10 passed in 4.09s
+```
+
+### Final narrow-review verification
+
+```text
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+164 passed in 10.07s
+
+uv.exe run --python 3.13 pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+542 passed in 86.08s
+
+uv.exe run --python 3.13 pytest -q
+1797 passed in 120.21s; zero skipped, zero failed
+
+uv.exe run --python 3.13 ruff check src tests
+All checks passed!
+
+uv.exe run --python 3.13 mypy src
+Success: no issues found in 75 source files
+```
+
+The import/signature/schema smoke remains at 103 unique root exports and
+SQLite schema version 3. The narrow-review scope contains only
+`src/agent_sdk/runtime/recovery.py`, its integration test file, and this
+report. There is no dependency, lockfile, docs, roadmap, progress-ledger,
+migration, or schema-version change. `git diff --check` passed with only
+Windows LF-to-CRLF informational warnings.
+
+No implementation or verification concerns remain. The worktree is preserved;
+no merge, push, Phase 5B, M02-T003, or M02-T004 action was taken.
+
 ## Independent re-review closure addendum
 
 The Phase 5A re-review returned C0/I1/M0. The remaining important finding was
