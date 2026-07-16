@@ -1778,6 +1778,302 @@ async def test_confirmed_tool_multi_resolution_replay_rejects_open_history(
             await store.close()
 
 
+async def _seed_confirmed_tool_then_resolved_tool_reconciliation(
+    store: Any,
+) -> tuple[str, AgentSpec, ToolSpec, Any, Any, Any, dict[str, object]]:
+    run_id, spec, tool_spec, _operation_id, original_request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    tool_entered = asyncio.Event()
+    tool_cancelled = asyncio.Event()
+
+    async def next_tool_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_later_resolution",
+                                    "function": {
+                                        "name": tool_spec.name,
+                                        "arguments": '{"value":9}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    async def blocked_later_tool(_: ToolContext, value: int) -> int:
+        assert value == 9
+        tool_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            tool_cancelled.set()
+            raise
+
+    original_evidence: dict[str, object] = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": tool_spec.name,
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    runner = AgentSDK.for_test(
+        store=store,
+        acompletion=next_tool_completion,
+        permission_default="allow",
+    )
+    runner.agents.define(spec)
+    runner.tools.register(tool_spec, blocked_later_tool)
+    try:
+        original_resolved = await runner.recovery.resolve(
+            original_request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator"},
+            evidence=original_evidence,
+        )
+        handle = await runner.recovery.recover_run(run_id)
+        await asyncio.wait_for(tool_entered.wait(), timeout=10)
+        assert handle._task is not None
+        handle._task.cancel()
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        await asyncio.wait_for(tool_cancelled.wait(), timeout=10)
+    finally:
+        await runner.close()
+    await _mark_interrupted(store)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("resolution must not invoke a Tool")
+
+    resolver = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    resolver.agents.define(spec)
+    resolver.tools.register(tool_spec, forbidden_tool)
+    try:
+        waiting = await resolver.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        later_request = (await resolver.recovery.pending_requests(run_id))[0]
+        assert later_request.reason == "tool_call_unknown_outcome"
+        later_resolved = await resolver.recovery.resolve(
+            later_request.request_id,
+            ReconciliationAction.CONFIRM_NOT_EXECUTED,
+            actor={"type": "operator"},
+            evidence={"disposition": "not_executed"},
+        )
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL
+        assert checkpoint.turn == 1
+    finally:
+        await resolver.close()
+    return (
+        run_id,
+        spec,
+        tool_spec,
+        original_request,
+        original_resolved,
+        later_resolved,
+        original_evidence,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_tool_replay_accepts_later_resolved_ready_for_tool_state(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-tool-later-ready-tool.db")
+    )
+    (
+        run_id,
+        spec,
+        tool_spec,
+        original_request,
+        original_resolved,
+        _later_resolved,
+        original_evidence,
+    ) = await _seed_confirmed_tool_then_resolved_tool_reconciliation(store)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("exact replay must not invoke a Tool")
+
+    replay = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("exact replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    replay.agents.define(spec)
+    replay.tools.register(tool_spec, forbidden_tool)
+    try:
+        before = await _resolution_domain_state(store)
+        exact = await replay.recovery.resolve(
+            original_request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator"},
+            evidence=original_evidence,
+        )
+        assert exact == original_resolved
+        assert await _resolution_domain_state(store) == before
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL
+        assert checkpoint.turn == 1
+    finally:
+        await replay.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+async def _corrupt_confirmed_tool_current_ready_tool_state(
+    store: Any,
+    *,
+    run_id: str,
+    corruption: str,
+) -> None:
+    if corruption == "checkpoint":
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        corrupted = checkpoint.model_copy(
+            update={"output_parts": (*checkpoint.output_parts, "corrupt")}
+        )
+        serialized = _canonical_record_json(corrupted)
+        if isinstance(store, InMemoryStore):
+            store._run_checkpoints[run_id] = serialized
+        else:
+            assert isinstance(store, SQLiteStore)
+            await store._connection.execute(
+                "UPDATE run_checkpoints SET data_json = ? WHERE run_id = ?",
+                (serialized, run_id),
+            )
+            await store._connection.commit()
+        return
+
+    if corruption == "event":
+        stored_events = list(await store.read_events(after_cursor=0))
+        target = next(
+            stored
+            for stored in reversed(stored_events)
+            if stored.event.run_id == run_id
+            and stored.event.type == "model.call.completed"
+        )
+        replacement = target._replace(
+            event=target.event.model_copy(
+                update={"payload": {"finish_reason": "stop"}}
+            )
+        )
+        stored_events[stored_events.index(target)] = replacement
+        await _replace_resolution_event_log(store, stored_events)
+        return
+
+    assert corruption == "operation"
+    operations = await store.list_external_operations(run_id)
+    operation = next(
+        item
+        for item in operations
+        if isinstance(item, ModelCallOperation) and item.turn == 1
+    )
+    corrupted = operation.model_copy(
+        update={"request_fingerprint": "sha256:corrupt-current-model"}
+    )
+    serialized = _canonical_record_json(corrupted)
+    if isinstance(store, InMemoryStore):
+        store._external_operations[operation.operation_id] = serialized
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE external_operations SET request_fingerprint = ?, data_json = ? "
+        "WHERE operation_id = ?",
+        (corrupted.request_fingerprint, serialized, corrupted.operation_id),
+    )
+    await store._connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("corruption", ("checkpoint", "event", "operation"))
+async def test_confirmed_tool_later_ready_tool_replay_rejects_corrupt_current_state(
+    backend: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / f"ready-tool-{corruption}.db")
+    )
+    (
+        run_id,
+        spec,
+        tool_spec,
+        original_request,
+        _original_resolved,
+        _later_resolved,
+        original_evidence,
+    ) = await _seed_confirmed_tool_then_resolved_tool_reconciliation(store)
+    await _corrupt_confirmed_tool_current_ready_tool_state(
+        store,
+        run_id=run_id,
+        corruption=corruption,
+    )
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("conflicting replay must not invoke a Tool")
+
+    replay = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("conflicting replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    replay.agents.define(spec)
+    replay.tools.register(tool_spec, forbidden_tool)
+    try:
+        before = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as caught:
+            await replay.recovery.resolve(
+                original_request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence=original_evidence,
+            )
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await replay.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_confirmed_tool_replay_survives_later_tool_turn(

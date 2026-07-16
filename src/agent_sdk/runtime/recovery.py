@@ -2193,7 +2193,7 @@ class RunRecoveryService:
                 if isinstance(item, ToolCallOperation)
             )
         )
-        return (
+        immediate_projection = (
             effective.run.status is RunStatus.INTERRUPTED
             and effective.run.run_id in effective.session.active_run_ids
             and checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
@@ -2204,6 +2204,19 @@ class RunRecoveryService:
             and tool_turns == tuple(range(checkpoint.turn))
             and effective.run_events[-1].type == "run.interrupted"
         )
+        if immediate_projection:
+            return True
+        if not any(
+            record.request_id != request.request_id
+            and record.status is ReconciliationStatus.RESOLVED
+            for record in evidence.reconciliations
+        ) or not self._is_certified_safe_checkpoint(effective, base_request):
+            return False
+        try:
+            self._engine.validate_resume_checkpoint(checkpoint)
+        except AgentSDKError:
+            return False
+        return True
 
     @staticmethod
     def _has_closed_reconciliation_markers(
@@ -5032,7 +5045,13 @@ class RunRecoveryService:
         )
         if effective is None:
             return False
-        evidence = effective
+        return self._is_certified_safe_checkpoint(effective, base_request)
+
+    def _is_certified_safe_checkpoint(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+    ) -> bool:
         checkpoint = evidence.checkpoint
         if (
             checkpoint is None
