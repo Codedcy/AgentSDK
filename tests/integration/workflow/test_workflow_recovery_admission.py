@@ -3008,27 +3008,21 @@ async def test_recover_selected_failed_run_projects_sanitized_failure() -> None:
 @pytest.mark.asyncio
 async def test_recover_selected_waiting_reconciliation_leaves_workflow_active() -> None:
     store = InMemoryStore()
-    completion = _CountingCompletion()
+    completion = _CountingCompletion(block=True)
     sdk, workflow = await _seed_current_workflow(store, completion)
     selected = await _select_root(store, workflow)
     created = await _create_selected_run(sdk, selected)
-    interrupted = created.model_copy(
-        update={"status": RunStatus.INTERRUPTED, "version": 3}
+    active = await sdk.recovery.recover_run(created.run_id)
+    await _wait_for_event(
+        completion.started,
+        diagnostic=lambda: {"phase": "provider_started", "calls": completion.calls},
     )
-    await store.commit(
-        CommitBatch(
-            events=(),
-            snapshots=(
-                SnapshotWrite(
-                    "run",
-                    interrupted.run_id,
-                    interrupted.session_id,
-                    interrupted.version,
-                    interrupted.model_dump(mode="json"),
-                ),
-            ),
-        )
-    )
+    assert active._task is not None  # type: ignore[attr-defined]
+    active._task.cancel()  # type: ignore[attr-defined]
+    with pytest.raises(AgentSDKError):
+        await active.result()
+    await sdk.recovery.scan()
+    assert (await sdk.runs.get(created.run_id)).status is RunStatus.INTERRUPTED
     with pytest.raises(AgentSDKError) as run_recovery:
         await (await sdk.recovery.recover_run(created.run_id)).result()
     assert run_recovery.value.message == "recovery required"
@@ -3045,8 +3039,9 @@ async def test_recover_selected_waiting_reconciliation_leaves_workflow_active() 
         assert durable.status is WorkflowRunStatus.RUNNING
         assert durable.nodes[0].status is WorkflowNodeStatus.RUNNING
         assert await store.latest_cursor() == cursor_before
-        assert completion.calls == 0
+        assert completion.calls == 1
     finally:
+        completion.release.set()
         await sdk.close()
 
 
