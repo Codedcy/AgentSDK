@@ -479,6 +479,7 @@ async def _seed_later_turn_in_flight(
     store: Any,
     *,
     operation_kind: str,
+    historical_usage: bool = False,
 ) -> tuple[str, AgentSpec, ToolSpec, str]:
     target_entered = asyncio.Event()
     target_cancelled = asyncio.Event()
@@ -492,10 +493,15 @@ async def _seed_later_turn_in_flight(
             value = attempt
 
             async def tool_chunks() -> AsyncIterator[dict[str, object]]:
-                yield {
+                chunk: dict[str, object] = {
                     "choices": [
                         {
                             "delta": {
+                                **(
+                                    {"content": "before"}
+                                    if historical_usage and attempt == 1
+                                    else {}
+                                ),
                                 "tool_calls": [
                                     {
                                         "index": 0,
@@ -511,6 +517,13 @@ async def _seed_later_turn_in_flight(
                         }
                     ]
                 }
+                if historical_usage and attempt == 1:
+                    chunk["usage"] = {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "total_tokens": 4,
+                    }
+                yield chunk
 
             return tool_chunks()
         assert attempt == 2 and operation_kind == "model"
@@ -564,6 +577,35 @@ async def _seed_later_turn_in_flight(
     assert historical_tool_calls == [1]
     await _mark_interrupted(store)
     return handle.run_id, spec, tool_spec, operation_id
+
+
+async def _seed_pending_later_model_reconciliation(
+    store: Any,
+) -> tuple[str, AgentSpec, ToolSpec, str, Any]:
+    run_id, spec, tool_spec, operation_id = await _seed_later_turn_in_flight(
+        store,
+        operation_kind="model",
+        historical_usage=True,
+    )
+    admitter = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion([]),
+        permission_default="allow",
+    )
+    admitter.agents.define(spec)
+
+    async def unused_tool(_: ToolContext, value: int) -> int:
+        return value
+
+    admitter.tools.register(tool_spec, unused_tool)
+    try:
+        waiting = await admitter.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        request = (await admitter.recovery.pending_requests(run_id))[0]
+        return run_id, spec, tool_spec, operation_id, request
+    finally:
+        await admitter.close()
 
 
 async def _final_completion(
@@ -1027,6 +1069,106 @@ async def _corrupt_confirmed_terminal_history(
     await _replace_resolution_event_log(store, stored_events)
 
 
+async def _corrupt_confirmed_terminal_lifecycle(
+    store: Any,
+    *,
+    run_id: str,
+    marker: str,
+    corruption: str,
+) -> None:
+    stored_events = list(await store.read_events(after_cursor=0))
+    requested = next(
+        stored
+        for stored in stored_events
+        if stored.event.run_id == run_id
+        and stored.event.type == "reconciliation.requested"
+    )
+    target = next(
+        stored
+        for stored in stored_events
+        if stored.cursor < requested.cursor
+        and stored.event.run_id == run_id
+        and stored.event.type == marker
+    )
+    partner = next(
+        stored
+        for stored in stored_events
+        if stored.cursor < requested.cursor
+        and stored.event.run_id == run_id
+        and stored.event.type == "step.completed"
+    )
+    target_index = stored_events.index(target)
+    partner_index = stored_events.index(partner)
+    if corruption == "missing":
+        stored_events[target_index] = target._replace(
+            event=target.event.model_copy(
+                update={
+                    "type": "model.text.delta",
+                    "payload": {"text": "orphan"},
+                }
+            )
+        )
+    elif corruption == "duplicate":
+        stored_events[partner_index] = partner._replace(
+            event=partner.event.model_copy(
+                update={
+                    "type": target.event.type,
+                    "payload": target.event.payload,
+                }
+            )
+        )
+    else:
+        assert corruption == "moved"
+        stored_events[target_index] = target._replace(
+            event=target.event.model_copy(
+                update={
+                    "type": partner.event.type,
+                    "payload": partner.event.payload,
+                }
+            )
+        )
+        stored_events[partner_index] = partner._replace(
+            event=partner.event.model_copy(
+                update={
+                    "type": target.event.type,
+                    "payload": target.event.payload,
+                }
+            )
+        )
+    await _replace_resolution_event_log(store, stored_events)
+
+
+async def _resolve_confirmed_later_model(
+    store: Any,
+) -> tuple[AgentSDK, str, Any, Any, dict[str, object]]:
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_later_model_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("confirmation and replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def unused_tool(_: ToolContext, value: int) -> int:
+        return value
+
+    sdk.tools.register(tool_spec, unused_tool)
+    resolution_evidence = {
+        "provider_result": _confirmed_provider_result(text="confirmed later")
+    }
+    resolved = await sdk.recovery.resolve(
+        request.request_id,
+        ReconciliationAction.CONFIRM_COMPLETED,
+        actor={"operator": "terminal-lifecycle"},
+        evidence=resolution_evidence,
+    )
+    return sdk, run_id, request, resolved, resolution_evidence
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 @pytest.mark.parametrize(
@@ -1095,6 +1237,103 @@ async def test_confirm_completed_terminal_replay_authenticates_entire_batch(
                 ReconciliationAction.CONFIRM_COMPLETED,
                 actor={"operator": "terminal-replay"},
                 evidence={"provider_result": provider_result},
+            )
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_terminal_replay_accepts_complete_multiturn_tool_history(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-multiturn-positive.db")
+    )
+    sdk, run_id, request, resolved, resolution_evidence = (
+        await _resolve_confirmed_later_model(store)
+    )
+    try:
+        run = await sdk.runs.get(run_id)
+        checkpoint = await store.get_run_checkpoint(run_id)
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        assert run.status is RunStatus.COMPLETED
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.TERMINAL
+        assert len(checkpoint.tool_results) == 1
+        assert sum(event.type == "step.started" for event in events) == 2
+        assert sum(event.type == "model.call.started" for event in events) == 2
+        assert sum(event.type == "model.call.completed" for event in events) == 2
+        assert sum(event.type == "tool.call.completed" for event in events) == 1
+
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "terminal-lifecycle"},
+            evidence=resolution_evidence,
+        )
+        assert replay == resolved
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "marker",
+    (
+        "step.started",
+        "model.call.started",
+        "model.usage.reported",
+        "model.call.completed",
+    ),
+)
+@pytest.mark.parametrize("corruption", ("missing", "duplicate", "moved"))
+async def test_confirmed_terminal_replay_authenticates_complete_lifecycle_history(
+    backend: str,
+    marker: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"confirmed-lifecycle-{marker}-{corruption}.db"
+        )
+    )
+    sdk, run_id, request, _resolved, resolution_evidence = (
+        await _resolve_confirmed_later_model(store)
+    )
+    try:
+        await _corrupt_confirmed_terminal_lifecycle(
+            store,
+            run_id=run_id,
+            marker=marker,
+            corruption=corruption,
+        )
+        before = await _resolution_domain_state(store)
+
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "terminal-lifecycle"},
+                evidence=resolution_evidence,
             )
         assert caught.value.code is ErrorCode.CONFLICT
         assert caught.value.message == "recovery state conflict"

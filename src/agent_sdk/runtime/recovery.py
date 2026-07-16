@@ -1751,7 +1751,7 @@ class RunRecoveryService:
                 request,
                 operation,
             )
-        return (
+        closed_world = (
             evidence.reconciliations == (request,)
             and not evidence.pending
             and self._has_exact_model_operation_turns(
@@ -1760,6 +1760,16 @@ class RunRecoveryService:
                 required=operation,
             )
         )
+        if not closed_world:
+            return False
+        if evidence.run.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            return self._is_exact_confirmed_terminal_history(
+                evidence,
+                base_request,
+                request,
+                operation,
+            )
+        return True
 
     @staticmethod
     def _has_closed_reconciliation_markers(
@@ -1924,6 +1934,90 @@ class RunRecoveryService:
             certified,
             base_request,
             current_operation,
+        )
+
+    def _is_exact_confirmed_terminal_history(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        request: ReconciliationRequest,
+        operation: ModelCallOperation,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        resolution = request.resolution
+        if (
+            checkpoint is None
+            or resolution is None
+            or checkpoint.phase is not RunCheckpointPhase.TERMINAL
+            or checkpoint.operation_id is not None
+        ):
+            return False
+        completed = self._completed_model_outcome(operation)
+        confirmed_tool_call = completed is not None and len(completed[2]) == 1
+        normalization_source = evidence
+        if confirmed_tool_call:
+            effective = self._effective_resolved_evidence(evidence, base_request)
+            if effective is None:
+                return False
+            normalization_source = effective
+            retained = tuple(
+                event
+                for event in effective.run_events
+                if event.type
+                not in {"reconciliation.requested", "reconciliation.resolved"}
+            )
+        else:
+            if checkpoint.turn != operation.turn:
+                return False
+            requested = tuple(
+                index
+                for index, event in enumerate(evidence.run_events)
+                if event.type == "reconciliation.requested"
+                and event.payload
+                == {
+                    "request_id": request.request_id,
+                    "operation_id": request.operation_id,
+                    "reason": request.reason,
+                }
+            )
+            resolved = tuple(
+                index
+                for index, event in enumerate(evidence.run_events)
+                if event.type == "reconciliation.resolved"
+                and event.event_id == resolution.event_id
+            )
+            if (
+                len(requested) != 1
+                or len(resolved) != 1
+                or requested[0] == 0
+                or evidence.run_events[requested[0] - 1].type != "run.interrupted"
+            ):
+                return False
+            removed = {requested[0] - 1, requested[0], resolved[0]}
+            retained = tuple(
+                event
+                for index, event in enumerate(evidence.run_events)
+                if index not in removed
+            )
+        normalized = replace(
+            normalization_source,
+            reconciliations=(),
+            run_events=tuple(
+                event.model_copy(update={"sequence": index})
+                for index, event in enumerate(retained, start=1)
+            ),
+            run_event_cursors=tuple(range(1, len(retained) + 1)),
+        )
+        confirmed_operation_id = (
+            operation.operation_id
+            if request.reason == "model_call_unknown_outcome"
+            else None
+        )
+        return self._is_valid_certified_provider_history(
+            normalized,
+            base_request=base_request,
+            terminal_status=evidence.run.status,
+            confirmed_operation_id=confirmed_operation_id,
         )
 
     @staticmethod
@@ -2819,10 +2913,17 @@ class RunRecoveryService:
         evidence: _RecoveryEvidence,
         *,
         current_kind: ExternalOperationKind | None,
+        terminal_status: RunStatus | None = None,
+        confirmed_operation_id: str | None = None,
     ) -> bool:
         checkpoint = evidence.checkpoint
         descriptor = evidence.run.execution_descriptor
-        if checkpoint is None or descriptor is None:
+        if (
+            checkpoint is None
+            or descriptor is None
+            or terminal_status
+            not in {None, RunStatus.COMPLETED, RunStatus.FAILED}
+        ):
             return False
         model_operations = {
             operation.turn: operation
@@ -2856,6 +2957,18 @@ class RunRecoveryService:
         permission_recovery = False
         permission_allowed: bool | None = None
         completed_result_count = 0
+        terminal_failure_payload: Mapping[str, Any] | None = None
+        model_deltas: list[str] = []
+        model_usage: TokenUsage | None = None
+        recovered_model_operation_ids = {
+            str(event.payload["operation_id"])
+            for event in evidence.run_events
+            if event.type
+            in {"model.recovery.query.started", "model.recovery.resend.started"}
+            and isinstance(event.payload.get("operation_id"), str)
+        }
+        if confirmed_operation_id is not None:
+            recovered_model_operation_ids.add(confirmed_operation_id)
 
         for event in evidence.run_events[2:]:
             event_type = event.type
@@ -2972,6 +3085,8 @@ class RunRecoveryService:
                 initial_permission_decision = None
                 permission_recovery = False
                 permission_allowed = None
+                model_deltas = []
+                model_usage = None
                 state = "model_starting"
                 continue
             if event_type == "model.call.started":
@@ -2991,6 +3106,8 @@ class RunRecoveryService:
                     or not isinstance(payload["text"], str)
                 ):
                     return False
+                if terminal_status is not None:
+                    model_deltas.append(payload["text"])
                 continue
             if event_type == "model.usage.reported":
                 if state != "model_in_flight":
@@ -3001,6 +3118,8 @@ class RunRecoveryService:
                     return False
                 if usage.model_dump(mode="json") != payload:
                     return False
+                if terminal_status is not None:
+                    model_usage = usage
                 state = "model_usage_reported"
                 continue
             if event_type == "model.call.completed":
@@ -3018,7 +3137,58 @@ class RunRecoveryService:
                     != payload["finish_reason"]
                 ):
                     return False
+                if terminal_status is not None:
+                    completed = RunRecoveryService._completed_model_outcome(
+                        current_model
+                    )
+                    if completed is None:
+                        return False
+                    recovered = (
+                        current_model.operation_id
+                        in recovered_model_operation_ids
+                    )
+                    expected_usage = completed[3]
+                    usage_required = recovered or any(
+                        value is not None
+                        for value in expected_usage.model_dump(
+                            mode="json"
+                        ).values()
+                    )
+                    if (
+                        (recovered and model_deltas)
+                        or (not recovered and "".join(model_deltas) != completed[1])
+                        or usage_required != (model_usage is not None)
+                        or (
+                            model_usage is not None
+                            and model_usage != expected_usage
+                        )
+                    ):
+                        return False
                 state = "model_completed"
+                continue
+            if event_type == "model.call.failed":
+                error = payload.get("error")
+                if (
+                    state != "model_in_flight"
+                    or set(payload) != {"error"}
+                    or not isinstance(error, dict)
+                    or set(error) != {"code", "message", "retryable"}
+                    or not isinstance(error["code"], str)
+                    or not isinstance(error["message"], str)
+                    or type(error["retryable"]) is not bool
+                    or current_model is None
+                    or current_model.status is not ExternalOperationStatus.FAILED
+                    or current_model.model_dump(mode="json")["outcome"]
+                    != {
+                        "error": {
+                            "code": error["code"],
+                            "message": error["message"],
+                        }
+                    }
+                ):
+                    return False
+                terminal_failure_payload = payload
+                state = "model_failed"
                 continue
             if event_type == "tool.call.proposed":
                 completed = (
@@ -3249,15 +3419,76 @@ class RunRecoveryService:
                 state = "tool_completed"
                 continue
             if event_type == "step.completed":
-                if state != "tool_completed" or payload != {}:
+                completed_model = (
+                    RunRecoveryService._completed_model_outcome(current_model)
+                    if current_model is not None
+                    else None
+                )
+                terminal_model_step = (
+                    terminal_status is RunStatus.COMPLETED
+                    and state == "model_completed"
+                    and completed_model is not None
+                    and not completed_model[2]
+                )
+                if (
+                    state != "tool_completed"
+                    and not terminal_model_step
+                ) or payload != {}:
                     return False
                 state = "ready_for_step"
                 continue
+            if event_type == "step.failed":
+                if (
+                    terminal_status is not RunStatus.FAILED
+                    or state != "model_failed"
+                    or payload != terminal_failure_payload
+                ):
+                    return False
+                state = "step_failed"
+                continue
+            if event_type == "run.completed":
+                if (
+                    terminal_status is not RunStatus.COMPLETED
+                    or state != "ready_for_step"
+                ):
+                    return False
+                state = "terminal_completed"
+                continue
+            if event_type == "run.failed":
+                if (
+                    terminal_status is not RunStatus.FAILED
+                    or state != "step_failed"
+                    or payload != terminal_failure_payload
+                ):
+                    return False
+                state = "terminal_failed"
+                continue
             return False
 
-        if state != "interrupted" or completed_result_count != len(
-            checkpoint.tool_results
-        ):
+        if completed_result_count != len(checkpoint.tool_results):
+            return False
+        if terminal_status is not None:
+            expected_state = (
+                "terminal_completed"
+                if terminal_status is RunStatus.COMPLETED
+                else "terminal_failed"
+            )
+            expected_operation_status = (
+                ExternalOperationStatus.COMPLETED
+                if terminal_status is RunStatus.COMPLETED
+                else ExternalOperationStatus.FAILED
+            )
+            return (
+                evidence.run.status is terminal_status
+                and state == expected_state
+                and turn == checkpoint.turn
+                and checkpoint.phase is RunCheckpointPhase.TERMINAL
+                and checkpoint.operation_id is None
+                and current_model is not None
+                and current_model.turn == checkpoint.turn
+                and current_model.status is expected_operation_status
+            )
+        if state != "interrupted":
             return False
         if current_kind is None:
             return (
@@ -3276,16 +3507,40 @@ class RunRecoveryService:
     @staticmethod
     def _is_valid_certified_provider_history(
         evidence: _RecoveryEvidence,
+        *,
+        base_request: ModelRequest | None = None,
+        terminal_status: RunStatus | None = None,
+        confirmed_operation_id: str | None = None,
     ) -> bool:
         checkpoint = evidence.checkpoint
         descriptor = evidence.run.execution_descriptor
-        if checkpoint is None or descriptor is None:
+        if (
+            checkpoint is None
+            or descriptor is None
+            or (
+                terminal_status is not None
+                and not RunRecoveryService._is_valid_run_event_envelope(
+                    evidence,
+                    allow_recovery_closed=True,
+                )
+            )
+        ):
             return False
         if not RunRecoveryService._is_valid_certified_lifecycle_positions(
             evidence,
             current_kind=ExternalOperationKind.MODEL_CALL,
+            terminal_status=terminal_status,
+            confirmed_operation_id=confirmed_operation_id,
         ):
             return False
+        if terminal_status is not None:
+            if base_request is None:
+                return False
+            return RunRecoveryService._is_valid_certified_terminal_provider_turns(
+                evidence,
+                base_request=base_request,
+                terminal_status=terminal_status,
+            )
         events = evidence.run_events
         first_interrupted = next(
             index for index, event in enumerate(events) if event.type == "run.interrupted"
@@ -3362,6 +3617,139 @@ class RunRecoveryService:
             event.type
             in {"model.recovery.query.started", "model.recovery.resend.started"}
             for event in events[last_interrupted + 1 :]
+        )
+
+    @staticmethod
+    def _is_valid_certified_terminal_provider_turns(
+        evidence: _RecoveryEvidence,
+        *,
+        base_request: ModelRequest,
+        terminal_status: RunStatus,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        if checkpoint is None or evidence.run.execution_descriptor is None:
+            return False
+        model_operations = {
+            operation.turn: operation
+            for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
+        }
+        if (
+            len(model_operations)
+            != sum(
+                isinstance(operation, ModelCallOperation)
+                for operation in evidence.operations
+            )
+            or tuple(sorted(model_operations))
+            != tuple(range(checkpoint.turn + 1))
+            or any(
+                operation.run_id != evidence.run.run_id
+                or operation.session_id != evidence.run.session_id
+                for operation in model_operations.values()
+            )
+        ):
+            return False
+        messages_before = RunRecoveryService._messages_before_turn(
+            evidence,
+            base_request,
+            checkpoint.turn,
+        )
+        if messages_before is None:
+            return False
+        final_operation = model_operations[checkpoint.turn]
+        try:
+            final_request = ModelRequest(
+                model=base_request.model,
+                messages=messages_before,
+                tools=base_request.tools,
+                params=dict(base_request.params),
+                purpose=base_request.purpose,
+            )
+        except Exception:
+            return False
+        if (
+            final_operation.provider_identity != base_request.model
+            or final_operation.request_fingerprint
+            != _model_request_fingerprint(final_request)
+        ):
+            return False
+
+        output_parts: list[str] = []
+        usage = TokenUsage()
+        for turn in range(checkpoint.turn):
+            completed = RunRecoveryService._completed_model_outcome(
+                model_operations[turn]
+            )
+            if completed is None or len(completed[2]) != 1:
+                return False
+            output_parts.append(completed[1])
+            usage = _add_usage(usage, completed[3])
+
+        expected_messages = list(messages_before)
+        if terminal_status is RunStatus.COMPLETED:
+            completed = RunRecoveryService._completed_model_outcome(final_operation)
+            if completed is None or completed[2]:
+                return False
+            output_parts.append(completed[1])
+            usage = _add_usage(usage, completed[3])
+            expected_messages.append(
+                {"role": "assistant", "content": completed[1] or None}
+            )
+        elif (
+            final_operation.status is not ExternalOperationStatus.FAILED
+            or final_operation.outcome is None
+            or set(final_operation.outcome) != {"error"}
+        ):
+            return False
+        output_text = "".join(output_parts)
+        if (
+            checkpoint.model_dump(mode="json")["messages"]
+            != expected_messages
+            or "".join(checkpoint.output_parts) != output_text
+            or checkpoint.usage != usage
+            or evidence.run.output_text != output_text
+            or evidence.run.usage != usage
+            or evidence.run.tool_results != checkpoint.tool_results
+        ):
+            return False
+        terminal_events = tuple(
+            event
+            for event in evidence.run_events
+            if event.type
+            == (
+                "run.completed"
+                if terminal_status is RunStatus.COMPLETED
+                else "run.failed"
+            )
+        )
+        if len(terminal_events) != 1:
+            return False
+        terminal_event = terminal_events[0]
+        if terminal_status is RunStatus.COMPLETED:
+            expected_payload: dict[str, Any] = {
+                "output_text": output_text,
+                "usage": usage.model_dump(mode="json"),
+            }
+            if checkpoint.tool_results:
+                expected_payload["tool_results"] = [
+                    result.model_dump(mode="json")
+                    for result in checkpoint.tool_results
+                ]
+            return evidence.run.error is None and terminal_event.payload == expected_payload
+        final_error = (
+            final_operation.outcome.get("error")
+            if final_operation.outcome is not None
+            else None
+        )
+        return (
+            isinstance(final_error, Mapping)
+            and evidence.run.error is not None
+            and evidence.run.error.model_dump(mode="json")
+            == terminal_event.payload.get("error")
+            and terminal_event.payload.get("error", {}).get("code")
+            == final_error.get("code")
+            and terminal_event.payload.get("error", {}).get("message")
+            == final_error.get("message")
         )
 
     async def _validated_request(
