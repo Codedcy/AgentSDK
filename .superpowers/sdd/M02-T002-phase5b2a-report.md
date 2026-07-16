@@ -191,3 +191,123 @@ Phase 5B2B must separately design and test Workflow snapshot projection. This
 implementation must not be treated as admitting Workflow evidence or changing
 Workflow recovery semantics. The branch and worktree are preserved for
 independent review. No merge or push was performed.
+
+## Independent review closure addendum
+
+The independent Phase 5B2A review returned C0/I1/M0. The Important finding
+was reproduced on Memory and SQLite before production code changed, then
+closed in commit `4f22203` (`fix(recovery): certify multiple tool
+resolutions`). This addendum supersedes the pre-review risk statement above.
+
+### I1: Tool exact replay assumed a single resolved request
+
+`_is_confirmed_tool_replay_closed_world` required every resolved record to be
+the original Tool request. Its pending branch also required exactly two total
+records. This rejected legal histories in both temporal directions:
+
+- confirmed Tool outcome, explicit recovery, later unknown Model outcome,
+  `CONFIRM_NOT_EXECUTED`, then exact replay of the original Tool decision;
+- a resolved Model attempt followed by a retried Model call, a later unknown
+  Tool outcome, Tool `CONFIRM_COMPLETED`, then immediate exact Tool replay.
+
+The Memory/SQLite production-path tests were written first. Both paths use
+real cancellation, startup scanning, reconciliation admission, resolution,
+and explicit recovery. Exact replay is also required to perform zero writes
+and invoke neither Provider nor Tool callbacks.
+
+```text
+RED:
+test_confirmed_tool_replay_survives_later_resolved_model_reconciliation
+test_confirmed_tool_replay_accepts_a_prior_resolved_model_attempt
+4 failed in 5.81s; all four failed only at original Tool replay with
+"recovery state conflict"
+```
+
+The first attempted removal of the two cardinality checks intentionally did
+not mask the deeper relation: the same four positive cases remained RED while
+the four corruption cases stayed GREEN. Diagnostics showed that
+`_effective_resolved_evidence` sorted records chronologically, but the next
+attempt was still certified against raw operations/events rather than the
+accumulated prior normalization. In particular, a confirmed Tool's historical
+interruption is deferred behind its authoritative Tool and step completion;
+that deferred interruption was absent from certification of a later resolved
+attempt.
+
+The fix keeps one closed grammar instead of adding another state machine:
+
+- `_has_closed_reconciliation_markers` still proves one exact requested marker
+  per record, one exact resolved marker per resolved record, no resolved marker
+  for pending records, and unique request IDs.
+- `_effective_resolved_evidence` remains the chronological certifier for every
+  resolved attempt. It now carries accumulated removed operations/events and
+  deferred confirmed-Tool interruptions into certification of the next
+  attempt.
+- Confirmed Tool replay delegates exact decision authentication to that closed
+  effective-history path instead of authenticating the same decision once
+  against unnormalized raw history and again against the normalized history.
+- Immediate interrupted-state projection uses the certified effective
+  operations and the normalized final `run.interrupted` marker. Pending and
+  terminal paths continue through their existing operation/provider history
+  certifiers.
+
+The negative matrix injects either an orphan resolved reconciliation record or
+a duplicate historical `reconciliation.resolved` event after constructing a
+real two-resolution history. Both Stores reject every corruption as a constant
+conflict with zero mutation, preventing the cardinality relaxation from
+opening the history grammar.
+
+```text
+GREEN:
+two temporal directions plus orphan/duplicate matrix
+8 passed in 4.21s
+```
+
+## Review-fix verification
+
+All commands used the explicit executable
+`C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` and Python
+3.13.
+
+```text
+pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+342 passed in 22.30s
+
+pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+720 passed in 97.94s
+
+Store/lease/Session and Workflow-neighbor gate:
+543 passed in 19.00s
+
+pytest -q
+1975 passed in 132.64s; zero skipped, zero failed
+
+ruff check .
+All checks passed!
+
+mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The fresh compatibility smoke passed with 103 unique root exports, exact
+unchanged `RecoveryAPI.resolve` and `ReconciliationService.resolve`
+signatures, and SQLite schema version 3. The implementation commit touched
+only `src/agent_sdk/runtime/recovery.py` and
+`tests/integration/runtime/test_reconciliation_resolution.py`; this report is
+the only documentation change.
+
+No known Phase 5B2A implementation or verification concern remains after the
+review fix. Workflow snapshot projection remains Phase 5B2B. Phase 5C,
+M02-T003, M02-T004, `TERMINATE`, roadmap, progress ledger, schema, public API,
+dependencies, and lockfiles remain untouched. No merge or push was performed.
