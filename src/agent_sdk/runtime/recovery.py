@@ -1805,7 +1805,8 @@ class RunRecoveryService:
             completed = self._completed_model_outcome(matches[0])
             if completed is None:
                 return False
-            prior_output.append(completed[1])
+            if completed[1]:
+                prior_output.append(completed[1])
             prior_usage = _add_usage(prior_usage, completed[3])
         trailing = evidence.run_events[resolved_index + 1 :]
         if request.reason == "model_call_completed_terminalization_unknown":
@@ -2233,10 +2234,6 @@ class RunRecoveryService:
                 ),
                 -1,
             )
-            normalized = replace(
-                effective,
-                pending=(),
-            )
             return (
                 terminal_index >= 0
                 and self._is_exact_resolution_event_batch(
@@ -2246,10 +2243,9 @@ class RunRecoveryService:
                     terminal_session_transition=True,
                     atomic_session_timestamp=False,
                 )
-                and self._is_valid_certified_provider_history(
-                    normalized,
-                    base_request=base_request,
-                    terminal_status=evidence.run.status,
+                and self._is_valid_normalized_terminal_history(
+                    evidence,
+                    base_request,
                 )
             )
         if evidence.pending:
@@ -2491,56 +2487,29 @@ class RunRecoveryService:
             or checkpoint.operation_id is not None
         ):
             return False
-        completed = self._completed_model_outcome(operation)
-        confirmed_tool_call = completed is not None and len(completed[2]) == 1
-        normalization_source = evidence
-        if confirmed_tool_call:
-            effective = self._effective_resolved_evidence(evidence, base_request)
-            if effective is None:
-                return False
-            normalization_source = effective
-            retained = tuple(
-                event
-                for event in effective.run_events
-                if event.type
-                not in {"reconciliation.requested", "reconciliation.resolved"}
-            )
-        else:
-            if checkpoint.turn != operation.turn:
-                return False
-            requested = tuple(
-                index
-                for index, event in enumerate(evidence.run_events)
-                if event.type == "reconciliation.requested"
-                and event.payload
-                == {
-                    "request_id": request.request_id,
-                    "operation_id": request.operation_id,
-                    "reason": request.reason,
-                }
-            )
-            resolved = tuple(
-                index
-                for index, event in enumerate(evidence.run_events)
-                if event.type == "reconciliation.resolved"
-                and event.event_id == resolution.event_id
-            )
-            if (
-                len(requested) != 1
-                or len(resolved) != 1
-                or requested[0] == 0
-                or evidence.run_events[requested[0] - 1].type != "run.interrupted"
-            ):
-                return False
-            removed = {requested[0] - 1, requested[0], resolved[0]}
-            retained = tuple(
-                event
-                for index, event in enumerate(evidence.run_events)
-                if index not in removed
-            )
+        return self._is_valid_normalized_terminal_history(
+            evidence,
+            base_request,
+        )
+
+    def _is_valid_normalized_terminal_history(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+    ) -> bool:
+        if evidence.run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            return False
+        effective = self._effective_resolved_evidence(evidence, base_request)
+        if effective is None:
+            return False
+        retained = tuple(
+            event
+            for event in effective.run_events
+            if event.type
+            not in {"reconciliation.requested", "reconciliation.resolved"}
+        )
         normalized = replace(
-            normalization_source,
-            reconciliations=(),
+            effective,
             run_events=tuple(
                 event.model_copy(update={"sequence": index})
                 for index, event in enumerate(retained, start=1)
@@ -4573,13 +4542,20 @@ class RunRecoveryService:
                     )
                 except Exception:
                     return None
+                if requested_indexes[0] == 0:
+                    return None
+                interrupt_index = requested_indexes[0] - 1
+                if confirmed.disposition is ProviderRecoveryDisposition.FAILED:
+                    if evidence.run.status is not RunStatus.FAILED:
+                        return None
+                    removed_event_indexes.add(interrupt_index)
+                    removed_event_indexes.update(requested_indexes)
+                    continue
                 if (
                     confirmed.disposition
                     is not ProviderRecoveryDisposition.COMPLETED
-                    or requested_indexes[0] == 0
                 ):
                     return None
-                interrupt_index = requested_indexes[0] - 1
                 if confirmed.tool_call is None:
                     if evidence.run.status not in {
                         RunStatus.COMPLETED,

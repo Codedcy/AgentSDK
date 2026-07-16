@@ -886,11 +886,13 @@ async def test_workflow_recovery_rejects_corrupt_confirmed_terminal_run(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("terminal_projection", ("live", "text", "failed"))
 async def test_confirmed_tool_replay_survives_later_workflow_reconciliation(
     backend: str,
+    terminal_projection: str,
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "later-workflow-reconciliation.db"
+    path = tmp_path / f"later-workflow-reconciliation-{terminal_projection}.db"
     store = await _open_store(backend, path)
     first_provider = _ToolCallCompletion()
     blocking_tool = _BlockingTool()
@@ -958,9 +960,20 @@ async def test_confirmed_tool_replay_survives_later_workflow_reconciliation(
             store = await SQLiteStore.open(path)
 
         final_provider = _FinalCompletion("after-second-decision")
+        terminal_provider_calls = 0
+
+        async def terminal_forbidden_provider(**_: Any) -> Any:
+            nonlocal terminal_provider_calls
+            terminal_provider_calls += 1
+            raise AssertionError("confirmed terminal Model must not repeat")
+
         final_sdk = AgentSDK.for_test(
             store=store,
-            acompletion=final_provider,
+            acompletion=(
+                final_provider
+                if terminal_projection == "live"
+                else terminal_forbidden_provider
+            ),
             permission_default="allow",
         )
         _register(final_sdk, tool_handler=_forbidden_tool)
@@ -970,27 +983,51 @@ async def test_confirmed_tool_replay_survives_later_workflow_reconciliation(
             run_id,
         )
         assert second_request.request_id != first_request.request_id
+        second_action = (
+            ReconciliationAction.CONFIRM_NOT_EXECUTED
+            if terminal_projection == "live"
+            else ReconciliationAction.CONFIRM_COMPLETED
+        )
+        second_actor = {"type": "operator", "id": "second-decision"}
+        second_evidence = (
+            {"disposition": "not_executed"}
+            if terminal_projection == "live"
+            else {"provider_result": _provider_result(terminal_projection)}
+        )
         second_resolution = await final_sdk.recovery.resolve(
             second_request.request_id,
-            ReconciliationAction.CONFIRM_NOT_EXECUTED,
-            actor={"type": "operator", "id": "second-decision"},
-            evidence={"disposition": "not_executed"},
+            second_action,
+            actor=second_actor,
+            evidence=second_evidence,
         )
         assert second_resolution.resolution is not None
 
-        result = await (
-            await final_sdk.recovery.recover_workflow(workflow_run_id)
-        ).result()
-        assert result.status is WorkflowRunStatus.COMPLETED
-        assert result.output_text == "after-second-decision"
-        assert final_provider.calls == 1
+        projected = await final_sdk.recovery.recover_workflow(workflow_run_id)
+        if terminal_projection == "failed":
+            with pytest.raises(AgentSDKError) as failed:
+                await projected.result()
+            assert failed.value.code is ErrorCode.INTERNAL
+            result = await final_sdk.workflows.get(workflow_run_id)
+            assert result.status is WorkflowRunStatus.FAILED
+            assert result.nodes[0].status is WorkflowNodeStatus.FAILED
+        else:
+            result = await projected.result()
+            assert result.status is WorkflowRunStatus.COMPLETED
+            assert result.output_text == (
+                "after-second-decision"
+                if terminal_projection == "live"
+                else "operator-confirmed"
+            )
+        assert final_provider.calls == (1 if terminal_projection == "live" else 0)
+        assert terminal_provider_calls == 0
         assert blocking_tool.calls == 1
-        assert final_provider.messages[-1][-1] == {
-            "role": "tool",
-            "tool_call_id": "call_confirmed_workflow",
-            "name": TOOL.name,
-            "content": first_result["content"],
-        }
+        if final_provider.messages:
+            assert final_provider.messages[-1][-1] == {
+                "role": "tool",
+                "tool_call_id": "call_confirmed_workflow",
+                "name": TOOL.name,
+                "content": first_result["content"],
+            }
 
         cursor = await store.latest_cursor()
         assert (
@@ -1003,7 +1040,18 @@ async def test_confirmed_tool_replay_survives_later_workflow_reconciliation(
             == first_resolution
         )
         assert await store.latest_cursor() == cursor
-        assert final_provider.calls == 1
+        assert (
+            await final_sdk.recovery.resolve(
+                second_request.request_id,
+                second_action,
+                actor=second_actor,
+                evidence=second_evidence,
+            )
+            == second_resolution
+        )
+        assert await store.latest_cursor() == cursor
+        assert final_provider.calls == (1 if terminal_projection == "live" else 0)
+        assert terminal_provider_calls == 0
         assert blocking_tool.calls == 1
     finally:
         blocking_tool.release.set()

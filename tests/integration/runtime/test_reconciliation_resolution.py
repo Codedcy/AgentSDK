@@ -3671,6 +3671,305 @@ async def test_confirmed_terminal_partial_text_resolves_and_replays(
             await store.close()
 
 
+async def _resolve_prior_model_decision_then_terminal(
+    store: Any,
+    *,
+    prior_action: ReconciliationAction,
+    terminal_projection: str,
+) -> tuple[
+    AgentSDK,
+    str,
+    Any,
+    Any,
+    dict[str, object],
+    Any,
+    dict[str, object],
+]:
+    run_id, spec, _operation_id, prior_request = (
+        await _seed_pending_model_reconciliation(store)
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_provider(**_: object) -> Any:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runner = AgentSDK.for_test(
+        store=store,
+        acompletion=blocked_provider,
+        permission_default="allow",
+    )
+    runner.agents.define(spec)
+    prior_evidence: dict[str, object] = (
+        {"disposition": "not_executed"}
+        if prior_action is ReconciliationAction.CONFIRM_NOT_EXECUTED
+        else {"acknowledge_duplicate_side_effect_risk": True}
+    )
+    try:
+        prior_resolved = await runner.recovery.resolve(
+            prior_request.request_id,
+            prior_action,
+            actor={"operator": "prior-decision"},
+            evidence=prior_evidence,
+        )
+        handle = await runner.recovery.recover_run(run_id)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert handle._task is not None
+        handle._task.cancel()
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        await asyncio.wait_for(cancelled.wait(), timeout=10)
+    finally:
+        await runner.close()
+    await _mark_interrupted(store)
+
+    resolver = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("terminal decision must not call provider")
+        ),
+        permission_default="allow",
+    )
+    resolver.agents.define(spec)
+    waiting = await resolver.recovery.recover_run(run_id)
+    with pytest.raises(AgentSDKError, match="recovery required"):
+        await waiting.result()
+    terminal_request = (await resolver.recovery.pending_requests(run_id))[0]
+    terminal_evidence: dict[str, object] = {
+        "provider_result": (
+            _confirmed_provider_result(text="terminal-confirmed")
+            if terminal_projection == "completed"
+            else {
+                "disposition": "failed",
+                "error_code": "internal",
+                "retryable": True,
+            }
+        )
+    }
+    terminal_resolved = await resolver.recovery.resolve(
+        terminal_request.request_id,
+        ReconciliationAction.CONFIRM_COMPLETED,
+        actor={"operator": "terminal-decision"},
+        evidence=terminal_evidence,
+    )
+    return (
+        resolver,
+        run_id,
+        prior_request,
+        prior_resolved,
+        prior_evidence,
+        terminal_resolved,
+        terminal_evidence,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "prior_action",
+    (
+        ReconciliationAction.CONFIRM_NOT_EXECUTED,
+        ReconciliationAction.RETRY,
+    ),
+)
+@pytest.mark.parametrize("terminal_projection", ("completed", "failed"))
+async def test_cumulative_model_decisions_replay_after_terminal_confirmation(
+    backend: str,
+    prior_action: ReconciliationAction,
+    terminal_projection: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path
+            / f"cumulative-{prior_action.value}-{terminal_projection}.sqlite3"
+        )
+    )
+    resolver: AgentSDK | None = None
+    try:
+        (
+            resolver,
+            run_id,
+            prior_request,
+            prior_resolved,
+            prior_evidence,
+            terminal_resolved,
+            terminal_evidence,
+        ) = await _resolve_prior_model_decision_then_terminal(
+            store,
+            prior_action=prior_action,
+            terminal_projection=terminal_projection,
+        )
+        expected_status = (
+            RunStatus.COMPLETED
+            if terminal_projection == "completed"
+            else RunStatus.FAILED
+        )
+        assert (await resolver.runs.get(run_id)).status is expected_status
+        before = await _resolution_domain_state(store)
+
+        assert (
+            await resolver.recovery.resolve(
+                prior_request.request_id,
+                prior_action,
+                actor={"operator": "prior-decision"},
+                evidence=prior_evidence,
+            )
+            == prior_resolved
+        )
+        assert (
+            await resolver.recovery.resolve(
+                terminal_resolved.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "terminal-decision"},
+                evidence=terminal_evidence,
+            )
+            == terminal_resolved
+        )
+        assert await _resolution_domain_state(store) == before
+    finally:
+        if resolver is not None:
+            await resolver.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("terminal_projection", ("completed", "failed"))
+async def test_confirmed_tool_replays_after_later_terminal_confirmation(
+    backend: str,
+    terminal_projection: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"tool-then-terminal-{terminal_projection}.sqlite3"
+        )
+    )
+    run_id, spec, tool_spec, _operation_id, tool_request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_provider(**_: object) -> Any:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("confirmed Tool must not repeat")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=blocked_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    tool_evidence: dict[str, object] = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": tool_spec.name,
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    terminal_resolver: AgentSDK | None = None
+    try:
+        tool_resolved = await sdk.recovery.resolve(
+            tool_request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "tool-decision"},
+            evidence=tool_evidence,
+        )
+        handle = await sdk.recovery.recover_run(run_id)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert handle._task is not None
+        handle._task.cancel()
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        await asyncio.wait_for(cancelled.wait(), timeout=10)
+        await sdk.close()
+        await _mark_interrupted(store)
+
+        terminal_resolver = AgentSDK.for_test(
+            store=store,
+            acompletion=lambda **_: (_ for _ in ()).throw(
+                AssertionError("terminal confirmation must not call provider")
+            ),
+            permission_default="allow",
+        )
+        terminal_resolver.agents.define(spec)
+        terminal_resolver.tools.register(tool_spec, forbidden_tool)
+        waiting = await terminal_resolver.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        terminal_request = (
+            await terminal_resolver.recovery.pending_requests(run_id)
+        )[0]
+        terminal_evidence: dict[str, object] = {
+            "provider_result": (
+                _confirmed_provider_result(text="terminal-after-tool")
+                if terminal_projection == "completed"
+                else {
+                    "disposition": "failed",
+                    "error_code": "internal",
+                    "retryable": True,
+                }
+            )
+        }
+        terminal_resolved = await terminal_resolver.recovery.resolve(
+            terminal_request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "terminal-decision"},
+            evidence=terminal_evidence,
+        )
+        before = await _resolution_domain_state(store)
+
+        assert (
+            await terminal_resolver.recovery.resolve(
+                tool_request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "tool-decision"},
+                evidence=tool_evidence,
+            )
+            == tool_resolved
+        )
+        assert (
+            await terminal_resolver.recovery.resolve(
+                terminal_request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "terminal-decision"},
+                evidence=terminal_evidence,
+            )
+            == terminal_resolved
+        )
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if terminal_resolver is not None:
+            await terminal_resolver.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_confirmed_partial_tool_call_recovers_and_replays(
