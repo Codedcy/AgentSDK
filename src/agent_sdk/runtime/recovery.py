@@ -2284,30 +2284,17 @@ class RunRecoveryService:
                 base_request,
                 current,
             )
-        model_turns = tuple(
-            sorted(
-                item.turn
-                for item in effective.operations
-                if isinstance(item, ModelCallOperation)
-            )
-        )
-        tool_turns = tuple(
-            sorted(
-                item.turn
-                for item in effective.operations
-                if isinstance(item, ToolCallOperation)
-            )
-        )
         immediate_projection = (
             effective.run.status is RunStatus.INTERRUPTED
             and effective.run.run_id in effective.session.active_run_ids
             and checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
             and checkpoint.operation_id is None
             and checkpoint.turn == operation.turn + 1
-            and len(checkpoint.tool_results) == checkpoint.turn
-            and model_turns == tuple(range(checkpoint.turn))
-            and tool_turns == tuple(range(checkpoint.turn))
             and effective.run_events[-1].type == "run.interrupted"
+            and self._is_exact_ready_model_relation(
+                effective,
+                base_request,
+            )
         )
         if immediate_projection:
             return True
@@ -4116,13 +4103,28 @@ class RunRecoveryService:
         if state != "interrupted":
             return False
         if current_kind is None:
+            if checkpoint.operation_id is not None:
+                return False
+            if checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
+                return (
+                    interrupted_state == "model_completed"
+                    and current_model is not None
+                    and current_model.turn == checkpoint.turn
+                    and current_model.status is ExternalOperationStatus.COMPLETED
+                )
             return (
-                checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL
-                and checkpoint.operation_id is None
-                and interrupted_state == "model_completed"
-                and current_model is not None
-                and current_model.turn == checkpoint.turn
-                and current_model.status is ExternalOperationStatus.COMPLETED
+                checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
+                and interrupted_state == "ready_for_step"
+                and turn == checkpoint.turn - 1
+                and (
+                    (checkpoint.turn == 0 and current_model is None)
+                    or (
+                        current_model is not None
+                        and current_model.turn == checkpoint.turn - 1
+                        and current_model.status
+                        is ExternalOperationStatus.COMPLETED
+                    )
+                )
             )
         if checkpoint.operation_id is None:
             return False
@@ -4696,14 +4698,22 @@ class RunRecoveryService:
             run_events=normalized_events,
             run_event_cursors=tuple(range(1, len(normalized_events) + 1)),
         )
-        return (
-            normalized
-            if self._is_valid_run_event_envelope(
+        if not self._is_valid_run_event_envelope(
+            normalized,
+            allow_recovery_closed=confirmed_history,
+        ):
+            return None
+        checkpoint = normalized.checkpoint
+        if (
+            checkpoint is not None
+            and checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
+            and not self._is_exact_ready_model_relation(
                 normalized,
-                allow_recovery_closed=confirmed_history,
+                base_request,
             )
-            else None
-        )
+        ):
+            return None
+        return normalized
 
     def _is_valid_resolved_attempt_lifecycle(
         self,
@@ -5207,9 +5217,9 @@ class RunRecoveryService:
                 evidence,
                 base_request,
             )
-        return not any(
-            operation.turn >= checkpoint.turn
-            for operation in evidence.operations
+        return RunRecoveryService._is_exact_ready_model_relation(
+            evidence,
+            base_request,
         )
 
     @staticmethod
@@ -5435,6 +5445,258 @@ class RunRecoveryService:
             ):
                 return False
         return True
+
+    @staticmethod
+    def _is_exact_ready_model_relation(
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if (
+            checkpoint is None
+            or descriptor is None
+            or evidence.run.status is not RunStatus.INTERRUPTED
+            or checkpoint.run_id != evidence.run.run_id
+            or checkpoint.session_id != evidence.run.session_id
+            or checkpoint.phase is not RunCheckpointPhase.READY_FOR_MODEL
+            or checkpoint.operation_id is not None
+            or len(checkpoint.tool_results) != checkpoint.turn
+            or evidence.pending
+            or not RunRecoveryService._is_valid_run_event_envelope(evidence)
+        ):
+            return False
+
+        model_operations = {
+            operation.turn: operation
+            for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
+        }
+        tool_operations = {
+            operation.turn: operation
+            for operation in evidence.operations
+            if isinstance(operation, ToolCallOperation)
+        }
+        if (
+            len(model_operations)
+            != sum(
+                isinstance(operation, ModelCallOperation)
+                for operation in evidence.operations
+            )
+            or len(tool_operations)
+            != sum(
+                isinstance(operation, ToolCallOperation)
+                for operation in evidence.operations
+            )
+            or tuple(sorted(model_operations)) != tuple(range(checkpoint.turn))
+            or any(turn >= checkpoint.turn for turn in tool_operations)
+            or any(
+                operation.status is ExternalOperationStatus.STARTED
+                for operation in evidence.operations
+            )
+        ):
+            return False
+
+        reconstructed_messages = list(
+            descriptor.model_dump(mode="json")["messages"]
+        )
+        reconstructed_output: list[str] = []
+        cumulative = TokenUsage()
+        completed: list[
+            tuple[ModelCallOperation, str | None, str, TokenUsage]
+        ] = []
+        try:
+            for turn in range(checkpoint.turn):
+                operation = model_operations[turn]
+                turn_operations = tuple(
+                    item for item in evidence.operations if item.turn == turn
+                )
+                tool_operation = tool_operations.get(turn)
+                if (
+                    operation.run_id != evidence.run.run_id
+                    or operation.session_id != evidence.run.session_id
+                    or operation.provider_identity != base_request.model
+                    or turn_operations
+                    != (
+                        (operation,)
+                        if tool_operation is None
+                        else (operation, tool_operation)
+                    )
+                ):
+                    return False
+                request = ModelRequest(
+                    model=base_request.model,
+                    messages=tuple(reconstructed_messages),
+                    tools=base_request.tools,
+                    params=dict(base_request.params),
+                    purpose=base_request.purpose,
+                )
+                if (
+                    operation.request_fingerprint
+                    != _model_request_fingerprint(request)
+                ):
+                    return False
+                outcome = RunRecoveryService._completed_model_outcome(operation)
+                if outcome is None or len(outcome[2]) != 1:
+                    return False
+                finish_reason, text, calls, usage = outcome
+                call = calls[0]
+                reconstructed_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": text or None,
+                        "tool_calls": [
+                            {
+                                "id": call["call_id"],
+                                "type": "function",
+                                "function": {
+                                    "name": call["name"],
+                                    "arguments": call["arguments_json"],
+                                },
+                            }
+                        ],
+                    }
+                )
+                cumulative = _add_usage(cumulative, usage)
+                result = checkpoint.tool_results[turn]
+                if (result.call_id, result.tool_name) != (
+                    call["call_id"],
+                    call["name"],
+                ):
+                    return False
+                reconstructed_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result.call_id,
+                        "name": result.tool_name,
+                        "content": result.content,
+                    }
+                )
+                completed.append((operation, finish_reason, text, usage))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+        checkpoint_transitions = sum(
+            event.type
+            in {
+                "model.call.started",
+                "model.call.completed",
+                "permission.requested",
+                "permission.resolved",
+                "tool.call.started",
+                "tool.call.completed",
+            }
+            for event in evidence.run_events
+        )
+        discarded_attempt_transitions = 2 * sum(
+            request.resolution is not None
+            and request.resolution.action
+            in {
+                ReconciliationAction.CONFIRM_NOT_EXECUTED,
+                ReconciliationAction.RETRY,
+            }
+            for request in evidence.reconciliations
+        )
+        if (
+            checkpoint.checkpoint_version
+            != 1 + checkpoint_transitions + discarded_attempt_transitions
+            or checkpoint.model_dump(mode="json")["messages"]
+            != reconstructed_messages
+            or checkpoint.usage != cumulative
+            or not RunRecoveryService._is_valid_certified_lifecycle_positions(
+                evidence,
+                current_kind=None,
+            )
+        ):
+            return False
+
+        step_positions = tuple(
+            index
+            for index, event in enumerate(evidence.run_events)
+            if event.type == "step.started"
+        )
+        if len(step_positions) != checkpoint.turn:
+            return False
+        for turn, (operation, finish_reason, text, usage) in enumerate(completed):
+            start = step_positions[turn]
+            end = (
+                step_positions[turn + 1]
+                if turn + 1 < checkpoint.turn
+                else len(evidence.run_events)
+            )
+            segment = evidence.run_events[start:end]
+            started = tuple(
+                index
+                for index, event in enumerate(segment)
+                if event.type == "model.call.started"
+            )
+            terminal = tuple(
+                index
+                for index, event in enumerate(segment)
+                if event.type == "model.call.completed"
+            )
+            if (
+                len(started) != 1
+                or len(terminal) != 1
+                or started[0] >= terminal[0]
+                or segment[started[0]].payload != {"model": base_request.model}
+                or segment[terminal[0]].payload
+                != {"finish_reason": finish_reason}
+            ):
+                return False
+            between = segment[started[0] + 1 : terminal[0]]
+            deltas = tuple(
+                event.payload.get("text")
+                for event in between
+                if event.type == "model.text.delta"
+            )
+            recovered = any(
+                (
+                    event.type
+                    in {
+                        "model.recovery.query.started",
+                        "model.recovery.resend.started",
+                    }
+                    or (
+                        event.type == "reconciliation.resolved"
+                        and event.payload.get("action")
+                        == ReconciliationAction.CONFIRM_COMPLETED.value
+                    )
+                )
+                and event.payload.get("operation_id") == operation.operation_id
+                for event in segment
+            )
+            if any(not isinstance(delta, str) for delta in deltas):
+                return False
+            text_deltas = tuple(
+                delta for delta in deltas if isinstance(delta, str)
+            )
+            if (
+                recovered
+                and not RunRecoveryService._is_exact_durable_text_prefix(
+                    text_deltas,
+                    text,
+                )
+            ) or (not recovered and "".join(text_deltas) != text):
+                return False
+            reconstructed_output.extend(text_deltas)
+            if recovered:
+                reconstructed_output.append(text)
+            usage_events = tuple(
+                event
+                for event in between
+                if event.type == "model.usage.reported"
+            )
+            expected_usage = usage.model_dump(mode="json")
+            usage_required = recovered or any(
+                value is not None for value in expected_usage.values()
+            )
+            if (
+                usage_required != (len(usage_events) == 1)
+                or (usage_events and usage_events[0].payload != expected_usage)
+            ):
+                return False
+        return checkpoint.output_parts == tuple(reconstructed_output)
 
     @staticmethod
     def _completed_model_outcome(

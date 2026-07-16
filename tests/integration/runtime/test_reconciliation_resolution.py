@@ -1061,6 +1061,229 @@ async def test_confirm_completed_tool_projects_and_recovers_exact_result(
             await store.close()
 
 
+async def _replace_run_checkpoint_record(store: Any, checkpoint: Any) -> None:
+    serialized = _canonical_record_json(checkpoint)
+    if isinstance(store, InMemoryStore):
+        store._run_checkpoints[checkpoint.run_id] = serialized
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE run_checkpoints SET checkpoint_version = ?, turn = ?, phase = ?, "
+        "operation_id = ?, data_json = ? "
+        "WHERE run_id = ?",
+        (
+            checkpoint.checkpoint_version,
+            checkpoint.turn,
+            checkpoint.phase.value,
+            checkpoint.operation_id,
+            serialized,
+            checkpoint.run_id,
+        ),
+    )
+    await store._connection.commit()
+
+
+async def _replace_external_operation_record(store: Any, operation: Any) -> None:
+    serialized = _canonical_record_json(operation)
+    if isinstance(store, InMemoryStore):
+        store._external_operations[operation.operation_id] = serialized
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE external_operations SET request_fingerprint = ?, status = ?, "
+        "provider_identity = ?, tool_identity = ?, data_json = ? "
+        "WHERE operation_id = ?",
+        (
+            operation.request_fingerprint,
+            operation.status.value,
+            getattr(operation, "provider_identity", None),
+            getattr(operation, "tool_identity", None),
+            serialized,
+            operation.operation_id,
+        ),
+    )
+    await store._connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("entrypoint", ("replay", "recovery"))
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "message_content",
+        "message_name",
+        "message_call_id",
+        "output",
+        "usage",
+        "tool_result",
+        "phase",
+        "turn",
+        "checkpoint_version",
+        "model_fingerprint",
+        "model_outcome",
+        "tool_fingerprint",
+        "tool_outcome",
+    ),
+)
+async def test_confirmed_tool_ready_model_replay_requires_exact_checkpoint_relation(
+    backend: str,
+    entrypoint: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path
+            / f"confirmed-tool-ready-model-{entrypoint}-{corruption}.sqlite3"
+        )
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    provider_calls = 0
+    tool_calls = 0
+
+    async def forbidden_provider(**_: object) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("corrupt READY_FOR_MODEL reached the provider")
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        nonlocal tool_calls
+        del value
+        tool_calls += 1
+        raise AssertionError("corrupt READY_FOR_MODEL reached the Tool")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    actor = {"type": "operator"}
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    try:
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        corrupted_checkpoint = None
+        if corruption.startswith("message_"):
+            messages = list(checkpoint.messages)
+            field = {
+                "message_content": "content",
+                "message_name": "name",
+                "message_call_id": "tool_call_id",
+            }[corruption]
+            messages[-1] = {**dict(messages[-1]), field: "forged"}
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={"messages": tuple(messages)}
+            )
+        elif corruption == "output":
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={"output_parts": (*checkpoint.output_parts, "forged")}
+            )
+        elif corruption == "usage":
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={
+                    "usage": checkpoint.usage.model_copy(
+                        update={"total_tokens": 99}
+                    )
+                }
+            )
+        elif corruption == "tool_result":
+            forged_result = checkpoint.tool_results[0].model_copy(
+                update={"content": "forged"}
+            )
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={"tool_results": (forged_result,)}
+            )
+        elif corruption == "phase":
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={"phase": RunCheckpointPhase.READY_FOR_TOOL}
+            )
+        elif corruption == "turn":
+            corrupted_checkpoint = checkpoint.model_copy(update={"turn": 2})
+        elif corruption == "checkpoint_version":
+            corrupted_checkpoint = checkpoint.model_copy(
+                update={"checkpoint_version": checkpoint.checkpoint_version + 1}
+            )
+        else:
+            operations = await store.list_external_operations(run_id)
+            target = next(
+                operation
+                for operation in operations
+                if (
+                    isinstance(operation, ModelCallOperation)
+                    if corruption.startswith("model_")
+                    else isinstance(operation, ToolCallOperation)
+                )
+            )
+            if corruption.endswith("fingerprint"):
+                corrupted_operation = target.model_copy(
+                    update={"request_fingerprint": "sha256:forged"}
+                )
+            else:
+                assert corruption.endswith("outcome")
+                outcome = target.model_dump(mode="json")["outcome"]
+                assert isinstance(outcome, dict)
+                corrupted_operation = target.model_copy(
+                    update={"outcome": {**outcome, "forged": True}}
+                )
+            await _replace_external_operation_record(store, corrupted_operation)
+        if corrupted_checkpoint is not None:
+            await _replace_run_checkpoint_record(store, corrupted_checkpoint)
+        before = await _resolution_domain_state(store)
+
+        if entrypoint == "replay":
+            with pytest.raises(AgentSDKError) as caught:
+                await sdk.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.CONFIRM_COMPLETED,
+                    actor=actor,
+                    evidence=evidence,
+                )
+
+            assert caught.value.code is ErrorCode.CONFLICT
+            assert caught.value.message == "recovery state conflict"
+            assert caught.value.retryable is True
+            assert await _resolution_domain_state(store) == before
+        else:
+            assert entrypoint == "recovery"
+            handle = await sdk.recovery.recover_run(run_id)
+            with pytest.raises(AgentSDKError) as caught:
+                await handle.result()
+            assert caught.value.code is ErrorCode.CONFLICT
+            assert caught.value.message == "recovery required"
+            assert caught.value.retryable is True
+            pending = await sdk.recovery.pending_requests(run_id)
+            assert len(pending) == 1
+            assert pending[0].reason == "recovery_state_invalid"
+        assert provider_calls == 0
+        assert tool_calls == 0
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_confirm_completed_tool_rejects_raw_evidence_before_mutation(
@@ -2673,6 +2896,7 @@ async def _remove_confirmed_tool_started_marker(store: Any, run_id: str) -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("entrypoint", ("replay", "recovery"))
 @pytest.mark.parametrize(
     ("corruption", "marker"),
     (
@@ -2685,6 +2909,7 @@ async def _remove_confirmed_tool_started_marker(store: Any, run_id: str) -> None
 )
 async def test_confirmed_tool_replay_rejects_corrupt_lifecycle_markers(
     backend: str,
+    entrypoint: str,
     corruption: str,
     marker: str,
     tmp_path: Path,
@@ -2693,7 +2918,8 @@ async def test_confirmed_tool_replay_rejects_corrupt_lifecycle_markers(
         InMemoryStore()
         if backend == "memory"
         else await SQLiteStore.open(
-            tmp_path / f"corrupt-confirmed-tool-{corruption}-{marker}.sqlite3"
+            tmp_path
+            / f"corrupt-confirmed-tool-{entrypoint}-{corruption}-{marker}.sqlite3"
         )
     )
     run_id, spec, tool_spec, _operation_id, request = (
@@ -2750,17 +2976,27 @@ async def test_confirmed_tool_replay_rejects_corrupt_lifecycle_markers(
             await _remove_confirmed_tool_started_marker(store, run_id)
         before = await _resolution_domain_state(store)
 
-        with pytest.raises(AgentSDKError) as conflict:
-            await sdk.recovery.resolve(
-                request.request_id,
-                ReconciliationAction.CONFIRM_COMPLETED,
-                actor=actor,
-                evidence=evidence,
-            )
+        if entrypoint == "replay":
+            with pytest.raises(AgentSDKError) as conflict:
+                await sdk.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.CONFIRM_COMPLETED,
+                    actor=actor,
+                    evidence=evidence,
+                )
 
-        assert conflict.value.code is ErrorCode.CONFLICT
-        assert conflict.value.message == "recovery state conflict"
-        assert await _resolution_domain_state(store) == before
+            assert conflict.value.code is ErrorCode.CONFLICT
+            assert conflict.value.message == "recovery state conflict"
+            assert await _resolution_domain_state(store) == before
+        else:
+            assert entrypoint == "recovery"
+            with pytest.raises(AgentSDKError) as conflict:
+                await (await sdk.recovery.recover_run(run_id)).result()
+            assert conflict.value.code is ErrorCode.CONFLICT
+            assert conflict.value.message == "recovery required"
+            pending = await sdk.recovery.pending_requests(run_id)
+            assert len(pending) == 1
+            assert pending[0].reason == "recovery_state_invalid"
     finally:
         await sdk.close()
         if isinstance(store, SQLiteStore):

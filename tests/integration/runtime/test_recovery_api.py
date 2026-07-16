@@ -47,7 +47,7 @@ from agent_sdk.storage.base import (
 )
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
-from agent_sdk.tools.models import ToolContext, ToolResult, ToolSpec
+from agent_sdk.tools.models import ToolContext, ToolResult, ToolResultStatus, ToolSpec
 from agent_sdk.workflow import WorkflowExecutor
 
 
@@ -217,7 +217,7 @@ async def _seed_nonpristine_current_run(
 
 
 async def _seed_ready_model_interrupted(
-    store: InMemoryStore,
+    store: Any,
     spec: AgentSpec,
 ) -> tuple[str, RunCheckpoint]:
     run_id = await _seed_pristine_current_run(store, spec)
@@ -254,55 +254,180 @@ async def _seed_ready_model_interrupted(
         now=now,
         expires_at=now + timedelta(seconds=30),
     )
-    prior_result = ToolResult.succeeded("call_prior", "lookup", {"value": 7})
-    checkpoint = RunCheckpoint(
+    initial_messages = ({"role": "user", "content": "resume me"},)
+    initial_checkpoint = RunCheckpoint(
         run_id=run_id,
         session_id=running.session_id,
         checkpoint_version=1,
-        turn=1,
+        turn=0,
         phase=RunCheckpointPhase.READY_FOR_MODEL,
-        messages=(
-            {"role": "user", "content": "resume me"},
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_prior",
-                        "type": "function",
-                        "function": {"name": "lookup", "arguments": "{}"},
-                    }
-                ],
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_prior",
-                "name": "lookup",
-                "content": '{"value":7}',
-            },
-        ),
-        output_parts=("prior ",),
-        usage=TokenUsage(prompt_tokens=5, completion_tokens=2, total_tokens=7),
-        tool_results=(prior_result,),
+        messages=initial_messages,
     )
     await store.put_run_checkpoint(
-        checkpoint,
+        initial_checkpoint,
         expected=None,
         lease=lease,
         now=now,
     )
+    model_request = ModelRequest(
+        model=spec.model,
+        messages=initial_messages,
+        params=dict(spec.model_params),
+    )
+    started_model = ModelCallOperation(
+        operation_id="op_ready_model_prior",
+        session_id=running.session_id,
+        run_id=run_id,
+        turn=0,
+        request_fingerprint=_model_request_fingerprint(model_request),
+        lease_generation=lease.generation,
+        status=ExternalOperationStatus.STARTED,
+        provider_identity=spec.model,
+        recovery_metadata={
+            "authoritative_status": False,
+            "same_operation_id_resend": False,
+        },
+    )
+    await store.create_external_operation(started_model, lease=lease, now=now)
+    model_in_flight = initial_checkpoint.model_copy(
+        update={
+            "checkpoint_version": 2,
+            "phase": RunCheckpointPhase.MODEL_IN_FLIGHT,
+            "operation_id": started_model.operation_id,
+        }
+    )
+    await store.put_run_checkpoint(
+        model_in_flight,
+        expected=initial_checkpoint,
+        lease=lease,
+        now=now,
+    )
+    prior_usage = TokenUsage(prompt_tokens=5, completion_tokens=2, total_tokens=7)
+    prior_call = ToolCallCompleted(
+        index=0,
+        call_id="call_prior",
+        name="lookup",
+        arguments_json="{}",
+    )
+    completed_model = started_model.model_copy(
+        update={
+            "status": ExternalOperationStatus.COMPLETED,
+            "outcome": {
+                "finish_reason": "tool_calls",
+                "text": "prior ",
+                "tool_calls": [
+                    {
+                        "index": prior_call.index,
+                        "call_id": prior_call.call_id,
+                        "name": prior_call.name,
+                        "arguments_json": prior_call.arguments_json,
+                    }
+                ],
+                "usage": prior_usage.model_dump(mode="json"),
+            },
+        }
+    )
+    await store.transition_external_operation(
+        expected=started_model,
+        updated=completed_model,
+        lease=lease,
+        now=now,
+    )
+    assistant_message = {
+        "role": "assistant",
+        "content": "prior ",
+        "tool_calls": [
+            {
+                "id": prior_call.call_id,
+                "type": "function",
+                "function": {
+                    "name": prior_call.name,
+                    "arguments": prior_call.arguments_json,
+                },
+            }
+        ],
+    }
+    ready_for_tool = model_in_flight.model_copy(
+        update={
+            "checkpoint_version": 3,
+            "phase": RunCheckpointPhase.READY_FOR_TOOL,
+            "operation_id": None,
+            "messages": (*initial_messages, assistant_message),
+            "output_parts": ("prior ",),
+            "usage": prior_usage,
+        }
+    )
+    await store.put_run_checkpoint(
+        ready_for_tool,
+        expected=model_in_flight,
+        lease=lease,
+        now=now,
+    )
+    prior_result = ToolResult.normalized_error(
+        prior_call.call_id,
+        prior_call.name,
+        ToolResultStatus.FAILED,
+        "tool not found",
+    )
+    tool_message = {
+        "role": "tool",
+        "tool_call_id": prior_call.call_id,
+        "name": prior_call.name,
+        "content": prior_result.content,
+    }
+    checkpoint = ready_for_tool.model_copy(
+        update={
+            "checkpoint_version": 4,
+            "turn": 1,
+            "phase": RunCheckpointPhase.READY_FOR_MODEL,
+            "messages": (*ready_for_tool.messages, tool_message),
+            "tool_results": (prior_result,),
+        }
+    )
+    await store.put_run_checkpoint(
+        checkpoint,
+        expected=ready_for_tool,
+        lease=lease,
+        now=now,
+    )
     await store.release_lease(lease)
+    history_events = tuple(
+        EventEnvelope.new(
+            type=event_type,
+            session_id=running.session_id,
+            run_id=run_id,
+            sequence=index,
+            payload=payload,
+        )
+        for index, (event_type, payload) in enumerate(
+            (
+                ("step.started", {}),
+                ("model.call.started", {"model": spec.model}),
+                ("model.text.delta", {"text": "prior "}),
+                ("model.usage.reported", prior_usage.model_dump(mode="json")),
+                ("model.call.completed", {"finish_reason": "tool_calls"}),
+                (
+                    "tool.call.proposed",
+                    {"call_id": prior_call.call_id, "tool_name": prior_call.name},
+                ),
+                ("tool.call.completed", prior_result.model_dump(mode="json")),
+                ("step.completed", {}),
+            ),
+            start=3,
+        )
+    )
     interrupted = running.model_copy(
         update={"status": RunStatus.INTERRUPTED, "version": 3}
     )
     await store.commit(
         CommitBatch(
             events=(
+                *history_events,
                 EventEnvelope.new(
                     type="run.interrupted",
                     session_id=interrupted.session_id,
                     run_id=interrupted.run_id,
-                    sequence=3,
+                    sequence=3 + len(history_events),
                     payload={"status": "interrupted"},
                 ),
             ),
@@ -2208,8 +2333,13 @@ async def test_ready_for_model_resume_preserves_exact_checkpoint_state() -> None
             for stored in await store.read_events(after_cursor=0)
             if stored.event.run_id == run_id
         ]
-        assert events[3].type == "run.recovery.started"
-        assert events[3].sequence == 4
+        recovery_started = next(
+            event for event in events if event.type == "run.recovery.started"
+        )
+        interrupted = next(
+            event for event in events if event.type == "run.interrupted"
+        )
+        assert recovery_started.sequence == interrupted.sequence + 1
     finally:
         await sdk.close()
 
