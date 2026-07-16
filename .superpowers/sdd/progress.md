@@ -208,3 +208,8 @@ M02-T003 operational plan: .superpowers/sdd/M02-T003-phase-plan.md
 M02-T003 Phase A: in progress - checksum bootstrap, migration/open coordinator, and schema-generation write fence
 M02-T003 Phase A brief: .superpowers/sdd/M02-T003-phaseA-brief.md
 M02-T003 Phases B-D remain pending until Phase A independent Spec C0/I0 and Quality C0/I0 review
+M02-T003 Phase A implementation: ac7f0ca
+M02-T003 Phase A initial review: Not Approved; Spec C0/I4/M0 and Quality C0/I1/M0
+M02-T003 Phase A review findings: coordinator hangs across threads/event loops; plan/applied lack one read snapshot; SQL normalization changes quoted literal semantics; migrations 1-3 share one transaction and v4 BEGIN cancellation lacks settlement; public open errors leak absolute paths
+M02-T003 Phase A review-fix brief: .superpowers/sdd/M02-T003-phaseA-review-fix-brief.md
+M02-T003 Phase A review fix: in progress; Phase B remains blocked
