@@ -2964,6 +2964,7 @@ class RunRecoveryService:
         up_to_cursor = await self._store.latest_cursor()
         events = await self._store.read_events(
             after_cursor=0,
+            session_id=run.session_id,
             up_to_cursor=up_to_cursor,
         )
         run_records = tuple(
@@ -2978,6 +2979,9 @@ class RunRecoveryService:
             and stored.event.payload.get("run_id") == run.run_id
         )
         event_ids = tuple(stored.event.event_id for stored in events)
+        events_match_session = all(
+            stored.event.session_id == run.session_id for stored in events
+        )
         return _RecoveryEvidence(
             run=run,
             session=session,
@@ -2993,7 +2997,9 @@ class RunRecoveryService:
             session_lifecycle_event_cursors=tuple(
                 stored.cursor for stored in session_lifecycle_records
             ),
-            run_event_ids_unique=len(event_ids) == len(set(event_ids)),
+            run_event_ids_unique=(
+                events_match_session and len(event_ids) == len(set(event_ids))
+            ),
         )
 
     @staticmethod

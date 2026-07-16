@@ -198,6 +198,42 @@ class _FollowerReadCountingStore:
         return lease
 
 
+class _EvidenceReadRecordingStore:
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        injected_scoped_event: StoredEvent | None = None,
+    ) -> None:
+        self._delegate = delegate
+        self._injected_scoped_event = injected_scoped_event
+        self.read_calls: list[tuple[int, str | None, int | None, int | None]] = []
+        self.returned_event_counts: list[int] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    async def read_events(
+        self,
+        *,
+        after_cursor: int,
+        session_id: str | None = None,
+        up_to_cursor: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredEvent]:
+        events = await self._delegate.read_events(
+            after_cursor=after_cursor,
+            session_id=session_id,
+            up_to_cursor=up_to_cursor,
+            limit=limit,
+        )
+        if session_id is not None and self._injected_scoped_event is not None:
+            events = [*events, self._injected_scoped_event]
+        self.read_calls.append((after_cursor, session_id, up_to_cursor, limit))
+        self.returned_event_counts.append(len(events))
+        return events
+
+
 async def _seed_pristine_current_run(
     store: InMemoryStore,
     spec: AgentSpec,
@@ -2929,6 +2965,109 @@ async def test_default_cross_sdk_follower_polling_is_bounded(
         if backend == "sqlite":
             await owner_store.close()
             await follower_delegate.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_recovery_evidence_read_is_bounded_to_target_session(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "session-scoped-evidence.db"
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(database_path)
+    )
+    spec = AgentSpec(name=f"session-evidence-{backend}", model="fake/recovery")
+    run_id, _checkpoint = await _seed_ready_model_interrupted(store, spec)
+    run_data = await store.get_snapshot("run", run_id)
+    assert run_data is not None
+    run = RunSnapshot.model_validate(run_data)
+    target_events_before_noise = await store.read_events(
+        after_cursor=0,
+        session_id=run.session_id,
+    )
+    commands = RuntimeCommands(store)
+    for _ in range(64):
+        await commands.create_session(workspaces=[])
+    fixed_cursor = await store.latest_cursor()
+    all_events = await store.read_events(
+        after_cursor=0,
+        up_to_cursor=fixed_cursor,
+    )
+    recording_store = _EvidenceReadRecordingStore(store)
+    sdk = AgentSDK.for_test(
+        store=recording_store,
+        acompletion=_unused_acompletion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        plan = await sdk.recovery._service.plan(run_id)
+
+        assert plan.kind == "resume"
+        assert len(all_events) > len(target_events_before_noise) + 60
+        assert recording_store.read_calls == [
+            (0, run.session_id, fixed_cursor, None)
+        ]
+        assert recording_store.returned_event_counts == [
+            len(target_events_before_noise)
+        ]
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", ("foreign_session", "duplicate_event_id"))
+async def test_session_scoped_evidence_rejects_materialized_corruption(
+    corruption: str,
+) -> None:
+    store = InMemoryStore()
+    spec = AgentSpec(name=f"session-corruption-{corruption}", model="fake/recovery")
+    run_id, _checkpoint = await _seed_ready_model_interrupted(store, spec)
+    run_data = await store.get_snapshot("run", run_id)
+    assert run_data is not None
+    run = RunSnapshot.model_validate(run_data)
+    target_events = await store.read_events(
+        after_cursor=0,
+        session_id=run.session_id,
+    )
+    if corruption == "foreign_session":
+        foreign = await RuntimeCommands(store).create_session(workspaces=[])
+        foreign_events = await store.read_events(
+            after_cursor=0,
+            session_id=foreign.session_id,
+        )
+        injected = foreign_events[0]
+    else:
+        injected = next(
+            stored for stored in target_events if stored.event.run_id is None
+        )
+    fixed_cursor = await store.latest_cursor()
+    recording_store = _EvidenceReadRecordingStore(
+        store,
+        injected_scoped_event=injected,
+    )
+    sdk = AgentSDK.for_test(
+        store=recording_store,
+        acompletion=_unused_acompletion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        plan = await sdk.recovery._service.plan(run_id)
+
+        assert plan.kind == "reconcile"
+        assert plan.reason == "recovery_state_invalid"
+        assert recording_store.read_calls == [
+            (0, run.session_id, fixed_cursor, None)
+        ]
+        assert recording_store.returned_event_counts == [len(target_events) + 1]
+    finally:
+        await sdk.close()
 
 
 @pytest.mark.asyncio
