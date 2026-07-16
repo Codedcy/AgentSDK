@@ -31,7 +31,7 @@ from agent_sdk.runtime.provider_recovery import (
     ProviderRecoveryDisposition,
     ProviderRecoveryResult,
 )
-from agent_sdk.tools.models import ToolResult, freeze_json, thaw_json
+from agent_sdk.tools.models import ToolResult, ToolResultStatus, freeze_json, thaw_json
 
 
 class ExternalOperationKind(StrEnum):
@@ -818,6 +818,192 @@ def _valid_confirmed_model_resolution_batch(batch: Any) -> bool:
         ):
             return False
     return True
+
+
+def _valid_confirmed_tool_resolution_batch(batch: Any) -> bool:
+    operation_write = batch.operation
+    checkpoint_write = batch.checkpoint
+    request_write = batch.reconciliation
+    if (
+        operation_write is None
+        or not isinstance(operation_write.expected, ToolCallOperation)
+        or checkpoint_write is None
+        or checkpoint_write.expected is None
+        or request_write is None
+        or request_write.expected is None
+        or len(batch.events) != 3
+        or len(batch.snapshots) != 1
+        or len(batch.preconditions) != 2
+        or len(batch.event_preconditions) != 1
+        or batch.checkpoint_precondition is not None
+        or batch.operation_precondition is not None
+    ):
+        return False
+    operation = operation_write.expected
+    projected_operation = operation_write.updated
+    checkpoint = checkpoint_write.expected
+    projected_checkpoint = checkpoint_write.updated
+    request = request_write.expected
+    resolved = request_write.updated
+    resolution = resolved.resolution
+    if (
+        resolution is None
+        or resolution.action is not ReconciliationAction.CONFIRM_COMPLETED
+        or set(resolution.evidence) != {"tool_result"}
+        or request.status is not ReconciliationStatus.PENDING
+        or resolved.status is not ReconciliationStatus.RESOLVED
+        or request.operation_id != operation.operation_id
+        or request.reason != "tool_call_unknown_outcome"
+        or dict(request.details)
+        != {"checkpoint_phase": RunCheckpointPhase.TOOL_IN_FLIGHT.value}
+        or operation.status is not ExternalOperationStatus.STARTED
+        or checkpoint.phase is not RunCheckpointPhase.TOOL_IN_FLIGHT
+        or checkpoint.operation_id != operation.operation_id
+        or checkpoint.turn != operation.turn
+        or len(checkpoint.tool_results) != operation.turn
+    ):
+        return False
+    try:
+        raw_result = thaw_json(resolution.evidence)["tool_result"]
+        result = ToolResult.model_validate_json(
+            json.dumps(
+                raw_result,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        if result.model_dump(mode="json") != raw_result:
+            return False
+        preconditions = {
+            precondition.kind: precondition for precondition in batch.preconditions
+        }
+        if set(preconditions) != {"session", "run"}:
+            return False
+        session_precondition = preconditions["session"]
+        run_precondition = preconditions["run"]
+        if session_precondition.data is None or run_precondition.data is None:
+            return False
+        session = SessionSnapshot.model_validate(session_precondition.data)
+        run = RunSnapshot.model_validate(run_precondition.data)
+        messages = checkpoint.model_dump(mode="json")["messages"]
+        assistant = messages[-1]
+        calls = assistant["tool_calls"]
+        call = calls[0]
+        function = call["function"]
+    except Exception:
+        return False
+    if (
+        session_precondition.entity_id != session.session_id
+        or session_precondition.version != session.version
+        or session_precondition.session_id != session.session_id
+        or run_precondition.entity_id != run.run_id
+        or run_precondition.version != run.version
+        or run_precondition.session_id != run.session_id
+        or request.run_id != run.run_id
+        or request.session_id != run.session_id
+        or operation.run_id != run.run_id
+        or operation.session_id != run.session_id
+        or run.session_id != session.session_id
+        or run.status is not RunStatus.WAITING_RECONCILIATION
+        or run.run_id not in session.active_run_ids
+        or not isinstance(assistant, dict)
+        or assistant.get("role") != "assistant"
+        or not isinstance(calls, list)
+        or len(calls) != 1
+        or not isinstance(call, dict)
+        or set(call) != {"id", "type", "function"}
+        or call["type"] != "function"
+        or not isinstance(function, dict)
+        or set(function) != {"name", "arguments"}
+        or not isinstance(function["arguments"], str)
+        or call["id"] != result.call_id
+        or function["name"] != result.tool_name
+    ):
+        return False
+    requested = batch.event_preconditions[0]
+    resolution_payload = {
+        "request_id": request.request_id,
+        "operation_id": request.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    expected_operation = operation.model_copy(
+        update={
+            "status": (
+                ExternalOperationStatus.COMPLETED
+                if result.status is ToolResultStatus.SUCCEEDED
+                else ExternalOperationStatus.FAILED
+            ),
+            "outcome": result.model_dump(mode="json"),
+        }
+    )
+    expected_checkpoint = checkpoint.model_copy(
+        update={
+            "checkpoint_version": checkpoint.checkpoint_version + 1,
+            "turn": checkpoint.turn + 1,
+            "phase": RunCheckpointPhase.READY_FOR_MODEL,
+            "operation_id": None,
+            "messages": (
+                *checkpoint.messages,
+                {
+                    "role": "tool",
+                    "tool_call_id": result.call_id,
+                    "name": result.tool_name,
+                    "content": result.content,
+                },
+            ),
+            "tool_results": (*checkpoint.tool_results, result),
+        }
+    )
+    expected_run = run.model_copy(
+        update={
+            "status": RunStatus.INTERRUPTED,
+            "version": run.version + 1,
+        }
+    )
+    expected_types = (
+        "reconciliation.resolved",
+        "tool.call.completed",
+        "step.completed",
+    )
+    expected_payloads: tuple[dict[str, Any], ...] = (
+        resolution_payload,
+        result.model_dump(mode="json"),
+        {},
+    )
+    run_write = batch.snapshots[0]
+    return (
+        requested.type == "reconciliation.requested"
+        and requested.session_id == run.session_id
+        and requested.run_id == run.run_id
+        and resolved
+        == request.model_copy(
+            update={
+                "status": ReconciliationStatus.RESOLVED,
+                "resolution": resolution,
+            }
+        )
+        and projected_operation == expected_operation
+        and projected_checkpoint == expected_checkpoint
+        and tuple(event.type for event in batch.events) == expected_types
+        and tuple(event.payload for event in batch.events) == expected_payloads
+        and all(event.occurred_at == batch.now for event in batch.events)
+        and all(
+            event.session_id == run.session_id
+            and event.run_id == run.run_id
+            and event.sequence == requested.sequence + 1 + offset
+            for offset, event in enumerate(batch.events)
+        )
+        and batch.events[0].event_id == resolution.event_id
+        and run_write.kind == "run"
+        and run_write.entity_id == run.run_id
+        and run_write.session_id == run.session_id
+        and run_write.version == expected_run.version
+        and run_write.data == expected_run.model_dump(mode="json")
+    )
 
 
 def _valid_confirmed_model_terminalization_batch(batch: Any) -> bool:

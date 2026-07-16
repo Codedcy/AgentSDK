@@ -26,6 +26,7 @@ from agent_sdk.runtime.reconciliation import (
     _valid_checkpoint_replay_shape,
     _valid_confirmed_model_resolution_batch,
     _valid_confirmed_model_terminalization_batch,
+    _valid_confirmed_tool_resolution_batch,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -266,17 +267,23 @@ class InMemoryStore:
             confirmed_terminalization = (
                 _valid_confirmed_model_terminalization_batch(batch)
             )
+            confirmed_tool_resolution = _valid_confirmed_tool_resolution_batch(batch)
             resolution_batch = (
                 retry_resolution
                 or confirmed_model_resolution
                 or confirmed_terminalization
+                or confirmed_tool_resolution
             )
             if (
                 reconciliation_write is not None
                 and reconciliation_write.updated.resolution is not None
                 and reconciliation_write.updated.resolution.action
                 is ReconciliationAction.CONFIRM_COMPLETED
-                and not (confirmed_model_resolution or confirmed_terminalization)
+                and not (
+                    confirmed_model_resolution
+                    or confirmed_terminalization
+                    or confirmed_tool_resolution
+                )
             ):
                 raise RecoveryStateConflictError
             operation_json: str | None = None

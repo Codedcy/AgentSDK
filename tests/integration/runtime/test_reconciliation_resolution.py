@@ -25,8 +25,10 @@ from agent_sdk.runtime.leases import LeaseManager
 from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
     ModelCallOperation,
+    ToolCallOperation,
     RunCheckpointPhase,
     ReconciliationStatus,
+    RecoveryStateConflictError,
     _canonical_record_json,
 )
 from agent_sdk.storage.base import CommitBatch, RunProgressBatch, SnapshotWrite
@@ -229,6 +231,40 @@ class _PartialAmbiguousResolutionMemoryStore(InMemoryStore):
             )
             raise RuntimeError("partial-resolution-store-secret")
         return result
+
+
+class _CaptureResolutionMemoryStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capture_resolution = False
+        self.captured_batch: RunProgressBatch | None = None
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> Any:
+        if (
+            self.capture_resolution
+            and batch.reconciliation is not None
+            and batch.reconciliation.updated.status is ReconciliationStatus.RESOLVED
+        ):
+            self.captured_batch = batch
+            raise RuntimeError("capture confirmed Tool resolution")
+        return await super().commit_run_progress(batch)
+
+
+class _CaptureResolutionSQLiteStore(SQLiteStore):
+    def __init__(self, connection: Any) -> None:
+        super().__init__(connection)
+        self.capture_resolution = False
+        self.captured_batch: RunProgressBatch | None = None
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> Any:
+        if (
+            self.capture_resolution
+            and batch.reconciliation is not None
+            and batch.reconciliation.updated.status is ReconciliationStatus.RESOLVED
+        ):
+            self.captured_batch = batch
+            raise RuntimeError("capture confirmed Tool resolution")
+        return await super().commit_run_progress(batch)
 
 
 class _RejectCompletedTerminalResolutionMemoryStore(InMemoryStore):
@@ -780,6 +816,1207 @@ def _confirmed_provider_result(
             else usage
         ),
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    ("tool_result", "expected_operation_status"),
+    (
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "succeeded",
+                "content": "7",
+                "value": 7,
+                "error": None,
+            },
+            ExternalOperationStatus.COMPLETED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "succeeded",
+                "content": '{"nested":[1,true,null]}',
+                "value": {"nested": [1, True, None]},
+                "error": None,
+            },
+            ExternalOperationStatus.COMPLETED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "succeeded",
+                "content": "[1,2,3]",
+                "value": [1, 2, 3],
+                "error": None,
+            },
+            ExternalOperationStatus.COMPLETED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "succeeded",
+                "content": "null",
+                "value": None,
+                "error": None,
+            },
+            ExternalOperationStatus.COMPLETED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "failed",
+                "content": (
+                    '{"error":"tool result is not JSON-compatible or exceeds '
+                    'size limit","status":"failed"}'
+                ),
+                "value": None,
+                "error": "tool result is not JSON-compatible or exceeds size limit",
+            },
+            ExternalOperationStatus.FAILED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "denied",
+                "content": '{"error":"permission denied","status":"denied"}',
+                "value": None,
+                "error": "permission denied",
+            },
+            ExternalOperationStatus.FAILED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "timed_out",
+                "content": (
+                    '{"error":"tool execution timed out","status":"timed_out"}'
+                ),
+                "value": None,
+                "error": "tool execution timed out",
+            },
+            ExternalOperationStatus.FAILED,
+        ),
+        (
+            {
+                "call_id": "call_resolution",
+                "tool_name": "resolution_tool",
+                "status": "invalid_arguments",
+                "content": (
+                    '{"error":"invalid tool arguments",'
+                    '"status":"invalid_arguments"}'
+                ),
+                "value": None,
+                "error": "invalid tool arguments",
+            },
+            ExternalOperationStatus.FAILED,
+        ),
+    ),
+)
+async def test_confirm_completed_tool_projects_and_recovers_exact_result(
+    backend: str,
+    tool_result: dict[str, object],
+    expected_operation_status: ExternalOperationStatus,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        raise AssertionError("confirmed tool result must not repeat the tool")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    actor = {"type": "operator"}
+    evidence = {"tool_result": tool_result}
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+
+        assert resolved.status is ReconciliationStatus.RESOLVED
+        run = await store.get_snapshot("run", run_id)
+        assert run is not None
+        assert run["status"] == RunStatus.INTERRUPTED.value
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
+        assert checkpoint.turn == 1
+        assert checkpoint.operation_id is None
+        assert checkpoint.model_dump(mode="json")["tool_results"] == [tool_result]
+        assert checkpoint.model_dump(mode="json")["messages"][-1] == {
+            "role": "tool",
+            "tool_call_id": "call_resolution",
+            "name": "resolution_tool",
+            "content": tool_result["content"],
+        }
+        operation = await store.get_external_operation(operation_id)
+        assert isinstance(operation, ToolCallOperation)
+        assert operation.status is expected_operation_status
+        assert operation.model_dump(mode="json")["outcome"] == tool_result
+        events = tuple(
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        )
+        assert tuple(event.type for event in events[-3:]) == (
+            "reconciliation.resolved",
+            "tool.call.completed",
+            "step.completed",
+        )
+        assert events[-2].payload == tool_result
+        assert events[-1].payload == {}
+        resolved_cursor = await store.latest_cursor()
+
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+        assert replay == resolved
+        assert await store.latest_cursor() == resolved_cursor
+        assert provider_calls == []
+        assert tool_calls == []
+
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+        assert result.output_text == "done"
+        assert result.tool_results[0].model_dump(mode="json") == tool_result
+        assert provider_calls == [1]
+        assert tool_calls == []
+
+        later_cursor = await store.latest_cursor()
+        assert (
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence=evidence,
+            )
+            == resolved
+        )
+        assert await store.latest_cursor() == later_cursor
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_tool_rejects_raw_evidence_before_mutation(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "invalid-confirmed-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("invalid Tool evidence must not call the provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("invalid Tool evidence must not call the tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    valid = {
+        "call_id": "call_resolution",
+        "tool_name": "resolution_tool",
+        "status": "succeeded",
+        "content": "7",
+        "value": 7,
+        "error": None,
+    }
+    invalid_results: tuple[object, ...] = (
+        {**valid, "call_id": "call_wrong"},
+        {**valid, "tool_name": "wrong_tool"},
+        {**valid, "status": "invented"},
+        {**valid, "call_id": 7},
+        {**valid, "tool_name": 7},
+        {**valid, "content": 7},
+        {**valid, "error": 7},
+        {**valid, "value": {1: "coerced-key"}},
+        {**valid, "value": (1, 2)},
+        {**valid, "value": float("nan")},
+        {**valid, "content": "x" * (16 * 1024 + 1)},
+        {**valid, "error": "x" * 513},
+        {**valid, "value": "x" * (16 * 1024)},
+        {**valid, "extra": True},
+    )
+    try:
+        before = await _resolution_domain_state(store)
+        for invalid in invalid_results:
+            with pytest.raises(AgentSDKError) as caught:
+                await sdk.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.CONFIRM_COMPLETED,
+                    actor={"type": "operator"},
+                    evidence={"tool_result": invalid},
+                )
+            assert caught.value.code is ErrorCode.INVALID_STATE
+            assert caught.value.message == "reconciliation decision is invalid"
+            assert caught.value.retryable is False
+            assert await _resolution_domain_state(store) == before
+
+        with pytest.raises(AgentSDKError) as extra_top:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence={"tool_result": valid, "extra": True},
+            )
+        assert extra_top.value.code is ErrorCode.INVALID_STATE
+        assert await _resolution_domain_state(store) == before
+        assert (await sdk.recovery.pending_requests(run_id)) == (request,)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_tool_detaches_boundary_evidence_and_conflicts_changed_replay(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "detached-confirmed-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("Tool resolution must not call the provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("Tool resolution must not call the tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    source_result: dict[str, Any] = {
+        "call_id": "call_resolution",
+        "tool_name": "resolution_tool",
+        "status": "succeeded",
+        "content": "x" * (16 * 1024),
+        "value": {"items": [1, None]},
+        "error": None,
+    }
+    submitted = json.loads(json.dumps(source_result))
+    actor = {"type": "operator"}
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence={"tool_result": source_result},
+        )
+        source_result["content"] = "mutated"
+        source_result["value"]["items"][0] = 99
+
+        assert resolved.resolution is not None
+        assert resolved.resolution.model_dump(mode="json")["evidence"] == {
+            "tool_result": submitted
+        }
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.tool_results[0].model_dump(mode="json") == submitted
+        cursor = await store.latest_cursor()
+        assert (
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence={"tool_result": submitted},
+            )
+            == resolved
+        )
+        with pytest.raises(AgentSDKError) as changed:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence={"tool_result": source_result},
+            )
+        assert changed.value.code is ErrorCode.CONFLICT
+        assert await store.latest_cursor() == cursor
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_tool_post_commit_ambiguity_converges_once(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        store: Any = _AmbiguousResolutionMemoryStore()
+    else:
+        opened = await SQLiteStore.open(tmp_path / "ambiguous-confirmed-tool.sqlite3")
+        store = _AmbiguousResolutionSQLiteStore(opened._connection)
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("Tool resolution must not call the provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("Tool resolution must not call the tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    try:
+        before = await store.latest_cursor()
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator"},
+            evidence=evidence,
+        )
+
+        assert resolved.status is ReconciliationStatus.RESOLVED
+        assert store.resolution_batches == 2
+        assert await store.latest_cursor() == before + 3
+        events = await store.read_events(after_cursor=0)
+        assert sum(
+            item.event.type == "reconciliation.resolved" for item in events
+        ) == 1
+        assert (await sdk.runs.get(run_id)).status is RunStatus.INTERRUPTED
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_two_sdk_confirm_completed_tool_converges_without_callbacks(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        owner_store: Any = _ResolutionBarrierMemoryStore()
+        follower_store: Any = owner_store
+    else:
+        opened = await SQLiteStore.open(tmp_path / "two-sdk-confirmed-tool.sqlite3")
+        owner_store = _ResolutionBarrierSQLiteStore(opened._connection)
+        follower_store = await SQLiteStore.open(
+            tmp_path / "two-sdk-confirmed-tool.sqlite3"
+        )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(owner_store)
+    )
+    callback_calls: list[str] = []
+
+    async def forbidden_provider(**_: object) -> Any:
+        callback_calls.append("provider")
+        raise AssertionError("Tool resolution must not call the provider")
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        callback_calls.append("tool")
+        raise AssertionError("Tool resolution must not call the tool")
+
+    owner = AgentSDK.for_test(
+        store=owner_store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    follower = AgentSDK.for_test(
+        store=follower_store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    for sdk in (owner, follower):
+        sdk.agents.define(spec)
+        sdk.tools.register(tool_spec, forbidden_tool)
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "failed",
+            "content": '{"error":"tool handler failed","status":"failed"}',
+            "value": None,
+            "error": "tool handler failed",
+        }
+    }
+    owner_store.resolution_barrier_enabled = True
+    try:
+        first = asyncio.create_task(
+            owner.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence=evidence,
+            )
+        )
+        await asyncio.wait_for(owner_store.resolution_reached.wait(), timeout=10)
+        second = asyncio.create_task(
+            follower.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence=evidence,
+            )
+        )
+        await asyncio.sleep(0)
+        owner_store.allow_resolution.set()
+        first_result, second_result = await asyncio.gather(first, second)
+
+        assert first_result == second_result
+        assert callback_calls == []
+        assert (await owner.runs.get(run_id)).status is RunStatus.INTERRUPTED
+        events = await owner_store.read_events(after_cursor=0)
+        assert sum(
+            item.event.type == "reconciliation.resolved" for item in events
+        ) == 1
+    finally:
+        owner_store.allow_resolution.set()
+        await asyncio.gather(owner.close(), follower.close())
+        if backend == "sqlite":
+            await owner_store.close()
+            await follower_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_tool_replay_survives_later_pending_model_reconciliation(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-tool-later-pending.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def blocked_provider(**_: object) -> Any:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("confirmed Tool must not be repeated")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=blocked_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    actor = {"type": "operator"}
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+        handle = await sdk.recovery.recover_run(run_id)
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert handle._task is not None
+        handle._task.cancel()
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        await asyncio.wait_for(cancelled.wait(), timeout=10)
+        await sdk.close()
+        await _mark_interrupted(store)
+
+        reopened = AgentSDK.for_test(
+            store=store,
+            acompletion=lambda **_: (_ for _ in ()).throw(
+                AssertionError("reconciliation admission must not call provider")
+            ),
+            permission_default="allow",
+        )
+        reopened.agents.define(spec)
+        reopened.tools.register(tool_spec, forbidden_tool)
+        try:
+            waiting = await reopened.recovery.recover_run(run_id)
+            with pytest.raises(AgentSDKError, match="recovery required"):
+                await waiting.result()
+            pending = await reopened.recovery.pending_requests(run_id)
+            assert len(pending) == 1
+            assert pending[0].request_id != request.request_id
+            before = await store.latest_cursor()
+
+            replay = await reopened.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence=evidence,
+            )
+
+            assert replay == resolved
+            assert await store.latest_cursor() == before
+        finally:
+            await reopened.close()
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_tool_replay_survives_later_tool_turn(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-tool-later-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_calls.append(1)
+        attempt = len(provider_calls)
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            if attempt == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_after_confirmed_tool",
+                                        "function": {
+                                            "name": "resolution_tool",
+                                            "arguments": '{"value":8}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            else:
+                yield {
+                    "choices": [
+                        {"delta": {"content": "done"}, "finish_reason": "stop"}
+                    ]
+                }
+
+        return chunks()
+
+    async def later_tool(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        return value + 1
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, later_tool)
+    actor = {"type": "operator"}
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+
+        assert result.output_text == "done"
+        assert len(provider_calls) == 2
+        assert tool_calls == [8]
+        assert len(result.tool_results) == 2
+        cursor = await store.latest_cursor()
+        assert (
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence=evidence,
+            )
+            == resolved
+        )
+        assert await store.latest_cursor() == cursor
+        assert tool_calls == [8]
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_tool_retains_closing_session_until_explicit_recovery(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "closing-confirmed-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    provider_calls: list[int] = []
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("confirmed Tool must not be repeated")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(provider_calls),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    try:
+        run = await sdk.runs.get(run_id)
+        closing = await sdk.sessions.close(run.session_id)
+        assert closing.status is SessionStatus.CLOSING
+        with pytest.raises(AgentSDKError) as busy:
+            await sdk.sessions.delete(run.session_id)
+        assert busy.value.code is ErrorCode.CONFLICT
+
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator"},
+            evidence={
+                "tool_result": {
+                    "call_id": "call_resolution",
+                    "tool_name": "resolution_tool",
+                    "status": "failed",
+                    "content": (
+                        '{"error":"tool handler failed","status":"failed"}'
+                    ),
+                    "value": None,
+                    "error": "tool handler failed",
+                }
+            },
+        )
+        retained = await sdk.sessions.get(run.session_id)
+        assert retained.status is SessionStatus.CLOSING
+        assert retained.active_run_ids == (run_id,)
+        assert provider_calls == []
+
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+        assert result.output_text == "done"
+        assert provider_calls == [1]
+        closed = await sdk.sessions.get(run.session_id)
+        assert closed.status is SessionStatus.CLOSED
+        assert closed.active_run_ids == ()
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ("cancel", "sdk_close"))
+async def test_confirmed_tool_resolution_lifecycle_is_atomic(
+    lifecycle: str,
+) -> None:
+    store = _ResolutionBarrierMemoryStore()
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    callback_calls: list[str] = []
+
+    async def forbidden_provider(**_: object) -> Any:
+        callback_calls.append("provider")
+        raise AssertionError("Tool resolution must not call the provider")
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        callback_calls.append("tool")
+        raise AssertionError("Tool resolution must not call the tool")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, forbidden_tool)
+    actor = {"type": "operator"}
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    resolve_task: asyncio.Task[Any] | None = None
+    close_task: asyncio.Task[None] | None = None
+    try:
+        before = await _resolution_domain_state(store)
+        before_cursor = await store.latest_cursor()
+        store.resolution_barrier_enabled = True
+        resolve_task = asyncio.create_task(
+            sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence=evidence,
+            )
+        )
+        await asyncio.wait_for(store.resolution_reached.wait(), timeout=10)
+
+        if lifecycle == "cancel":
+            assert resolve_task.cancel()
+        else:
+            close_task = asyncio.create_task(sdk.close())
+            await asyncio.wait_for(sdk._lifecycle.close_signal.wait(), timeout=10)
+            assert not close_task.done()
+        assert await _resolution_domain_state(store) == before
+        assert callback_calls == []
+
+        store.allow_resolution.set()
+        if lifecycle == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(resolve_task, timeout=10)
+        else:
+            resolved = await asyncio.wait_for(resolve_task, timeout=10)
+            assert resolved.status is ReconciliationStatus.RESOLVED
+            assert close_task is not None
+            await asyncio.wait_for(close_task, timeout=10)
+
+        durable = await store.get_reconciliation_request(request.request_id)
+        assert durable is not None
+        assert durable.status is ReconciliationStatus.RESOLVED
+        assert await store.latest_cursor() == before_cursor + 3
+        assert callback_calls == []
+        assert (await store.get_snapshot("run", run_id))["status"] == (
+            RunStatus.INTERRUPTED.value
+        )
+        if lifecycle == "cancel":
+            cursor = await store.latest_cursor()
+            assert (
+                await sdk.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.CONFIRM_COMPLETED,
+                    actor=actor,
+                    evidence=evidence,
+                )
+                == durable
+            )
+            assert await store.latest_cursor() == cursor
+    finally:
+        store.allow_resolution.set()
+        if resolve_task is not None and not resolve_task.done():
+            await asyncio.gather(resolve_task, return_exceptions=True)
+        if close_task is not None and not close_task.done():
+            await close_task
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_tool_rejects_capability_drift_without_mutation(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "drift-confirmed-tool.sqlite3")
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("capability drift must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("capability drift must not call Tool")
+
+    sdk.tools.register(
+        tool_spec.model_copy(update={"version": "drift-secret"}),
+        forbidden_tool,
+    )
+    try:
+        before = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence={
+                    "tool_result": {
+                        "call_id": "call_resolution",
+                        "tool_name": "resolution_tool",
+                        "status": "succeeded",
+                        "content": "7",
+                        "value": 7,
+                        "error": None,
+                    }
+                },
+            )
+
+        assert caught.value.code is ErrorCode.INVALID_STATE
+        assert caught.value.message == "recovery capabilities unavailable"
+        assert await _resolution_domain_state(store) == before
+        assert (await sdk.runs.get(run_id)).status is RunStatus.WAITING_RECONCILIATION
+        _assert_secret_free(caught.value, "drift-secret")
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_store_rejects_malformed_old_generation_confirmed_tool_batches(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        store: Any = _CaptureResolutionMemoryStore()
+    else:
+        opened = await SQLiteStore.open(tmp_path / "malformed-confirmed-tool.sqlite3")
+        store = _CaptureResolutionSQLiteStore(opened._connection)
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("Tool resolution must not call the provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("Tool resolution must not call the tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    store.capture_resolution = True
+    try:
+        before = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as captured:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"type": "operator"},
+                evidence={
+                    "tool_result": {
+                        "call_id": "call_resolution",
+                        "tool_name": "resolution_tool",
+                        "status": "succeeded",
+                        "content": "7",
+                        "value": 7,
+                        "error": None,
+                    }
+                },
+            )
+        assert captured.value.code is ErrorCode.INTERNAL
+        batch = store.captured_batch
+        assert batch is not None
+        assert await _resolution_domain_state(store) == before
+        store.capture_resolution = False
+        lease = await store.acquire_lease(
+            run_id=run_id,
+            owner=f"malformed-{backend}",
+            now=batch.now,
+            expires_at=batch.now + timedelta(seconds=30),
+        )
+        assert batch.operation is not None
+        assert batch.operation.expected is not None
+        assert batch.checkpoint is not None
+        assert batch.checkpoint.expected is not None
+        run_write = batch.snapshots[0]
+        projected_run = RunStatus(run_write.data["status"])
+        assert projected_run is RunStatus.INTERRUPTED
+        malformed_run = {
+            **run_write.data,
+            "status": RunStatus.WAITING_RECONCILIATION.value,
+        }
+        malformed_batches = (
+            batch._replace(
+                lease=lease,
+                events=(batch.events[0], batch.events[2], batch.events[1]),
+            ),
+            batch._replace(
+                lease=lease,
+                events=batch.events[:-1],
+            ),
+            batch._replace(
+                lease=lease,
+                operation=batch.operation._replace(
+                    updated=batch.operation.updated.model_copy(
+                        update={"status": ExternalOperationStatus.FAILED}
+                    )
+                ),
+            ),
+            batch._replace(
+                lease=lease,
+                checkpoint=batch.checkpoint._replace(
+                    updated=batch.checkpoint.updated.model_copy(
+                        update={"phase": RunCheckpointPhase.READY_FOR_TOOL}
+                    )
+                ),
+            ),
+            batch._replace(
+                lease=lease,
+                snapshots=(run_write._replace(data=malformed_run),),
+            ),
+        )
+        for malformed in malformed_batches:
+            with pytest.raises(RecoveryStateConflictError):
+                await store.commit_run_progress(malformed)
+            assert await _resolution_domain_state(store) == before
+        await store.release_lease(lease)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+async def _remove_confirmed_tool_started_marker(store: Any, run_id: str) -> None:
+    events = tuple(
+        stored
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run_id
+    )
+    started = next(stored for stored in events if stored.event.type == "tool.call.started")
+    authorized = next(
+        stored for stored in events if stored.event.type == "tool.call.authorized"
+    )
+    replacement = started.event.model_copy(
+        update={
+            "type": authorized.event.type,
+            "payload": authorized.event.payload,
+        }
+    )
+    if isinstance(store, InMemoryStore):
+        index = store._events.index(started)
+        store._events[index] = started._replace(event=replacement)
+        return
+    await store._connection.execute(
+        "UPDATE events SET type = ?, payload_json = ? WHERE cursor = ?",
+        (
+            replacement.type,
+            json.dumps(
+                replacement.payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            started.cursor,
+        ),
+    )
+    await store._connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    ("corruption", "marker"),
+    (
+        ("duplicate", "tool.call.proposed"),
+        ("duplicate", "tool.call.started"),
+        ("moved", "tool.call.proposed"),
+        ("moved", "tool.call.authorized"),
+        ("missing", "tool.call.started"),
+    ),
+)
+async def test_confirmed_tool_replay_rejects_corrupt_lifecycle_markers(
+    backend: str,
+    corruption: str,
+    marker: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"corrupt-confirmed-tool-{corruption}-{marker}.sqlite3"
+        )
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("corrupt replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("corrupt replay must not call Tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    actor = {"type": "operator"}
+    evidence = {
+        "tool_result": {
+            "call_id": "call_resolution",
+            "tool_name": "resolution_tool",
+            "status": "succeeded",
+            "content": "7",
+            "value": 7,
+            "error": None,
+        }
+    }
+    try:
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=actor,
+            evidence=evidence,
+        )
+        if corruption == "duplicate":
+            await _insert_duplicate_run_event_before_paired_interrupt(
+                store,
+                run_id=run_id,
+                request_id=request.request_id,
+                event_type=marker,
+            )
+        elif corruption == "moved":
+            await _move_run_event_before_paired_interrupt(
+                store,
+                run_id=run_id,
+                request_id=request.request_id,
+                event_type=marker,
+            )
+        else:
+            assert corruption == "missing"
+            await _remove_confirmed_tool_started_marker(store, run_id)
+        before = await _resolution_domain_state(store)
+
+        with pytest.raises(AgentSDKError) as conflict:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=actor,
+                evidence=evidence,
+            )
+
+        assert conflict.value.code is ErrorCode.CONFLICT
+        assert conflict.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
 
 
 @pytest.mark.asyncio
