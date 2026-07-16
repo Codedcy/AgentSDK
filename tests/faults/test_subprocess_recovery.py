@@ -6,12 +6,14 @@ import os
 import subprocess
 import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from mcp import types as mcp_types
 
 from agent_sdk import (
     AgentSDK,
@@ -24,6 +26,7 @@ from agent_sdk import (
     ToolRetryPolicy,
     ToolSpec,
 )
+from agent_sdk.mcp import MCPManager, MCPServerConfig, StdioMCPTransport
 from agent_sdk.runtime.reconciliation import RunCheckpointPhase
 from agent_sdk.storage.base import CommitResult, RunProgressBatch
 from agent_sdk.storage.memory import InMemoryStore
@@ -137,8 +140,71 @@ class _PauseAfterSafeToolStore:
         return result
 
 
+class _FaultMCPSession:
+    def __init__(self, effect_path: Path, label: str, *, hard_exit: bool) -> None:
+        self._effect_path = effect_path
+        self._label = label
+        self._hard_exit = hard_exit
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def initialize(self) -> Any:
+        return type("InitializeResult", (), {"protocolVersion": "2025-11-25"})()
+
+    async def list_tools(
+        self,
+        cursor: str | None = None,
+    ) -> mcp_types.ListToolsResult:
+        assert cursor is None
+        return mcp_types.ListToolsResult(
+            tools=[
+                mcp_types.Tool(
+                    name="external_lookup",
+                    description="Perform one externally visible lookup",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "additionalProperties": False,
+                    },
+                )
+            ]
+        )
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+        **_: Any,
+    ) -> mcp_types.CallToolResult:
+        self.calls.append((name, dict(arguments or {})))
+        _append_record(self._effect_path, effect=self._label)
+        if self._hard_exit:
+            os._exit(_HARD_EXIT)
+        return mcp_types.CallToolResult(
+            content=[mcp_types.TextContent(type="text", text="remote-ok")]
+        )
+
+    def connector(self, _: MCPServerConfig) -> Any:
+        session = self
+
+        @asynccontextmanager
+        async def connected() -> AsyncIterator[_FaultMCPSession]:
+            yield session
+
+        return connected()
+
+
+def _mcp_config() -> MCPServerConfig:
+    return MCPServerConfig(
+        name="fault",
+        transport=StdioMCPTransport(command="ignored"),
+    )
+
+
 async def _tool_call_completion(
     gate: asyncio.Event,
+    *,
+    tool_name: str = "external_lookup",
 ) -> AsyncIterator[dict[str, object]]:
     await gate.wait()
 
@@ -152,7 +218,7 @@ async def _tool_call_completion(
                                 "index": 0,
                                 "id": "call_fault_1",
                                 "function": {
-                                    "name": "external_lookup",
+                                    "name": tool_name,
                                     "arguments": '{"value":7}',
                                 },
                             }
@@ -196,7 +262,14 @@ async def _child_main(
     else:
 
         async def completion(**_: object) -> Any:
-            return await _tool_call_completion(gate)
+            return await _tool_call_completion(
+                gate,
+                tool_name=(
+                    "mcp.fault.external_lookup"
+                    if scenario == "mcp_unknown"
+                    else "external_lookup"
+                ),
+            )
 
     sdk = AgentSDK.for_test(
         store=store,
@@ -204,17 +277,24 @@ async def _child_main(
         permission_default="allow",
     )
     sdk.agents.define(_AGENT)
-    source = "mcp/fault-server" if scenario == "mcp_unknown" else "application"
-    tool = _tool(source=source)
 
     async def handler(_: ToolContext, value: int) -> object:
         assert value == 7
-        if scenario in {"tool_workflow_unknown", "mcp_unknown"}:
-            _append_record(effect_path, effect=f"{source}:side_effect")
+        if scenario == "tool_workflow_unknown":
+            _append_record(effect_path, effect="application:side_effect")
             os._exit(_HARD_EXIT)
         return {"value": value + 1}
 
-    sdk.tools.register(tool, handler)
+    if scenario == "mcp_unknown":
+        mcp_session = _FaultMCPSession(
+            effect_path,
+            "mcp_session:side_effect",
+            hard_exit=True,
+        )
+        mcp_manager = MCPManager._for_test(sdk.tools, mcp_session.connector)
+        await mcp_manager.connect(_mcp_config())
+    else:
+        sdk.tools.register(_tool(), handler)
     session = await sdk.sessions.create(workspaces=[])
     if scenario in {"tool_workflow_unknown", "safe_tool_workflow"}:
         handle = await sdk.workflows.start(
@@ -478,27 +558,28 @@ async def test_mcp_side_effect_hard_exit_waits_for_explicit_retry(
     )
     run_id = str(control["run_id"])
 
-    async def explicit_mcp_retry(_: ToolContext, value: int) -> object:
-        _append_record(effects, effect="mcp/fault-server:explicit_retry")
-        return value + 1
-
     sdk = AgentSDK.for_test(
         database_path=database_path,
         acompletion=lambda **_: _final_completion(effects, "mcp_final_model"),
         permission_default="allow",
     )
     sdk.agents.define(_AGENT)
-    sdk.tools.register(_tool(source="mcp/fault-server"), explicit_mcp_retry)
     _advance_scanner(sdk)
+    mcp_session = _FaultMCPSession(
+        effects,
+        "mcp_session:explicit_retry",
+        hard_exit=False,
+    )
+    mcp_manager = MCPManager._for_test(sdk.tools, mcp_session.connector)
+    await mcp_manager.connect(_mcp_config())
     try:
         await sdk.recovery.scan()
         waiting = await sdk.recovery.recover_run(run_id)
         with pytest.raises(AgentSDKError, match="recovery required"):
             await waiting.result()
         request = (await sdk.recovery.pending_requests(run_id))[0]
-        assert _record_values(effects, "effect") == [
-            "mcp/fault-server:side_effect"
-        ]
+        assert _record_values(effects, "effect") == ["mcp_session:side_effect"]
+        assert mcp_session.calls == []
 
         await sdk.recovery.resolve(
             request.request_id,
@@ -506,19 +587,20 @@ async def test_mcp_side_effect_hard_exit_waits_for_explicit_retry(
             actor={"type": "operator", "id": "fault-test"},
             evidence={"acknowledge_duplicate_side_effect_risk": True},
         )
-        assert _record_values(effects, "effect") == [
-            "mcp/fault-server:side_effect"
-        ]
+        assert _record_values(effects, "effect") == ["mcp_session:side_effect"]
+        assert mcp_session.calls == []
 
         result = await (await sdk.recovery.recover_run(run_id)).result()
         assert result.output_text == "recovered"
         assert _record_values(effects, "effect") == [
-            "mcp/fault-server:side_effect",
-            "mcp/fault-server:explicit_retry",
+            "mcp_session:side_effect",
+            "mcp_session:explicit_retry",
             "mcp_final_model",
         ]
+        assert mcp_session.calls == [("external_lookup", {"value": 7})]
     finally:
         await sdk.close()
+        await mcp_manager.close()
 
 
 @pytest.mark.asyncio
