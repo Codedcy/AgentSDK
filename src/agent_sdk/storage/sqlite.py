@@ -48,6 +48,8 @@ from agent_sdk.storage.base import (
     CommitResult,
     EventPreconditionConflictError,
     EventPreconditionNotFoundError,
+    RunRecoveryEvidencePrecondition,
+    RunRecoveryEvidencePreconditionError,
     RunProgressBatch,
     SnapshotPreconditionError,
     SnapshotPrecondition,
@@ -799,6 +801,9 @@ class SQLiteStore:
                             "idempotency replay record no longer exists"
                         )
                 await self._check_event_preconditions(batch)
+                await self._check_run_recovery_evidence_precondition(
+                    batch.run_recovery_evidence_precondition
+                )
                 await self._check_snapshot_preconditions(batch.preconditions)
                 for event in batch.events:
                     await self._insert_event(event)
@@ -1563,6 +1568,114 @@ class SQLiteStore:
                 and cast(str, row[2]) != _canonical_json(precondition.data)
             ):
                 raise SnapshotPreconditionError("snapshot precondition failed")
+
+    async def _check_run_recovery_evidence_precondition(
+        self,
+        expected: RunRecoveryEvidencePrecondition | None,
+    ) -> None:
+        if expected is None:
+            return
+        message = "run recovery evidence precondition failed"
+        try:
+            async with self._connection.execute(
+                "SELECT data_json FROM run_checkpoints WHERE run_id = ?",
+                (expected.run_id,),
+            ) as cursor:
+                checkpoint_row = await cursor.fetchone()
+            checkpoint_json = (
+                None if checkpoint_row is None else cast(str, checkpoint_row[0])
+            )
+            if checkpoint_json != expected.checkpoint_json:
+                raise RunRecoveryEvidencePreconditionError(message)
+
+            async with self._connection.execute(
+                """
+                SELECT operation_id, operation_kind, session_id, run_id, turn,
+                       request_fingerprint, provider_identity, tool_identity,
+                       lease_generation, status, data_json
+                FROM external_operations
+                WHERE run_id = ?
+                ORDER BY turn, operation_kind, operation_id
+                """,
+                (expected.run_id,),
+            ) as cursor:
+                operation_rows = await cursor.fetchall()
+            operation_jsons: list[str] = []
+            for row in operation_rows:
+                serialized = cast(str, row[10])
+                operation = _external_operation_from_json(serialized)
+                if (
+                    operation.operation_id != cast(str, row[0])
+                    or operation.operation_kind.value != cast(str, row[1])
+                    or operation.session_id != cast(str, row[2])
+                    or operation.run_id != cast(str, row[3])
+                    or operation.turn != cast(int, row[4])
+                    or operation.request_fingerprint != cast(str, row[5])
+                    or operation.provider_identity != cast(str | None, row[6])
+                    or operation.tool_identity != cast(str | None, row[7])
+                    or operation.lease_generation != cast(int, row[8])
+                    or operation.status.value != cast(str, row[9])
+                    or operation.run_id != expected.run_id
+                    or _canonical_record_json(operation) != serialized
+                ):
+                    raise RunRecoveryEvidencePreconditionError(message)
+                operation_jsons.append(serialized)
+
+            async with self._connection.execute(
+                """
+                SELECT request_id, session_id, run_id, operation_id, status,
+                       data_json
+                FROM reconciliation_requests
+                WHERE run_id = ?
+                ORDER BY request_id
+                """,
+                (expected.run_id,),
+            ) as cursor:
+                reconciliation_rows = await cursor.fetchall()
+            reconciliation_jsons: list[str] = []
+            for row in reconciliation_rows:
+                serialized = cast(str, row[5])
+                request = _reconciliation_request_from_json(serialized)
+                if (
+                    request.request_id != cast(str, row[0])
+                    or request.session_id != cast(str, row[1])
+                    or request.run_id != cast(str, row[2])
+                    or request.operation_id != cast(str | None, row[3])
+                    or request.status.value != cast(str, row[4])
+                    or request.run_id != expected.run_id
+                    or _canonical_record_json(request) != serialized
+                ):
+                    raise RunRecoveryEvidencePreconditionError(message)
+                reconciliation_jsons.append(serialized)
+
+            async with self._connection.execute(
+                """
+                SELECT cursor, event_id, schema_version, type, session_id, run_id,
+                       sequence, payload_json, occurred_at
+                FROM events
+                WHERE run_id = ?
+                ORDER BY cursor
+                """,
+                (expected.run_id,),
+            ) as cursor:
+                event_rows = await cursor.fetchall()
+            run_events = tuple(
+                (
+                    stored.cursor,
+                    canonical_snapshot_data(stored.event.model_dump(mode="json")),
+                )
+                for stored in (self._stored_event(row) for row in event_rows)
+            )
+        except RunRecoveryEvidencePreconditionError:
+            raise
+        except Exception:
+            raise RunRecoveryEvidencePreconditionError(message) from None
+        if (
+            tuple(operation_jsons) != expected.operation_jsons
+            or tuple(reconciliation_jsons) != expected.reconciliation_jsons
+            or run_events != expected.run_events
+        ):
+            raise RunRecoveryEvidencePreconditionError(message)
 
     async def _check_event_preconditions(self, batch: CommitBatch) -> None:
         for precondition in batch.event_preconditions:

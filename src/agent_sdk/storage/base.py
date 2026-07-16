@@ -71,6 +71,18 @@ class EventPreconditionConflictError(EventPreconditionError):
     """A required evidence event exists with a different durable identity."""
 
 
+class RunRecoveryEvidencePrecondition(NamedTuple):
+    run_id: str
+    checkpoint_json: str | None
+    operation_jsons: tuple[str, ...]
+    reconciliation_jsons: tuple[str, ...]
+    run_events: tuple[tuple[int, str], ...]
+
+
+class RunRecoveryEvidencePreconditionError(SnapshotPreconditionError):
+    """Certified Run recovery evidence changed before an atomic projection."""
+
+
 class CommitBatch(NamedTuple):
     events: tuple[EventEnvelope, ...]
     snapshots: tuple[SnapshotWrite, ...] = ()
@@ -78,6 +90,9 @@ class CommitBatch(NamedTuple):
     event_preconditions: tuple[EventPrecondition, ...] = ()
     idempotency: IdempotencyWrite | IdempotencyReplay | None = None
     replay_preconditions: tuple[SnapshotPrecondition, ...] = ()
+    run_recovery_evidence_precondition: (
+        RunRecoveryEvidencePrecondition | None
+    ) = None
 
 
 class ExternalOperationWrite(NamedTuple):

@@ -18,6 +18,8 @@ from agent_sdk.runtime.session_lifecycle import (
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
+    RunRecoveryEvidencePrecondition,
+    RunRecoveryEvidencePreconditionError,
     SnapshotPrecondition,
     SnapshotPreconditionError,
     SnapshotWrite,
@@ -50,6 +52,7 @@ class _LoadFailure(Enum):
 
 class _CommitFailure(Enum):
     PRECONDITION = "precondition"
+    RECOVERY_EVIDENCE = "recovery_evidence"
     STORE = "store"
 
 
@@ -293,6 +296,9 @@ class WorkflowState:
         result: RunResult,
         *,
         related_preconditions: tuple[SnapshotPrecondition, ...] = (),
+        recovery_evidence_precondition: (
+            RunRecoveryEvidencePrecondition | None
+        ) = None,
     ) -> WorkflowRunSnapshot:
         current = snapshot.nodes[index]
         node = current.model_copy(
@@ -315,6 +321,7 @@ class WorkflowState:
                 "usage": result.usage.model_dump(mode="json"),
             },
             related_preconditions=related_preconditions,
+            recovery_evidence_precondition=recovery_evidence_precondition,
         )
 
     async def fail_node(
@@ -324,6 +331,9 @@ class WorkflowState:
         failure: WorkflowFailure,
         *,
         related_preconditions: tuple[SnapshotPrecondition, ...] = (),
+        recovery_evidence_precondition: (
+            RunRecoveryEvidencePrecondition | None
+        ) = None,
     ) -> WorkflowRunSnapshot:
         current = snapshot.nodes[index]
         node = current.model_copy(
@@ -340,6 +350,7 @@ class WorkflowState:
             "workflow.node.failed",
             {"node_id": node.node_id, "run_id": node.run_id, "error": failure.model_dump()},
             related_preconditions=related_preconditions,
+            recovery_evidence_precondition=recovery_evidence_precondition,
         )
 
     async def complete_workflow(
@@ -393,6 +404,9 @@ class WorkflowState:
         payload: dict[str, object],
         *,
         related_preconditions: tuple[SnapshotPrecondition, ...] = (),
+        recovery_evidence_precondition: (
+            RunRecoveryEvidencePrecondition | None
+        ) = None,
     ) -> WorkflowRunSnapshot:
         nodes = list(snapshot.nodes)
         previous_node = nodes[index]
@@ -416,6 +430,9 @@ class WorkflowState:
                     _exact_workflow_precondition(snapshot),
                     _exact_node_precondition(previous_node),
                     *related_preconditions,
+                ),
+                run_recovery_evidence_precondition=(
+                    recovery_evidence_precondition
                 ),
             ),
             snapshot.session_id,
@@ -501,6 +518,12 @@ class WorkflowState:
         result = await _commit_batch(self._store, batch)
         if result is None:
             return
+        if result is _CommitFailure.RECOVERY_EVIDENCE:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "related terminal run recovery evidence changed after certification",
+                retryable=False,
+            ) from None
         if result is _CommitFailure.PRECONDITION:
             session_exists = await _session_exists(self._store, session_id)
             if session_exists is False:
@@ -577,6 +600,8 @@ async def _commit_batch(
         return None
     except IdempotencyError:
         raise
+    except RunRecoveryEvidencePreconditionError:
+        return _CommitFailure.RECOVERY_EVIDENCE
     except SnapshotPreconditionError:
         return _CommitFailure.PRECONDITION
     except Exception:

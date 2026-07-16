@@ -76,12 +76,14 @@ from agent_sdk.runtime.session_lifecycle import (
     session_write,
 )
 from agent_sdk.storage.base import (
+    canonical_snapshot_data,
     CommitResult,
     EventPrecondition,
     ExternalOperationWrite,
     ReconciliationRequestWrite,
     RunCheckpointWrite,
     RunProgressBatch,
+    RunRecoveryEvidencePrecondition,
     SnapshotWrite,
     StateStore,
 )
@@ -391,7 +393,10 @@ class RunRecoveryService:
             details=(("checkpoint_phase", checkpoint.phase.value),),
         )
 
-    async def _certify_terminal_run_for_workflow(self, run_id: str) -> RunSnapshot:
+    async def _certify_terminal_run_for_workflow(
+        self,
+        run_id: str,
+    ) -> tuple[RunSnapshot, RunRecoveryEvidencePrecondition]:
         public_error: tuple[ErrorCode, str, bool] | None = None
         try:
             run = await self._load_run(run_id)
@@ -477,7 +482,7 @@ class RunRecoveryService:
                 or not (confirmed_history or ordinary_history)
             ):
                 raise self._state_error() from None
-            return run
+            return run, self._recovery_evidence_precondition(evidence)
         except AgentSDKError as error:
             public_error = (error.code, error.message, error.retryable)
         except Exception:
@@ -492,6 +497,35 @@ class RunRecoveryService:
             public_error[1],
             retryable=public_error[2],
         ) from None
+
+    @staticmethod
+    def _recovery_evidence_precondition(
+        evidence: _RecoveryEvidence,
+    ) -> RunRecoveryEvidencePrecondition:
+        checkpoint = evidence.checkpoint
+        return RunRecoveryEvidencePrecondition(
+            run_id=evidence.run.run_id,
+            checkpoint_json=(
+                None
+                if checkpoint is None
+                else canonical_snapshot_data(checkpoint.model_dump(mode="json"))
+            ),
+            operation_jsons=tuple(
+                canonical_snapshot_data(operation.model_dump(mode="json"))
+                for operation in evidence.operations
+            ),
+            reconciliation_jsons=tuple(
+                canonical_snapshot_data(request.model_dump(mode="json"))
+                for request in evidence.reconciliations
+            ),
+            run_events=tuple(
+                (
+                    evidence.run_event_cursors[index],
+                    canonical_snapshot_data(event.model_dump(mode="json")),
+                )
+                for index, event in enumerate(evidence.run_events)
+            ),
+        )
 
     async def pending_requests(
         self,

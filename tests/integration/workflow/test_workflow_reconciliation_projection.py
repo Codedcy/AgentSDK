@@ -19,8 +19,10 @@ from agent_sdk import (
     ToolContext,
 )
 from agent_sdk.errors import SessionBusyError
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.models import RunStatus, SessionStatus
 from agent_sdk.runtime.reconciliation import RunCheckpointPhase
+from agent_sdk.storage.base import CommitBatch
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.subagents.service import render_task_envelope
@@ -356,6 +358,50 @@ async def _replace_external_operation_data(
     await store._connection.commit()
 
 
+def _canonical_json(data: dict[str, Any]) -> str:
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+async def _replace_checkpoint_data(
+    store: Any,
+    run_id: str,
+    data: dict[str, Any],
+) -> None:
+    encoded = _canonical_json(data)
+    if isinstance(store, InMemoryStore):
+        store._run_checkpoints[run_id] = encoded
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE run_checkpoints SET data_json = ? WHERE run_id = ?",
+        (encoded, run_id),
+    )
+    await store._connection.commit()
+
+
+async def _replace_reconciliation_data(
+    store: Any,
+    request_id: str,
+    data: dict[str, Any],
+) -> None:
+    encoded = _canonical_json(data)
+    if isinstance(store, InMemoryStore):
+        store._reconciliation_requests[request_id] = encoded
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE reconciliation_requests SET data_json = ? WHERE request_id = ?",
+        (encoded, request_id),
+    )
+    await store._connection.commit()
+
+
 def _workflow_yaml(definition: dict[str, Any] = ONE_NODE_DEFINITION) -> str:
     return yaml.safe_dump(definition, sort_keys=False)
 
@@ -419,6 +465,128 @@ async def _admit_workflow_reconciliation(
     requests = await sdk.recovery.pending_requests(run_id)
     assert len(requests) == 1
     return requests[0]
+
+
+async def _mutate_terminal_recovery_evidence(
+    store: Any,
+    run_id: str,
+    mutation: str,
+) -> None:
+    if mutation == "checkpoint":
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        checkpoint_data = checkpoint.model_dump(mode="json")
+        checkpoint_data["output_parts"] = ["forged-after-certification"]
+        await _replace_checkpoint_data(store, run_id, checkpoint_data)
+        return
+
+    if mutation == "operation":
+        operations = await store.list_external_operations(run_id)
+        assert operations
+        operation = operations[-1]
+        operation_data = operation.model_dump(mode="json")
+        operation_data["outcome"] = {"forged": "after-certification"}
+        await _replace_external_operation_data(
+            store,
+            operation.operation_id,
+            operation_data,
+        )
+        return
+
+    if mutation == "reconciliation":
+        reconciliations = await store.list_reconciliation_requests(run_id)
+        assert reconciliations
+        request = reconciliations[-1]
+        request_data = request.model_dump(mode="json")
+        resolution = dict(request_data["resolution"])
+        resolution["actor"] = {"forged": "after-certification"}
+        request_data["resolution"] = resolution
+        await _replace_reconciliation_data(store, request.request_id, request_data)
+        return
+
+    run_records = tuple(
+        record
+        for record in await store.read_events(after_cursor=0)
+        if record.event.run_id == run_id
+    )
+    assert len(run_records) >= 2
+    selected = run_records[-1]
+    if mutation == "event_extra":
+        extra = EventEnvelope.new(
+            type="run.interrupted",
+            session_id=selected.event.session_id,
+            run_id=run_id,
+            sequence=selected.event.sequence + 1,
+            payload={"forged": "after-certification"},
+        )
+        await store.commit(CommitBatch(events=(extra,)))
+        return
+
+    if isinstance(store, InMemoryStore):
+        index_by_id = {
+            record.event.event_id: index
+            for index, record in enumerate(store._events)
+        }
+        selected_index = index_by_id[selected.event.event_id]
+        if mutation == "event_missing":
+            del store._events[selected_index]
+            return
+        if mutation == "event_moved":
+            prior = run_records[-2]
+            prior_index = index_by_id[prior.event.event_id]
+            store._events[prior_index] = store._events[prior_index]._replace(
+                event=selected.event
+            )
+            store._events[selected_index] = store._events[selected_index]._replace(
+                event=prior.event
+            )
+            return
+        changed = selected.event.model_copy(
+            update=(
+                {"event_id": "evt_forged_after_certification"}
+                if mutation == "event_identity"
+                else {"payload": {"forged": "after-certification"}}
+            )
+        )
+        store._events[selected_index] = store._events[selected_index]._replace(
+            event=changed
+        )
+        return
+
+    assert isinstance(store, SQLiteStore)
+    if mutation == "event_missing":
+        await store._connection.execute(
+            "DELETE FROM events WHERE event_id = ?",
+            (selected.event.event_id,),
+        )
+    elif mutation == "event_moved":
+        prior = run_records[-2]
+        await store._connection.execute(
+            "UPDATE events SET cursor = -1 WHERE cursor = ?",
+            (prior.cursor,),
+        )
+        await store._connection.execute(
+            "UPDATE events SET cursor = ? WHERE cursor = ?",
+            (prior.cursor, selected.cursor),
+        )
+        await store._connection.execute(
+            "UPDATE events SET cursor = ? WHERE cursor = -1",
+            (selected.cursor,),
+        )
+    elif mutation == "event_identity":
+        await store._connection.execute(
+            "UPDATE events SET event_id = ? WHERE event_id = ?",
+            ("evt_forged_after_certification", selected.event.event_id),
+        )
+    else:
+        await store._connection.execute(
+            "UPDATE events SET payload_json = ? WHERE event_id = ?",
+            (
+                _canonical_json({"forged": "after-certification"}),
+                selected.event.event_id,
+            ),
+        )
+    await store._connection.commit()
 
 
 def _provider_result(projection: str) -> dict[str, object]:
@@ -1519,6 +1687,118 @@ async def test_terminal_projection_cas_rejects_post_certification_mutation(
             await store.get_snapshot("workflow_node", workflow_before.nodes[0].entity_id)
             == node_before
         )
+        assert await store.latest_cursor() == cursor_before
+        events = await store.read_events(after_cursor=0, session_id=session.session_id)
+        assert not any(item.event.type == event_type for item in events)
+        assert not any(
+            item.event.type in {"workflow.completed", "workflow.failed"}
+            for item in events
+        )
+        assert blocking.calls == 1
+    finally:
+        blocking.release.set()
+        if barrier_store is not None:
+            barrier_store.release.set()
+        if resolver is not None:
+            await resolver.close()
+        if projecting is not None:
+            await projecting.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("projection", ("text", "failed"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "checkpoint",
+        "operation",
+        "reconciliation",
+        "event_identity",
+        "event_content",
+        "event_missing",
+        "event_extra",
+        "event_moved",
+    ),
+)
+async def test_terminal_projection_cas_rejects_recovery_evidence_mutation(
+    backend: str,
+    projection: str,
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"terminal-evidence-cas-{projection}-{mutation}.db"
+    store = await _open_store(backend, path)
+    blocking = _BlockingCompletion()
+    owner = AgentSDK.for_test(store=store, acompletion=blocking)
+    _register(owner)
+    session = await owner.sessions.create(workspaces=[])
+    original = await owner.workflows.start(session.session_id, _workflow_yaml())
+    resolver: AgentSDK | None = None
+    projecting: AgentSDK | None = None
+    barrier_store: _NodeProjectionBarrierStore | None = None
+    try:
+        workflow_run_id, run_id = await _interrupt_active_workflow(
+            owner,
+            store,
+            original,
+            blocking.started,
+        )
+        blocking.release.set()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+            store = await SQLiteStore.open(path)
+        resolver = AgentSDK.for_test(store=store, acompletion=blocking)
+        _register(resolver)
+        request = await _admit_workflow_reconciliation(
+            resolver,
+            workflow_run_id,
+            run_id,
+        )
+        await resolver.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator", "id": "evidence-cas"},
+            evidence={"provider_result": _provider_result(projection)},
+        )
+        await resolver.close()
+        resolver = None
+
+        event_type = (
+            "workflow.node.failed"
+            if projection == "failed"
+            else "workflow.node.completed"
+        )
+        barrier_store = _NodeProjectionBarrierStore(store, event_type)
+        projecting = AgentSDK.for_test(store=barrier_store, acompletion=blocking)
+        _register(projecting)
+        workflow_before = await projecting.workflows.get(workflow_run_id)
+        node_before = await store.get_snapshot(
+            "workflow_node",
+            workflow_before.nodes[0].entity_id,
+        )
+        session_before = await store.get_snapshot("session", session.session_id)
+        handle = await projecting.recovery.recover_workflow(workflow_run_id)
+        await asyncio.wait_for(barrier_store.entered.wait(), timeout=_TIMEOUT)
+
+        await _mutate_terminal_recovery_evidence(store, run_id, mutation)
+        cursor_before = await store.latest_cursor()
+        barrier_store.release.set()
+
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+
+        assert await projecting.workflows.get(workflow_run_id) == workflow_before
+        assert (
+            await store.get_snapshot(
+                "workflow_node",
+                workflow_before.nodes[0].entity_id,
+            )
+            == node_before
+        )
+        assert await store.get_snapshot("session", session.session_id) == session_before
         assert await store.latest_cursor() == cursor_before
         events = await store.read_events(after_cursor=0, session_id=session.session_id)
         assert not any(item.event.type == event_type for item in events)

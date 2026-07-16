@@ -34,6 +34,8 @@ from agent_sdk.storage.base import (
     CommitResult,
     EventPreconditionConflictError,
     EventPreconditionNotFoundError,
+    RunRecoveryEvidencePrecondition,
+    RunRecoveryEvidencePreconditionError,
     RunProgressBatch,
     SnapshotPreconditionError,
     SnapshotPrecondition,
@@ -125,6 +127,9 @@ class InMemoryStore:
                         raise EventPreconditionConflictError(
                             "event precondition failed"
                         )
+            self._check_run_recovery_evidence_precondition(
+                batch.run_recovery_evidence_precondition
+            )
             self._check_snapshot_preconditions(batch.preconditions)
             events = self._events.copy()
             snapshots = self._snapshots.copy()
@@ -813,6 +818,83 @@ class InMemoryStore:
                 != canonical_snapshot_data(snapshot_precondition.data)
             ):
                 raise SnapshotPreconditionError("snapshot precondition failed")
+
+    def _check_run_recovery_evidence_precondition(
+        self,
+        expected: RunRecoveryEvidencePrecondition | None,
+    ) -> None:
+        if expected is None:
+            return
+        try:
+            if self._run_checkpoints.get(expected.run_id) != expected.checkpoint_json:
+                raise RunRecoveryEvidencePreconditionError(
+                    "run recovery evidence precondition failed"
+                )
+
+            operation_records: list[tuple[tuple[int, str, str], str]] = []
+            for wrapper_id, serialized in self._external_operations.items():
+                operation = _external_operation_from_json(serialized)
+                if (
+                    operation.operation_id != wrapper_id
+                    or _canonical_record_json(operation) != serialized
+                ):
+                    raise RunRecoveryEvidencePreconditionError(
+                        "run recovery evidence precondition failed"
+                    )
+                if operation.run_id == expected.run_id:
+                    operation_records.append(
+                        (
+                            (
+                                operation.turn,
+                                operation.operation_kind.value,
+                                operation.operation_id,
+                            ),
+                            serialized,
+                        )
+                    )
+            operation_jsons = tuple(
+                serialized
+                for _, serialized in sorted(operation_records, key=lambda item: item[0])
+            )
+
+            reconciliation_records: list[tuple[str, str]] = []
+            for wrapper_id, serialized in self._reconciliation_requests.items():
+                request = _reconciliation_request_from_json(serialized)
+                if (
+                    request.request_id != wrapper_id
+                    or _canonical_record_json(request) != serialized
+                ):
+                    raise RunRecoveryEvidencePreconditionError(
+                        "run recovery evidence precondition failed"
+                    )
+                if request.run_id == expected.run_id:
+                    reconciliation_records.append((request.request_id, serialized))
+            reconciliation_jsons = tuple(
+                serialized for _, serialized in sorted(reconciliation_records)
+            )
+
+            run_events = tuple(
+                (
+                    stored.cursor,
+                    canonical_snapshot_data(stored.event.model_dump(mode="json")),
+                )
+                for stored in self._events
+                if stored.event.run_id == expected.run_id
+            )
+        except RunRecoveryEvidencePreconditionError:
+            raise
+        except Exception:
+            raise RunRecoveryEvidencePreconditionError(
+                "run recovery evidence precondition failed"
+            ) from None
+        if (
+            operation_jsons != expected.operation_jsons
+            or reconciliation_jsons != expected.reconciliation_jsons
+            or run_events != expected.run_events
+        ):
+            raise RunRecoveryEvidencePreconditionError(
+                "run recovery evidence precondition failed"
+            )
 
     async def read_events(
         self,

@@ -32,8 +32,11 @@ from agent_sdk.runtime.models import (
     mutable_model_params,
 )
 from agent_sdk.runtime.session_lifecycle import exact_session_precondition, load_session
-from agent_sdk.storage.base import StateStore
-from agent_sdk.storage.base import SnapshotPrecondition
+from agent_sdk.storage.base import (
+    RunRecoveryEvidencePrecondition,
+    SnapshotPrecondition,
+    StateStore,
+)
 from agent_sdk.storage.idempotency import IdempotencyError
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.subagents.service import SubagentService, render_task_envelope
@@ -103,13 +106,20 @@ class WorkflowExecutor:
         self._start_lock = asyncio.Lock()
         self._recover_run: Callable[[str], Awaitable[RunHandle]] | None = None
         self._certify_terminal_run: (
-            Callable[[str], Awaitable[RunSnapshot]] | None
+            Callable[
+                [str],
+                Awaitable[tuple[RunSnapshot, RunRecoveryEvidencePrecondition]],
+            ]
+            | None
         ) = None
 
     def _set_run_recovery(
         self,
         recover_run: Callable[[str], Awaitable[RunHandle]],
-        certify_terminal_run: Callable[[str], Awaitable[RunSnapshot]],
+        certify_terminal_run: Callable[
+            [str],
+            Awaitable[tuple[RunSnapshot, RunRecoveryEvidencePrecondition]],
+        ],
     ) -> None:
         self._recover_run = recover_run
         self._certify_terminal_run = certify_terminal_run
@@ -487,7 +497,7 @@ class WorkflowExecutor:
 
             if run.status is RunStatus.COMPLETED:
                 try:
-                    run, projection_preconditions = (
+                    run, projection_preconditions, evidence_precondition = (
                         await self._certified_terminal_selected_run(
                             snapshot,
                             index,
@@ -502,6 +512,7 @@ class WorkflowExecutor:
                         index,
                         _run_result(run),
                         related_preconditions=projection_preconditions,
+                        recovery_evidence_precondition=evidence_precondition,
                     )
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
@@ -511,7 +522,7 @@ class WorkflowExecutor:
 
             if run.status is RunStatus.FAILED:
                 try:
-                    run, projection_preconditions = (
+                    run, projection_preconditions, evidence_precondition = (
                         await self._certified_terminal_selected_run(
                             snapshot,
                             index,
@@ -527,6 +538,7 @@ class WorkflowExecutor:
                         index,
                         failure,
                         related_preconditions=projection_preconditions,
+                        recovery_evidence_precondition=evidence_precondition,
                     )
                     self._validate_recovery_descriptor(node_failed)
                     failed = await self._state.fail_workflow(node_failed, failure)
@@ -699,14 +711,18 @@ class WorkflowExecutor:
         node: AgentNode,
         run_id: str,
         expected_descriptor: ExecutionDescriptor,
-    ) -> tuple[RunSnapshot, tuple[SnapshotPrecondition, ...]]:
+    ) -> tuple[
+        RunSnapshot,
+        tuple[SnapshotPrecondition, ...],
+        RunRecoveryEvidencePrecondition,
+    ]:
         if self._certify_terminal_run is None:
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
                 "terminal run certification is unavailable",
                 retryable=False,
             ) from None
-        certified = await self._certify_terminal_run(run_id)
+        certified, evidence_precondition = await self._certify_terminal_run(run_id)
         run = await self._load_selected_run(run_id)
         if run != certified:
             raise AgentSDKError(
@@ -739,7 +755,7 @@ class WorkflowExecutor:
             _exact_run_precondition(run),
             *(() if parent is None else (_exact_run_precondition(parent),)),
         )
-        return run, related_preconditions
+        return run, related_preconditions, evidence_precondition
 
     async def _raise_terminal_projection_ownership_error(
         self,
