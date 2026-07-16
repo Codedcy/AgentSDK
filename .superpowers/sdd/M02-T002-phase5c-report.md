@@ -208,3 +208,86 @@ untracked files before this report was added.
 Phase 5C implementation and release evidence are ready for independent Spec and
 Quality review, followed by the required fresh whole-M02-T002 review. Task and
 progress ledgers intentionally remain unchanged until those approvals.
+
+## Independent review finding closure
+
+The first independent Phase 5C review returned no Critical finding and two
+test-evidence findings: I1 and M1. Commit `3c7fe7c` closes both without changing
+production code, public API, schema, dependencies, or ledgers.
+
+### I1 - distinguish the Tool side effect from the Store commit
+
+The original safe Tool subprocess cases wrote
+`safe_tool_outcome_committed` only after `commit_run_progress` returned. That
+proved the atomic Store boundary but did not independently prove that the Tool
+handler's externally visible effect happened before the SDK committed its
+outcome.
+
+Tests-first RED added the required
+`application:safe_side_effect` expectation to both the standalone and Workflow
+safe Tool cases. Both failed with only the commit and recovery-model markers
+present. The child Tool handler now fsyncs the distinct append-only side-effect
+marker before returning. The Store delegate continues to fsync the separate
+`safe_tool_outcome_committed` marker after the durable outcome/checkpoint batch
+returns and then performs `os._exit(86)`.
+
+Both reopened tests now assert the complete cross-process order:
+
+```text
+application:safe_side_effect
+safe_tool_outcome_committed
+safe_*_model
+```
+
+They independently assert that `application:safe_side_effect` occurs exactly
+once and that the reopened Tool handler call count remains zero. Thus the proof
+now distinguishes the real Tool effect, the SDK outcome commit, and the later
+recovered Model call.
+
+### M1 - derive scanner time from the actual durable lease
+
+The original helper used `datetime.now() + 1 hour`. Although it advanced the
+scanner beyond the current 30 second lease in practice, it was not bound to the
+actual durable lease used by each child scenario.
+
+Tests-first RED compared the configured clock to the child Run's real
+`lease.expires_at + 1 microsecond`; the old helper failed that exact equality.
+The replacement async helper opens a fresh `SQLiteStore` connection, loads the
+target Run lease by `run_id`, closes the connection, settles the SDK startup
+scan through the public recovery API, and sets the scanner test clock to the
+captured expiry plus the deterministic one-microsecond delta. Provider,
+application Tool, MCP, safe standalone Tool, and safe Workflow Tool subprocess
+cases all use this helper. No test reads a Store through `RecoveryAPI` private
+state.
+
+### Fresh post-review gates
+
+```text
+three exact RED-to-GREEN cases
+3 passed in 11.58s
+
+complete tests/faults/test_subprocess_recovery.py
+6 passed in 17.73s
+
+RecoveryAPI + Tool recovery regressions
+248 passed in 73.50s
+
+scanner-reached Workflow + safe Workflow targets
+2 passed in 5.84s
+
+fault matrix + MCP neighboring suite
+36 passed in 17.79s
+
+ruff check src tests examples
+All checks passed!
+
+mypy src
+Success: no issues found in 75 source files
+
+git diff --check 00f576b..HEAD
+exit 0
+```
+
+The post-review scope from `00f576b` contains only
+`tests/faults/test_subprocess_recovery.py` and this report. The task/progress
+ledgers and M02-T003/M02-T004 remain untouched pending fresh independent review.
