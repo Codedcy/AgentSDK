@@ -204,3 +204,7 @@ M02-T002 retained nonblocking Minors: consolidate duplicated Memory/SQLite stric
 M02-T002: complete - generation-fenced leases, durable checkpoints/external operations, conservative explicit recovery, immutable reconciliation decisions, certified Provider/Tool outcomes, exact Workflow projection, Session ownership, and real process-death proofs
 M02-T003: in progress - artifact lifecycle and generalized migration checksums/coordinator
 Next action: prepare and execute the M02-T003 Artifact Lifecycle and Migrations task plan; do not enter M02-T004 cancellation/control scope
+M02-T003 operational plan: .superpowers/sdd/M02-T003-phase-plan.md
+M02-T003 Phase A: in progress - checksum bootstrap, migration/open coordinator, and schema-generation write fence
+M02-T003 Phase A brief: .superpowers/sdd/M02-T003-phaseA-brief.md
+M02-T003 Phases B-D remain pending until Phase A independent Spec C0/I0 and Quality C0/I0 review
