@@ -1495,12 +1495,6 @@ class RunRecoveryService:
             tool_replay = (
                 isinstance(operation, ToolCallOperation)
                 and base_request is not None
-                and self._is_exact_confirmed_tool_replay(
-                    recovery_evidence,
-                    base_request,
-                    request,
-                    operation,
-                )
                 and self._is_confirmed_tool_replay_closed_world(
                     recovery_evidence,
                     base_request,
@@ -1975,6 +1969,10 @@ class RunRecoveryService:
         base_request: ModelRequest,
         request: ReconciliationRequest,
         operation: ToolCallOperation,
+        *,
+        removed_event_indexes: set[int] | None = None,
+        removed_operation_ids: set[str] | None = None,
+        deferred_events: Mapping[int, list[EventEnvelope]] | None = None,
     ) -> bool:
         resolution = request.resolution
         checkpoint = evidence.checkpoint
@@ -2067,10 +2065,15 @@ class RunRecoveryService:
         ):
             return False
 
+        excluded_operation_ids = removed_operation_ids or set()
         model_operations = tuple(
             item
             for item in evidence.operations
-            if isinstance(item, ModelCallOperation) and item.turn == operation.turn
+            if (
+                isinstance(item, ModelCallOperation)
+                and item.turn == operation.turn
+                and item.operation_id not in excluded_operation_ids
+            )
         )
         if len(model_operations) != 1:
             return False
@@ -2088,8 +2091,9 @@ class RunRecoveryService:
             base_request,
             operation,
             interrupt_index=requested[0] - 1,
-            removed_event_indexes=set(),
-            resolved_operation_ids=frozenset({operation.operation_id}),
+            removed_event_indexes=removed_event_indexes or set(),
+            removed_operation_ids=frozenset(excluded_operation_ids),
+            deferred_events=deferred_events,
         )
 
     def _is_confirmed_tool_replay_closed_world(
@@ -2103,12 +2107,6 @@ class RunRecoveryService:
         if (
             checkpoint is None
             or not self._has_closed_reconciliation_markers(evidence)
-            or tuple(
-                record
-                for record in evidence.reconciliations
-                if record.status is ReconciliationStatus.RESOLVED
-            )
-            != (request,)
         ):
             return False
         effective = self._effective_resolved_evidence(evidence, base_request)
@@ -2152,7 +2150,6 @@ class RunRecoveryService:
         if evidence.pending:
             if (
                 len(evidence.pending) != 1
-                or len(evidence.reconciliations) != 2
                 or evidence.run.status is not RunStatus.WAITING_RECONCILIATION
             ):
                 return False
@@ -2185,28 +2182,27 @@ class RunRecoveryService:
         model_turns = tuple(
             sorted(
                 item.turn
-                for item in evidence.operations
+                for item in effective.operations
                 if isinstance(item, ModelCallOperation)
             )
         )
         tool_turns = tuple(
             sorted(
                 item.turn
-                for item in evidence.operations
+                for item in effective.operations
                 if isinstance(item, ToolCallOperation)
             )
         )
         return (
-            evidence.reconciliations == (request,)
-            and evidence.run.status is RunStatus.INTERRUPTED
-            and evidence.run.run_id in evidence.session.active_run_ids
+            effective.run.status is RunStatus.INTERRUPTED
+            and effective.run.run_id in effective.session.active_run_ids
             and checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
             and checkpoint.operation_id is None
             and checkpoint.turn == operation.turn + 1
             and len(checkpoint.tool_results) == checkpoint.turn
             and model_turns == tuple(range(checkpoint.turn))
             and tool_turns == tuple(range(checkpoint.turn))
-            and evidence.run_events[-1].type == "step.completed"
+            and effective.run_events[-1].type == "run.interrupted"
         )
 
     @staticmethod
@@ -4345,12 +4341,6 @@ class RunRecoveryService:
                 key=lambda request: requested_positions[request.request_id][0],
             )
         )
-        resolved_operation_ids = frozenset(
-            request.operation_id
-            for request in resolved
-            if request.operation_id is not None
-        )
-
         removed_event_indexes: set[int] = set()
         removed_operation_ids: set[str] = set()
         deferred_events: dict[int, list[EventEnvelope]] = {}
@@ -4400,6 +4390,9 @@ class RunRecoveryService:
                             base_request,
                             request,
                             operation,
+                            removed_event_indexes=removed_event_indexes,
+                            removed_operation_ids=removed_operation_ids,
+                            deferred_events=deferred_events,
                         )
                         or len(requested_indexes) != 1
                         or len(resolved_indexes) != 1
@@ -4529,7 +4522,8 @@ class RunRecoveryService:
                 operation,
                 interrupt_index=interrupt_index,
                 removed_event_indexes=removed_event_indexes,
-                resolved_operation_ids=resolved_operation_ids,
+                removed_operation_ids=frozenset(removed_operation_ids),
+                deferred_events=deferred_events,
             ):
                 return None
             removed_event_indexes.update(range(attempt_start, interrupt_index))
@@ -4574,15 +4568,22 @@ class RunRecoveryService:
         *,
         interrupt_index: int,
         removed_event_indexes: set[int],
-        resolved_operation_ids: frozenset[str],
+        removed_operation_ids: frozenset[str],
+        deferred_events: Mapping[int, list[EventEnvelope]] | None = None,
     ) -> bool:
-        retained = tuple(
-            (cursor, event)
-            for index, (cursor, event) in enumerate(
-                zip(evidence.run_event_cursors, evidence.run_events)
-            )
-            if index <= interrupt_index and index not in removed_event_indexes
-        )
+        retained_list: list[tuple[int, EventEnvelope]] = []
+        for index, (cursor, event) in enumerate(
+            zip(evidence.run_event_cursors, evidence.run_events)
+        ):
+            if index > interrupt_index:
+                break
+            if index not in removed_event_indexes:
+                retained_list.append((cursor, event))
+            if deferred_events is not None:
+                retained_list.extend(
+                    (0, deferred) for deferred in deferred_events.get(index, ())
+                )
+        retained = tuple(retained_list)
         projected_events = tuple(
             event.model_copy(update={"sequence": index})
             for index, (_, event) in enumerate(retained, start=1)
@@ -4600,7 +4601,7 @@ class RunRecoveryService:
             for item in evidence.operations
             if item.operation_id == operation.operation_id
             or (
-                item.operation_id not in resolved_operation_ids
+                item.operation_id not in removed_operation_ids
                 and (
                     item.turn < operation.turn
                     or (
@@ -4702,7 +4703,11 @@ class RunRecoveryService:
             pending=(),
             reconciliations=(),
             run_events=projected_events,
-            run_event_cursors=tuple(cursor for cursor, _ in retained),
+            run_event_cursors=(
+                tuple(range(1, len(retained) + 1))
+                if deferred_events
+                else tuple(cursor for cursor, _ in retained)
+            ),
         )
         return self._is_resolution_operation_certified(
             projected,
