@@ -169,3 +169,11 @@ Phase 5B2A final gates: focused 350 passed; core 728 passed; adjacent 543 passed
 Phase 5B2A final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; fresh confirmed-Tool matrix 70 passed and reconciliation/Store 350 passed
 Phase 5B2A: complete - strict confirmed Tool outcomes, exact atomic projection, stable multi-resolution replay, safe explicit recovery, and zero repeated Tool side effects
 Phase 5B2B: in progress - Workflow projection after confirmed Run outcomes
+Phase 5B2B brief: .superpowers/sdd/M02-T002-phase5b2b-brief.md
+Phase 5B2B implementation/review commits: 3bacf27, 069ec71, a5829c7
+Phase 5B2B report: .superpowers/sdd/M02-T002-phase5b2b-report.md
+Phase 5B2B review history: initial C0/I2/M0 and re-review C0/I1/M0 closed terminal-certification/node-CAS Run/Session/parent TOCTOU, cumulative Model-confirmed multi-resolution normalization, two-SDK follower convergence, and universal Session-exists node-transition regression
+Phase 5B2B final gates: projection+admission 147 passed; Workflow recovery/admission/ownership 207 passed; Phase5 core 772 passed; adjacent 692 passed; full Python3.13 2031 passed with zero skips/failures; Ruff/mypy75/diff/import/signature/schema clean
+Phase 5B2B final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
+Phase 5B2B: complete - explicit Workflow projection of certified terminal/interrupted Run outcomes, exact atomic node preconditions, stable cumulative decisions, Session lifecycle, and zero repeated side effects
+Phase 5B whole review: in progress - fresh read-only review across Phase 5B1, 5B2A, and 5B2B
