@@ -311,3 +311,123 @@ No known Phase 5B2A implementation or verification concern remains after the
 review fix. Workflow snapshot projection remains Phase 5B2B. Phase 5C,
 M02-T003, M02-T004, `TERMINATE`, roadmap, progress ledger, schema, public API,
 dependencies, and lockfiles remain untouched. No merge or push was performed.
+
+## Second independent review closure addendum
+
+The second independent Phase 5B2A review returned C0/I1/M0. The remaining
+Important finding was reproduced on Memory and SQLite before production code
+changed, then closed in commit `a05ac6b` (`fix(recovery): replay later safe
+tool states`). This addendum supersedes the preceding post-review risk
+statement.
+
+### I1: later resolved READY_FOR_TOOL state was tied to the original Tool turn
+
+After an original Tool `CONFIRM_COMPLETED`, explicit recovery can run the next
+Model turn and produce a new Tool call. If that later Tool outcome is unknown
+and the operator chooses `CONFIRM_NOT_EXECUTED`, the canonical current state is
+an interrupted `READY_FOR_TOOL` checkpoint at the later turn. Exact replay of
+the original confirmed Tool decision incorrectly conflicted.
+
+The outer closed-world branch still required the original decision's immediate
+projection: `READY_FOR_MODEL`, `checkpoint.turn == original_tool.turn + 1`,
+equal completed Model/Tool turn sets, and a final normalized interruption. It
+therefore rejected a history that `_has_closed_reconciliation_markers` and
+`_effective_resolved_evidence` had already authenticated as two chronological
+resolved attempts with a legal current checkpoint.
+
+The Memory/SQLite production-path test was written first. It performs the
+original Tool confirmation, explicit recovery, a real following Model Tool
+call, cancellation during that new Tool execution, startup scan, a new Tool
+reconciliation, `CONFIRM_NOT_EXECUTED`, and exact replay of the original
+decision. Provider and Tool callbacks are forbidden during replay, and the
+complete resolution domain must remain byte-identical.
+
+```text
+RED:
+test_confirmed_tool_replay_accepts_later_resolved_ready_for_tool_state
+2 failed in 4.01s; Memory and SQLite both returned
+"recovery state conflict" only at original Tool replay
+```
+
+The fix preserves the original immediate `READY_FOR_MODEL` fast path. A
+fallback is available only when another resolved reconciliation record exists.
+That fallback reuses the same effective-history safe-checkpoint certification
+already used by recovery planning:
+
+- `_is_safe_checkpoint` now delegates its already-normalized state check to
+  `_is_certified_safe_checkpoint`;
+- confirmed Tool replay calls that helper only after exact closed marker and
+  chronological resolved-attempt certification;
+- `READY_FOR_TOOL` continues through `_is_exact_ready_tool_relation`, which
+  authenticates checkpoint messages/output/usage/results, exact operation
+  turns and fingerprints, lifecycle event order and payloads, and the full FSM
+  relation;
+- the engine's resume-checkpoint validator is also applied before replay is
+  accepted.
+
+The original immediate branch is unchanged semantically, and histories without
+a second resolved record cannot enter the fallback.
+
+### Fail-closed current-state matrix
+
+The negative matrix constructs the same real two-resolution history, then
+corrupts exactly one current-state component: the checkpoint output, the later
+Model completion event, or the later Model operation fingerprint. It crosses
+both Stores. All six replay attempts remain constant conflicts with zero
+mutation and no callbacks.
+
+```text
+Initial negative characterization: 6 passed in 3.77s
+GREEN positive plus negative matrix: 8 passed in 4.52s
+Two-review compatibility matrix:    32 passed in 6.34s
+```
+
+## Second-review verification
+
+All commands used the explicit executable
+`C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe` and Python
+3.13.
+
+```text
+pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py
+350 passed in 22.48s
+
+pytest -q \
+  tests/integration/runtime/test_reconciliation_resolution.py \
+  tests/integration/storage/test_run_progress_reconciliation.py \
+  tests/unit/runtime/test_provider_recovery.py \
+  tests/integration/runtime/test_provider_recovery_live.py \
+  tests/integration/runtime/test_provider_recovery_execution.py \
+  tests/integration/runtime/test_tool_recovery_execution.py \
+  tests/integration/runtime/test_recovery_api.py
+728 passed in 98.23s
+
+Store/lease/Session and Workflow-neighbor gate:
+543 passed in 19.06s
+
+pytest -q
+1983 passed in 131.07s; zero skipped, zero failed
+
+ruff check .
+All checks passed!
+
+mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The fresh compatibility smoke passed with 103 unique root exports, exact
+unchanged `RecoveryAPI.resolve` and `ReconciliationService.resolve`
+signatures, and SQLite schema version 3. The implementation commit touched
+only `src/agent_sdk/runtime/recovery.py` and
+`tests/integration/runtime/test_reconciliation_resolution.py`; this report is
+the only documentation change.
+
+No known Phase 5B2A implementation or verification concern remains after the
+second review fix. Workflow snapshot projection remains Phase 5B2B. Phase 5C,
+M02-T003, M02-T004, `TERMINATE`, roadmap, progress ledger, schema, public API,
+dependencies, and lockfiles remain untouched. No merge or push was performed.
