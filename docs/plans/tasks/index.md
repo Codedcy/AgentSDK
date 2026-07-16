@@ -15,8 +15,8 @@ Status values: `pending`, `in_progress`, `blocked`, `done`.
 | [M01-T009](M01-T009-observability-evaluation-slice.md) | Observability, evaluation, analytics slice | M01 | T008 | done |
 | [M01-T010](M01-T010-integrated-e2e.md) | Integrated vertical-slice CLI and E2E | M01 | T009 | done |
 | [M02-T001](M02-T001-session-idempotency.md) | Complete Session lifecycle and idempotency | M02 | M01 | done |
-| [M02-T002](M02-T002-leases-reconciliation.md) | Leases, interruption, and reconciliation | M02 | T001 | in_progress |
-| [M02-T003](M02-T003-artifacts-migrations.md) | Artifact lifecycle and migrations | M02 | T001 | pending |
+| [M02-T002](M02-T002-leases-reconciliation.md) | Leases, interruption, and reconciliation | M02 | T001 | done |
+| [M02-T003](M02-T003-artifacts-migrations.md) | Artifact lifecycle and migrations | M02 | T001 | in_progress |
 | [M02-T004](M02-T004-control-sync-api.md) | Cancellation, pause/resume, sync facade | M02 | T002 | pending |
 | [M03-T001](M03-T001-tool-executor.md) | Tool registry and executor hardening | M03 | M02 | pending |
 | [M03-T002](M03-T002-policy-permissions.md) | Path/command policy and permission scopes | M03 | T001 | pending |

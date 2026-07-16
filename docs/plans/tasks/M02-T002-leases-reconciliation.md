@@ -82,7 +82,7 @@ M02-T001 Run or Workflow execution descriptor before Run-lease/CAS admission.
   Workflow exact state preconditions, Tool registry/schema hashes, Tool
   idempotency metadata, and Session ownership coordinator.
 
-- [ ] **Step 1: Write lease fencing and unknown-outcome tests**
+- [x] **Step 1: Write lease fencing and unknown-outcome tests**
 
 ```python
 @pytest.mark.asyncio
@@ -168,13 +168,13 @@ async def test_real_v2_database_upgrades_atomically_to_v3(version_two_database) 
     assert await migration_versions(second) == (1, 2, 3)
 ```
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
 
 Expected: Lease/Reconciliation types missing.
 
-- [ ] **Step 3: Implement lease storage and heartbeat**
+- [x] **Step 3: Implement lease storage and heartbeat**
 
 Lease table fields: run_id PK, owner, generation, acquired_at, renewed_at,
 expires_at. The owner is a fresh coordinator token for one local Run task.
@@ -243,7 +243,7 @@ version insert, validation, and commit race; reopen observes exact v2 or complet
 v3, never partial. Add real v2 fixtures plus malformed/gapped/future version
 rows and transient/exhausted busy tests.
 
-- [ ] **Step 4: Implement recovery scan**
+- [x] **Step 4: Implement recovery scan**
 
 At SDK open, a read/write recovery scan may mark stale leased Runs interrupted,
 but it must not invoke LiteLLM, Tools, MCP, or Workflow execution. Application
@@ -308,7 +308,7 @@ SDK instances at pending-node, created-Run, and terminal-Run projection
 boundaries and assert one provider/Tool side effect. Workflow-wide scheduler
 ownership is completed in M04-T002.
 
-- [ ] **Step 5: Implement resolution actions**
+- [x] **Step 5: Implement resolution actions**
 
 ```python
 class ReconciliationAction(StrEnum):
@@ -320,7 +320,7 @@ class ReconciliationAction(StrEnum):
 
 Require evidence/actor metadata; RETRY remains forbidden unless user explicitly selects it.
 
-- [ ] **Step 6: Verify crash boundary**
+- [x] **Step 6: Verify crash boundary**
 
 Run: `uv run pytest tests/integration/runtime/test_leases.py tests/integration/runtime/test_recovery_admission.py tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py -v`
 
@@ -331,9 +331,19 @@ response receipt, and lease expiry during an in-flight request never causes a
 second provider call by default; only certified status/idempotency adapters may
 resolve automatically.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```powershell
 git add src/agent_sdk/runtime src/agent_sdk/workflow src/agent_sdk/storage tests/integration/runtime tests/integration/workflow/test_workflow_recovery_admission.py tests/integration/storage/test_sqlite_v3_migration.py tests/faults/test_model_call_unknown_outcome.py tests/e2e/test_unknown_tool_outcome.py
 git commit -m "feat: add run leases and reconciliation"
 ```
+
+## Completion evidence
+
+Completed on 2026-07-17 at `5ff955b`. The final independent whole-task
+re-review approved Spec C0/I0/M0 and Quality C0/I0/M2. Python 3.13 passed all
+2,159 tests with zero failures/skips; the Phase 5C release gate also passed the
+full supported Python 3.12 suite, external sdist/wheel builds, clean installs,
+and side-effect-free reference CLI help. See
+`.superpowers/sdd/M02-T002-final-report.md` for the consolidated evidence and
+retained nonblocking maintenance notes.

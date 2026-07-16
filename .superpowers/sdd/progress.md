@@ -186,3 +186,21 @@ Phase 5B final gates: full Python3.13 2147 passed with zero skips/failures; Ruff
 Phase 5B final independent whole re-review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; no Critical/Important/Minor findings
 Phase 5B: complete - strict confirmed Model/Tool outcomes, stable closed-world multi-resolution replay, exact safe recovery, and certified atomic Workflow projection
 Phase 5C: in progress - subprocess hard-exit E2E and dual-Python/package release gate
+Phase 5C implementation/review commits: 64b8854, 70fb21d, 5cb53e7, b91c7c2, 3c7fe7c
+Phase 5C report: .superpowers/sdd/M02-T002-phase5c-report.md
+Phase 5C fault evidence: real SQLite subprocess os._exit boundaries for Provider acceptance, application Tool side effect, MCP session.call_tool, committed safe Tool outcome, and safe Workflow outcome; durable lease-expiry scanner clocks and cross-process side-effect counts are exact
+Phase 5C release gates: full Python3.12 2153 and Python3.13 2153 passed with zero skips/failures; Ruff clean; mypy75; 53 modules; 103 root exports; exact public signatures; schema3/migration hashes; external sdist/wheel and dual-version clean installs; reference CLI --help opened no Store and invoked no model
+Phase 5C initial review: Not Approved; Spec C0/I1/M1 and Quality C0/I1/M0 because safe Tool cases lacked a true handler-side cross-process effect marker and scanner time was not bound to the durable lease
+Phase 5C review fixes: safe Tool/Workflow record distinct handler-side and post-commit markers; every subprocess scanner reads the actual durable lease and advances to expires_at+1us
+Phase 5C final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
+Phase 5C: complete - real hard-exit recovery, exact no-default-replay proofs, lifecycle/Workflow E2E, and supported-package release certification
+M02-T002 whole review initial result: Not Approved; Spec C0/I0/M0 and Quality C0/I2/M2
+M02-T002 whole-review Important findings: default cross-SDK followers busy-polled the Store with sleep(0); recovery evidence materialized the entire database event log before filtering the target Session
+M02-T002 whole-review fix brief/report: .superpowers/sdd/M02-T002-whole-review-fix-brief.md, .superpowers/sdd/M02-T002-whole-review-fix-report.md
+M02-T002 whole-review fixes: f9971af adds one private 50ms default follower interval for Run and resolution followers; efd62b0 fixes recovery evidence to the target Session at one upper cursor and preserves fail-closed target evidence validation
+M02-T002 final gates: exact I1/I2 10 passed; Workflow evidence/Session 52 passed; subprocess/scanner/MCP 60 passed; broad recovery matrix 1267 passed; full Python3.13 2159 passed with zero skips/failures; Ruff/mypy75/import/export/signature/schema/migration/diff/scope clean
+M02-T002 final independent whole re-review: Approved; Spec C0/I0/M0 and Quality C0/I0/M2
+M02-T002 retained nonblocking Minors: consolidate duplicated Memory/SQLite strict recovery validators during later storage maintenance; add direct signed-int64 type/subclass/MIN/MAX-focused automation without changing current semantics
+M02-T002: complete - generation-fenced leases, durable checkpoints/external operations, conservative explicit recovery, immutable reconciliation decisions, certified Provider/Tool outcomes, exact Workflow projection, Session ownership, and real process-death proofs
+M02-T003: in progress - artifact lifecycle and generalized migration checksums/coordinator
+Next action: prepare and execute the M02-T003 Artifact Lifecycle and Migrations task plan; do not enter M02-T004 cancellation/control scope
