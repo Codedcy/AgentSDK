@@ -153,3 +153,11 @@ Phase 5A review: initial C0/I3/M0; successive re-reviews closed cancellation san
 Phase 5A final review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
 Phase 5A: complete - strict operator decisions, exact safe retries, atomic two-backend resolution, closed recovery grammar, lifecycle races, and secret sanitization
 Phase 5B: in progress - strict confirmed external outcome projection
+Phase 5B1 brief: .superpowers/sdd/M02-T002-phase5b1-brief.md
+Phase 5B1 implementation/review commits: 8d9d671, 3aeaddb, 85856f4, f1b9ba0, 54b31ba
+Phase 5B1 report: .superpowers/sdd/M02-T002-phase5b1-report.md
+Phase 5B1 review history: four repair rounds closed replay stability after continued execution, exact terminal event/Session projection, empty usage recovery, Session successor evolution, reconciliation/operation closed-world grammar, full terminal lifecycle/provider certification, and partial-stream prefix admission
+Phase 5B1 final gates: focused 288 passed; seven-file core 666 passed; adjacent 543 passed; full Python3.13 1921 passed with zero skips/failures; Ruff clean; mypy clean across 75 source files; 103 exports/signatures/schema3/diff/scope clean
+Phase 5B1 final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; fresh focused 310 passed and partial-stream matrix 12 passed
+Phase 5B1: complete - strict confirmed Model text/ToolCall/failure outcomes, terminalization gap, exact atomic Run/checkpoint/Session/event projection, stable closed-world replay, and zero external callbacks
+Phase 5B2: in progress - strict confirmed Tool outcomes and Workflow projection
