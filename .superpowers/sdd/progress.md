@@ -161,3 +161,11 @@ Phase 5B1 final gates: focused 288 passed; seven-file core 666 passed; adjacent 
 Phase 5B1 final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; fresh focused 310 passed and partial-stream matrix 12 passed
 Phase 5B1: complete - strict confirmed Model text/ToolCall/failure outcomes, terminalization gap, exact atomic Run/checkpoint/Session/event projection, stable closed-world replay, and zero external callbacks
 Phase 5B2: in progress - strict confirmed Tool outcomes and Workflow projection
+Phase 5B2A brief: .superpowers/sdd/M02-T002-phase5b2a-brief.md
+Phase 5B2A implementation/review commits: 2178fab, 4f22203, a05ac6b
+Phase 5B2A report: .superpowers/sdd/M02-T002-phase5b2a-report.md
+Phase 5B2A review history: two repair rounds closed stable replay across chronological prior/later resolved attempts and later certified READY_FOR_TOOL safe states without weakening orphan/duplicate/current-state corruption checks
+Phase 5B2A final gates: focused 350 passed; core 728 passed; adjacent 543 passed; full Python3.13 1983 passed with zero failures; Ruff clean; mypy clean across 75 source files; exports/signatures/schema3/diff/scope clean
+Phase 5B2A final independent review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0; fresh confirmed-Tool matrix 70 passed and reconciliation/Store 350 passed
+Phase 5B2A: complete - strict confirmed Tool outcomes, exact atomic projection, stable multi-resolution replay, safe explicit recovery, and zero repeated Tool side effects
+Phase 5B2B: in progress - Workflow projection after confirmed Run outcomes
