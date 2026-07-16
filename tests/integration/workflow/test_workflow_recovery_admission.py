@@ -343,6 +343,45 @@ class _ProjectionBarrierStore:
         return await self.delegate.commit(batch)
 
 
+class _SingleProjectionBarrierStore:
+    def __init__(self, delegate: Any, event_type: str) -> None:
+        self.delegate = delegate
+        self.event_type = event_type
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fired = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: CommitBatch) -> Any:
+        if not self.fired and any(
+            event.type == self.event_type for event in batch.events
+        ):
+            self.fired = True
+            self.entered.set()
+            await _wait_for_event(
+                self.release,
+                diagnostic=lambda: {
+                    "phase": "single_projection_release",
+                    "event_type": self.event_type,
+                },
+            )
+        return await self.delegate.commit(batch)
+
+
+async def _delete_only_session_snapshot(store: Any, session_id: str) -> None:
+    if isinstance(store, InMemoryStore):
+        store._snapshots.pop(("session", session_id), None)
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "DELETE FROM snapshots WHERE kind = 'session' AND entity_id = ?",
+        (session_id,),
+    )
+    await store._connection.commit()
+
+
 class _LeaseBarrier:
     def __init__(self) -> None:
         self.arrivals = 0
@@ -1180,6 +1219,110 @@ async def test_two_sdks_pending_node_select_one_run_and_converge(
         barrier.recovery_committed.set()
         await asyncio.gather(first.close(), second.close())
         await asyncio.gather(*(store.close() for store in sqlite_stores))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "deletion",
+    ("session-snapshot-only", "supported-cascade"),
+)
+async def test_pending_node_projection_requires_live_session(
+    backend: str,
+    deletion: str,
+    tmp_path: Path,
+) -> None:
+    delegate: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / f"node-session-{deletion}.db")
+    )
+    barrier_store = _SingleProjectionBarrierStore(
+        delegate,
+        "workflow.node.started",
+    )
+    completion = _CountingCompletion()
+    sdk = AgentSDK.for_test(store=barrier_store, acompletion=completion)
+    sdk.agents.define(AGENT)
+    session = await sdk.sessions.create(workspaces=[])
+    workflow = WorkflowCompiler().compile_yaml(_workflow_yaml())
+    descriptor = sdk.workflows._executor._workflow_execution_descriptor(  # type: ignore[attr-defined]
+        workflow
+    )
+    created = (
+        await WorkflowState(barrier_store).create(
+            session.session_id,
+            workflow,
+            execution_descriptor=descriptor,
+        )
+    ).value
+    workflow_before = await sdk.workflows.get(created.workflow_run_id)
+    node_before = await delegate.get_snapshot(
+        "workflow_node",
+        workflow_before.nodes[0].entity_id,
+    )
+    handle = await sdk.recovery.recover_workflow(created.workflow_run_id)
+    try:
+        await _wait_for_event(
+            barrier_store.entered,
+            diagnostic=lambda: {
+                "phase": "node_start_projection",
+                "workflow_run_id": created.workflow_run_id,
+            },
+        )
+        cursor_before = await delegate.latest_cursor()
+        if deletion == "supported-cascade":
+            await delegate.delete_session(session.session_id)
+        else:
+            await _delete_only_session_snapshot(delegate, session.session_id)
+        barrier_store.release.set()
+
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+
+        assert completion.calls == 0
+        events = await delegate.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        assert not any(
+            item.event.type == "workflow.node.started" for item in events
+        )
+        if deletion == "supported-cascade":
+            assert events == []
+            assert (
+                await delegate.get_snapshot("session", session.session_id)
+                is None
+            )
+            assert (
+                await delegate.get_snapshot("workflow", created.workflow_run_id)
+                is None
+            )
+            assert (
+                await delegate.get_snapshot(
+                    "workflow_node",
+                    workflow_before.nodes[0].entity_id,
+                )
+                is None
+            )
+        else:
+            assert await delegate.latest_cursor() == cursor_before
+            assert (
+                await delegate.get_snapshot("workflow", created.workflow_run_id)
+                == workflow_before.model_dump(mode="json")
+            )
+            assert (
+                await delegate.get_snapshot(
+                    "workflow_node",
+                    workflow_before.nodes[0].entity_id,
+                )
+                == node_before
+            )
+    finally:
+        barrier_store.release.set()
+        await sdk.close()
+        if isinstance(delegate, SQLiteStore):
+            await delegate.close()
 
 
 @pytest.mark.asyncio

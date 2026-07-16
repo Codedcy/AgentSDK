@@ -412,6 +412,7 @@ class WorkflowState:
                 events=(event,),
                 snapshots=(_workflow_write(updated), _node_write(node)),
                 preconditions=(
+                    SnapshotPrecondition("session", snapshot.session_id),
                     _exact_workflow_precondition(snapshot),
                     _exact_node_precondition(previous_node),
                     *related_preconditions,
