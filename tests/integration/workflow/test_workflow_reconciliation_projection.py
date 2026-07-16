@@ -1175,6 +1175,7 @@ async def test_closing_session_waits_for_confirmed_workflow_projection_then_dele
         if isinstance(store, InMemoryStore):
             assert store._external_operations == {}
             assert store._reconciliation_requests == {}
+            assert store._idempotency == {}
         else:
             for table in ("external_operations", "reconciliation_requests"):
                 async with store._connection.execute(
@@ -1183,6 +1184,12 @@ async def test_closing_session_waits_for_confirmed_workflow_projection_then_dele
                 ) as cursor:
                     row = await cursor.fetchone()
                 assert row is not None and row[0] == 0
+            async with store._connection.execute(
+                "SELECT COUNT(*) FROM idempotency_records WHERE session_id = ?",
+                (session.session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            assert row is not None and row[0] == 0
         assert not await store.read_events(
             after_cursor=0,
             session_id=session.session_id,
