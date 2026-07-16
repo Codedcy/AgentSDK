@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 import traceback
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,40 @@ class _SecretMapping(dict[str, object]):
 
     def __repr__(self) -> str:
         return f"{super().__repr__()}<{self._secret}>"
+
+
+class _RaisingMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        del key
+        raise RuntimeError("mapping access must be contained")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("mapping iteration must be contained")
+
+    def __len__(self) -> int:
+        raise RuntimeError("mapping length must be contained")
+
+
+class _JSONListSubclass(list[object]):
+    pass
+
+
+class _JSONDictSubclass(dict[str, object]):
+    pass
+
+
+def _nested_json_list(depth: int) -> object:
+    value: object = 0
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _nested_json_object(depth: int) -> object:
+    value: object = 0
+    for _ in range(depth):
+        value = {"value": value}
+    return value
 
 
 class _ResolutionBarrierMemoryStore(InMemoryStore):
@@ -1063,7 +1097,21 @@ async def test_confirm_completed_tool_rejects_raw_evidence_before_mutation(
         "value": 7,
         "error": None,
     }
+    cyclic_list: list[object] = []
+    cyclic_list.append(cyclic_list)
+    cyclic_object: dict[str, object] = {}
+    cyclic_object["self"] = cyclic_object
     invalid_results: tuple[object, ...] = (
+        {**valid, "value": _nested_json_list(65)},
+        {**valid, "value": _nested_json_object(65)},
+        {**valid, "value": cyclic_list},
+        {**valid, "value": cyclic_object},
+        {**valid, "value": _RaisingMapping()},
+        _RaisingMapping(),
+        {**valid, "value": [0] * 4096},
+        {**valid, "value": {"nested": [float("inf")]}},
+        {**valid, "value": _JSONListSubclass([1])},
+        {**valid, "value": _JSONDictSubclass({"value": 1})},
         {**valid, "call_id": "call_wrong"},
         {**valid, "tool_name": "wrong_tool"},
         {**valid, "status": "invented"},
@@ -1104,6 +1152,72 @@ async def test_confirm_completed_tool_rejects_raw_evidence_before_mutation(
         assert extra_top.value.code is ErrorCode.INVALID_STATE
         assert await _resolution_domain_state(store) == before
         assert (await sdk.recovery.pending_requests(run_id)) == (request,)
+    finally:
+        await sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("boundary", ("depth", "nodes", "bytes"))
+async def test_confirm_completed_tool_accepts_strict_json_budget_boundaries(
+    backend: str,
+    boundary: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"confirmed-tool-{boundary}-boundary.sqlite3"
+        )
+    )
+    run_id, spec, tool_spec, _operation_id, request = (
+        await _seed_pending_tool_reconciliation(store)
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("confirmed Tool evidence must not call the provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("confirmed Tool evidence must not call the tool")
+
+    sdk.tools.register(tool_spec, forbidden_tool)
+    values = {
+        "depth": _nested_json_list(64),
+        "nodes": [0] * 4095,
+        "bytes": "x" * 16382,
+    }
+    tool_result = {
+        "call_id": "call_resolution",
+        "tool_name": "resolution_tool",
+        "status": "succeeded",
+        "content": "bounded",
+        "value": values[boundary],
+        "error": None,
+    }
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator"},
+            evidence={"tool_result": tool_result},
+        )
+
+        assert resolved.resolution is not None
+        assert resolved.resolution.model_dump(mode="json")["evidence"] == {
+            "tool_result": tool_result
+        }
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        assert checkpoint.tool_results[0].model_dump(mode="json") == tool_result
     finally:
         await sdk.close()
         if isinstance(store, SQLiteStore):

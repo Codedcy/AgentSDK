@@ -7367,42 +7367,54 @@ async def _yield_once() -> None:
     await asyncio.sleep(0)
 
 
+_STRICT_TOOL_JSON_MAX_DEPTH = 64
+_STRICT_TOOL_JSON_MAX_NODES = 4096
+_STRICT_TOOL_JSON_MAX_BYTES = 16 * 1024
+_INVALID_STRICT_JSON = object()
+
+
 def _strict_tool_result(value: object) -> ToolResult | None:
-    if not isinstance(value, Mapping) or set(value) != {
-        "call_id",
-        "tool_name",
-        "status",
-        "content",
-        "value",
-        "error",
-    }:
-        return None
-    raw = dict(value)
-    if (
-        type(raw["call_id"]) is not str
-        or type(raw["tool_name"]) is not str
-        or type(raw["status"]) is not str
-        or raw["status"] not in {status.value for status in ToolResultStatus}
-        or type(raw["content"]) is not str
-        or (raw["error"] is not None and type(raw["error"]) is not str)
-        or not _is_strict_json_value(raw["value"])
-    ):
+    if type(value) is not dict:
         return None
     try:
-        if len(raw["content"].encode("utf-8")) > 16 * 1024:
+        if set(value) != {
+            "call_id",
+            "tool_name",
+            "status",
+            "content",
+            "value",
+            "error",
+        }:
             return None
-        error = raw["error"]
+        call_id = value["call_id"]
+        tool_name = value["tool_name"]
+        status = value["status"]
+        content = value["content"]
+        error = value["error"]
+        if (
+            type(call_id) is not str
+            or type(tool_name) is not str
+            or type(status) is not str
+            or status not in {item.value for item in ToolResultStatus}
+            or type(content) is not str
+            or (error is not None and type(error) is not str)
+        ):
+            return None
+        if len(content.encode("utf-8")) > 16 * 1024:
+            return None
         if error is not None and len(error.encode("utf-8")) > 512:
             return None
-        value_text = json.dumps(
-            raw["value"],
-            ensure_ascii=False,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        if len(value_text.encode("utf-8")) > 16 * 1024:
+        detached_value = _detach_strict_json_value(value["value"])
+        if detached_value is _INVALID_STRICT_JSON:
             return None
+        raw = {
+            "call_id": call_id,
+            "tool_name": tool_name,
+            "status": status,
+            "content": content,
+            "value": detached_value,
+            "error": error,
+        }
         encoded = json.dumps(
             raw,
             ensure_ascii=False,
@@ -7411,24 +7423,113 @@ def _strict_tool_result(value: object) -> ToolResult | None:
             separators=(",", ":"),
         )
         result = ToolResult.model_validate_json(encoded)
+        detached_result = result.model_dump(mode="json")
     except Exception:
         return None
-    return result if result.model_dump(mode="json") == raw else None
+    return result if detached_result == raw else None
 
 
-def _is_strict_json_value(value: object) -> bool:
-    if value is None or type(value) in {bool, int, str}:
-        return True
-    if type(value) is float:
-        return math.isfinite(value)
-    if isinstance(value, list):
-        return all(_is_strict_json_value(item) for item in value)
-    if isinstance(value, Mapping):
-        return all(
-            type(key) is str and _is_strict_json_value(item)
-            for key, item in value.items()
-        )
-    return False
+def _detach_strict_json_value(value: object) -> object:
+    holder: list[object] = [None]
+    active_container_ids: set[int] = set()
+    stack: list[
+        tuple[
+            Literal["visit", "leave"],
+            object,
+            list[object] | dict[str, object] | None,
+            int | str | None,
+            int,
+        ]
+    ] = [("visit", value, holder, 0, 0)]
+    scheduled_nodes = 1
+    encoded_bytes = 0
+
+    try:
+        while stack:
+            action, source, parent, position, depth = stack.pop()
+            if action == "leave":
+                active_container_ids.remove(id(source))
+                continue
+            if depth > _STRICT_TOOL_JSON_MAX_DEPTH:
+                return _INVALID_STRICT_JSON
+
+            detached: object
+            if source is None or type(source) in {bool, int, str}:
+                scalar = json.dumps(
+                    source,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                encoded_bytes += len(scalar.encode("utf-8"))
+                detached = source
+            elif type(source) is float:
+                if not math.isfinite(source):
+                    return _INVALID_STRICT_JSON
+                scalar = json.dumps(
+                    source,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                encoded_bytes += len(scalar.encode("utf-8"))
+                detached = source
+            elif type(source) is list:
+                if id(source) in active_container_ids:
+                    return _INVALID_STRICT_JSON
+                child_count = len(source)
+                if scheduled_nodes + child_count > _STRICT_TOOL_JSON_MAX_NODES:
+                    return _INVALID_STRICT_JSON
+                scheduled_nodes += child_count
+                encoded_bytes += 2 + max(0, child_count - 1)
+                detached_list: list[object] = [None] * child_count
+                detached = detached_list
+                active_container_ids.add(id(source))
+                stack.append(("leave", source, None, None, depth))
+                for index in range(child_count - 1, -1, -1):
+                    stack.append(
+                        ("visit", source[index], detached_list, index, depth + 1)
+                    )
+            elif type(source) is dict:
+                if id(source) in active_container_ids:
+                    return _INVALID_STRICT_JSON
+                child_count = len(source)
+                if scheduled_nodes + child_count > _STRICT_TOOL_JSON_MAX_NODES:
+                    return _INVALID_STRICT_JSON
+                scheduled_nodes += child_count
+                encoded_bytes += 2 + max(0, child_count - 1) + child_count
+                source_items = tuple(source.items())
+                for key, _ in source_items:
+                    if type(key) is not str:
+                        return _INVALID_STRICT_JSON
+                    encoded_key = json.dumps(
+                        key,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                    encoded_bytes += len(encoded_key.encode("utf-8"))
+                detached_dict: dict[str, object] = {}
+                detached = detached_dict
+                active_container_ids.add(id(source))
+                stack.append(("leave", source, None, None, depth))
+                for key, item in reversed(source_items):
+                    stack.append(("visit", item, detached_dict, key, depth + 1))
+            else:
+                return _INVALID_STRICT_JSON
+
+            if encoded_bytes > _STRICT_TOOL_JSON_MAX_BYTES:
+                return _INVALID_STRICT_JSON
+            if parent is not None:
+                if type(parent) is list and type(position) is int:
+                    parent[position] = detached
+                elif type(parent) is dict and type(position) is str:
+                    parent[position] = detached
+                else:
+                    return _INVALID_STRICT_JSON
+    except Exception:
+        return _INVALID_STRICT_JSON
+    return holder[0]
 
 
 def _reject_json_constant(value: str) -> None:
