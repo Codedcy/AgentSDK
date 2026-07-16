@@ -92,6 +92,7 @@ from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
 
 
 _SCANNER_LEASE_TTL = timedelta(seconds=30)
+_FOLLOWER_POLL_INTERVAL_SECONDS = 0.05
 
 _CERTIFIED_RUN_EVENT_TYPES = frozenset(
     {
@@ -7636,7 +7637,7 @@ async def _settle_task(
 
 
 async def _yield_once() -> None:
-    await asyncio.sleep(0)
+    await asyncio.sleep(_FOLLOWER_POLL_INTERVAL_SECONDS)
 
 
 _STRICT_TOOL_JSON_MAX_DEPTH = 64

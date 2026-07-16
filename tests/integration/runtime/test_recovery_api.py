@@ -165,6 +165,39 @@ class _RejectCompletedTerminalSQLiteStore(SQLiteStore):
         return await super().commit_run_progress(batch)
 
 
+class _FollowerReadCountingStore:
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+        self.first_lease_read = asyncio.Event()
+        self.snapshot_reads = 0
+        self.lease_reads = 0
+        self._counting = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
+
+    def begin_counting(self) -> None:
+        self.snapshot_reads = 0
+        self.lease_reads = 0
+        self._counting = True
+
+    async def get_snapshot(
+        self,
+        kind: str,
+        entity_id: str,
+    ) -> dict[str, Any] | None:
+        if self._counting and kind == "run":
+            self.snapshot_reads += 1
+        return await self._delegate.get_snapshot(kind, entity_id)
+
+    async def get_run_lease(self, run_id: str) -> Any:
+        if self._counting:
+            self.lease_reads += 1
+        lease = await self._delegate.get_run_lease(run_id)
+        self.first_lease_read.set()
+        return lease
+
+
 async def _seed_pristine_current_run(
     store: InMemoryStore,
     spec: AgentSpec,
@@ -2822,6 +2855,80 @@ async def test_two_sdks_recover_one_pristine_run_and_loser_follows() -> None:
         allow_provider.set()
         await first.close()
         await second.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_default_cross_sdk_follower_polling_is_bounded(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "bounded-follower-polling.db"
+    if backend == "memory":
+        owner_store: Any = InMemoryStore()
+        follower_delegate = owner_store
+    else:
+        owner_store = await SQLiteStore.open(database_path)
+        follower_delegate = await SQLiteStore.open(database_path)
+    follower_store = _FollowerReadCountingStore(follower_delegate)
+    spec = AgentSpec(name=f"bounded-follower-{backend}", model="fake/recovery")
+    run_id = await _seed_pristine_current_run(owner_store, spec)
+    provider_started = asyncio.Event()
+    allow_provider = asyncio.Event()
+    provider_calls = 0
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+        provider_started.set()
+        await allow_provider.wait()
+        return _success_chunks()
+
+    owner = AgentSDK.for_test(
+        store=owner_store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    follower = AgentSDK.for_test(
+        store=follower_store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    owner.agents.define(spec)
+    follower.agents.define(spec)
+    owner_handle = None
+    follower_handle = None
+    try:
+        owner_handle = await owner.recovery.recover_run(run_id)
+        await asyncio.wait_for(provider_started.wait(), timeout=2)
+        follower_handle = await follower.recovery.recover_run(run_id)
+        await asyncio.wait_for(follower_store.first_lease_read.wait(), timeout=2)
+
+        follower_store.begin_counting()
+        await asyncio.sleep(0.18)
+
+        assert follower_store.snapshot_reads <= 4
+        assert follower_store.lease_reads <= 4
+        assert provider_calls == 1
+
+        allow_provider.set()
+        owner_result = await asyncio.wait_for(owner_handle.result(), timeout=2)
+        follower_result = await asyncio.wait_for(follower_handle.result(), timeout=0.2)
+
+        assert follower_result == owner_result
+        assert follower_result.output_text == "recovered"
+        assert provider_calls == 1
+    finally:
+        allow_provider.set()
+        if owner_handle is not None:
+            await asyncio.gather(owner_handle.result(), return_exceptions=True)
+        if follower_handle is not None:
+            await asyncio.gather(follower_handle.result(), return_exceptions=True)
+        await owner.close()
+        await follower.close()
+        if backend == "sqlite":
+            await owner_store.close()
+            await follower_delegate.close()
 
 
 @pytest.mark.asyncio
