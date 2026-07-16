@@ -697,17 +697,22 @@ def _confirmed_provider_result(
     *,
     text: str = "confirmed",
     tool_call: dict[str, object] | None = None,
+    usage: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "disposition": "completed",
         "finish_reason": "tool_calls" if tool_call is not None else "stop",
         "text": text,
         "tool_call": tool_call,
-        "usage": {
-            "prompt_tokens": 5,
-            "completion_tokens": 2,
-            "total_tokens": 7,
-        },
+        "usage": (
+            {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "total_tokens": 7,
+            }
+            if usage is None
+            else usage
+        ),
     }
 
 
@@ -887,6 +892,213 @@ async def test_confirm_completed_model_projects_exact_durable_outcome(
             await store.close()
 
 
+async def _replace_resolution_event_log(
+    store: Any,
+    stored_events: list[Any],
+) -> None:
+    stored_events.sort(key=lambda stored: stored.cursor)
+    if isinstance(store, InMemoryStore):
+        store._events = stored_events
+        store._last_cursor = max(
+            (stored.cursor for stored in stored_events),
+            default=0,
+        )
+        return
+
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute("DELETE FROM events")
+    for stored in stored_events:
+        event = stored.event
+        await store._connection.execute(
+            """
+            INSERT INTO events(
+                cursor, event_id, session_id, run_id, sequence, type,
+                schema_version, occurred_at, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                stored.cursor,
+                event.event_id,
+                event.session_id,
+                event.run_id,
+                event.sequence,
+                event.type,
+                event.schema_version,
+                event.occurred_at.isoformat(),
+                json.dumps(
+                    event.payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+    await store._connection.execute(
+        "UPDATE sqlite_sequence SET seq = ? WHERE name = 'events'",
+        (max((stored.cursor for stored in stored_events), default=0),),
+    )
+    await store._connection.commit()
+
+
+async def _corrupt_confirmed_terminal_history(
+    store: Any,
+    *,
+    run_id: str,
+    projection: str,
+    corruption: str,
+) -> None:
+    stored_events = list(await store.read_events(after_cursor=0))
+    terminal_type = "run.completed" if projection == "completed" else "run.failed"
+    terminal = next(
+        stored
+        for stored in stored_events
+        if stored.event.run_id == run_id and stored.event.type == terminal_type
+    )
+    session_event = next(
+        stored
+        for stored in stored_events
+        if stored.event.run_id is None
+        and stored.event.type in {"session.run.detached", "session.closed"}
+        and stored.event.payload.get("run_id") == run_id
+    )
+    if corruption == "step_payload":
+        step = next(
+            stored
+            for stored in stored_events
+            if stored.event.run_id == run_id and stored.event.type == "step.completed"
+        )
+        index = stored_events.index(step)
+        stored_events[index] = step._replace(
+            event=step.event.model_copy(update={"payload": {"corrupt": True}})
+        )
+    elif corruption == "terminal_payload":
+        index = stored_events.index(terminal)
+        stored_events[index] = terminal._replace(
+            event=terminal.event.model_copy(update={"payload": {"corrupt": True}})
+        )
+    elif corruption == "session_missing":
+        stored_events.remove(session_event)
+    elif corruption == "session_duplicate":
+        duplicate_sequence = max(
+            stored.event.sequence
+            for stored in stored_events
+            if stored.event.session_id == session_event.event.session_id
+            and stored.event.run_id is None
+        ) + 1
+        stored_events.append(
+            session_event._replace(
+                cursor=max(stored.cursor for stored in stored_events) + 1,
+                event=session_event.event.model_copy(
+                    update={
+                        "event_id": "evt_duplicate_terminal_session",
+                        "sequence": duplicate_sequence,
+                    }
+                ),
+            )
+        )
+    elif corruption == "session_moved":
+        terminal_index = stored_events.index(terminal)
+        session_index = stored_events.index(session_event)
+        stored_events[terminal_index] = terminal._replace(
+            cursor=session_event.cursor
+        )
+        stored_events[session_index] = session_event._replace(
+            cursor=terminal.cursor
+        )
+    else:
+        assert corruption == "session_payload"
+        index = stored_events.index(session_event)
+        stored_events[index] = session_event._replace(
+            event=session_event.event.model_copy(
+                update={
+                    "payload": {
+                        "run_id": run_id,
+                        "status": "corrupt",
+                    }
+                }
+            )
+        )
+    await _replace_resolution_event_log(store, stored_events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    ("projection", "corruption"),
+    (
+        ("completed", "step_payload"),
+        ("completed", "terminal_payload"),
+        ("completed", "session_missing"),
+        ("failed", "session_duplicate"),
+        ("completed", "session_moved"),
+        ("failed", "session_payload"),
+        ("failed", "terminal_payload"),
+    ),
+)
+async def test_confirm_completed_terminal_replay_authenticates_entire_batch(
+    backend: str,
+    projection: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"terminal-replay-{projection}-{corruption}.db"
+        )
+    )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("exact replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    provider_result = (
+        _confirmed_provider_result()
+        if projection == "completed"
+        else {
+            "disposition": "failed",
+            "error_code": "internal",
+            "retryable": True,
+        }
+    )
+    try:
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "terminal-replay"},
+            evidence={"provider_result": provider_result},
+        )
+        await _corrupt_confirmed_terminal_history(
+            store,
+            run_id=run_id,
+            projection=projection,
+            corruption=corruption,
+        )
+        before = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "terminal-replay"},
+                evidence={"provider_result": provider_result},
+            )
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
@@ -1019,8 +1231,10 @@ async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("usage", ("reported", "empty"))
 async def test_confirmed_model_tool_call_resumes_only_on_explicit_recovery(
     backend: str,
+    usage: str,
     tmp_path: Path,
 ) -> None:
     store: Any = (
@@ -1047,21 +1261,23 @@ async def test_confirmed_model_tool_call_resumes_only_on_explicit_recovery(
         raise AssertionError("resolve must not call tool")
 
     resolver.tools.register(tool_spec, forbidden_tool)
-    await resolver.recovery.resolve(
+    resolution_evidence = {
+        "provider_result": _confirmed_provider_result(
+            text="confirmed",
+            tool_call={
+                "index": 0,
+                "call_id": "call_resume",
+                "name": tool_spec.name,
+                "arguments_json": '{"value":7}',
+            },
+            usage={} if usage == "empty" else None,
+        )
+    }
+    resolved = await resolver.recovery.resolve(
         request.request_id,
         ReconciliationAction.CONFIRM_COMPLETED,
         actor={"operator": "resume"},
-        evidence={
-            "provider_result": _confirmed_provider_result(
-                text="confirmed",
-                tool_call={
-                    "index": 0,
-                    "call_id": "call_resume",
-                    "name": tool_spec.name,
-                    "arguments_json": '{"value":7}',
-                },
-            )
-        },
+        evidence=resolution_evidence,
     )
     assert (await resolver.runs.get(run_id)).status is RunStatus.INTERRUPTED
     await resolver.close()
@@ -1095,6 +1311,124 @@ async def test_confirmed_model_tool_call_resumes_only_on_explicit_recovery(
         assert tool_calls == [7]
         assert provider_calls == [1]
         assert (await recovery.runs.get(run_id)).status is RunStatus.COMPLETED
+        replay = await recovery.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "resume"},
+            evidence=resolution_evidence,
+        )
+        assert replay == resolved
+    finally:
+        await recovery.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_tool_call_history_allows_a_later_model_reconciliation(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirmed-then-crash.db")
+    )
+    tool_spec = _unsafe_tool_spec()
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store,
+        tool_spec,
+    )
+    resolution_evidence = {
+        "provider_result": _confirmed_provider_result(
+            text="confirmed",
+            tool_call={
+                "index": 0,
+                "call_id": "call_then_crash",
+                "name": tool_spec.name,
+                "arguments_json": '{"value":7}',
+            },
+        )
+    }
+    resolver = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    resolver.agents.define(spec)
+
+    async def resolver_tool(_: ToolContext, value: int) -> int:
+        return value
+
+    resolver.tools.register(tool_spec, resolver_tool)
+    resolved = await resolver.recovery.resolve(
+        request.request_id,
+        ReconciliationAction.CONFIRM_COMPLETED,
+        actor={"operator": "then-crash"},
+        evidence=resolution_evidence,
+    )
+    await resolver.close()
+
+    provider_entered = asyncio.Event()
+    provider_cancelled = asyncio.Event()
+    tool_calls: list[int] = []
+
+    async def blocked_completion(**_: object) -> Any:
+        provider_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            provider_cancelled.set()
+            raise
+
+    async def handler(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        return value + 1
+
+    runner = AgentSDK.for_test(
+        store=store,
+        acompletion=blocked_completion,
+        permission_default="allow",
+    )
+    runner.agents.define(spec)
+    runner.tools.register(tool_spec, handler)
+    handle = await runner.recovery.recover_run(run_id)
+    await asyncio.wait_for(provider_entered.wait(), timeout=10)
+    assert tool_calls == [7]
+    assert handle._task is not None
+    handle._task.cancel()
+    with pytest.raises(AgentSDKError):
+        await handle.result()
+    await asyncio.wait_for(provider_cancelled.wait(), timeout=10)
+    await runner.close()
+    await _mark_interrupted(store)
+
+    recovery = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("unknown outcome must not call provider")
+        ),
+        permission_default="allow",
+    )
+    recovery.agents.define(spec)
+    recovery.tools.register(tool_spec, handler)
+    try:
+        waiting = await recovery.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        pending = await recovery.recovery.pending_requests(run_id)
+        assert len(pending) == 1
+        assert pending[0].reason == "model_call_unknown_outcome"
+        replay = await recovery.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "then-crash"},
+            evidence=resolution_evidence,
+        )
+        assert replay == resolved
     finally:
         await recovery.close()
         if backend == "sqlite":
@@ -1360,17 +1694,25 @@ async def test_confirm_completed_closes_a_closing_session_atomically(
         run = await sdk.runs.get(run_id)
         closing = await sdk.sessions.close(run.session_id)
         assert closing.status is SessionStatus.CLOSING
-        await sdk.recovery.resolve(
+        evidence = {"provider_result": _confirmed_provider_result()}
+        resolved = await sdk.recovery.resolve(
             request.request_id,
             ReconciliationAction.CONFIRM_COMPLETED,
             actor={"operator": "close"},
-            evidence={"provider_result": _confirmed_provider_result()},
+            evidence=evidence,
         )
         closed = await sdk.sessions.get(run.session_id)
         assert closed.status is SessionStatus.CLOSED
         assert closed.active_run_ids == ()
         events = await store.read_events(after_cursor=0)
         assert sum(stored.event.type == "session.closed" for stored in events) == 1
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "close"},
+            evidence=evidence,
+        )
+        assert replay == resolved
     finally:
         await sdk.close()
         if backend == "sqlite":

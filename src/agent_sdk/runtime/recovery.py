@@ -43,6 +43,7 @@ from agent_sdk.runtime.models import (
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
+    SessionStatus,
     TokenUsage,
     mutable_model_params,
 )
@@ -150,6 +151,8 @@ class _RecoveryEvidence:
     reconciliations: tuple[ReconciliationRequest, ...]
     run_events: tuple[EventEnvelope, ...]
     run_event_cursors: tuple[int, ...]
+    session_lifecycle_events: tuple[EventEnvelope, ...]
+    session_lifecycle_event_cursors: tuple[int, ...]
     run_event_ids_unique: bool
 
 
@@ -1381,9 +1384,10 @@ class RunRecoveryService:
             or operation.session_id != evidence.run.session_id
             or checkpoint.run_id != evidence.run.run_id
             or checkpoint.session_id != evidence.run.session_id
-            or checkpoint.turn != operation.turn
-            or evidence.pending
-            or not self._is_valid_run_event_envelope(evidence)
+            or not self._is_valid_run_event_envelope(
+                evidence,
+                allow_recovery_closed=True,
+            )
         ):
             return False
         try:
@@ -1499,9 +1503,6 @@ class RunRecoveryService:
                 return False
             prior_output.append(completed[1])
             prior_usage = _add_usage(prior_usage, completed[3])
-        if len(checkpoint.tool_results) != operation.turn:
-            return False
-
         trailing = evidence.run_events[resolved_index + 1 :]
         if request.reason == "model_call_completed_terminalization_unknown":
             if (
@@ -1516,7 +1517,30 @@ class RunRecoveryService:
                     "tool_calls": [],
                     "usage": result.usage.model_dump(mode="json"),
                 }
+                or checkpoint.turn != operation.turn
+                or len(checkpoint.tool_results) != operation.turn
                 or tuple(event.type for event in trailing) != ("run.completed",)
+            ):
+                return False
+            output_parts = (*prior_output, result.text)
+            usage = _add_usage(prior_usage, result.usage)
+            terminal_payload: dict[str, Any] = {
+                "output_text": "".join(output_parts),
+                "usage": usage.model_dump(mode="json"),
+            }
+            if checkpoint.tool_results:
+                terminal_payload["tool_results"] = [
+                    item.model_dump(mode="json")
+                    for item in checkpoint.tool_results
+                ]
+            if (
+                trailing[0].payload != terminal_payload
+                or not self._is_exact_resolution_event_batch(
+                    evidence,
+                    first_run_index=resolved_index,
+                    last_run_index=resolved_index + 1,
+                    terminal_session_transition=True,
+                )
             ):
                 return False
             return self._is_exact_confirmed_terminal_state(
@@ -1556,26 +1580,30 @@ class RunRecoveryService:
             )
             if operation != expected_operation:
                 return False
-            expected_types: tuple[str, ...] = (
-                "model.usage.reported",
-                "model.call.completed",
-            )
-            if result.tool_call is None:
-                expected_types += ("step.completed", "run.completed")
             if (
-                tuple(event.type for event in trailing) != expected_types
+                len(trailing) < 2
+                or tuple(event.type for event in trailing[:2])
+                != ("model.usage.reported", "model.call.completed")
                 or trailing[0].payload != result.usage.model_dump(mode="json")
                 or trailing[1].payload
                 != {"finish_reason": result.finish_reason}
+                or not self._is_exact_resolution_event_batch(
+                    evidence,
+                    first_run_index=resolved_index,
+                    last_run_index=resolved_index + 2,
+                    terminal_session_transition=False,
+                )
             ):
                 return False
             if result.tool_call is not None:
                 interrupt = evidence.run_events[requested_index - 1]
+                later = trailing[2:]
                 retained = (
                     *evidence.run_events[: requested_index - 1],
                     evidence.run_events[resolved_index],
-                    *trailing,
+                    *trailing[:2],
                     interrupt,
+                    *later,
                 )
                 normalized = replace(
                     evidence,
@@ -1587,10 +1615,48 @@ class RunRecoveryService:
                     ),
                     run_event_cursors=tuple(range(1, len(retained) + 1)),
                 )
-                return self._is_exact_ready_tool_relation(
-                    normalized,
-                    base_request,
+                if later:
+                    return self._is_valid_run_event_envelope(
+                        normalized,
+                        allow_recovery_closed=True,
+                    )
+                return (
+                    checkpoint.turn == operation.turn
+                    and len(checkpoint.tool_results) == operation.turn
+                    and self._is_exact_ready_tool_relation(
+                        normalized,
+                        base_request,
+                    )
                 )
+            if (
+                checkpoint.turn != operation.turn
+                or len(checkpoint.tool_results) != operation.turn
+                or tuple(event.type for event in trailing[2:])
+                != ("step.completed", "run.completed")
+                or trailing[2].payload != {}
+            ):
+                return False
+            output_parts = (*prior_output, result.text)
+            usage = _add_usage(prior_usage, result.usage)
+            terminal_payload = {
+                "output_text": "".join(output_parts),
+                "usage": usage.model_dump(mode="json"),
+            }
+            if checkpoint.tool_results:
+                terminal_payload["tool_results"] = [
+                    item.model_dump(mode="json")
+                    for item in checkpoint.tool_results
+                ]
+            if (
+                trailing[3].payload != terminal_payload
+                or not self._is_exact_resolution_event_batch(
+                    evidence,
+                    first_run_index=resolved_index,
+                    last_run_index=resolved_index + 4,
+                    terminal_session_transition=True,
+                )
+            ):
+                return False
             return self._is_exact_confirmed_terminal_state(
                 evidence,
                 operation,
@@ -1625,6 +1691,14 @@ class RunRecoveryService:
                 }
             }
             and all(event.payload == expected_error for event in trailing)
+            and checkpoint.turn == operation.turn
+            and len(checkpoint.tool_results) == operation.turn
+            and self._is_exact_resolution_event_batch(
+                evidence,
+                first_run_index=resolved_index,
+                last_run_index=resolved_index + 3,
+                terminal_session_transition=True,
+            )
             and checkpoint.phase is RunCheckpointPhase.TERMINAL
             and checkpoint.operation_id is None
             and checkpoint.model_dump(mode="json")["messages"]
@@ -1688,6 +1762,64 @@ class RunRecoveryService:
                 "tool_calls": [],
                 "usage": result.usage.model_dump(mode="json"),
             })
+        )
+
+    @staticmethod
+    def _is_exact_resolution_event_batch(
+        evidence: _RecoveryEvidence,
+        *,
+        first_run_index: int,
+        last_run_index: int,
+        terminal_session_transition: bool,
+    ) -> bool:
+        if (
+            first_run_index < 0
+            or last_run_index < first_run_index
+            or last_run_index >= len(evidence.run_events)
+        ):
+            return False
+        run_events = evidence.run_events[first_run_index : last_run_index + 1]
+        run_cursors = evidence.run_event_cursors[
+            first_run_index : last_run_index + 1
+        ]
+        if (
+            not run_cursors
+            or run_cursors
+            != tuple(range(run_cursors[0], run_cursors[0] + len(run_cursors)))
+            or any(event.occurred_at != run_events[0].occurred_at for event in run_events)
+        ):
+            return False
+        if not terminal_session_transition:
+            return True
+        if (
+            len(evidence.session_lifecycle_events) != 1
+            or len(evidence.session_lifecycle_event_cursors) != 1
+        ):
+            return False
+        session_event = evidence.session_lifecycle_events[0]
+        expected_type = (
+            "session.closed"
+            if evidence.session.status is SessionStatus.CLOSED
+            else "session.run.detached"
+        )
+        return (
+            type(evidence.session_lifecycle_event_cursors[0]) is int
+            and evidence.session_lifecycle_event_cursors[0] == run_cursors[-1] + 1
+            and isinstance(session_event.event_id, str)
+            and bool(session_event.event_id.strip())
+            and type(session_event.schema_version) is int
+            and session_event.schema_version == 1
+            and session_event.type == expected_type
+            and session_event.session_id == evidence.session.session_id
+            and session_event.run_id is None
+            and type(session_event.sequence) is int
+            and session_event.sequence == evidence.session.version
+            and session_event.occurred_at == run_events[0].occurred_at
+            and session_event.payload
+            == {
+                "run_id": evidence.run.run_id,
+                "status": evidence.session.status.value,
+            }
         )
 
     def _is_resolution_operation_certified(
@@ -1941,6 +2073,14 @@ class RunRecoveryService:
         run_records = tuple(
             stored for stored in events if stored.event.run_id == run.run_id
         )
+        session_lifecycle_records = tuple(
+            stored
+            for stored in events
+            if stored.event.run_id is None
+            and stored.event.session_id == run.session_id
+            and stored.event.type in {"session.run.detached", "session.closed"}
+            and stored.event.payload.get("run_id") == run.run_id
+        )
         event_ids = tuple(stored.event.event_id for stored in events)
         return _RecoveryEvidence(
             run=run,
@@ -1951,11 +2091,21 @@ class RunRecoveryService:
             reconciliations=reconciliations,
             run_events=tuple(stored.event for stored in run_records),
             run_event_cursors=tuple(stored.cursor for stored in run_records),
+            session_lifecycle_events=tuple(
+                stored.event for stored in session_lifecycle_records
+            ),
+            session_lifecycle_event_cursors=tuple(
+                stored.cursor for stored in session_lifecycle_records
+            ),
             run_event_ids_unique=len(event_ids) == len(set(event_ids)),
         )
 
     @staticmethod
-    def _is_valid_run_event_envelope(evidence: _RecoveryEvidence) -> bool:
+    def _is_valid_run_event_envelope(
+        evidence: _RecoveryEvidence,
+        *,
+        allow_recovery_closed: bool = False,
+    ) -> bool:
         events = evidence.run_events
         cursors = evidence.run_event_cursors
         run = evidence.run
@@ -1995,8 +2145,23 @@ class RunRecoveryService:
         interrupted = tuple(
             event for event in events if event.type == "run.interrupted"
         )
+        control_types = tuple(
+            event.type
+            for event in events
+            if event.type in {"run.interrupted", "run.recovery.started"}
+        )
+        closed_after_recovery = (
+            allow_recovery_closed
+            and run.status in {RunStatus.COMPLETED, RunStatus.FAILED}
+            and len(interrupted) == len(recovery_started)
+        )
+        expected_control_types = tuple(
+            event_type
+            for _ in range(len(recovery_started))
+            for event_type in ("run.interrupted", "run.recovery.started")
+        ) + (() if closed_after_recovery else ("run.interrupted",))
         if (
-            len(interrupted) != len(recovery_started) + 1
+            control_types != expected_control_types
             or any(
                 event.payload != {"status": RunStatus.RUNNING.value}
                 for event in recovery_started
@@ -3035,9 +3200,17 @@ class RunRecoveryService:
         )
         if not resolved:
             return evidence if not resolution_events else None
+        confirmed_history = any(
+            request.resolution is not None
+            and request.resolution.action is ReconciliationAction.CONFIRM_COMPLETED
+            for request in resolved
+        )
         if (
             len(resolved) != len(resolution_events)
-            or not self._is_valid_run_event_envelope(evidence)
+            or not self._is_valid_run_event_envelope(
+                evidence,
+                allow_recovery_closed=confirmed_history,
+            )
         ):
             return None
 
@@ -3066,7 +3239,7 @@ class RunRecoveryService:
 
         removed_event_indexes: set[int] = set()
         removed_operation_ids: set[str] = set()
-        deferred_events: list[EventEnvelope] = []
+        deferred_events: dict[int, list[EventEnvelope]] = {}
         for request in resolved:
             resolution = request.resolution
             if resolution is None or request.operation_id is None:
@@ -3138,7 +3311,10 @@ class RunRecoveryService:
                 ):
                     return None
                 interrupt_index = requested_indexes[0] - 1
-                deferred_events.append(evidence.run_events[interrupt_index])
+                decision_end_index = resolved_indexes[0] + 2
+                deferred_events.setdefault(decision_end_index, []).append(
+                    evidence.run_events[interrupt_index]
+                )
                 removed_event_indexes.add(interrupt_index)
                 removed_event_indexes.update(requested_indexes)
                 continue
@@ -3223,25 +3399,14 @@ class RunRecoveryService:
             removed_event_indexes.update(resolved_indexes)
             removed_operation_ids.add(operation.operation_id)
 
-        retained = tuple(
-            (cursor, event)
-            for index, (cursor, event) in enumerate(
-                zip(evidence.run_event_cursors, evidence.run_events)
-            )
-            if index not in removed_event_indexes
-        )
-        if deferred_events:
-            next_cursor = max((cursor for cursor, _ in retained), default=0) + 1
-            retained = (
-                *retained,
-                *(
-                    (next_cursor + offset, event)
-                    for offset, event in enumerate(deferred_events)
-                ),
-            )
+        retained_events: list[EventEnvelope] = []
+        for index, event in enumerate(evidence.run_events):
+            if index not in removed_event_indexes:
+                retained_events.append(event)
+            retained_events.extend(deferred_events.get(index, ()))
         normalized_events = tuple(
             event.model_copy(update={"sequence": index})
-            for index, (_, event) in enumerate(retained, start=1)
+            for index, event in enumerate(retained_events, start=1)
         )
         normalized = replace(
             evidence,
@@ -3252,11 +3417,14 @@ class RunRecoveryService:
             ),
             pending=(),
             run_events=normalized_events,
-            run_event_cursors=tuple(cursor for cursor, _ in retained),
+            run_event_cursors=tuple(range(1, len(normalized_events) + 1)),
         )
         return (
             normalized
-            if self._is_valid_run_event_envelope(normalized)
+            if self._is_valid_run_event_envelope(
+                normalized,
+                allow_recovery_closed=confirmed_history,
+            )
             else None
         )
 
@@ -3910,9 +4078,11 @@ class RunRecoveryService:
                 event for event in between if event.type == "model.usage.reported"
             )
             expected_usage = usage.model_dump(mode="json")
+            usage_event_required = recovered or any(
+                value is not None for value in expected_usage.values()
+            )
             if (
-                (any(value is not None for value in expected_usage.values()))
-                != (len(usage_events) == 1)
+                usage_event_required != (len(usage_events) == 1)
                 or (usage_events and usage_events[0].payload != expected_usage)
             ):
                 return False
