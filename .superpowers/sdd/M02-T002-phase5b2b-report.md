@@ -362,3 +362,70 @@ The review closure changes only:
 There is still no public API, dependency, lockfile, migration, schema version,
 root export, event contract, design, roadmap, progress ledger, or task-index
 change. Phase 5C scope remains unchanged.
+
+## Independent re-review closure addendum
+
+Independent re-review confirmed the original I1 and I2 findings closed, then
+found one new blocking regression introduced by `069ec71`. It is fixed in
+implementation commit `a5829c7` (`fix(workflow): require session for node
+transitions`) and is ready for another independent re-review. This report does
+not self-approve that review.
+
+### Universal Session existence on node transitions
+
+`069ec71` replaced the former `_node_transition` precondition tuple while
+adding exact terminal projection evidence. That accidentally removed the
+universal `SnapshotPrecondition("session", session_id)`. Terminal recovery still
+carried an exact Session precondition, but `start_node` and ordinary live
+complete/fail transitions passed no related preconditions and could therefore
+commit after their Session disappeared.
+
+A public `recover_workflow` barrier now pauses the pending-node
+`workflow.node.started` commit. The test deletes only the Session snapshot,
+then releases the commit. Before the fix, both Stores wrote the node event and
+left an orphaned running Workflow/node projection:
+
+```text
+Session-snapshot-only deletion x Memory/SQLite: 2 failed
+```
+
+The paired positive path uses the supported Store `delete_session` cascade at
+the same barrier. Memory and SQLite already rejected the stale node commit and
+left no Session, Workflow, node, or event residue:
+
+```text
+supported delete cascade x Memory/SQLite: 2 passed
+```
+
+The production correction restores the universal Session-exists precondition
+to every `_node_transition`. Terminal projection still adds its exact Session,
+certified Run, and optional parent Run preconditions in the same atomic batch;
+the exact Workflow and node data preconditions are unchanged.
+
+Fresh focused evidence after the one-line production fix:
+
+```text
+missing Session + supported cascade + terminal/parent CAS: 14 passed
+new projection + Workflow admission files:               147 passed
+Phase 5 Provider/Tool/RecoveryAPI core:                   772 passed
+Workflow recovery/admission/ownership core:               207 passed
+Store/lease/Session/Workflow/observability neighbors:     692 passed
+full Python 3.13 suite:                                  2031 passed in 137.14s
+
+ruff check .
+All checks passed!
+
+mypy src
+Success: no issues found in 75 source files
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+This re-review closure changes only:
+
+- `src/agent_sdk/workflow/state.py`
+- `tests/integration/workflow/test_workflow_recovery_admission.py`
+- this report
+
+Phase 5C and all prior out-of-scope items remain untouched.
