@@ -788,8 +788,11 @@ class RunRecoveryService:
                 certified = replace(
                     effective_evidence,
                     pending=(),
-                    run_events=tuple(event for _, event in certified_events),
-                    run_event_cursors=tuple(cursor for cursor, _ in certified_events),
+                    run_events=tuple(
+                        event.model_copy(update={"sequence": index})
+                        for index, (_, event) in enumerate(certified_events, start=1)
+                    ),
+                    run_event_cursors=tuple(range(1, len(certified_events) + 1)),
                 )
                 if not self._is_resolution_operation_certified(
                     certified,
@@ -2045,6 +2048,13 @@ class RunRecoveryService:
                 request,
                 operation,
             )
+        if evidence.run.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
+            return self._is_exact_confirmed_terminal_history(
+                evidence,
+                base_request,
+                request,
+                operation,
+            )
         closed_world = (
             evidence.reconciliations == (request,)
             and not evidence.pending
@@ -2056,13 +2066,6 @@ class RunRecoveryService:
         )
         if not closed_world:
             return False
-        if evidence.run.status in {RunStatus.COMPLETED, RunStatus.FAILED}:
-            return self._is_exact_confirmed_terminal_history(
-                evidence,
-                base_request,
-                request,
-                operation,
-            )
         return True
 
     def _is_exact_confirmed_tool_replay(
@@ -2557,16 +2560,36 @@ class RunRecoveryService:
             ),
             run_event_cursors=tuple(range(1, len(retained) + 1)),
         )
-        confirmed_operation_id = (
-            operation.operation_id
-            if request.reason == "model_call_unknown_outcome"
-            else None
-        )
+        operations_by_id = {
+            item.operation_id: item for item in evidence.operations
+        }
+        confirmed_operation_ids: set[str] = set()
+        for record in evidence.reconciliations:
+            operation_id = record.operation_id
+            confirmed_operation = (
+                None
+                if operation_id is None
+                else operations_by_id.get(operation_id)
+            )
+            if (
+                record.reason == "model_call_unknown_outcome"
+                and record.resolution is not None
+                and record.resolution.action
+                is ReconciliationAction.CONFIRM_COMPLETED
+                and isinstance(confirmed_operation, ModelCallOperation)
+                and self._is_exact_confirmed_model_replay(
+                    evidence,
+                    base_request,
+                    record,
+                    confirmed_operation,
+                )
+            ):
+                confirmed_operation_ids.add(confirmed_operation.operation_id)
         return self._is_valid_certified_provider_history(
             normalized,
             base_request=base_request,
             terminal_status=evidence.run.status,
-            confirmed_operation_id=confirmed_operation_id,
+            confirmed_operation_ids=frozenset(confirmed_operation_ids),
         )
 
     @staticmethod
@@ -3511,7 +3534,7 @@ class RunRecoveryService:
         *,
         current_kind: ExternalOperationKind | None,
         terminal_status: RunStatus | None = None,
-        confirmed_operation_id: str | None = None,
+        confirmed_operation_ids: frozenset[str] = frozenset(),
     ) -> bool:
         checkpoint = evidence.checkpoint
         descriptor = evidence.run.execution_descriptor
@@ -3564,8 +3587,7 @@ class RunRecoveryService:
             in {"model.recovery.query.started", "model.recovery.resend.started"}
             and isinstance(event.payload.get("operation_id"), str)
         }
-        if confirmed_operation_id is not None:
-            recovered_model_operation_ids.add(confirmed_operation_id)
+        recovered_model_operation_ids.update(confirmed_operation_ids)
 
         for event in evidence.run_events[2:]:
             event_type = event.type
@@ -4113,7 +4135,7 @@ class RunRecoveryService:
         *,
         base_request: ModelRequest | None = None,
         terminal_status: RunStatus | None = None,
-        confirmed_operation_id: str | None = None,
+        confirmed_operation_ids: frozenset[str] = frozenset(),
     ) -> bool:
         checkpoint = evidence.checkpoint
         descriptor = evidence.run.execution_descriptor
@@ -4133,7 +4155,7 @@ class RunRecoveryService:
             evidence,
             current_kind=ExternalOperationKind.MODEL_CALL,
             terminal_status=terminal_status,
-            confirmed_operation_id=confirmed_operation_id,
+            confirmed_operation_ids=confirmed_operation_ids,
         ):
             return False
         if terminal_status is not None:
@@ -4552,11 +4574,19 @@ class RunRecoveryService:
                 if (
                     confirmed.disposition
                     is not ProviderRecoveryDisposition.COMPLETED
-                    or confirmed.tool_call is None
                     or requested_indexes[0] == 0
                 ):
                     return None
                 interrupt_index = requested_indexes[0] - 1
+                if confirmed.tool_call is None:
+                    if evidence.run.status not in {
+                        RunStatus.COMPLETED,
+                        RunStatus.FAILED,
+                    }:
+                        return None
+                    removed_event_indexes.add(interrupt_index)
+                    removed_event_indexes.update(requested_indexes)
+                    continue
                 decision_end_index = resolved_indexes[0] + 2
                 deferred_events.setdefault(decision_end_index, []).append(
                     evidence.run_events[interrupt_index]

@@ -291,6 +291,8 @@ class WorkflowState:
         snapshot: WorkflowRunSnapshot,
         index: int,
         result: RunResult,
+        *,
+        related_preconditions: tuple[SnapshotPrecondition, ...] = (),
     ) -> WorkflowRunSnapshot:
         current = snapshot.nodes[index]
         node = current.model_copy(
@@ -312,6 +314,7 @@ class WorkflowState:
                 "output_text": result.output_text,
                 "usage": result.usage.model_dump(mode="json"),
             },
+            related_preconditions=related_preconditions,
         )
 
     async def fail_node(
@@ -319,6 +322,8 @@ class WorkflowState:
         snapshot: WorkflowRunSnapshot,
         index: int,
         failure: WorkflowFailure,
+        *,
+        related_preconditions: tuple[SnapshotPrecondition, ...] = (),
     ) -> WorkflowRunSnapshot:
         current = snapshot.nodes[index]
         node = current.model_copy(
@@ -334,6 +339,7 @@ class WorkflowState:
             node,
             "workflow.node.failed",
             {"node_id": node.node_id, "run_id": node.run_id, "error": failure.model_dump()},
+            related_preconditions=related_preconditions,
         )
 
     async def complete_workflow(
@@ -385,6 +391,8 @@ class WorkflowState:
         node: WorkflowNodeSnapshot,
         event_type: str,
         payload: dict[str, object],
+        *,
+        related_preconditions: tuple[SnapshotPrecondition, ...] = (),
     ) -> WorkflowRunSnapshot:
         nodes = list(snapshot.nodes)
         previous_node = nodes[index]
@@ -404,13 +412,9 @@ class WorkflowState:
                 events=(event,),
                 snapshots=(_workflow_write(updated), _node_write(node)),
                 preconditions=(
-                    SnapshotPrecondition("session", snapshot.session_id),
-                    SnapshotPrecondition(
-                        "workflow", snapshot.workflow_run_id, snapshot.version
-                    ),
-                    SnapshotPrecondition(
-                        "workflow_node", previous_node.entity_id, previous_node.version
-                    ),
+                    _exact_workflow_precondition(snapshot),
+                    _exact_node_precondition(previous_node),
+                    *related_preconditions,
                 ),
             ),
             snapshot.session_id,
@@ -689,6 +693,18 @@ def _node_write(snapshot: WorkflowNodeSnapshot) -> SnapshotWrite:
         snapshot.entity_id,
         snapshot.session_id,
         snapshot.version,
+        snapshot.model_dump(mode="json"),
+    )
+
+
+def _exact_node_precondition(
+    snapshot: WorkflowNodeSnapshot,
+) -> SnapshotPrecondition:
+    return SnapshotPrecondition(
+        "workflow_node",
+        snapshot.entity_id,
+        snapshot.version,
+        snapshot.session_id,
         snapshot.model_dump(mode="json"),
     )
 

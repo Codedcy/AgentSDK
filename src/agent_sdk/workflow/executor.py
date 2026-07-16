@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any
+from typing import Any, NoReturn
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.ids import new_id
@@ -31,7 +31,7 @@ from agent_sdk.runtime.models import (
     TokenUsage,
     mutable_model_params,
 )
-from agent_sdk.runtime.session_lifecycle import load_session
+from agent_sdk.runtime.session_lifecycle import exact_session_precondition, load_session
 from agent_sdk.storage.base import StateStore
 from agent_sdk.storage.base import SnapshotPrecondition
 from agent_sdk.storage.idempotency import IdempotencyError
@@ -486,16 +486,23 @@ class WorkflowExecutor:
                     ) from None
 
             if run.status is RunStatus.COMPLETED:
-                run = await self._certified_terminal_selected_run(
-                    snapshot,
-                    index,
-                    node,
-                    run_id,
-                    expected_descriptor,
-                )
                 try:
+                    run, projection_preconditions = (
+                        await self._certified_terminal_selected_run(
+                            snapshot,
+                            index,
+                            node,
+                            run_id,
+                            expected_descriptor,
+                        )
+                    )
                     self._validate_recovery_descriptor(snapshot)
-                    await self._state.complete_node(snapshot, index, _run_result(run))
+                    await self._state.complete_node(
+                        snapshot,
+                        index,
+                        _run_result(run),
+                        related_preconditions=projection_preconditions,
+                    )
                 except AgentSDKError as error:
                     if error.code is ErrorCode.CONFLICT:
                         continue
@@ -503,20 +510,23 @@ class WorkflowExecutor:
                 continue
 
             if run.status is RunStatus.FAILED:
-                run = await self._certified_terminal_selected_run(
-                    snapshot,
-                    index,
-                    node,
-                    run_id,
-                    expected_descriptor,
-                )
-                failure = _run_workflow_failure(run)
                 try:
+                    run, projection_preconditions = (
+                        await self._certified_terminal_selected_run(
+                            snapshot,
+                            index,
+                            node,
+                            run_id,
+                            expected_descriptor,
+                        )
+                    )
+                    failure = _run_workflow_failure(run)
                     self._validate_recovery_descriptor(snapshot)
                     node_failed = await self._state.fail_node(
                         snapshot,
                         index,
                         failure,
+                        related_preconditions=projection_preconditions,
                     )
                     self._validate_recovery_descriptor(node_failed)
                     failed = await self._state.fail_workflow(node_failed, failure)
@@ -689,14 +699,21 @@ class WorkflowExecutor:
         node: AgentNode,
         run_id: str,
         expected_descriptor: ExecutionDescriptor,
-    ) -> RunSnapshot:
+    ) -> tuple[RunSnapshot, tuple[SnapshotPrecondition, ...]]:
         if self._certify_terminal_run is None:
             raise AgentSDKError(
                 ErrorCode.INTERNAL,
                 "terminal run certification is unavailable",
                 retryable=False,
             ) from None
-        run = await self._certify_terminal_run(run_id)
+        certified = await self._certify_terminal_run(run_id)
+        run = await self._load_selected_run(run_id)
+        if run != certified:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "related terminal run changed after certification",
+                retryable=False,
+            ) from None
         if not _related_run_matches(
             workflow,
             index,
@@ -709,7 +726,37 @@ class WorkflowExecutor:
                 "related run does not match workflow node",
                 retryable=False,
             ) from None
-        return run
+        try:
+            session = await load_session(self._store, workflow.session_id)
+        except Exception:
+            await self._raise_terminal_projection_ownership_error(workflow)
+        if workflow.workflow_run_id not in session.active_workflow_run_ids:
+            await self._raise_terminal_projection_ownership_error(workflow)
+        parent = await self._validated_child_parent(workflow, index, node)
+        self._validate_recovery_descriptor(workflow)
+        related_preconditions = (
+            exact_session_precondition(session),
+            _exact_run_precondition(run),
+            *(() if parent is None else (_exact_run_precondition(parent),)),
+        )
+        return run, related_preconditions
+
+    async def _raise_terminal_projection_ownership_error(
+        self,
+        previous: WorkflowRunSnapshot,
+    ) -> NoReturn:
+        current = await self._state.load(previous.workflow_run_id)
+        if current != previous:
+            raise AgentSDKError(
+                ErrorCode.CONFLICT,
+                "workflow state changed concurrently",
+                retryable=True,
+            ) from None
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "workflow recovery ownership unavailable",
+            retryable=False,
+        ) from None
 
     async def _workflow_changed_after_conflict(
         self,

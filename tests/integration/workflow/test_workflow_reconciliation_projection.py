@@ -99,6 +99,33 @@ class _BlockingCompletion:
         raise AssertionError("the abandoned Provider call must not complete")
 
 
+class _FirstThenBlockingCompletion:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, **_: Any) -> AsyncIterator[dict[str, object]]:
+        self.calls += 1
+        if self.calls == 1:
+            async def chunks() -> AsyncIterator[dict[str, object]]:
+                yield {
+                    "choices": [
+                        {"delta": {"content": "parent"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+
+            return chunks()
+        self.started.set()
+        await self.release.wait()
+        raise AssertionError("the abandoned child Provider call must not complete")
+
+
 class _ToolCallCompletion:
     def __init__(self) -> None:
         self.calls = 0
@@ -251,10 +278,82 @@ class _CancelAfterWorkflowCommitStore:
         return result
 
 
+class _NodeProjectionBarrierStore:
+    def __init__(self, delegate: Any, event_type: str) -> None:
+        self.delegate = delegate
+        self.event_type = event_type
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.fired = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: Any) -> Any:
+        if not self.fired and any(
+            event.type == self.event_type for event in batch.events
+        ):
+            self.fired = True
+            self.entered.set()
+            await asyncio.wait_for(self.release.wait(), timeout=_TIMEOUT)
+        return await self.delegate.commit(batch)
+
+
 async def _open_store(backend: str, path: Path) -> Any:
     if backend == "memory":
         return InMemoryStore()
     return await SQLiteStore.open(path)
+
+
+async def _replace_snapshot_data(
+    store: Any,
+    kind: str,
+    entity_id: str,
+    data: dict[str, Any],
+) -> None:
+    if isinstance(store, InMemoryStore):
+        key = (kind, entity_id)
+        store._snapshots[key] = store._snapshots[key]._replace(data=data)
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE snapshots SET data_json = ? WHERE kind = ? AND entity_id = ?",
+        (
+            json.dumps(
+                data,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            kind,
+            entity_id,
+        ),
+    )
+    await store._connection.commit()
+
+
+async def _replace_external_operation_data(
+    store: Any,
+    operation_id: str,
+    data: dict[str, Any],
+) -> None:
+    encoded = json.dumps(
+        data,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if isinstance(store, InMemoryStore):
+        store._external_operations[operation_id] = encoded
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        "UPDATE external_operations SET data_json = ? WHERE operation_id = ?",
+        (encoded, operation_id),
+    )
+    await store._connection.commit()
 
 
 def _workflow_yaml(definition: dict[str, Any] = ONE_NODE_DEFINITION) -> str:
@@ -287,10 +386,12 @@ async def _interrupt_active_workflow(
     store: Any,
     workflow_handle: Any,
     entered: asyncio.Event,
+    *,
+    node_index: int = 0,
 ) -> tuple[str, str]:
     await asyncio.wait_for(entered.wait(), timeout=_TIMEOUT)
     workflow = await sdk.workflows.get(workflow_handle.workflow_run_id)
-    run_id = workflow.nodes[0].run_id
+    run_id = workflow.nodes[node_index].run_id
     assert run_id is not None
     lease = await store.get_run_lease(run_id)
     assert lease is not None
@@ -1020,6 +1121,487 @@ async def test_two_sdks_project_confirmed_terminal_child_once(
         await asyncio.gather(*(store.close() for store in stores))
         if isinstance(primary, SQLiteStore) and primary not in stores:
             await primary.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "second_action",
+    (
+        ReconciliationAction.CONFIRM_NOT_EXECUTED,
+        ReconciliationAction.CONFIRM_COMPLETED,
+    ),
+    ids=("confirm-not-executed", "confirm-completed"),
+)
+@pytest.mark.parametrize(
+    "corrupt_history",
+    (False, True),
+    ids=("canonical", "corrupt-prior-model"),
+)
+async def test_confirmed_model_tool_call_survives_later_workflow_reconciliation(
+    backend: str,
+    second_action: ReconciliationAction,
+    corrupt_history: bool,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"model-first-later-{second_action.value}.db"
+    store = await _open_store(backend, path)
+    first_blocking = _BlockingCompletion()
+    owner = AgentSDK.for_test(
+        store=store,
+        acompletion=first_blocking,
+        permission_default="allow",
+    )
+    tool_calls: list[int] = []
+
+    async def normal_tool(_: ToolContext, value: int) -> object:
+        tool_calls.append(value)
+        return {"observed": value}
+
+    _register(owner, tool_handler=normal_tool)
+    session = await owner.sessions.create(workspaces=[])
+    original = await owner.workflows.start(session.session_id, _workflow_yaml())
+    model_owner: AgentSDK | None = None
+    final_sdk: AgentSDK | None = None
+    second_blocking = _BlockingCompletion()
+    try:
+        workflow_run_id, run_id = await _interrupt_active_workflow(
+            owner,
+            store,
+            original,
+            first_blocking.started,
+        )
+        first_blocking.release.set()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+            store = await SQLiteStore.open(path)
+
+        model_owner = AgentSDK.for_test(
+            store=store,
+            acompletion=second_blocking,
+            permission_default="allow",
+        )
+        _register(model_owner, tool_handler=normal_tool)
+        first_request = await _admit_workflow_reconciliation(
+            model_owner,
+            workflow_run_id,
+            run_id,
+        )
+        first_actor = {"type": "operator", "id": "model-first-decision"}
+        first_evidence = {
+            "provider_result": {
+                "disposition": "completed",
+                "finish_reason": "tool_calls",
+                "text": "confirmed-tool-plan",
+                "tool_call": {
+                    "index": 0,
+                    "call_id": "call_model_first",
+                    "name": TOOL.name,
+                    "arguments_json": '{"value":7}',
+                },
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
+            }
+        }
+        first_resolution = await model_owner.recovery.resolve(
+            first_request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor=first_actor,
+            evidence=first_evidence,
+        )
+
+        model_workflow = await model_owner.recovery.recover_workflow(workflow_run_id)
+        second_workflow_run_id, second_run_id = await _interrupt_active_workflow(
+            model_owner,
+            store,
+            model_workflow,
+            second_blocking.started,
+        )
+        assert second_workflow_run_id == workflow_run_id
+        assert second_run_id == run_id
+        model_owner = None
+        second_blocking.release.set()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+            store = await SQLiteStore.open(path)
+
+        final_provider = _FinalCompletion("after-second-decision")
+        final_sdk = AgentSDK.for_test(
+            store=store,
+            acompletion=final_provider,
+            permission_default="allow",
+        )
+        _register(final_sdk, tool_handler=normal_tool)
+        second_request = await _admit_workflow_reconciliation(
+            final_sdk,
+            workflow_run_id,
+            run_id,
+        )
+        assert second_request.request_id != first_request.request_id
+        if second_action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
+            second_evidence: dict[str, Any] = {"disposition": "not_executed"}
+        else:
+            second_evidence = {
+                "provider_result": {
+                    "disposition": "completed",
+                    "finish_reason": "stop",
+                    "text": "second-confirmed",
+                    "tool_call": None,
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "total_tokens": 4,
+                    },
+                }
+            }
+        if corrupt_history:
+            first_operation_id = first_request.operation_id
+            assert first_operation_id is not None
+            if isinstance(store, InMemoryStore):
+                first_operation_data = json.loads(
+                    store._external_operations[first_operation_id]
+                )
+            else:
+                assert isinstance(store, SQLiteStore)
+                async with store._connection.execute(
+                    "SELECT data_json FROM external_operations "
+                    "WHERE operation_id = ?",
+                    (first_operation_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                assert row is not None
+                first_operation_data = json.loads(row[0])
+            assert isinstance(first_operation_data, dict)
+            outcome = dict(first_operation_data["outcome"])
+            outcome["text"] = "forged-confirmed-history"
+            await _replace_external_operation_data(
+                store,
+                first_operation_id,
+                {**first_operation_data, "outcome": outcome},
+            )
+            workflow_before = await final_sdk.workflows.get(workflow_run_id)
+            node_before = await store.get_snapshot(
+                "workflow_node",
+                workflow_before.nodes[0].entity_id,
+            )
+            run_before = await final_sdk.runs.get(run_id)
+            checkpoint_before = await store.get_run_checkpoint(run_id)
+            operations_before = await store.list_external_operations(run_id)
+            requests_before = await store.list_reconciliation_requests(run_id)
+            cursor_before = await store.latest_cursor()
+
+            with pytest.raises(AgentSDKError) as conflict:
+                await final_sdk.recovery.resolve(
+                    second_request.request_id,
+                    second_action,
+                    actor={"type": "operator", "id": "second-decision"},
+                    evidence=second_evidence,
+                )
+
+            assert conflict.value.code is ErrorCode.CONFLICT
+            assert conflict.value.message == "recovery state conflict"
+            assert await final_sdk.workflows.get(workflow_run_id) == workflow_before
+            assert (
+                await store.get_snapshot(
+                    "workflow_node",
+                    workflow_before.nodes[0].entity_id,
+                )
+                == node_before
+            )
+            assert await final_sdk.runs.get(run_id) == run_before
+            assert await store.get_run_checkpoint(run_id) == checkpoint_before
+            assert await store.list_external_operations(run_id) == operations_before
+            assert await store.list_reconciliation_requests(run_id) == requests_before
+            assert await store.latest_cursor() == cursor_before
+            assert tool_calls == [7]
+            assert final_provider.calls == 0
+            return
+        second_resolution = await final_sdk.recovery.resolve(
+            second_request.request_id,
+            second_action,
+            actor={"type": "operator", "id": "second-decision"},
+            evidence=second_evidence,
+        )
+        assert second_resolution.resolution is not None
+
+        expected_tail = (
+            "after-second-decision"
+            if second_action is ReconciliationAction.CONFIRM_NOT_EXECUTED
+            else "second-confirmed"
+        )
+        result = await (
+            await final_sdk.recovery.recover_workflow(workflow_run_id)
+        ).result()
+        assert result.status is WorkflowRunStatus.COMPLETED
+        assert result.output_text == f"confirmed-tool-plan{expected_tail}"
+        assert tool_calls == [7]
+        assert final_provider.calls == (
+            1
+            if second_action is ReconciliationAction.CONFIRM_NOT_EXECUTED
+            else 0
+        )
+        run = await final_sdk.runs.get(run_id)
+        assert len(run.tool_results) == 1
+        assert run.tool_results[0].call_id == "call_model_first"
+        assert run.tool_results[0].tool_name == TOOL.name
+        assert run.tool_results[0].status is ToolResultStatus.SUCCEEDED
+        if final_provider.messages:
+            assert final_provider.messages[-1][-1] == {
+                "role": "tool",
+                "tool_call_id": "call_model_first",
+                "name": TOOL.name,
+                "content": run.tool_results[0].content,
+            }
+
+        cursor = await store.latest_cursor()
+        assert (
+            await final_sdk.recovery.resolve(
+                first_request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor=first_actor,
+                evidence=first_evidence,
+            )
+            == first_resolution
+        )
+        assert await store.latest_cursor() == cursor
+    finally:
+        first_blocking.release.set()
+        second_blocking.release.set()
+        if model_owner is not None:
+            await model_owner.close()
+        if final_sdk is not None:
+            await final_sdk.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("projection", ("text", "failed"))
+@pytest.mark.parametrize("mutation", ("run", "session"))
+async def test_terminal_projection_cas_rejects_post_certification_mutation(
+    backend: str,
+    projection: str,
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"terminal-projection-cas-{projection}-{mutation}.db"
+    store = await _open_store(backend, path)
+    blocking = _BlockingCompletion()
+    owner = AgentSDK.for_test(store=store, acompletion=blocking)
+    _register(owner)
+    session = await owner.sessions.create(workspaces=[])
+    original = await owner.workflows.start(session.session_id, _workflow_yaml())
+    resolver: AgentSDK | None = None
+    projecting: AgentSDK | None = None
+    barrier_store: _NodeProjectionBarrierStore | None = None
+    try:
+        workflow_run_id, run_id = await _interrupt_active_workflow(
+            owner,
+            store,
+            original,
+            blocking.started,
+        )
+        blocking.release.set()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+            store = await SQLiteStore.open(path)
+        resolver = AgentSDK.for_test(store=store, acompletion=blocking)
+        _register(resolver)
+        request = await _admit_workflow_reconciliation(
+            resolver,
+            workflow_run_id,
+            run_id,
+        )
+        await resolver.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator", "id": "projection-cas"},
+            evidence={"provider_result": _provider_result(projection)},
+        )
+        await resolver.close()
+        resolver = None
+
+        event_type = (
+            "workflow.node.failed"
+            if projection == "failed"
+            else "workflow.node.completed"
+        )
+        barrier_store = _NodeProjectionBarrierStore(store, event_type)
+        projecting = AgentSDK.for_test(store=barrier_store, acompletion=blocking)
+        _register(projecting)
+        workflow_before = await projecting.workflows.get(workflow_run_id)
+        node_before = await store.get_snapshot(
+            "workflow_node", workflow_before.nodes[0].entity_id
+        )
+        handle = await projecting.recovery.recover_workflow(workflow_run_id)
+        await asyncio.wait_for(barrier_store.entered.wait(), timeout=_TIMEOUT)
+
+        if mutation == "run":
+            run_data = await store.get_snapshot("run", run_id)
+            assert run_data is not None
+            if projection == "failed":
+                error = dict(run_data["error"])
+                error["message"] = "forged-after-certification"
+                changed = {**run_data, "error": error}
+            else:
+                changed = {**run_data, "output_text": "forged-after-certification"}
+            await _replace_snapshot_data(store, "run", run_id, changed)
+        else:
+            session_data = await store.get_snapshot("session", session.session_id)
+            assert session_data is not None
+            changed = {**session_data, "active_workflow_run_ids": []}
+            await _replace_snapshot_data(
+                store,
+                "session",
+                session.session_id,
+                changed,
+            )
+        cursor_before = await store.latest_cursor()
+        barrier_store.release.set()
+
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+
+        assert await projecting.workflows.get(workflow_run_id) == workflow_before
+        assert (
+            await store.get_snapshot("workflow_node", workflow_before.nodes[0].entity_id)
+            == node_before
+        )
+        assert await store.latest_cursor() == cursor_before
+        events = await store.read_events(after_cursor=0, session_id=session.session_id)
+        assert not any(item.event.type == event_type for item in events)
+        assert not any(
+            item.event.type in {"workflow.completed", "workflow.failed"}
+            for item in events
+        )
+        assert blocking.calls == 1
+    finally:
+        blocking.release.set()
+        if barrier_store is not None:
+            barrier_store.release.set()
+        if resolver is not None:
+            await resolver.close()
+        if projecting is not None:
+            await projecting.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_child_terminal_projection_cas_rejects_parent_mutation(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "child-terminal-projection-parent-cas.db"
+    store = await _open_store(backend, path)
+    blocking = _FirstThenBlockingCompletion()
+    owner = AgentSDK.for_test(
+        store=store,
+        acompletion=blocking,
+        permission_default="allow",
+    )
+    _register(owner, include_worker=True, tool_handler=_forbidden_tool)
+    session = await owner.sessions.create(workspaces=[])
+    original = await owner.workflows.start(
+        session.session_id,
+        _workflow_yaml(TWO_NODE_DEFINITION),
+    )
+    resolver: AgentSDK | None = None
+    projecting: AgentSDK | None = None
+    barrier_store: _NodeProjectionBarrierStore | None = None
+    try:
+        workflow_run_id, child_run_id = await _interrupt_active_workflow(
+            owner,
+            store,
+            original,
+            blocking.started,
+            node_index=1,
+        )
+        blocking.release.set()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+            store = await SQLiteStore.open(path)
+        resolver = AgentSDK.for_test(
+            store=store,
+            acompletion=blocking,
+            permission_default="allow",
+        )
+        _register(resolver, include_worker=True, tool_handler=_forbidden_tool)
+        request = await _admit_workflow_reconciliation(
+            resolver,
+            workflow_run_id,
+            child_run_id,
+        )
+        await resolver.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"type": "operator", "id": "parent-projection-cas"},
+            evidence={"provider_result": _provider_result("text")},
+        )
+        await resolver.close()
+        resolver = None
+
+        barrier_store = _NodeProjectionBarrierStore(store, "workflow.node.completed")
+        projecting = AgentSDK.for_test(
+            store=barrier_store,
+            acompletion=blocking,
+            permission_default="allow",
+        )
+        _register(projecting, include_worker=True, tool_handler=_forbidden_tool)
+        workflow_before = await projecting.workflows.get(workflow_run_id)
+        parent_run_id = workflow_before.nodes[0].run_id
+        assert parent_run_id is not None
+        child_node_before = await store.get_snapshot(
+            "workflow_node",
+            workflow_before.nodes[1].entity_id,
+        )
+        handle = await projecting.recovery.recover_workflow(workflow_run_id)
+        await asyncio.wait_for(barrier_store.entered.wait(), timeout=_TIMEOUT)
+
+        parent_data = await store.get_snapshot("run", parent_run_id)
+        assert parent_data is not None
+        await _replace_snapshot_data(
+            store,
+            "run",
+            parent_run_id,
+            {**parent_data, "output_text": "forged-parent-after-certification"},
+        )
+        cursor_before = await store.latest_cursor()
+        barrier_store.release.set()
+
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+
+        assert await projecting.workflows.get(workflow_run_id) == workflow_before
+        assert (
+            await store.get_snapshot(
+                "workflow_node",
+                workflow_before.nodes[1].entity_id,
+            )
+            == child_node_before
+        )
+        assert await store.latest_cursor() == cursor_before
+        events = await store.read_events(after_cursor=0, session_id=session.session_id)
+        assert sum(
+            item.event.type == "workflow.node.completed" for item in events
+        ) == 1
+        assert not any(item.event.type == "workflow.completed" for item in events)
+        assert blocking.calls == 2
+    finally:
+        blocking.release.set()
+        if barrier_store is not None:
+            barrier_store.release.set()
+        if resolver is not None:
+            await resolver.close()
+        if projecting is not None:
+            await projecting.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
 
 
 @pytest.mark.asyncio
