@@ -146,3 +146,10 @@ Phase 5: in progress - reconciliation decisions, subprocess/fault E2E, dual-Pyth
 Phase 5 operational plan: .superpowers/sdd/M02-T002-phase5-plan.md
 Phase 5A: in progress - strict resolution admission and explicit safe retry decisions
 Phase 5A brief: .superpowers/sdd/M02-T002-phase5a-brief.md
+Phase 5A implementation commits: 8c86bfe, 187b5b7, 7d60cd1, 3dacbe6, 111fea9
+Phase 5A final report: .superpowers/sdd/M02-T002-phase5a-report.md
+Phase 5A final gates: public/storage 168 passed; Provider/Tool lifecycle 132 passed; seven-file focused superset 546 passed; full Python3.13 1801 passed with zero skips/failures; Ruff clean; mypy clean across 75 source files; diff/import/scope/schema/signature clean
+Phase 5A review: initial C0/I3/M0; successive re-reviews closed cancellation sanitization, exact Store old-generation admission, complete resolved-row discovery/pair grammar, unique turn-scoped attempt slicing, later-turn admission, and canonical lifecycle ordering
+Phase 5A final review: Approved; Spec C0/I0/M0 and Quality C0/I0/M0
+Phase 5A: complete - strict operator decisions, exact safe retries, atomic two-backend resolution, closed recovery grammar, lifecycle races, and secret sanitization
+Phase 5B: in progress - strict confirmed external outcome projection
