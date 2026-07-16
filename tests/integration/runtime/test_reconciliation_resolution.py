@@ -26,6 +26,7 @@ from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
     ModelCallOperation,
     RunCheckpointPhase,
+    ReconciliationStatus,
     _canonical_record_json,
 )
 from agent_sdk.storage.base import CommitBatch, RunProgressBatch, SnapshotWrite
@@ -1007,14 +1008,18 @@ async def _corrupt_confirmed_terminal_history(
             cursor=terminal.cursor
         )
     else:
-        assert corruption == "session_payload"
+        assert corruption in {"session_payload", "session_deleting_status"}
         index = stored_events.index(session_event)
         stored_events[index] = session_event._replace(
             event=session_event.event.model_copy(
                 update={
                     "payload": {
                         "run_id": run_id,
-                        "status": "corrupt",
+                        "status": (
+                            SessionStatus.DELETING.value
+                            if corruption == "session_deleting_status"
+                            else "corrupt"
+                        ),
                     }
                 }
             )
@@ -1033,6 +1038,7 @@ async def _corrupt_confirmed_terminal_history(
         ("failed", "session_duplicate"),
         ("completed", "session_moved"),
         ("failed", "session_payload"),
+        ("failed", "session_deleting_status"),
         ("failed", "terminal_payload"),
     ),
 )
@@ -1101,6 +1107,228 @@ async def test_confirm_completed_terminal_replay_authenticates_entire_batch(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("projection", ("completed", "failed"))
+async def test_confirmed_terminal_replay_accepts_later_session_run_evolution(
+    backend: str,
+    projection: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"terminal-session-successor-{projection}.db"
+        )
+    )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    provider_calls: list[int] = []
+
+    async def later_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_calls.append(1)
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "later"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=later_completion,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    provider_result = (
+        _confirmed_provider_result()
+        if projection == "completed"
+        else {
+            "disposition": "failed",
+            "error_code": "internal",
+            "retryable": True,
+        }
+    )
+    evidence = {"provider_result": provider_result}
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "session-successor"},
+            evidence=evidence,
+        )
+        original = await sdk.runs.get(run_id)
+        later = await sdk.runs.start(original.session_id, spec, "later run")
+        later_result = await later.result()
+        assert later_result.output_text == "later"
+        assert provider_calls == [1]
+
+        replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "session-successor"},
+            evidence=evidence,
+        )
+        assert replay == resolved
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+async def _inject_confirmed_replay_orphan(
+    store: Any,
+    *,
+    resolved: Any,
+    operation: ModelCallOperation,
+    orphan: str,
+) -> None:
+    if orphan in {"pending_request", "resolved_request"}:
+        if orphan == "pending_request":
+            record = resolved.model_copy(
+                update={
+                    "request_id": "rec_orphan_confirmed_pending",
+                    "status": ReconciliationStatus.PENDING,
+                    "resolution": None,
+                }
+            )
+        else:
+            assert resolved.resolution is not None
+            record = resolved.model_copy(
+                update={
+                    "request_id": "rec_orphan_confirmed_resolved",
+                    "resolution": resolved.resolution.model_copy(
+                        update={"event_id": "evt_orphan_confirmed_resolved"}
+                    ),
+                }
+            )
+        serialized = _canonical_record_json(record)
+        if isinstance(store, InMemoryStore):
+            store._reconciliation_requests[record.request_id] = serialized
+        else:
+            assert isinstance(store, SQLiteStore)
+            await store._connection.execute(
+                """
+                INSERT INTO reconciliation_requests(
+                    request_id, session_id, run_id, operation_id, status, data_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.request_id,
+                    record.session_id,
+                    record.run_id,
+                    record.operation_id,
+                    record.status.value,
+                    serialized,
+                ),
+            )
+            await store._connection.commit()
+        return
+
+    assert orphan == "completed_model_operation"
+    orphan_operation = operation.model_copy(
+        update={"operation_id": "op_orphan_confirmed_completed"}
+    )
+    serialized = _canonical_record_json(orphan_operation)
+    if isinstance(store, InMemoryStore):
+        store._external_operations[orphan_operation.operation_id] = serialized
+        return
+    assert isinstance(store, SQLiteStore)
+    await store._connection.execute(
+        """
+        INSERT INTO external_operations(
+            operation_id, operation_kind, session_id, run_id, turn,
+            request_fingerprint, provider_identity, tool_identity,
+            lease_generation, status, data_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            orphan_operation.operation_id,
+            orphan_operation.operation_kind.value,
+            orphan_operation.session_id,
+            orphan_operation.run_id,
+            orphan_operation.turn,
+            orphan_operation.request_fingerprint,
+            orphan_operation.provider_identity,
+            orphan_operation.tool_identity,
+            orphan_operation.lease_generation,
+            orphan_operation.status.value,
+            serialized,
+        ),
+    )
+    await store._connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "orphan",
+    ("pending_request", "resolved_request", "completed_model_operation"),
+)
+async def test_confirmed_terminal_replay_rejects_orphan_closed_world_records(
+    backend: str,
+    orphan: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / f"confirmed-orphan-{orphan}.db")
+    )
+    run_id, spec, operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("exact replay must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    evidence = {"provider_result": _confirmed_provider_result()}
+    try:
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "closed-world"},
+            evidence=evidence,
+        )
+        operation = next(
+            item
+            for item in await store.list_external_operations(run_id)
+            if item.operation_id == operation_id
+        )
+        assert isinstance(operation, ModelCallOperation)
+        await _inject_confirmed_replay_orphan(
+            store,
+            resolved=resolved,
+            operation=operation,
+            orphan=orphan,
+        )
+        before = await _resolution_domain_state(store)
+
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "closed-world"},
+                evidence=evidence,
+            )
+        assert caught.value.code is ErrorCode.CONFLICT
+        assert caught.value.message == "recovery state conflict"
+        assert await _resolution_domain_state(store) == before
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
     backend: str,
     tmp_path: Path,
@@ -1150,11 +1378,23 @@ async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
     store.reject_terminal = False
 
     await _mark_interrupted(store)
+    later_provider_calls: list[int] = []
+
+    async def later_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        later_provider_calls.append(1)
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "later"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
     second = AgentSDK.for_test(
         store=store,
-        acompletion=lambda **_: (_ for _ in ()).throw(
-            AssertionError("resolution must not call provider")
-        ),
+        acompletion=later_completion,
         permission_default="allow",
     )
     second.agents.define(spec)
@@ -1208,19 +1448,24 @@ async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
             "run.completed",
         )
         assert provider_calls == [1]
+        resolution_evidence = {
+            "provider_result": {
+                "disposition": "completed",
+                "finish_reason": outcome["finish_reason"],
+                "text": outcome["text"],
+                "tool_call": None,
+                "usage": outcome["usage"],
+            }
+        }
+        later = await second.runs.start(run.session_id, spec, "later gap run")
+        later_result = await later.result()
+        assert later_result.output_text == "later"
+        assert later_provider_calls == [1]
         exact_replay = await second.recovery.resolve(
             request.request_id,
             ReconciliationAction.CONFIRM_COMPLETED,
             actor={"operator": "gap"},
-            evidence={
-                "provider_result": {
-                    "disposition": "completed",
-                    "finish_reason": outcome["finish_reason"],
-                    "text": outcome["text"],
-                    "tool_call": None,
-                    "usage": outcome["usage"],
-                }
-            },
+            evidence=resolution_evidence,
         )
         assert exact_replay == resolved
     finally:
@@ -1326,8 +1571,14 @@ async def test_confirmed_model_tool_call_resumes_only_on_explicit_recovery(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
-async def test_confirmed_tool_call_history_allows_a_later_model_reconciliation(
+@pytest.mark.parametrize(
+    "orphan",
+    (None, "pending_request", "resolved_request", "completed_model_operation"),
+    ids=("canonical", "pending-request", "resolved-request", "model-operation"),
+)
+async def test_confirmed_tool_call_later_pending_history_is_closed_world(
     backend: str,
+    orphan: str | None,
     tmp_path: Path,
 ) -> None:
     store: Any = (
@@ -1336,7 +1587,7 @@ async def test_confirmed_tool_call_history_allows_a_later_model_reconciliation(
         else await SQLiteStore.open(tmp_path / "confirmed-then-crash.db")
     )
     tool_spec = _unsafe_tool_spec()
-    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+    run_id, spec, operation_id, request = await _seed_pending_model_reconciliation(
         store,
         tool_spec,
     )
@@ -1422,13 +1673,38 @@ async def test_confirmed_tool_call_history_allows_a_later_model_reconciliation(
         pending = await recovery.recovery.pending_requests(run_id)
         assert len(pending) == 1
         assert pending[0].reason == "model_call_unknown_outcome"
-        replay = await recovery.recovery.resolve(
-            request.request_id,
-            ReconciliationAction.CONFIRM_COMPLETED,
-            actor={"operator": "then-crash"},
-            evidence=resolution_evidence,
-        )
-        assert replay == resolved
+        if orphan is None:
+            replay = await recovery.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "then-crash"},
+                evidence=resolution_evidence,
+            )
+            assert replay == resolved
+        else:
+            operation = next(
+                item
+                for item in await store.list_external_operations(run_id)
+                if item.operation_id == operation_id
+            )
+            assert isinstance(operation, ModelCallOperation)
+            await _inject_confirmed_replay_orphan(
+                store,
+                resolved=resolved,
+                operation=operation,
+                orphan=orphan,
+            )
+            before = await _resolution_domain_state(store)
+            with pytest.raises(AgentSDKError) as caught:
+                await recovery.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.CONFIRM_COMPLETED,
+                    actor={"operator": "then-crash"},
+                    evidence=resolution_evidence,
+                )
+            assert caught.value.code is ErrorCode.CONFLICT
+            assert caught.value.message == "recovery state conflict"
+            assert await _resolution_domain_state(store) == before
     finally:
         await recovery.close()
         if backend == "sqlite":

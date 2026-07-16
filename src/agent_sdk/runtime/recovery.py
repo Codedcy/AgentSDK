@@ -1298,10 +1298,17 @@ class RunRecoveryService:
                 matching != (request,)
                 or not isinstance(operation, ModelCallOperation)
                 or not self._is_exact_confirmed_model_replay(
-                recovery_evidence,
-                base_request,
-                request,
-                operation,
+                    recovery_evidence,
+                    base_request,
+                    request,
+                    operation,
+                )
+                or base_request is None
+                or not self._is_confirmed_replay_closed_world(
+                    recovery_evidence,
+                    base_request,
+                    request,
+                    operation,
                 )
             ):
                 raise RecoveryStateConflictError
@@ -1722,6 +1729,203 @@ class RunRecoveryService:
             )
         )
 
+    def _is_confirmed_replay_closed_world(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        request: ReconciliationRequest,
+        operation: ModelCallOperation,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        if (
+            checkpoint is None
+            or not self._has_closed_reconciliation_markers(evidence)
+        ):
+            return False
+        completed = self._completed_model_outcome(operation)
+        confirmed_tool_call = completed is not None and len(completed[2]) == 1
+        if confirmed_tool_call and evidence.run.status is RunStatus.WAITING_RECONCILIATION:
+            return self._is_exact_confirmed_later_model_pending(
+                evidence,
+                base_request,
+                request,
+                operation,
+            )
+        return (
+            evidence.reconciliations == (request,)
+            and not evidence.pending
+            and self._has_exact_model_operation_turns(
+                evidence,
+                through_turn=checkpoint.turn,
+                required=operation,
+            )
+        )
+
+    @staticmethod
+    def _has_closed_reconciliation_markers(
+        evidence: _RecoveryEvidence,
+    ) -> bool:
+        records = evidence.reconciliations
+        requested_events = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "reconciliation.requested"
+        )
+        resolved_events = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "reconciliation.resolved"
+        )
+        resolved_records = tuple(
+            record
+            for record in records
+            if record.status is ReconciliationStatus.RESOLVED
+        )
+        if (
+            len({record.request_id for record in records}) != len(records)
+            or len(requested_events) != len(records)
+            or len(resolved_events) != len(resolved_records)
+        ):
+            return False
+        for record in records:
+            requested = tuple(
+                event
+                for event in requested_events
+                if event.payload
+                == {
+                    "request_id": record.request_id,
+                    "operation_id": record.operation_id,
+                    "reason": record.reason,
+                }
+            )
+            if len(requested) != 1:
+                return False
+            resolution = record.resolution
+            matching_resolved = tuple(
+                event
+                for event in resolved_events
+                if resolution is not None
+                and event.event_id == resolution.event_id
+                and event.occurred_at == resolution.decided_at
+                and event.payload
+                == {
+                    "request_id": record.request_id,
+                    "operation_id": record.operation_id,
+                    "action": resolution.action.value,
+                    "actor": thaw_json(resolution.actor),
+                    "evidence": thaw_json(resolution.evidence),
+                }
+            )
+            if (
+                record.status is ReconciliationStatus.RESOLVED
+                and len(matching_resolved) != 1
+            ) or (
+                record.status is ReconciliationStatus.PENDING
+                and (resolution is not None or matching_resolved)
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _has_exact_model_operation_turns(
+        evidence: _RecoveryEvidence,
+        *,
+        through_turn: int,
+        required: ModelCallOperation,
+    ) -> bool:
+        model_operations = tuple(
+            operation
+            for operation in evidence.operations
+            if isinstance(operation, ModelCallOperation)
+        )
+        by_turn = {operation.turn: operation for operation in model_operations}
+        return (
+            len(by_turn) == len(model_operations)
+            and tuple(sorted(by_turn)) == tuple(range(through_turn + 1))
+            and by_turn.get(required.turn) == required
+        )
+
+    def _is_exact_confirmed_later_model_pending(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+        original_request: ReconciliationRequest,
+        original_operation: ModelCallOperation,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        if (
+            checkpoint is None
+            or evidence.run.status is not RunStatus.WAITING_RECONCILIATION
+            or checkpoint.phase is not RunCheckpointPhase.MODEL_IN_FLIGHT
+            or len(evidence.pending) != 1
+        ):
+            return False
+        pending = evidence.pending[0]
+        resolved_records = tuple(
+            record
+            for record in evidence.reconciliations
+            if record.status is ReconciliationStatus.RESOLVED
+        )
+        if (
+            resolved_records != (original_request,)
+            or len(evidence.reconciliations) != 2
+            or pending.request_id == original_request.request_id
+            or pending.run_id != evidence.run.run_id
+            or pending.session_id != evidence.run.session_id
+            or pending.operation_id != checkpoint.operation_id
+            or pending.reason != "model_call_unknown_outcome"
+            or dict(pending.details)
+            != {"checkpoint_phase": RunCheckpointPhase.MODEL_IN_FLIGHT.value}
+        ):
+            return False
+        requested = tuple(
+            event
+            for event in evidence.run_events
+            if event.type == "reconciliation.requested"
+            and event.payload
+            == {
+                "request_id": pending.request_id,
+                "operation_id": pending.operation_id,
+                "reason": pending.reason,
+            }
+        )
+        current_operation = self._matching_in_flight_operation(evidence)
+        if (
+            len(requested) != 1
+            or requested[0] != evidence.run_events[-1]
+            or not isinstance(current_operation, ModelCallOperation)
+            or current_operation.status is not ExternalOperationStatus.STARTED
+            or not self._has_exact_model_operation_turns(
+                evidence,
+                through_turn=checkpoint.turn,
+                required=original_operation,
+            )
+        ):
+            return False
+        effective = self._effective_resolved_evidence(evidence, base_request)
+        if effective is None:
+            return False
+        retained_events = tuple(
+            event
+            for event in effective.run_events
+            if event.type
+            not in {"reconciliation.requested", "reconciliation.resolved"}
+        )
+        certified = replace(
+            effective,
+            reconciliations=(),
+            run_events=tuple(
+                event.model_copy(update={"sequence": index})
+                for index, event in enumerate(retained_events, start=1)
+            ),
+            run_event_cursors=tuple(range(1, len(retained_events) + 1)),
+        )
+        return self._is_resolution_operation_certified(
+            certified,
+            base_request,
+            current_operation,
+        )
+
     @staticmethod
     def _is_exact_confirmed_terminal_state(
         evidence: _RecoveryEvidence,
@@ -1797,10 +2001,39 @@ class RunRecoveryService:
         ):
             return False
         session_event = evidence.session_lifecycle_events[0]
-        expected_type = (
-            "session.closed"
-            if evidence.session.status is SessionStatus.CLOSED
-            else "session.run.detached"
+        if set(session_event.payload) != {"run_id", "status"}:
+            return False
+        try:
+            projected_status = SessionStatus(session_event.payload["status"])
+        except (TypeError, ValueError):
+            return False
+        event_matches_projection = (
+            session_event.type == "session.closed"
+            and projected_status is SessionStatus.CLOSED
+        ) or (
+            session_event.type == "session.run.detached"
+            and projected_status in {SessionStatus.ACTIVE, SessionStatus.CLOSING}
+        )
+        legal_current_statuses = {
+            SessionStatus.ACTIVE: {
+                SessionStatus.ACTIVE,
+                SessionStatus.CLOSING,
+                SessionStatus.CLOSED,
+            },
+            SessionStatus.CLOSING: {
+                SessionStatus.CLOSING,
+                SessionStatus.CLOSED,
+            },
+            SessionStatus.CLOSED: {SessionStatus.CLOSED},
+        }
+        exact_current = evidence.session.version == session_event.sequence
+        later_current = evidence.session.version > session_event.sequence
+        legal_session_successor = (
+            exact_current and evidence.session.status is projected_status
+        ) or (
+            later_current
+            and projected_status is not SessionStatus.CLOSED
+            and evidence.session.status in legal_current_statuses[projected_status]
         )
         return (
             type(evidence.session_lifecycle_event_cursors[0]) is int
@@ -1809,16 +2042,17 @@ class RunRecoveryService:
             and bool(session_event.event_id.strip())
             and type(session_event.schema_version) is int
             and session_event.schema_version == 1
-            and session_event.type == expected_type
+            and event_matches_projection
             and session_event.session_id == evidence.session.session_id
             and session_event.run_id is None
             and type(session_event.sequence) is int
-            and session_event.sequence == evidence.session.version
+            and session_event.sequence >= 1
+            and legal_session_successor
             and session_event.occurred_at == run_events[0].occurred_at
             and session_event.payload
             == {
                 "run_id": evidence.run.run_id,
-                "status": evidence.session.status.value,
+                "status": projected_status.value,
             }
         )
 
