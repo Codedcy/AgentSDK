@@ -22,11 +22,15 @@ from agent_sdk.runtime.reconciliation import (
     ReconciliationResolution,
     ReconciliationStatus,
     RecoveryStateConflictError,
+    RunCheckpoint,
+    RunCheckpointPhase,
 )
 from agent_sdk.storage import base as storage_base
 from agent_sdk.storage.base import (
     CommitBatch,
+    EventPrecondition,
     ExternalOperationWrite,
+    RunCheckpointWrite,
     RunProgressBatch,
     SnapshotPrecondition,
     SnapshotWrite,
@@ -902,4 +906,287 @@ async def test_reconciliation_target_rejects_illegal_replay_shapes_and_int64(
         await progress_store.commit_run_progress(batch)
 
     assert await progress_store.latest_cursor() == 0
+    assert await progress_store.get_reconciliation_request(request.request_id) == request
+
+
+async def _seed_retry_resolution_batch(
+    store: Any,
+) -> tuple[
+    RunProgressBatch,
+    ReconciliationRequest,
+    ReconciliationRequest,
+    ModelCallOperation,
+    RunCheckpoint,
+]:
+    run, first_lease = await _seed(store)
+    operation = _operation(run, first_lease)
+    checkpoint = RunCheckpoint(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        checkpoint_version=1,
+        turn=operation.turn,
+        phase=RunCheckpointPhase.MODEL_IN_FLIGHT,
+        operation_id=operation.operation_id,
+        messages=({"role": "user", "content": "hello"},),
+    )
+    request = _request(
+        operation_id=operation.operation_id,
+        reason="model_call_unknown_outcome",
+        details={"checkpoint_phase": "model_in_flight"},
+    )
+    waiting = run.model_copy(
+        update={"status": RunStatus.WAITING_RECONCILIATION, "version": 3}
+    )
+    requested = EventEnvelope(
+        event_id="evt_reconciliation_requested",
+        type="reconciliation.requested",
+        session_id=run.session_id,
+        run_id=run.run_id,
+        sequence=1,
+        payload={
+            "request_id": request.request_id,
+            "operation_id": request.operation_id,
+            "reason": request.reason,
+        },
+        occurred_at=NOW,
+    )
+    await store.commit_run_progress(
+        RunProgressBatch(
+            lease=first_lease,
+            now=NOW,
+            events=(requested,),
+            snapshots=(_run_write(waiting),),
+            preconditions=(
+                SnapshotPrecondition(
+                    "run",
+                    run.run_id,
+                    run.version,
+                    run.session_id,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+            operation=ExternalOperationWrite(None, operation),
+            checkpoint=RunCheckpointWrite(None, checkpoint),
+            reconciliation=storage_base.ReconciliationRequestWrite(None, request),
+        )
+    )
+    await store.release_lease(first_lease)
+    now = NOW + timedelta(seconds=1)
+    lease = await store.acquire_lease(
+        run_id=run.run_id,
+        owner="resolution-owner",
+        now=now,
+        expires_at=now + timedelta(seconds=30),
+    )
+    resolution = ReconciliationResolution(
+        action=ReconciliationAction.CONFIRM_NOT_EXECUTED,
+        actor={"type": "operator", "id": "user_1"},
+        evidence={"disposition": "not_executed"},
+        decided_at=now,
+        event_id="evt_reconciliation_resolved_safe",
+    )
+    resolved = request.model_copy(
+        update={
+            "status": ReconciliationStatus.RESOLVED,
+            "resolution": resolution,
+        }
+    )
+    terminalized = operation.model_copy(
+        update={
+            "status": ExternalOperationStatus.FAILED,
+            "outcome": {
+                "reconciliation": {
+                    "request_id": request.request_id,
+                    "action": resolution.action.value,
+                }
+            },
+        }
+    )
+    safe_checkpoint = checkpoint.model_copy(
+        update={
+            "checkpoint_version": checkpoint.checkpoint_version + 1,
+            "phase": RunCheckpointPhase.READY_FOR_MODEL,
+            "operation_id": None,
+        }
+    )
+    interrupted = waiting.model_copy(
+        update={"status": RunStatus.INTERRUPTED, "version": 4}
+    )
+    event = EventEnvelope(
+        event_id=resolution.event_id,
+        type="reconciliation.resolved",
+        session_id=run.session_id,
+        run_id=run.run_id,
+        sequence=2,
+        payload={
+            "request_id": request.request_id,
+            "operation_id": request.operation_id,
+            "action": resolution.action.value,
+            "actor": {"type": "operator", "id": "user_1"},
+            "evidence": {"disposition": "not_executed"},
+        },
+        occurred_at=now,
+    )
+    return (
+        RunProgressBatch(
+            lease=lease,
+            now=now,
+            events=(event,),
+            snapshots=(_run_write(interrupted),),
+            preconditions=(
+                SnapshotPrecondition(
+                    "session",
+                    run.session_id,
+                    1,
+                    run.session_id,
+                ),
+                SnapshotPrecondition(
+                    "run",
+                    waiting.run_id,
+                    waiting.version,
+                    waiting.session_id,
+                    waiting.model_dump(mode="json"),
+                ),
+            ),
+            event_preconditions=(
+                EventPrecondition(
+                    requested.event_id,
+                    1,
+                    requested.session_id,
+                    requested.run_id,
+                    requested.type,
+                    requested.sequence,
+                ),
+            ),
+            operation=ExternalOperationWrite(operation, terminalized),
+            checkpoint=RunCheckpointWrite(checkpoint, safe_checkpoint),
+            reconciliation=storage_base.ReconciliationRequestWrite(
+                request,
+                resolved,
+            ),
+        ),
+        request,
+        resolved,
+        terminalized,
+        safe_checkpoint,
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_resolution_batch_terminalizes_old_generation_atomically(
+    progress_store: Any,
+) -> None:
+    batch, request, resolved, operation, checkpoint = (
+        await _seed_retry_resolution_batch(progress_store)
+    )
+
+    applied = await progress_store.commit_run_progress(batch)
+    await progress_store.release_lease(batch.lease)
+    replay = await progress_store.commit_run_progress(batch)
+
+    assert applied == storage_base.CommitResult(last_cursor=2, applied=True)
+    assert replay == storage_base.CommitResult(last_cursor=2, applied=False)
+    assert await progress_store.get_reconciliation_request(request.request_id) == resolved
+    assert await progress_store.get_external_operation(operation.operation_id) == operation
+    assert await progress_store.get_run_checkpoint(operation.run_id) == checkpoint
+
+
+@pytest.mark.asyncio
+async def test_retry_resolution_exact_replay_requires_paired_requested_event(
+    progress_store: Any,
+) -> None:
+    batch, request, resolved, operation, checkpoint = (
+        await _seed_retry_resolution_batch(progress_store)
+    )
+    await progress_store.commit_run_progress(batch)
+    await progress_store.release_lease(batch.lease)
+    requested = batch.event_preconditions[0]
+    unpaired = batch._replace(
+        event_preconditions=(
+            EventPrecondition(
+                "evt_unpaired_requested",
+                requested.cursor,
+                requested.session_id,
+                requested.run_id,
+                requested.type,
+                requested.sequence,
+            ),
+        )
+    )
+
+    with pytest.raises(RecoveryStateConflictError):
+        await progress_store.commit_run_progress(unpaired)
+
+    assert await progress_store.latest_cursor() == 2
+    assert await progress_store.get_reconciliation_request(request.request_id) == resolved
+    assert await progress_store.get_external_operation(operation.operation_id) == operation
+    assert await progress_store.get_run_checkpoint(operation.run_id) == checkpoint
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("operation_outcome", "checkpoint_payload", "unsupported_action", "run_status"),
+)
+@pytest.mark.asyncio
+async def test_retry_resolution_batch_rejects_mixed_or_unsupported_targets(
+    progress_store: Any,
+    corruption: str,
+) -> None:
+    batch, request, _resolved, _operation, _checkpoint = (
+        await _seed_retry_resolution_batch(progress_store)
+    )
+    if corruption == "operation_outcome":
+        assert batch.operation is not None
+        changed = batch.operation.updated.model_copy(
+            update={"outcome": {"reconciliation": {"request_id": "rec_other"}}}
+        )
+        batch = batch._replace(operation=ExternalOperationWrite(batch.operation.expected, changed))
+    elif corruption == "checkpoint_payload":
+        assert batch.checkpoint is not None
+        changed = batch.checkpoint.updated.model_copy(
+            update={"messages": ({"role": "user", "content": "changed"},)}
+        )
+        batch = batch._replace(
+            checkpoint=RunCheckpointWrite(batch.checkpoint.expected, changed)
+        )
+    elif corruption == "unsupported_action":
+        assert batch.reconciliation is not None
+        resolution = batch.reconciliation.updated.resolution
+        assert resolution is not None
+        changed_resolution = resolution.model_copy(
+            update={
+                "action": ReconciliationAction.TERMINATE,
+                "evidence": {"reason": "stop"},
+            }
+        )
+        changed_request = batch.reconciliation.updated.model_copy(
+            update={"resolution": changed_resolution}
+        )
+        changed_event = batch.events[0].model_copy(
+            update={
+                "payload": {
+                    **batch.events[0].payload,
+                    "action": "terminate",
+                    "evidence": {"reason": "stop"},
+                }
+            }
+        )
+        batch = batch._replace(
+            events=(changed_event,),
+            reconciliation=storage_base.ReconciliationRequestWrite(
+                batch.reconciliation.expected,
+                changed_request,
+            ),
+        )
+    else:
+        run = RunSnapshot.model_validate(batch.snapshots[0].data)
+        changed = run.model_copy(
+            update={"status": RunStatus.WAITING_RECONCILIATION}
+        )
+        batch = batch._replace(snapshots=(_run_write(changed),))
+
+    with pytest.raises(RecoveryStateConflictError):
+        await progress_store.commit_run_progress(batch)
+
+    assert await progress_store.latest_cursor() == 1
     assert await progress_store.get_reconciliation_request(request.request_id) == request

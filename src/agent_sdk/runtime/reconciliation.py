@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import wraps
-from typing import Any, Literal, ParamSpec, Self, TypeAlias, TypeVar
+from typing import Any, Literal, ParamSpec, Protocol, Self, TypeAlias, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -344,6 +344,42 @@ class ReconciliationRequest(_RecoveryModel):
         elif self.resolution is None:
             raise ValueError("resolved reconciliation requires a resolution")
         return self
+
+
+class _ReconciliationResolver(Protocol):
+    async def resolve(
+        self,
+        request_id: str,
+        action: ReconciliationAction,
+        *,
+        actor: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> ReconciliationRequest: ...
+
+
+class ReconciliationService:
+    """Apply explicit operator decisions to durable reconciliation requests."""
+
+    def __init__(self, resolver: _ReconciliationResolver) -> None:
+        self._resolver = resolver
+
+    async def resolve(
+        self,
+        request_id: str,
+        action: ReconciliationAction,
+        *,
+        actor: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> ReconciliationRequest:
+        try:
+            return await self._resolver.resolve(
+                request_id,
+                action,
+                actor=actor,
+                evidence=evidence,
+            )
+        finally:
+            del request_id, action, actor, evidence
 
 
 def _canonical_record_json(record: _RecoveryModel) -> str:

@@ -78,6 +78,12 @@ from agent_sdk.runtime.provider_recovery import (
     ProviderRecoveryRequest,
     ProviderRecoveryResult,
 )
+from agent_sdk.runtime.reconciliation import (
+    ReconciliationAction,
+    ReconciliationRequest,
+    ReconciliationResolution,
+    ReconciliationService,
+)
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
 from agent_sdk.subagents import ChildResult, ChildUsage, SubagentService, TaskEnvelope
 from agent_sdk.tools import (
@@ -167,6 +173,10 @@ __all__ = [
     "QueryAPI",
     "QueryService",
     "RecoveryAPI",
+    "ReconciliationAction",
+    "ReconciliationRequest",
+    "ReconciliationResolution",
+    "ReconciliationService",
     "SessionAPI",
     "SessionBusyError",
     "SessionSnapshot",

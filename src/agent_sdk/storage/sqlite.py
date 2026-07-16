@@ -25,6 +25,7 @@ from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
     ModelCallOperation,
+    ReconciliationAction,
     ReconciliationRequest,
     ReconciliationStatus,
     RecoveryStateConflictError,
@@ -566,6 +567,89 @@ def _valid_reconciliation_resolution(
     return event.payload == expected_payload
 
 
+def _valid_retry_resolution_batch(batch: RunProgressBatch) -> bool:
+    operation_write = batch.operation
+    checkpoint_write = batch.checkpoint
+    request_write = batch.reconciliation
+    if (
+        operation_write is None
+        or operation_write.expected is None
+        or checkpoint_write is None
+        or checkpoint_write.expected is None
+        or request_write is None
+        or request_write.expected is None
+        or len(batch.events) != 1
+        or len(batch.snapshots) != 1
+        or len(batch.event_preconditions) != 1
+        or batch.checkpoint_precondition is not None
+    ):
+        return False
+    operation = operation_write.expected
+    terminalized = operation_write.updated
+    checkpoint = checkpoint_write.expected
+    safe_checkpoint = checkpoint_write.updated
+    request = request_write.expected
+    resolved = request_write.updated
+    resolution = resolved.resolution
+    event = batch.events[0]
+    run_write = batch.snapshots[0]
+    if resolution is None:
+        return False
+    expected_evidence: dict[str, object]
+    if resolution.action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
+        expected_evidence = {"disposition": "not_executed"}
+    elif resolution.action is ReconciliationAction.RETRY:
+        expected_evidence = {"acknowledge_duplicate_side_effect_risk": True}
+    else:
+        return False
+    expected_phase = (
+        RunCheckpointPhase.READY_FOR_MODEL
+        if isinstance(operation, ModelCallOperation)
+        else RunCheckpointPhase.READY_FOR_TOOL
+    )
+    try:
+        target_run = RunSnapshot.model_validate(run_write.data)
+    except ValueError:
+        return False
+    return (
+        operation.status is ExternalOperationStatus.STARTED
+        and terminalized.status is ExternalOperationStatus.FAILED
+        and terminalized.lease_generation == operation.lease_generation
+        and terminalized.model_dump(mode="json")["outcome"]
+        == {
+            "reconciliation": {
+                "request_id": request.request_id,
+                "action": resolution.action.value,
+            }
+        }
+        and request.operation_id == operation.operation_id
+        and checkpoint.operation_id == operation.operation_id
+        and checkpoint.turn == operation.turn
+        and checkpoint.phase
+        is (
+            RunCheckpointPhase.MODEL_IN_FLIGHT
+            if isinstance(operation, ModelCallOperation)
+            else RunCheckpointPhase.TOOL_IN_FLIGHT
+        )
+        and safe_checkpoint
+        == checkpoint.model_copy(
+            update={
+                "checkpoint_version": checkpoint.checkpoint_version + 1,
+                "phase": expected_phase,
+                "operation_id": None,
+            }
+        )
+        and dict(resolution.evidence) == expected_evidence
+        and _valid_reconciliation_resolution(request, resolved, event)
+        and run_write.kind == "run"
+        and target_run.run_id == operation.run_id
+        and target_run.session_id == operation.session_id
+        and target_run.status is RunStatus.INTERRUPTED
+        and event.sequence == batch.event_preconditions[0].sequence + 1
+        and batch.event_preconditions[0].type == "reconciliation.requested"
+    )
+
+
 class _StoredLease(NamedTuple):
     lease: Lease
     released: bool
@@ -711,10 +795,20 @@ class SQLiteStore:
                     exact_targets and exact_targets != len(target_states)
                 ):
                     raise RecoveryStateConflictError
+                retry_resolution = _valid_retry_resolution_batch(batch)
+                if retry_resolution:
+                    await self._check_retry_resolution_requested_event(batch)
                 if exact_targets == len(target_states):
                     cursor = await self._last_cursor()
                     await self._rollback()
                     return CommitResult(last_cursor=cursor, applied=False)
+                if retry_resolution:
+                    target_run = RunSnapshot.model_validate(batch.snapshots[0].data)
+                    if (
+                        run.status is not RunStatus.WAITING_RECONCILIATION
+                        or target_run.version != run.version + 1
+                    ):
+                        raise RecoveryStateConflictError
 
                 await self._check_recovery_lease(
                     batch.lease,
@@ -781,6 +875,7 @@ class SQLiteStore:
     def _validate_run_progress_scope(
         batch: RunProgressBatch, run: RunSnapshot
     ) -> None:
+        retry_resolution = _valid_retry_resolution_batch(batch)
         for event in batch.events:
             if event.session_id != run.session_id or event.run_id not in {
                 None,
@@ -815,7 +910,10 @@ class SQLiteStore:
             if (
                 operation.run_id != run.run_id
                 or operation.session_id != run.session_id
-                or operation.lease_generation != batch.lease.generation
+                or (
+                    operation.lease_generation != batch.lease.generation
+                    and not retry_resolution
+                )
             ):
                 raise RecoveryStateConflictError
         if batch.checkpoint is not None:
@@ -839,7 +937,6 @@ class SQLiteStore:
                 or request.session_id != run.session_id
             ):
                 raise RecoveryStateConflictError
-
     @staticmethod
     def _validate_run_progress_write_shapes(batch: RunProgressBatch) -> None:
         if batch.operation is not None:
@@ -1035,6 +1132,29 @@ class SQLiteStore:
         except (EventPreconditionNotFoundError, EventPreconditionConflictError,
                 SnapshotPreconditionError):
             raise RecoveryStateConflictError from None
+
+    async def _check_retry_resolution_requested_event(
+        self,
+        batch: RunProgressBatch,
+    ) -> None:
+        try:
+            await self._check_event_preconditions(
+                CommitBatch(events=(), event_preconditions=batch.event_preconditions)
+            )
+        except (EventPreconditionNotFoundError, EventPreconditionConflictError):
+            raise RecoveryStateConflictError from None
+        requested_precondition = batch.event_preconditions[0]
+        requested = await self._read_event_by_id(requested_precondition.event_id)
+        resolution_write = batch.reconciliation
+        assert resolution_write is not None
+        expected_request = resolution_write.expected
+        assert expected_request is not None
+        if requested is None or requested.payload != {
+            "request_id": expected_request.request_id,
+            "operation_id": expected_request.operation_id,
+            "reason": expected_request.reason,
+        }:
+            raise RecoveryStateConflictError
 
     async def _check_run_progress_event_targets(
         self, batch: RunProgressBatch

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
@@ -63,7 +63,9 @@ from agent_sdk.runtime.recovery import (
 )
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
+    ReconciliationAction,
     ReconciliationRequest,
+    ReconciliationService,
     RunCheckpoint,
     _context_free_recovery_errors,
 )
@@ -680,6 +682,7 @@ class RecoveryAPI:
             _wait_stopping=lifecycle.close_signal.wait,
             _adapter_timeout=provider_recovery_timeout_seconds,
         )
+        self._reconciliation = ReconciliationService(self._service)
         self._workflows._set_run_recovery(self._recover_run_handle)
 
     def register_adapter(
@@ -727,6 +730,27 @@ class RecoveryAPI:
                 workflow_run_id,
                 self._recover_run_handle,
             )
+
+    async def resolve(
+        self,
+        request_id: str,
+        action: ReconciliationAction,
+        *,
+        actor: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> ReconciliationRequest:
+        try:
+            async with self._lifecycle.admit():
+                startup, _created = await self._ensure_startup_scan()
+                await asyncio.shield(startup)
+                return await self._reconciliation.resolve(
+                    request_id,
+                    action,
+                    actor=actor,
+                    evidence=evidence,
+                )
+        finally:
+            del request_id, action, actor, evidence
 
     async def _recover_run_handle(self, run_id: str) -> RunHandle:
         async with self._start_lock:
