@@ -7,7 +7,7 @@ import subprocess
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ from agent_sdk.workflow import WorkflowNodeStatus, WorkflowRunStatus
 
 _HARD_EXIT = 86
 _CHILD_TIMEOUT_SECONDS = 15
+_SCANNER_AFTER_LEASE_DELTA = timedelta(microseconds=1)
 _AGENT = AgentSpec(name="fault-agent", revision="1", model="fault/provider")
 _WORKFLOW = {
     "api_version": "agent-sdk/v1",
@@ -283,6 +284,8 @@ async def _child_main(
         if scenario == "tool_workflow_unknown":
             _append_record(effect_path, effect="application:side_effect")
             os._exit(_HARD_EXIT)
+        if scenario in {"safe_tool", "safe_tool_workflow"}:
+            _append_record(effect_path, effect="application:safe_side_effect")
         return {"value": value + 1}
 
     if scenario == "mcp_unknown":
@@ -352,10 +355,21 @@ def _launch_child(
     return database_path, effect_path, merged, completed
 
 
-def _advance_scanner(sdk: AgentSDK) -> None:
-    sdk._recovery_scanner._clock = (  # type: ignore[attr-defined]
-        lambda: datetime.now(UTC) + timedelta(hours=1)
-    )
+async def _advance_scanner(
+    sdk: AgentSDK,
+    database_path: Path,
+    run_id: str,
+) -> datetime:
+    lease_reader = await SQLiteStore.open(database_path)
+    try:
+        durable_lease = await lease_reader.get_run_lease(run_id)
+        assert durable_lease is not None
+    finally:
+        await lease_reader.close()
+    await sdk.recovery.scan()
+    scan_at = durable_lease.expires_at + _SCANNER_AFTER_LEASE_DELTA
+    sdk._recovery_scanner._clock = lambda: scan_at  # type: ignore[attr-defined]
+    return scan_at
 
 
 async def _final_completion(effect_path: Path, label: str) -> Any:
@@ -451,7 +465,8 @@ async def test_provider_accept_hard_exit_requires_explicit_decision_without_repl
         raise AssertionError(f"Provider-only recovery invoked Tool with {value}")
 
     sdk.tools.register(_tool(), unused_tool)
-    _advance_scanner(sdk)
+    scan_at = await _advance_scanner(sdk, database_path, run_id)
+    assert sdk._recovery_scanner._clock() == scan_at  # type: ignore[attr-defined]
     try:
         await sdk.recovery.scan()
         assert (await sdk.runs.get(run_id)).status is RunStatus.INTERRUPTED
@@ -509,7 +524,7 @@ async def test_tool_side_effect_hard_exit_projects_workflow_without_replay(
     )
     sdk.agents.define(_AGENT)
     sdk.tools.register(_tool(), duplicate_tool)
-    _advance_scanner(sdk)
+    await _advance_scanner(sdk, database_path, run_id)
     try:
         await sdk.recovery.scan()
         waiting = await sdk.recovery.recover_run(run_id)
@@ -564,7 +579,6 @@ async def test_mcp_side_effect_hard_exit_waits_for_explicit_retry(
         permission_default="allow",
     )
     sdk.agents.define(_AGENT)
-    _advance_scanner(sdk)
     mcp_session = _FaultMCPSession(
         effects,
         "mcp_session:explicit_retry",
@@ -572,6 +586,7 @@ async def test_mcp_side_effect_hard_exit_waits_for_explicit_retry(
     )
     mcp_manager = MCPManager._for_test(sdk.tools, mcp_session.connector)
     await mcp_manager.connect(_mcp_config())
+    await _advance_scanner(sdk, database_path, run_id)
     try:
         await sdk.recovery.scan()
         waiting = await sdk.recovery.recover_run(run_id)
@@ -630,7 +645,7 @@ async def test_safe_tool_commit_hard_exit_resumes_without_repeating_tool(
     )
     sdk.agents.define(_AGENT)
     sdk.tools.register(_tool(), duplicate_tool)
-    _advance_scanner(sdk)
+    await _advance_scanner(sdk, database_path, run_id)
     try:
         await sdk.recovery.scan()
         assert (await sdk.runs.get(run_id)).status is RunStatus.INTERRUPTED
@@ -639,9 +654,13 @@ async def test_safe_tool_commit_hard_exit_resumes_without_repeating_tool(
         assert result.output_text == "recovered"
         assert tool_calls == 0
         assert _record_values(effects, "effect") == [
+            "application:safe_side_effect",
             "safe_tool_outcome_committed",
             "safe_resume_model",
         ]
+        assert _record_values(effects, "effect").count(
+            "application:safe_side_effect"
+        ) == 1
     finally:
         await sdk.close()
 
@@ -654,6 +673,7 @@ async def test_safe_tool_commit_hard_exit_completes_workflow_projection(
         tmp_path,
         "safe_tool_workflow",
     )
+    run_id = str(control["run_id"])
     workflow_run_id = str(control["workflow_run_id"])
     tool_calls = 0
 
@@ -669,7 +689,7 @@ async def test_safe_tool_commit_hard_exit_completes_workflow_projection(
     )
     sdk.agents.define(_AGENT)
     sdk.tools.register(_tool(), duplicate_tool)
-    _advance_scanner(sdk)
+    await _advance_scanner(sdk, database_path, run_id)
     try:
         await sdk.recovery.scan()
         result = await (
@@ -680,9 +700,13 @@ async def test_safe_tool_commit_hard_exit_completes_workflow_projection(
         assert result.output_text == "recovered"
         assert tool_calls == 0
         assert _record_values(effects, "effect") == [
+            "application:safe_side_effect",
             "safe_tool_outcome_committed",
             "safe_workflow_model",
         ]
+        assert _record_values(effects, "effect").count(
+            "application:safe_side_effect"
+        ) == 1
     finally:
         await sdk.close()
 
