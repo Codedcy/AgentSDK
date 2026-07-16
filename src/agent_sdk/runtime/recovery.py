@@ -22,6 +22,7 @@ from agent_sdk.runtime._recovery_observability import hashed_identity
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import (
     RunEngine,
+    _add_usage,
     _model_request_fingerprint,
     _tool_request_fingerprint,
 )
@@ -37,6 +38,7 @@ from agent_sdk.runtime.leases import (
     LeaseManager,
 )
 from agent_sdk.runtime.models import (
+    RunFailure,
     RunResult,
     RunSnapshot,
     RunStatus,
@@ -66,8 +68,10 @@ from agent_sdk.runtime.reconciliation import (
     ToolCallOperation,
 )
 from agent_sdk.runtime.session_lifecycle import (
+    detach_run_transition,
     exact_run_precondition,
     exact_session_precondition,
+    session_write,
 )
 from agent_sdk.storage.base import (
     CommitResult,
@@ -93,10 +97,12 @@ _CERTIFIED_RUN_EVENT_TYPES = frozenset(
         "run.interrupted",
         "step.started",
         "step.completed",
+        "step.failed",
         "model.call.started",
         "model.text.delta",
         "model.usage.reported",
         "model.call.completed",
+        "model.call.failed",
         "tool.call.proposed",
         "permission.requested",
         "permission.resolved",
@@ -108,6 +114,8 @@ _CERTIFIED_RUN_EVENT_TYPES = frozenset(
         "tool.recovery.retry.started",
         "reconciliation.requested",
         "reconciliation.resolved",
+        "run.completed",
+        "run.failed",
     }
 )
 
@@ -459,21 +467,50 @@ class RunRecoveryService:
                 "reconciliation decision is invalid",
                 retryable=False,
             ) from None
-        if action in {
-            ReconciliationAction.CONFIRM_COMPLETED,
-            ReconciliationAction.TERMINATE,
-        }:
+        if action is ReconciliationAction.TERMINATE:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
                 "reconciliation action is not supported",
                 retryable=False,
             ) from None
         expected_evidence: dict[str, object]
+        provider_result: ProviderRecoveryResult | None = None
         if action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
             expected_evidence = {"disposition": "not_executed"}
-        else:
-            assert action is ReconciliationAction.RETRY
+        elif action is ReconciliationAction.RETRY:
             expected_evidence = {"acknowledge_duplicate_side_effect_risk": True}
+        else:
+            assert action is ReconciliationAction.CONFIRM_COMPLETED
+            try:
+                if not isinstance(evidence, Mapping) or set(evidence) != {
+                    "provider_result"
+                }:
+                    raise ValueError
+                raw_result = evidence["provider_result"]
+                if not isinstance(raw_result, Mapping):
+                    raise ValueError
+                encoded_result = json.dumps(
+                    dict(raw_result),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                provider_result = ProviderRecoveryResult.model_validate_json(
+                    encoded_result
+                )
+                if provider_result.disposition not in {
+                    ProviderRecoveryDisposition.COMPLETED,
+                    ProviderRecoveryDisposition.FAILED,
+                }:
+                    raise ValueError
+            except Exception:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "reconciliation decision is invalid",
+                    retryable=False,
+                ) from None
+            expected_evidence = dict(evidence)
         if (
             not isinstance(actor, Mapping)
             or not actor
@@ -558,14 +595,21 @@ class RunRecoveryService:
                 if event.type == "reconciliation.requested"
                 and event.payload.get("request_id") == current.request_id
             )
+            confirm_model = action is ReconciliationAction.CONFIRM_COMPLETED
+            terminalization_gap = (
+                confirm_model
+                and current.reason == "model_call_completed_terminalization_unknown"
+            )
             if (
                 base_request is None
                 or checkpoint is None
                 or operation is None
                 or not self._is_valid_run_event_envelope(recovery_evidence)
-                or operation.status is not ExternalOperationStatus.STARTED
-                or checkpoint.operation_id != operation.operation_id
-                or checkpoint.turn != operation.turn
+                or (confirm_model and not isinstance(operation, ModelCallOperation))
+            ):
+                raise RecoveryStateConflictError
+            if (
+                checkpoint.turn != operation.turn
                 or current.operation_id != operation.operation_id
                 or len(requested) != 1
                 or requested[0][1] != recovery_evidence.run_events[-1]
@@ -575,6 +619,29 @@ class RunRecoveryService:
                     "operation_id": current.operation_id,
                     "reason": current.reason,
                 }
+            ):
+                raise RecoveryStateConflictError
+            if terminalization_gap:
+                pre_request_evidence = replace(
+                    recovery_evidence,
+                    pending=(),
+                    run_events=recovery_evidence.run_events[:-1],
+                    run_event_cursors=recovery_evidence.run_event_cursors[:-1],
+                )
+                if (
+                    self._completed_model_terminalization_gap(pre_request_evidence)
+                    != operation
+                    or checkpoint.operation_id is not None
+                    or dict(current.details)
+                    != {
+                        "checkpoint_phase": RunCheckpointPhase.READY_FOR_MODEL.value,
+                        "operation_status": ExternalOperationStatus.COMPLETED.value,
+                    }
+                ):
+                    raise RecoveryStateConflictError
+            elif (
+                operation.status is not ExternalOperationStatus.STARTED
+                or checkpoint.operation_id != operation.operation_id
                 or current.reason
                 != (
                     "model_call_unknown_outcome"
@@ -585,33 +652,34 @@ class RunRecoveryService:
                 != {"checkpoint_phase": checkpoint.phase.value}
             ):
                 raise RecoveryStateConflictError
-            effective_evidence = self._effective_resolved_evidence(
-                recovery_evidence,
-                base_request,
-            )
-            if effective_evidence is None:
-                raise RecoveryStateConflictError
-            certified_events = tuple(
-                (cursor, event)
-                for cursor, event in zip(
-                    effective_evidence.run_event_cursors,
-                    effective_evidence.run_events,
+            if not terminalization_gap:
+                effective_evidence = self._effective_resolved_evidence(
+                    recovery_evidence,
+                    base_request,
                 )
-                if event.type
-                not in {"reconciliation.requested", "reconciliation.resolved"}
-            )
-            certified = replace(
-                effective_evidence,
-                pending=(),
-                run_events=tuple(event for _, event in certified_events),
-                run_event_cursors=tuple(cursor for cursor, _ in certified_events),
-            )
-            if not self._is_resolution_operation_certified(
-                certified,
-                base_request,
-                operation,
-            ):
-                raise RecoveryStateConflictError
+                if effective_evidence is None:
+                    raise RecoveryStateConflictError
+                certified_events = tuple(
+                    (cursor, event)
+                    for cursor, event in zip(
+                        effective_evidence.run_event_cursors,
+                        effective_evidence.run_events,
+                    )
+                    if event.type
+                    not in {"reconciliation.requested", "reconciliation.resolved"}
+                )
+                certified = replace(
+                    effective_evidence,
+                    pending=(),
+                    run_events=tuple(event for _, event in certified_events),
+                    run_event_cursors=tuple(cursor for cursor, _ in certified_events),
+                )
+                if not self._is_resolution_operation_certified(
+                    certified,
+                    base_request,
+                    operation,
+                ):
+                    raise RecoveryStateConflictError
 
             now = self._clock()
             resolution = ReconciliationResolution(
@@ -627,6 +695,33 @@ class RunRecoveryService:
                     "resolution": resolution,
                 }
             )
+            if confirm_model:
+                assert provider_result is not None
+                assert isinstance(operation, ModelCallOperation)
+                batch_builder = (
+                    self._confirmed_model_terminalization_batch
+                    if terminalization_gap
+                    else self._confirmed_model_resolution_batch
+                )
+                batch = batch_builder(
+                    lease=lease,
+                    now=now,
+                    run=run,
+                    session=recovery_evidence.session,
+                    checkpoint=checkpoint,
+                    operation=operation,
+                    request=current,
+                    resolved=resolved,
+                    resolution=resolution,
+                    requested_cursor=requested[0][0],
+                    requested_event=requested[0][1],
+                    result=provider_result,
+                )
+                await _commit_progress(self._store, batch)
+                return ReconciliationRequest.model_validate_json(
+                    resolved.model_dump_json()
+                )
+
             terminalized = operation.model_copy(
                 update={
                     "status": ExternalOperationStatus.FAILED,
@@ -723,6 +818,416 @@ class RunRecoveryService:
                 if active_error is None and cancellation is not None:
                     raise cancellation from None
 
+    @staticmethod
+    def _confirmed_model_terminalization_batch(
+        *,
+        lease: Lease,
+        now: datetime,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ModelCallOperation,
+        request: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        resolution: ReconciliationResolution,
+        requested_cursor: int,
+        requested_event: EventEnvelope,
+        result: ProviderRecoveryResult,
+    ) -> RunProgressBatch:
+        if (
+            result.disposition is not ProviderRecoveryDisposition.COMPLETED
+            or result.text is None
+            or result.usage is None
+            or result.tool_call is not None
+            or operation.outcome is None
+            or operation.model_dump(mode="json")["outcome"]
+            != {
+                "finish_reason": result.finish_reason,
+                "text": result.text,
+                "tool_calls": [],
+                "usage": result.usage.model_dump(mode="json"),
+            }
+        ):
+            raise RecoveryStateConflictError
+        terminal_checkpoint = checkpoint.model_copy(
+            update={
+                "checkpoint_version": checkpoint.checkpoint_version + 1,
+                "phase": RunCheckpointPhase.TERMINAL,
+            }
+        )
+        output_text = "".join(checkpoint.output_parts)
+        completed_run = run.model_copy(
+            update={
+                "status": RunStatus.COMPLETED,
+                "version": run.version + 1,
+                "output_text": output_text,
+                "usage": checkpoint.usage,
+                "tool_results": checkpoint.tool_results,
+            }
+        )
+        resolved_event = EventEnvelope(
+            event_id=resolution.event_id,
+            type="reconciliation.resolved",
+            session_id=run.session_id,
+            run_id=run.run_id,
+            sequence=requested_event.sequence + 1,
+            payload={
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "action": resolution.action.value,
+                "actor": thaw_json(resolution.actor),
+                "evidence": thaw_json(resolution.evidence),
+            },
+            occurred_at=now,
+        )
+        terminal_payload: dict[str, Any] = {
+            "output_text": output_text,
+            "usage": checkpoint.usage.model_dump(mode="json"),
+        }
+        if checkpoint.tool_results:
+            terminal_payload["tool_results"] = [
+                item.model_dump(mode="json") for item in checkpoint.tool_results
+            ]
+        run_event = EventEnvelope(
+            event_id=new_id("evt"),
+            type="run.completed",
+            session_id=run.session_id,
+            run_id=run.run_id,
+            sequence=requested_event.sequence + 2,
+            payload=terminal_payload,
+            occurred_at=now,
+        )
+        updated_session, session_event_type = detach_run_transition(session, run.run_id)
+        session_event = EventEnvelope(
+            event_id=new_id("evt"),
+            type=session_event_type,
+            session_id=session.session_id,
+            run_id=None,
+            sequence=updated_session.version,
+            payload={
+                "run_id": run.run_id,
+                "status": updated_session.status.value,
+            },
+            occurred_at=now,
+        )
+        return RunProgressBatch(
+            lease=lease,
+            now=now,
+            events=(resolved_event, run_event, session_event),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    completed_run.run_id,
+                    completed_run.session_id,
+                    completed_run.version,
+                    completed_run.model_dump(mode="json"),
+                ),
+                session_write(updated_session),
+            ),
+            preconditions=(
+                exact_session_precondition(session),
+                exact_run_precondition(run),
+            ),
+            event_preconditions=(
+                EventPrecondition(
+                    requested_event.event_id,
+                    requested_cursor,
+                    requested_event.session_id,
+                    requested_event.run_id,
+                    requested_event.type,
+                    requested_event.sequence,
+                ),
+            ),
+            checkpoint=RunCheckpointWrite(checkpoint, terminal_checkpoint),
+            reconciliation=ReconciliationRequestWrite(request, resolved),
+            operation_precondition=operation,
+        )
+
+    @staticmethod
+    def _confirmed_model_resolution_batch(
+        *,
+        lease: Lease,
+        now: datetime,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ModelCallOperation,
+        request: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        resolution: ReconciliationResolution,
+        requested_cursor: int,
+        requested_event: EventEnvelope,
+        result: ProviderRecoveryResult,
+    ) -> RunProgressBatch:
+        sequence = requested_event.sequence + 1
+
+        def run_event(event_type: str, payload: dict[str, Any]) -> EventEnvelope:
+            nonlocal sequence
+            event = EventEnvelope(
+                event_id=(resolution.event_id if sequence == requested_event.sequence + 1 else new_id("evt")),
+                type=event_type,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                sequence=sequence,
+                payload=payload,
+                occurred_at=now,
+            )
+            sequence += 1
+            return event
+
+        events: list[EventEnvelope] = [
+            run_event(
+                "reconciliation.resolved",
+                {
+                    "request_id": request.request_id,
+                    "operation_id": request.operation_id,
+                    "action": resolution.action.value,
+                    "actor": thaw_json(resolution.actor),
+                    "evidence": thaw_json(resolution.evidence),
+                },
+            )
+        ]
+        snapshots: list[SnapshotWrite]
+        if result.disposition is ProviderRecoveryDisposition.COMPLETED:
+            assert result.text is not None
+            assert result.usage is not None
+            calls = () if result.tool_call is None else (result.tool_call,)
+            operation_outcome = {
+                "finish_reason": result.finish_reason,
+                "text": result.text,
+                "tool_calls": [
+                    {
+                        "index": call.index,
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "arguments_json": call.arguments_json,
+                    }
+                    for call in calls
+                ],
+                "usage": result.usage.model_dump(mode="json"),
+            }
+            projected_operation = operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.COMPLETED,
+                    "outcome": operation_outcome,
+                }
+            )
+            assistant: dict[str, Any] = {
+                "role": "assistant",
+                "content": result.text or None,
+            }
+            if calls:
+                assistant["tool_calls"] = [
+                    {
+                        "id": call.call_id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments_json,
+                        },
+                    }
+                    for call in calls
+                ]
+            cumulative_usage = _add_usage(checkpoint.usage, result.usage)
+            output_parts = (*checkpoint.output_parts, result.text)
+            events.extend(
+                (
+                    run_event(
+                        "model.usage.reported",
+                        result.usage.model_dump(mode="json"),
+                    ),
+                    run_event(
+                        "model.call.completed",
+                        {"finish_reason": result.finish_reason},
+                    ),
+                )
+            )
+            if calls:
+                projected_checkpoint = checkpoint.model_copy(
+                    update={
+                        "checkpoint_version": checkpoint.checkpoint_version + 1,
+                        "phase": RunCheckpointPhase.READY_FOR_TOOL,
+                        "operation_id": None,
+                        "messages": (*checkpoint.messages, assistant),
+                        "output_parts": output_parts,
+                        "usage": cumulative_usage,
+                    }
+                )
+                projected_run = run.model_copy(
+                    update={
+                        "status": RunStatus.INTERRUPTED,
+                        "version": run.version + 1,
+                    }
+                )
+                snapshots = [
+                    SnapshotWrite(
+                        "run",
+                        projected_run.run_id,
+                        projected_run.session_id,
+                        projected_run.version,
+                        projected_run.model_dump(mode="json"),
+                    )
+                ]
+            else:
+                projected_checkpoint = checkpoint.model_copy(
+                    update={
+                        "checkpoint_version": checkpoint.checkpoint_version + 1,
+                        "phase": RunCheckpointPhase.TERMINAL,
+                        "operation_id": None,
+                        "messages": (*checkpoint.messages, assistant),
+                        "output_parts": output_parts,
+                        "usage": cumulative_usage,
+                    }
+                )
+                output_text = "".join(output_parts)
+                projected_run = run.model_copy(
+                    update={
+                        "status": RunStatus.COMPLETED,
+                        "version": run.version + 1,
+                        "output_text": output_text,
+                        "usage": cumulative_usage,
+                        "tool_results": checkpoint.tool_results,
+                    }
+                )
+                events.append(run_event("step.completed", {}))
+                terminal_payload: dict[str, Any] = {
+                    "output_text": output_text,
+                    "usage": cumulative_usage.model_dump(mode="json"),
+                }
+                if checkpoint.tool_results:
+                    terminal_payload["tool_results"] = [
+                        item.model_dump(mode="json")
+                        for item in checkpoint.tool_results
+                    ]
+                events.append(run_event("run.completed", terminal_payload))
+                updated_session, session_event_type = detach_run_transition(
+                    session, run.run_id
+                )
+                events.append(
+                    EventEnvelope(
+                        event_id=new_id("evt"),
+                        type=session_event_type,
+                        session_id=session.session_id,
+                        run_id=None,
+                        sequence=updated_session.version,
+                        payload={
+                            "run_id": run.run_id,
+                            "status": updated_session.status.value,
+                        },
+                        occurred_at=now,
+                    )
+                )
+                snapshots = [
+                    SnapshotWrite(
+                        "run",
+                        projected_run.run_id,
+                        projected_run.session_id,
+                        projected_run.version,
+                        projected_run.model_dump(mode="json"),
+                    ),
+                    session_write(updated_session),
+                ]
+        else:
+            assert result.disposition is ProviderRecoveryDisposition.FAILED
+            assert result.error_code is not None
+            assert result.retryable is not None
+            public_error = {
+                "code": result.error_code.value,
+                "message": "model call failed",
+                "retryable": result.retryable,
+            }
+            projected_operation = operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.FAILED,
+                    "outcome": {
+                        "error": {
+                            "code": result.error_code.value,
+                            "message": "model call failed",
+                        }
+                    },
+                }
+            )
+            projected_checkpoint = checkpoint.model_copy(
+                update={
+                    "checkpoint_version": checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.TERMINAL,
+                    "operation_id": None,
+                }
+            )
+            projected_run = run.model_copy(
+                update={
+                    "status": RunStatus.FAILED,
+                    "version": run.version + 1,
+                    "output_text": "".join(checkpoint.output_parts),
+                    "usage": checkpoint.usage,
+                    "tool_results": checkpoint.tool_results,
+                    "error": RunFailure(
+                        code=result.error_code.value,
+                        message="model call failed",
+                        retryable=result.retryable,
+                    ),
+                }
+            )
+            payload = {"error": public_error}
+            events.extend(
+                (
+                    run_event("model.call.failed", payload),
+                    run_event("step.failed", payload),
+                    run_event("run.failed", payload),
+                )
+            )
+            updated_session, session_event_type = detach_run_transition(
+                session, run.run_id
+            )
+            events.append(
+                EventEnvelope(
+                    event_id=new_id("evt"),
+                    type=session_event_type,
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=updated_session.version,
+                    payload={
+                        "run_id": run.run_id,
+                        "status": updated_session.status.value,
+                    },
+                    occurred_at=now,
+                )
+            )
+            snapshots = [
+                SnapshotWrite(
+                    "run",
+                    projected_run.run_id,
+                    projected_run.session_id,
+                    projected_run.version,
+                    projected_run.model_dump(mode="json"),
+                ),
+                session_write(updated_session),
+            ]
+
+        return RunProgressBatch(
+            lease=lease,
+            now=now,
+            events=tuple(events),
+            snapshots=tuple(snapshots),
+            preconditions=(
+                exact_session_precondition(session),
+                exact_run_precondition(run),
+            ),
+            event_preconditions=(
+                EventPrecondition(
+                    requested_event.event_id,
+                    requested_cursor,
+                    requested_event.session_id,
+                    requested_event.run_id,
+                    requested_event.type,
+                    requested_event.sequence,
+                ),
+            ),
+            operation=ExternalOperationWrite(operation, projected_operation),
+            checkpoint=RunCheckpointWrite(checkpoint, projected_checkpoint),
+            reconciliation=ReconciliationRequestWrite(request, resolved),
+        )
+
     async def _follow_resolution(
         self,
         request_id: str,
@@ -766,20 +1271,15 @@ class RunRecoveryService:
             evidence=evidence,
         )
         run = await self._load_run(request.run_id)
-        recovery_evidence = await self._load_evidence(run)
+        recovery_evidence = await self._load_evidence(
+            run,
+            allow_terminal_detached=True,
+        )
         base_request = await self._validated_request(recovery_evidence)
         matching = tuple(
             item
             for item in recovery_evidence.reconciliations
             if item.request_id == request.request_id
-        )
-        effective = (
-            None
-            if base_request is None
-            else self._effective_resolved_evidence(
-                recovery_evidence,
-                base_request,
-            )
         )
         resolution = request.resolution
         operation = next(
@@ -789,6 +1289,28 @@ class RunRecoveryService:
                 if item.operation_id == request.operation_id
             ),
             None,
+        )
+        if resolution is not None and resolution.action is ReconciliationAction.CONFIRM_COMPLETED:
+            if (
+                matching != (request,)
+                or not isinstance(operation, ModelCallOperation)
+                or not self._is_exact_confirmed_model_replay(
+                recovery_evidence,
+                base_request,
+                request,
+                operation,
+                )
+            ):
+                raise RecoveryStateConflictError
+            return replay
+
+        effective = (
+            None
+            if base_request is None
+            else self._effective_resolved_evidence(
+                recovery_evidence,
+                base_request,
+            )
         )
         if (
             matching != (request,)
@@ -837,6 +1359,336 @@ class RunRecoveryService:
         ):
             raise RecoveryStateConflictError
         return ReconciliationRequest.model_validate_json(request.model_dump_json())
+
+    def _is_exact_confirmed_model_replay(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest | None,
+        request: ReconciliationRequest,
+        operation: ModelCallOperation,
+    ) -> bool:
+        resolution = request.resolution
+        checkpoint = evidence.checkpoint
+        if (
+            resolution is None
+            or base_request is None
+            or checkpoint is None
+            or resolution.action is not ReconciliationAction.CONFIRM_COMPLETED
+            or request.operation_id != operation.operation_id
+            or request.run_id != evidence.run.run_id
+            or request.session_id != evidence.run.session_id
+            or operation.run_id != evidence.run.run_id
+            or operation.session_id != evidence.run.session_id
+            or checkpoint.run_id != evidence.run.run_id
+            or checkpoint.session_id != evidence.run.session_id
+            or checkpoint.turn != operation.turn
+            or evidence.pending
+            or not self._is_valid_run_event_envelope(evidence)
+        ):
+            return False
+        try:
+            raw_evidence = thaw_json(resolution.evidence)
+            if set(raw_evidence) != {"provider_result"}:
+                return False
+            result = ProviderRecoveryResult.model_validate_json(
+                json.dumps(
+                    raw_evidence["provider_result"],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        except Exception:
+            return False
+        requested_positions = tuple(
+            index
+            for index, event in enumerate(evidence.run_events)
+            if event.type == "reconciliation.requested"
+            and event.payload
+            == {
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "reason": request.reason,
+            }
+        )
+        resolved_positions = tuple(
+            index
+            for index, event in enumerate(evidence.run_events)
+            if event.type == "reconciliation.resolved"
+            and event.event_id == resolution.event_id
+            and event.occurred_at == resolution.decided_at
+            and event.payload
+            == {
+                "request_id": request.request_id,
+                "operation_id": request.operation_id,
+                "action": resolution.action.value,
+                "actor": thaw_json(resolution.actor),
+                "evidence": raw_evidence,
+            }
+        )
+        if (
+            len(requested_positions) != 1
+            or len(resolved_positions) != 1
+            or resolved_positions[0] != requested_positions[0] + 1
+            or requested_positions[0] == 0
+            or evidence.run_events[requested_positions[0] - 1].type
+            != "run.interrupted"
+        ):
+            return False
+        requested_index = requested_positions[0]
+        resolved_index = resolved_positions[0]
+        messages_before = self._messages_before_turn(
+            evidence,
+            base_request,
+            operation.turn,
+        )
+        if messages_before is None:
+            return False
+        try:
+            reconstructed = ModelRequest(
+                model=base_request.model,
+                messages=messages_before,
+                tools=base_request.tools,
+                params=dict(base_request.params),
+                purpose=base_request.purpose,
+            )
+        except Exception:
+            return False
+        metadata = dict(operation.recovery_metadata)
+        metadata_valid = metadata == {
+            "authoritative_status": False,
+            "same_operation_id_resend": False,
+        } or (
+            set(metadata)
+            == {
+                "adapter_id",
+                "adapter_version",
+                "authoritative_status",
+                "same_operation_id_resend",
+            }
+            and all(
+                isinstance(metadata[field], str) and bool(metadata[field])
+                for field in ("adapter_id", "adapter_version")
+            )
+            and type(metadata["authoritative_status"]) is bool
+            and type(metadata["same_operation_id_resend"]) is bool
+        )
+        if (
+            not metadata_valid
+            or operation.provider_identity != base_request.model
+            or operation.request_fingerprint
+            != _model_request_fingerprint(reconstructed)
+        ):
+            return False
+
+        prior_output: list[str] = []
+        prior_usage = TokenUsage()
+        for turn in range(operation.turn):
+            matches = tuple(
+                item
+                for item in evidence.operations
+                if isinstance(item, ModelCallOperation)
+                and item.turn == turn
+                and item.status is ExternalOperationStatus.COMPLETED
+            )
+            if len(matches) != 1:
+                return False
+            completed = self._completed_model_outcome(matches[0])
+            if completed is None:
+                return False
+            prior_output.append(completed[1])
+            prior_usage = _add_usage(prior_usage, completed[3])
+        if len(checkpoint.tool_results) != operation.turn:
+            return False
+
+        trailing = evidence.run_events[resolved_index + 1 :]
+        if request.reason == "model_call_completed_terminalization_unknown":
+            if (
+                result.disposition is not ProviderRecoveryDisposition.COMPLETED
+                or result.text is None
+                or result.usage is None
+                or result.tool_call is not None
+                or operation.model_dump(mode="json")["outcome"]
+                != {
+                    "finish_reason": result.finish_reason,
+                    "text": result.text,
+                    "tool_calls": [],
+                    "usage": result.usage.model_dump(mode="json"),
+                }
+                or tuple(event.type for event in trailing) != ("run.completed",)
+            ):
+                return False
+            return self._is_exact_confirmed_terminal_state(
+                evidence,
+                operation,
+                result,
+                prior_output=prior_output,
+                prior_usage=prior_usage,
+                messages_before=messages_before,
+                gap=True,
+            )
+        if request.reason != "model_call_unknown_outcome" or dict(request.details) != {
+            "checkpoint_phase": RunCheckpointPhase.MODEL_IN_FLIGHT.value
+        }:
+            return False
+        if result.disposition is ProviderRecoveryDisposition.COMPLETED:
+            assert result.text is not None and result.usage is not None
+            expected_operation = operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.COMPLETED,
+                    "outcome": {
+                        "finish_reason": result.finish_reason,
+                        "text": result.text,
+                        "tool_calls": []
+                        if result.tool_call is None
+                        else [
+                            {
+                                "index": result.tool_call.index,
+                                "call_id": result.tool_call.call_id,
+                                "name": result.tool_call.name,
+                                "arguments_json": result.tool_call.arguments_json,
+                            }
+                        ],
+                        "usage": result.usage.model_dump(mode="json"),
+                    },
+                }
+            )
+            if operation != expected_operation:
+                return False
+            expected_types: tuple[str, ...] = (
+                "model.usage.reported",
+                "model.call.completed",
+            )
+            if result.tool_call is None:
+                expected_types += ("step.completed", "run.completed")
+            if (
+                tuple(event.type for event in trailing) != expected_types
+                or trailing[0].payload != result.usage.model_dump(mode="json")
+                or trailing[1].payload
+                != {"finish_reason": result.finish_reason}
+            ):
+                return False
+            if result.tool_call is not None:
+                interrupt = evidence.run_events[requested_index - 1]
+                retained = (
+                    *evidence.run_events[: requested_index - 1],
+                    evidence.run_events[resolved_index],
+                    *trailing,
+                    interrupt,
+                )
+                normalized = replace(
+                    evidence,
+                    pending=(),
+                    reconciliations=(),
+                    run_events=tuple(
+                        event.model_copy(update={"sequence": index})
+                        for index, event in enumerate(retained, start=1)
+                    ),
+                    run_event_cursors=tuple(range(1, len(retained) + 1)),
+                )
+                return self._is_exact_ready_tool_relation(
+                    normalized,
+                    base_request,
+                )
+            return self._is_exact_confirmed_terminal_state(
+                evidence,
+                operation,
+                result,
+                prior_output=prior_output,
+                prior_usage=prior_usage,
+                messages_before=messages_before,
+                gap=False,
+            )
+        if (
+            result.disposition is not ProviderRecoveryDisposition.FAILED
+            or result.error_code is None
+            or result.retryable is None
+            or tuple(event.type for event in trailing)
+            != ("model.call.failed", "step.failed", "run.failed")
+        ):
+            return False
+        expected_error = {
+            "error": {
+                "code": result.error_code.value,
+                "message": "model call failed",
+                "retryable": result.retryable,
+            }
+        }
+        return (
+            operation.status is ExternalOperationStatus.FAILED
+            and operation.model_dump(mode="json")["outcome"]
+            == {
+                "error": {
+                    "code": result.error_code.value,
+                    "message": "model call failed",
+                }
+            }
+            and all(event.payload == expected_error for event in trailing)
+            and checkpoint.phase is RunCheckpointPhase.TERMINAL
+            and checkpoint.operation_id is None
+            and checkpoint.model_dump(mode="json")["messages"]
+            == list(messages_before)
+            and checkpoint.output_parts == tuple(prior_output)
+            and checkpoint.usage == prior_usage
+            and evidence.run
+            == evidence.run.model_copy(
+                update={
+                    "status": RunStatus.FAILED,
+                    "version": evidence.run.version,
+                    "output_text": "".join(prior_output),
+                    "usage": prior_usage,
+                    "tool_results": checkpoint.tool_results,
+                    "error": RunFailure(
+                        code=result.error_code.value,
+                        message="model call failed",
+                        retryable=result.retryable,
+                    ),
+                }
+            )
+        )
+
+    @staticmethod
+    def _is_exact_confirmed_terminal_state(
+        evidence: _RecoveryEvidence,
+        operation: ModelCallOperation,
+        result: ProviderRecoveryResult,
+        *,
+        prior_output: list[str],
+        prior_usage: TokenUsage,
+        messages_before: tuple[dict[str, Any], ...],
+        gap: bool,
+    ) -> bool:
+        checkpoint = evidence.checkpoint
+        if (
+            checkpoint is None
+            or result.text is None
+            or result.usage is None
+            or result.tool_call is not None
+        ):
+            return False
+        output_parts = (*prior_output, result.text)
+        usage = _add_usage(prior_usage, result.usage)
+        assistant = {"role": "assistant", "content": result.text or None}
+        return (
+            operation.status is ExternalOperationStatus.COMPLETED
+            and checkpoint.phase is RunCheckpointPhase.TERMINAL
+            and checkpoint.operation_id is None
+            and checkpoint.model_dump(mode="json")["messages"]
+            == [*messages_before, assistant]
+            and checkpoint.output_parts == output_parts
+            and checkpoint.usage == usage
+            and evidence.run.status is RunStatus.COMPLETED
+            and evidence.run.output_text == "".join(output_parts)
+            and evidence.run.usage == usage
+            and evidence.run.tool_results == checkpoint.tool_results
+            and (not gap or operation.model_dump(mode="json")["outcome"] == {
+                "finish_reason": result.finish_reason,
+                "text": result.text,
+                "tool_calls": [],
+                "usage": result.usage.model_dump(mode="json"),
+            })
+        )
 
     def _is_resolution_operation_certified(
         self,
@@ -1056,13 +1908,22 @@ class RunRecoveryService:
             ) from None
         return run
 
-    async def _load_evidence(self, run: RunSnapshot) -> _RecoveryEvidence:
+    async def _load_evidence(
+        self,
+        run: RunSnapshot,
+        *,
+        allow_terminal_detached: bool = False,
+    ) -> _RecoveryEvidence:
         session_data = await self._store.get_snapshot("session", run.session_id)
         try:
             session = SessionSnapshot.model_validate(session_data)
         except Exception:
             raise self._state_error() from None
-        if run.run_id not in session.active_run_ids:
+        terminal = run.status in {RunStatus.COMPLETED, RunStatus.FAILED}
+        if (
+            run.run_id not in session.active_run_ids
+            and not (allow_terminal_detached and terminal)
+        ) or (terminal and run.run_id in session.active_run_ids):
             raise self._state_error() from None
         checkpoint = await self._store.get_run_checkpoint(run.run_id)
         operations = await self._store.list_external_operations(run.run_id)
@@ -1653,6 +2514,18 @@ class RunRecoveryService:
                     return False
                 audit_kind = ExternalOperationKind.TOOL_CALL
                 continue
+            if event_type == "reconciliation.resolved":
+                if (
+                    state != "model_in_flight"
+                    or current_model is None
+                    or payload.get("operation_id") != current_model.operation_id
+                    or payload.get("action")
+                    != ReconciliationAction.CONFIRM_COMPLETED.value
+                    or set(payload)
+                    != {"request_id", "operation_id", "action", "actor", "evidence"}
+                ):
+                    return False
+                continue
             if event_type == "run.recovery.started":
                 if state != "interrupted" or interrupted_state is None:
                     return False
@@ -2193,6 +3066,7 @@ class RunRecoveryService:
 
         removed_event_indexes: set[int] = set()
         removed_operation_ids: set[str] = set()
+        deferred_events: list[EventEnvelope] = []
         for request in resolved:
             resolution = request.resolution
             if resolution is None or request.operation_id is None:
@@ -2231,6 +3105,43 @@ class RunRecoveryService:
                     "evidence": thaw_json(resolution.evidence),
                 }
             )
+            if resolution.action is ReconciliationAction.CONFIRM_COMPLETED:
+                if (
+                    not isinstance(operation, ModelCallOperation)
+                    or not self._is_exact_confirmed_model_replay(
+                        evidence,
+                        base_request,
+                        request,
+                        operation,
+                    )
+                    or len(requested_indexes) != 1
+                    or len(resolved_indexes) != 1
+                ):
+                    return None
+                try:
+                    confirmed = ProviderRecoveryResult.model_validate_json(
+                        json.dumps(
+                            thaw_json(resolution.evidence)["provider_result"],
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    )
+                except Exception:
+                    return None
+                if (
+                    confirmed.disposition
+                    is not ProviderRecoveryDisposition.COMPLETED
+                    or confirmed.tool_call is None
+                    or requested_indexes[0] == 0
+                ):
+                    return None
+                interrupt_index = requested_indexes[0] - 1
+                deferred_events.append(evidence.run_events[interrupt_index])
+                removed_event_indexes.add(interrupt_index)
+                removed_event_indexes.update(requested_indexes)
+                continue
             expected_outcome = {
                 "reconciliation": {
                     "request_id": request.request_id,
@@ -2319,6 +3230,15 @@ class RunRecoveryService:
             )
             if index not in removed_event_indexes
         )
+        if deferred_events:
+            next_cursor = max((cursor for cursor, _ in retained), default=0) + 1
+            retained = (
+                *retained,
+                *(
+                    (next_cursor + offset, event)
+                    for offset, event in enumerate(deferred_events)
+                ),
+            )
         normalized_events = tuple(
             event.model_copy(update={"sequence": index})
             for index, (_, event) in enumerate(retained, start=1)
@@ -2963,8 +3883,15 @@ class RunRecoveryService:
                 if event.type == "model.text.delta"
             )
             recovered = any(
-                event.type
-                in {"model.recovery.query.started", "model.recovery.resend.started"}
+                (
+                    event.type
+                    in {"model.recovery.query.started", "model.recovery.resend.started"}
+                    or (
+                        event.type == "reconciliation.resolved"
+                        and event.payload.get("action")
+                        == ReconciliationAction.CONFIRM_COMPLETED.value
+                    )
+                )
                 and event.payload.get("operation_id") == operation.operation_id
                 for event in segment
             )

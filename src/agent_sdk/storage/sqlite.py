@@ -38,6 +38,8 @@ from agent_sdk.runtime.reconciliation import (
     _external_operation_from_json,
     _reconciliation_request_from_json,
     _valid_checkpoint_replay_shape,
+    _valid_confirmed_model_resolution_batch,
+    _valid_confirmed_model_terminalization_batch,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -834,20 +836,25 @@ class SQLiteStore:
                 self._validate_run_progress_internal_targets(batch)
                 await self._check_run_progress_checkpoint_operation(batch)
                 await self._check_run_progress_checkpoint_precondition(batch)
+                await self._check_run_progress_operation_precondition(batch)
                 target_states = await self._run_progress_target_states(batch)
                 exact_targets = target_states.count("exact")
                 if "conflict" in target_states or (
                     exact_targets and exact_targets != len(target_states)
                 ):
                     raise RecoveryStateConflictError
-                retry_resolution = _valid_retry_resolution_batch(batch)
-                if retry_resolution:
+                resolution_batch = (
+                    _valid_retry_resolution_batch(batch)
+                    or _valid_confirmed_model_resolution_batch(batch)
+                    or _valid_confirmed_model_terminalization_batch(batch)
+                )
+                if resolution_batch:
                     await self._check_retry_resolution_requested_event(batch)
                 if exact_targets == len(target_states):
                     cursor = await self._last_cursor()
                     await self._rollback()
                     return CommitResult(last_cursor=cursor, applied=False)
-                if retry_resolution:
+                if resolution_batch:
                     target_run = RunSnapshot.model_validate(batch.snapshots[0].data)
                     if (
                         run.status is not RunStatus.WAITING_RECONCILIATION
@@ -920,7 +927,11 @@ class SQLiteStore:
     def _validate_run_progress_scope(
         batch: RunProgressBatch, run: RunSnapshot
     ) -> None:
-        retry_resolution = _valid_retry_resolution_batch(batch)
+        resolution_batch = (
+            _valid_retry_resolution_batch(batch)
+            or _valid_confirmed_model_resolution_batch(batch)
+            or _valid_confirmed_model_terminalization_batch(batch)
+        )
         for event in batch.events:
             if event.session_id != run.session_id or event.run_id not in {
                 None,
@@ -957,7 +968,7 @@ class SQLiteStore:
                 or operation.session_id != run.session_id
                 or (
                     operation.lease_generation != batch.lease.generation
-                    and not retry_resolution
+                    and not resolution_batch
                 )
             ):
                 raise RecoveryStateConflictError
@@ -975,6 +986,13 @@ class SQLiteStore:
                 or checkpoint.session_id != run.session_id
             ):
                 raise RecoveryStateConflictError
+        if batch.operation_precondition is not None:
+            operation = batch.operation_precondition
+            if (
+                operation.run_id != run.run_id
+                or operation.session_id != run.session_id
+            ):
+                raise RecoveryStateConflictError
         if batch.reconciliation is not None:
             request = batch.reconciliation.updated
             if (
@@ -984,6 +1002,18 @@ class SQLiteStore:
                 raise RecoveryStateConflictError
     @staticmethod
     def _validate_run_progress_write_shapes(batch: RunProgressBatch) -> None:
+        confirmed_model_resolution = _valid_confirmed_model_resolution_batch(batch)
+        confirmed_terminalization = (
+            _valid_confirmed_model_terminalization_batch(batch)
+        )
+        if (
+            batch.reconciliation is not None
+            and batch.reconciliation.updated.resolution is not None
+            and batch.reconciliation.updated.resolution.action
+            is ReconciliationAction.CONFIRM_COMPLETED
+            and not (confirmed_model_resolution or confirmed_terminalization)
+        ):
+            raise RecoveryStateConflictError
         if batch.operation is not None:
             if batch.operation.expected is None:
                 legal_operation = (
@@ -1292,6 +1322,17 @@ class SQLiteStore:
         if expected is None:
             return
         current = await self._read_run_checkpoint(expected.run_id)
+        if current != expected:
+            raise RecoveryStateConflictError
+
+    async def _check_run_progress_operation_precondition(
+        self,
+        batch: RunProgressBatch,
+    ) -> None:
+        expected = batch.operation_precondition
+        if expected is None:
+            return
+        current = await self._read_external_operation(expected.operation_id)
         if current != expected:
             raise RecoveryStateConflictError
 
@@ -1945,7 +1986,10 @@ class SQLiteStore:
                 session.session_id != run.session_id
                 or session.session_id != cast(str, session_row[0])
                 or session.version != cast(int, session_row[1])
-                or run.run_id not in session.active_run_ids
+                or (
+                    run.status in {RunStatus.COMPLETED, RunStatus.FAILED}
+                )
+                == (run.run_id in session.active_run_ids)
                 or _canonical_json(session.model_dump(mode="json"))
                 != cast(str, session_row[2])
             ):

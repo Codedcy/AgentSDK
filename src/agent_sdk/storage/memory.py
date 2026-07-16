@@ -24,6 +24,8 @@ from agent_sdk.runtime.reconciliation import (
     _external_operation_from_json,
     _reconciliation_request_from_json,
     _valid_checkpoint_replay_shape,
+    _valid_confirmed_model_resolution_batch,
+    _valid_confirmed_model_terminalization_batch,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -206,6 +208,8 @@ class InMemoryStore:
                         _canonical_record_json(batch.checkpoint.expected)
                 if batch.checkpoint_precondition is not None:
                     _canonical_record_json(batch.checkpoint_precondition)
+                if batch.operation_precondition is not None:
+                    _canonical_record_json(batch.operation_precondition)
                 if batch.reconciliation is not None:
                     _canonical_record_json(batch.reconciliation.updated)
                     if batch.reconciliation.expected is not None:
@@ -258,6 +262,23 @@ class InMemoryStore:
             checkpoint_write = batch.checkpoint
             reconciliation_write = batch.reconciliation
             retry_resolution = _valid_retry_resolution_batch(batch)
+            confirmed_model_resolution = _valid_confirmed_model_resolution_batch(batch)
+            confirmed_terminalization = (
+                _valid_confirmed_model_terminalization_batch(batch)
+            )
+            resolution_batch = (
+                retry_resolution
+                or confirmed_model_resolution
+                or confirmed_terminalization
+            )
+            if (
+                reconciliation_write is not None
+                and reconciliation_write.updated.resolution is not None
+                and reconciliation_write.updated.resolution.action
+                is ReconciliationAction.CONFIRM_COMPLETED
+                and not (confirmed_model_resolution or confirmed_terminalization)
+            ):
+                raise RecoveryStateConflictError
             operation_json: str | None = None
             checkpoint_json: str | None = None
             reconciliation_json: str | None = None
@@ -321,7 +342,7 @@ class InMemoryStore:
                     or operation.session_id != run.session_id
                     or (
                         operation.lease_generation != batch.lease.generation
-                        and not retry_resolution
+                        and not resolution_batch
                     )
                 ):
                     raise RecoveryStateConflictError
@@ -349,6 +370,18 @@ class InMemoryStore:
                     != _canonical_record_json(checkpoint_precondition)
                 ):
                     raise RecoveryStateConflictError
+            operation_precondition = batch.operation_precondition
+            if operation_precondition is not None:
+                stored_operation = self._external_operations.get(
+                    operation_precondition.operation_id
+                )
+                if (
+                    operation_precondition.run_id != run.run_id
+                    or operation_precondition.session_id != run.session_id
+                    or stored_operation
+                    != _canonical_record_json(operation_precondition)
+                ):
+                    raise RecoveryStateConflictError
             if reconciliation_write is not None:
                 request = reconciliation_write.updated
                 if (
@@ -362,11 +395,11 @@ class InMemoryStore:
                 exact_targets and exact_targets != len(target_states)
             ):
                 raise RecoveryStateConflictError
-            if retry_resolution:
+            if resolution_batch:
                 self._check_retry_resolution_requested_event(batch)
             if target_states and exact_targets == len(target_states):
                 return CommitResult(last_cursor=self._last_cursor, applied=False)
-            if retry_resolution:
+            if resolution_batch:
                 target_run = RunSnapshot.model_validate(batch.snapshots[0].data)
                 if (
                     run.status is not RunStatus.WAITING_RECONCILIATION
@@ -392,7 +425,7 @@ class InMemoryStore:
                     run_id=operation.run_id,
                     lease_generation=(
                         batch.lease.generation
-                        if retry_resolution
+                        if resolution_batch
                         else operation.lease_generation
                     ),
                 )
@@ -1031,7 +1064,10 @@ class InMemoryStore:
                 session.session_id != run.session_id
                 or session.session_id != session_write.session_id
                 or session.version != session_write.version
-                or run.run_id not in session.active_run_ids
+                or (
+                    run.status in {RunStatus.COMPLETED, RunStatus.FAILED}
+                )
+                == (run.run_id in session.active_run_ids)
             ):
                 raise RecoveryStateConflictError
             operations: list[ExternalOperation] = []

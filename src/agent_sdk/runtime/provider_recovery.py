@@ -230,18 +230,30 @@ class ProviderRecoveryResult(_ProviderRecoveryModel):
             arguments_json=value.arguments_json,
         )
 
-    @field_validator("usage", mode="after")
+    @field_validator("usage", mode="before")
     @classmethod
-    def _detach_usage(cls, value: TokenUsage | None) -> TokenUsage | None:
+    def _detach_usage(cls, value: object) -> TokenUsage | None:
         if value is None:
             return None
+        if isinstance(value, Mapping):
+            if set(value) - {
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+            }:
+                raise ValueError("provider recovery usage is invalid")
+            raw_usage = value
+        elif type(value) is TokenUsage:
+            raw_usage = value.model_dump(mode="python")
+        else:
+            raise ValueError("provider recovery usage is invalid")
         for field_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            token_count = getattr(value, field_name)
+            token_count = raw_usage.get(field_name)
             if token_count is not None and (
                 type(token_count) is not int or token_count < 0
             ):
                 raise ValueError("provider recovery usage is invalid")
-        return TokenUsage.model_validate_json(value.model_dump_json())
+        return TokenUsage.model_validate(raw_usage)
 
     @model_validator(mode="after")
     def _validate_disposition_fields(self) -> Self:

@@ -106,6 +106,7 @@ class RunProgressBatch(NamedTuple):
     checkpoint: RunCheckpointWrite | None = None
     reconciliation: ReconciliationRequestWrite | None = None
     checkpoint_precondition: RunCheckpoint | None = None
+    operation_precondition: ExternalOperation | None = None
 
 
 _SIGNED_INT64_MIN = -(1 << 63)
@@ -146,6 +147,10 @@ def _valid_run_progress_int64_fields(batch: RunProgressBatch) -> bool:
                 operation.lease_generation
             ):
                 return False
+    if batch.operation_precondition is not None:
+        operation = batch.operation_precondition
+        if not valid(operation.turn) or not valid(operation.lease_generation):
+            return False
     if batch.checkpoint is not None:
         checkpoints = [batch.checkpoint.updated]
         if batch.checkpoint.expected is not None:

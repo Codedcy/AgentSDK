@@ -19,7 +19,18 @@ from pydantic import (
 )
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import TokenUsage
+from agent_sdk.runtime.models import (
+    RunFailure,
+    RunSnapshot,
+    RunStatus,
+    SessionSnapshot,
+    SessionStatus,
+    TokenUsage,
+)
+from agent_sdk.runtime.provider_recovery import (
+    ProviderRecoveryDisposition,
+    ProviderRecoveryResult,
+)
 from agent_sdk.tools.models import ToolResult, freeze_json, thaw_json
 
 
@@ -422,4 +433,576 @@ def _valid_checkpoint_replay_shape(
         and checkpoint.run_id == expected.run_id
         and checkpoint.session_id == expected.session_id
         and checkpoint.checkpoint_version == expected.checkpoint_version + 1
+    )
+
+
+def _valid_confirmed_model_resolution_batch(batch: Any) -> bool:
+    operation_write = batch.operation
+    checkpoint_write = batch.checkpoint
+    request_write = batch.reconciliation
+    if (
+        operation_write is None
+        or not isinstance(operation_write.expected, ModelCallOperation)
+        or checkpoint_write is None
+        or checkpoint_write.expected is None
+        or request_write is None
+        or request_write.expected is None
+        or len(batch.preconditions) != 2
+        or len(batch.event_preconditions) != 1
+        or batch.checkpoint_precondition is not None
+    ):
+        return False
+    operation = operation_write.expected
+    projected_operation = operation_write.updated
+    checkpoint = checkpoint_write.expected
+    projected_checkpoint = checkpoint_write.updated
+    request = request_write.expected
+    resolved = request_write.updated
+    resolution = resolved.resolution
+    if (
+        resolution is None
+        or resolution.action is not ReconciliationAction.CONFIRM_COMPLETED
+        or set(resolution.evidence) != {"provider_result"}
+        or request.status is not ReconciliationStatus.PENDING
+        or resolved.status is not ReconciliationStatus.RESOLVED
+        or request.operation_id != operation.operation_id
+        or request.reason != "model_call_unknown_outcome"
+        or dict(request.details)
+        != {"checkpoint_phase": RunCheckpointPhase.MODEL_IN_FLIGHT.value}
+        or operation.status is not ExternalOperationStatus.STARTED
+        or checkpoint.phase is not RunCheckpointPhase.MODEL_IN_FLIGHT
+        or checkpoint.operation_id != operation.operation_id
+        or checkpoint.turn != operation.turn
+    ):
+        return False
+    try:
+        result = ProviderRecoveryResult.model_validate_json(
+            json.dumps(
+                thaw_json(resolution.evidence)["provider_result"],
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        preconditions = {
+            precondition.kind: precondition for precondition in batch.preconditions
+        }
+        if set(preconditions) != {"session", "run"}:
+            return False
+        session_precondition = preconditions["session"]
+        run_precondition = preconditions["run"]
+        if session_precondition.data is None or run_precondition.data is None:
+            return False
+        session = SessionSnapshot.model_validate(session_precondition.data)
+        run = RunSnapshot.model_validate(run_precondition.data)
+    except Exception:
+        return False
+    if result.disposition not in {
+        ProviderRecoveryDisposition.COMPLETED,
+        ProviderRecoveryDisposition.FAILED,
+    }:
+        return False
+    if (
+        session_precondition.entity_id != session.session_id
+        or session_precondition.version != session.version
+        or session_precondition.session_id != session.session_id
+        or run_precondition.entity_id != run.run_id
+        or run_precondition.version != run.version
+        or run_precondition.session_id != run.session_id
+        or request.run_id != run.run_id
+        or request.session_id != run.session_id
+        or operation.run_id != run.run_id
+        or operation.session_id != run.session_id
+        or run.session_id != session.session_id
+        or run.status is not RunStatus.WAITING_RECONCILIATION
+        or run.run_id not in session.active_run_ids
+    ):
+        return False
+    requested = batch.event_preconditions[0]
+    if (
+        requested.type != "reconciliation.requested"
+        or requested.session_id != run.session_id
+        or requested.run_id != run.run_id
+    ):
+        return False
+    expected_resolution_payload = {
+        "request_id": request.request_id,
+        "operation_id": request.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    if not batch.events:
+        return False
+    first = batch.events[0]
+    if (
+        first.event_id != resolution.event_id
+        or first.type != "reconciliation.resolved"
+        or first.session_id != run.session_id
+        or first.run_id != run.run_id
+        or first.sequence != requested.sequence + 1
+        or first.occurred_at != batch.now
+        or first.payload != expected_resolution_payload
+        or resolved
+        != request.model_copy(
+            update={
+                "status": ReconciliationStatus.RESOLVED,
+                "resolution": resolution,
+            }
+        )
+    ):
+        return False
+
+    expected_types: tuple[str, ...]
+    expected_payloads: tuple[dict[str, Any], ...]
+    projected_session: SessionSnapshot | None = None
+    session_event_type: str | None = None
+    if result.disposition is ProviderRecoveryDisposition.COMPLETED:
+        assert result.text is not None and result.usage is not None
+        calls = () if result.tool_call is None else (result.tool_call,)
+        expected_operation = operation.model_copy(
+            update={
+                "status": ExternalOperationStatus.COMPLETED,
+                "outcome": {
+                    "finish_reason": result.finish_reason,
+                    "text": result.text,
+                    "tool_calls": [
+                        {
+                            "index": call.index,
+                            "call_id": call.call_id,
+                            "name": call.name,
+                            "arguments_json": call.arguments_json,
+                        }
+                        for call in calls
+                    ],
+                    "usage": result.usage.model_dump(mode="json"),
+                },
+            }
+        )
+        assistant: dict[str, Any] = {
+            "role": "assistant",
+            "content": result.text or None,
+        }
+        if calls:
+            assistant["tool_calls"] = [
+                {
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments_json,
+                    },
+                }
+                for call in calls
+            ]
+
+        def add(first_value: int | None, second_value: int | None) -> int | None:
+            if first_value is None:
+                return second_value
+            if second_value is None:
+                return first_value
+            return first_value + second_value
+
+        cumulative = TokenUsage(
+            prompt_tokens=add(
+                checkpoint.usage.prompt_tokens, result.usage.prompt_tokens
+            ),
+            completion_tokens=add(
+                checkpoint.usage.completion_tokens,
+                result.usage.completion_tokens,
+            ),
+            total_tokens=add(
+                checkpoint.usage.total_tokens, result.usage.total_tokens
+            ),
+        )
+        output_parts = (*checkpoint.output_parts, result.text)
+        if calls:
+            expected_checkpoint = checkpoint.model_copy(
+                update={
+                    "checkpoint_version": checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.READY_FOR_TOOL,
+                    "operation_id": None,
+                    "messages": (*checkpoint.messages, assistant),
+                    "output_parts": output_parts,
+                    "usage": cumulative,
+                }
+            )
+            expected_run = run.model_copy(
+                update={
+                    "status": RunStatus.INTERRUPTED,
+                    "version": run.version + 1,
+                }
+            )
+            expected_types = (
+                "reconciliation.resolved",
+                "model.usage.reported",
+                "model.call.completed",
+            )
+            expected_payloads = (
+                expected_resolution_payload,
+                result.usage.model_dump(mode="json"),
+                {"finish_reason": result.finish_reason},
+            )
+        else:
+            expected_checkpoint = checkpoint.model_copy(
+                update={
+                    "checkpoint_version": checkpoint.checkpoint_version + 1,
+                    "phase": RunCheckpointPhase.TERMINAL,
+                    "operation_id": None,
+                    "messages": (*checkpoint.messages, assistant),
+                    "output_parts": output_parts,
+                    "usage": cumulative,
+                }
+            )
+            output_text = "".join(output_parts)
+            expected_run = run.model_copy(
+                update={
+                    "status": RunStatus.COMPLETED,
+                    "version": run.version + 1,
+                    "output_text": output_text,
+                    "usage": cumulative,
+                    "tool_results": checkpoint.tool_results,
+                }
+            )
+            terminal_payload: dict[str, Any] = {
+                "output_text": output_text,
+                "usage": cumulative.model_dump(mode="json"),
+            }
+            if checkpoint.tool_results:
+                terminal_payload["tool_results"] = [
+                    item.model_dump(mode="json") for item in checkpoint.tool_results
+                ]
+            expected_types = (
+                "reconciliation.resolved",
+                "model.usage.reported",
+                "model.call.completed",
+                "step.completed",
+                "run.completed",
+                "session.closed"
+                if session.status is SessionStatus.CLOSING
+                and not session.active_workflow_run_ids
+                and session.active_run_ids == (run.run_id,)
+                else "session.run.detached",
+            )
+            expected_payloads = (
+                expected_resolution_payload,
+                result.usage.model_dump(mode="json"),
+                {"finish_reason": result.finish_reason},
+                {},
+                terminal_payload,
+                {},
+            )
+    else:
+        assert result.error_code is not None and result.retryable is not None
+        expected_operation = operation.model_copy(
+            update={
+                "status": ExternalOperationStatus.FAILED,
+                "outcome": {
+                    "error": {
+                        "code": result.error_code.value,
+                        "message": "model call failed",
+                    }
+                },
+            }
+        )
+        expected_checkpoint = checkpoint.model_copy(
+            update={
+                "checkpoint_version": checkpoint.checkpoint_version + 1,
+                "phase": RunCheckpointPhase.TERMINAL,
+                "operation_id": None,
+            }
+        )
+        expected_run = run.model_copy(
+            update={
+                "status": RunStatus.FAILED,
+                "version": run.version + 1,
+                "output_text": "".join(checkpoint.output_parts),
+                "usage": checkpoint.usage,
+                "tool_results": checkpoint.tool_results,
+                "error": RunFailure(
+                    code=result.error_code.value,
+                    message="model call failed",
+                    retryable=result.retryable,
+                ),
+            }
+        )
+        failure_payload = {
+            "error": {
+                "code": result.error_code.value,
+                "message": "model call failed",
+                "retryable": result.retryable,
+            }
+        }
+        expected_types = (
+            "reconciliation.resolved",
+            "model.call.failed",
+            "step.failed",
+            "run.failed",
+            "session.closed"
+            if session.status is SessionStatus.CLOSING
+            and not session.active_workflow_run_ids
+            and session.active_run_ids == (run.run_id,)
+            else "session.run.detached",
+        )
+        expected_payloads = (
+            expected_resolution_payload,
+            failure_payload,
+            failure_payload,
+            failure_payload,
+            {},
+        )
+    terminal = expected_run.status in {RunStatus.COMPLETED, RunStatus.FAILED}
+    if terminal:
+        remaining = tuple(
+            run_id for run_id in session.active_run_ids if run_id != run.run_id
+        )
+        close_now = (
+            session.status is SessionStatus.CLOSING
+            and not remaining
+            and not session.active_workflow_run_ids
+        )
+        projected_session = session.model_copy(
+            update={
+                "active_run_ids": remaining,
+                "status": SessionStatus.CLOSED if close_now else session.status,
+                "version": session.version + 1,
+            }
+        )
+        session_event_type = "session.closed" if close_now else "session.run.detached"
+        session_payload = {
+            "run_id": run.run_id,
+            "status": projected_session.status.value,
+        }
+        expected_payloads = (*expected_payloads[:-1], session_payload)
+    if (
+        projected_operation != expected_operation
+        or projected_checkpoint != expected_checkpoint
+        or tuple(event.type for event in batch.events) != expected_types
+        or tuple(event.payload for event in batch.events) != expected_payloads
+        or any(event.occurred_at != batch.now for event in batch.events)
+    ):
+        return False
+    for offset, event in enumerate(batch.events[:-1] if terminal else batch.events):
+        if (
+            event.session_id != run.session_id
+            or event.run_id != run.run_id
+            or event.sequence != requested.sequence + 1 + offset
+        ):
+            return False
+    if len(batch.snapshots) != (2 if terminal else 1):
+        return False
+    run_write = batch.snapshots[0]
+    if (
+        run_write.kind != "run"
+        or run_write.entity_id != run.run_id
+        or run_write.session_id != run.session_id
+        or run_write.version != expected_run.version
+        or run_write.data != expected_run.model_dump(mode="json")
+    ):
+        return False
+    if terminal:
+        assert projected_session is not None and session_event_type is not None
+        session_write = batch.snapshots[1]
+        session_event = batch.events[-1]
+        if (
+            session_write.kind != "session"
+            or session_write.entity_id != session.session_id
+            or session_write.session_id != session.session_id
+            or session_write.version != projected_session.version
+            or session_write.data != projected_session.model_dump(mode="json")
+            or session_event.type != session_event_type
+            or session_event.session_id != session.session_id
+            or session_event.run_id is not None
+            or session_event.sequence != projected_session.version
+        ):
+            return False
+    return True
+
+
+def _valid_confirmed_model_terminalization_batch(batch: Any) -> bool:
+    checkpoint_write = batch.checkpoint
+    request_write = batch.reconciliation
+    operation = batch.operation_precondition
+    if (
+        batch.operation is not None
+        or not isinstance(operation, ModelCallOperation)
+        or operation.status is not ExternalOperationStatus.COMPLETED
+        or operation.outcome is None
+        or checkpoint_write is None
+        or checkpoint_write.expected is None
+        or request_write is None
+        or request_write.expected is None
+        or len(batch.events) != 3
+        or len(batch.snapshots) != 2
+        or len(batch.preconditions) != 2
+        or len(batch.event_preconditions) != 1
+        or batch.checkpoint_precondition is not None
+    ):
+        return False
+    checkpoint = checkpoint_write.expected
+    terminal_checkpoint = checkpoint_write.updated
+    request = request_write.expected
+    resolved = request_write.updated
+    resolution = resolved.resolution
+    if (
+        resolution is None
+        or resolution.action is not ReconciliationAction.CONFIRM_COMPLETED
+        or set(resolution.evidence) != {"provider_result"}
+        or request.status is not ReconciliationStatus.PENDING
+        or resolved.status is not ReconciliationStatus.RESOLVED
+        or request.operation_id != operation.operation_id
+        or request.reason != "model_call_completed_terminalization_unknown"
+        or dict(request.details)
+        != {
+            "checkpoint_phase": RunCheckpointPhase.READY_FOR_MODEL.value,
+            "operation_status": ExternalOperationStatus.COMPLETED.value,
+        }
+        or checkpoint.phase is not RunCheckpointPhase.READY_FOR_MODEL
+        or checkpoint.operation_id is not None
+        or checkpoint.turn != operation.turn
+    ):
+        return False
+    try:
+        result = ProviderRecoveryResult.model_validate_json(
+            json.dumps(
+                thaw_json(resolution.evidence)["provider_result"],
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        preconditions = {
+            precondition.kind: precondition for precondition in batch.preconditions
+        }
+        if set(preconditions) != {"session", "run"}:
+            return False
+        session_precondition = preconditions["session"]
+        run_precondition = preconditions["run"]
+        if session_precondition.data is None or run_precondition.data is None:
+            return False
+        session = SessionSnapshot.model_validate(session_precondition.data)
+        run = RunSnapshot.model_validate(run_precondition.data)
+    except Exception:
+        return False
+    if (
+        result.disposition is not ProviderRecoveryDisposition.COMPLETED
+        or result.text is None
+        or result.usage is None
+        or result.tool_call is not None
+        or operation.model_dump(mode="json")["outcome"]
+        != {
+            "finish_reason": result.finish_reason,
+            "text": result.text,
+            "tool_calls": [],
+            "usage": result.usage.model_dump(mode="json"),
+        }
+        or run.status is not RunStatus.WAITING_RECONCILIATION
+        or run.run_id != operation.run_id
+        or run.session_id != operation.session_id
+        or run.session_id != session.session_id
+        or run.run_id not in session.active_run_ids
+        or request.run_id != run.run_id
+        or request.session_id != run.session_id
+        or session_precondition.entity_id != session.session_id
+        or session_precondition.version != session.version
+        or session_precondition.session_id != session.session_id
+        or run_precondition.entity_id != run.run_id
+        or run_precondition.version != run.version
+        or run_precondition.session_id != run.session_id
+    ):
+        return False
+    expected_checkpoint = checkpoint.model_copy(
+        update={
+            "checkpoint_version": checkpoint.checkpoint_version + 1,
+            "phase": RunCheckpointPhase.TERMINAL,
+        }
+    )
+    output_text = "".join(checkpoint.output_parts)
+    expected_run = run.model_copy(
+        update={
+            "status": RunStatus.COMPLETED,
+            "version": run.version + 1,
+            "output_text": output_text,
+            "usage": checkpoint.usage,
+            "tool_results": checkpoint.tool_results,
+        }
+    )
+    remaining = tuple(
+        active for active in session.active_run_ids if active != run.run_id
+    )
+    close_now = (
+        session.status is SessionStatus.CLOSING
+        and not remaining
+        and not session.active_workflow_run_ids
+    )
+    expected_session = session.model_copy(
+        update={
+            "active_run_ids": remaining,
+            "status": SessionStatus.CLOSED if close_now else session.status,
+            "version": session.version + 1,
+        }
+    )
+    terminal_payload: dict[str, Any] = {
+        "output_text": output_text,
+        "usage": checkpoint.usage.model_dump(mode="json"),
+    }
+    if checkpoint.tool_results:
+        terminal_payload["tool_results"] = [
+            item.model_dump(mode="json") for item in checkpoint.tool_results
+        ]
+    resolution_payload = {
+        "request_id": request.request_id,
+        "operation_id": request.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    requested = batch.event_preconditions[0]
+    expected_types = (
+        "reconciliation.resolved",
+        "run.completed",
+        "session.closed" if close_now else "session.run.detached",
+    )
+    expected_payloads = (
+        resolution_payload,
+        terminal_payload,
+        {"run_id": run.run_id, "status": expected_session.status.value},
+    )
+    run_write, session_write = batch.snapshots
+    first, terminal_event, session_event = batch.events
+    return (
+        terminal_checkpoint == expected_checkpoint
+        and resolved
+        == request.model_copy(
+            update={
+                "status": ReconciliationStatus.RESOLVED,
+                "resolution": resolution,
+            }
+        )
+        and requested.type == "reconciliation.requested"
+        and requested.session_id == run.session_id
+        and requested.run_id == run.run_id
+        and tuple(event.type for event in batch.events) == expected_types
+        and tuple(event.payload for event in batch.events) == expected_payloads
+        and all(event.occurred_at == batch.now for event in batch.events)
+        and first.event_id == resolution.event_id
+        and first.sequence == requested.sequence + 1
+        and terminal_event.sequence == requested.sequence + 2
+        and first.session_id == terminal_event.session_id == run.session_id
+        and first.run_id == terminal_event.run_id == run.run_id
+        and session_event.session_id == session.session_id
+        and session_event.run_id is None
+        and session_event.sequence == expected_session.version
+        and run_write.kind == "run"
+        and run_write.entity_id == run.run_id
+        and run_write.session_id == run.session_id
+        and run_write.version == expected_run.version
+        and run_write.data == expected_run.model_dump(mode="json")
+        and session_write.kind == "session"
+        and session_write.entity_id == session.session_id
+        and session_write.session_id == session.session_id
+        and session_write.version == expected_session.version
+        and session_write.data == expected_session.model_dump(mode="json")
     )

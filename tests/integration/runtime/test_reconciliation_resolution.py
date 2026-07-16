@@ -24,6 +24,7 @@ from agent_sdk.runtime.models import RunStatus
 from agent_sdk.runtime.leases import LeaseManager
 from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
+    ModelCallOperation,
     RunCheckpointPhase,
     _canonical_record_json,
 )
@@ -229,6 +230,32 @@ class _PartialAmbiguousResolutionMemoryStore(InMemoryStore):
         return result
 
 
+class _RejectCompletedTerminalResolutionMemoryStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject_terminal = True
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> Any:
+        if self.reject_terminal and any(
+            event.type == "run.completed" for event in batch.events
+        ):
+            raise RuntimeError("completed-terminal-precommit")
+        return await super().commit_run_progress(batch)
+
+
+class _RejectCompletedTerminalResolutionSQLiteStore(SQLiteStore):
+    def __init__(self, connection: Any) -> None:
+        super().__init__(connection)
+        self.reject_terminal = True
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> Any:
+        if self.reject_terminal and any(
+            event.type == "run.completed" for event in batch.events
+        ):
+            raise RuntimeError("completed-terminal-precommit")
+        return await super().commit_run_progress(batch)
+
+
 def _assert_secret_free(error: BaseException, *secrets: str) -> None:
     rendered = "".join(traceback.format_exception(error))
     assert error.__cause__ is None
@@ -287,6 +314,7 @@ async def _mark_interrupted(store: Any) -> None:
 
 async def _seed_real_model_in_flight(
     store: Any,
+    tool_spec: ToolSpec | None = None,
 ) -> tuple[str, AgentSpec, str]:
     entered = asyncio.Event()
     cancelled = asyncio.Event()
@@ -305,6 +333,11 @@ async def _seed_real_model_in_flight(
         acompletion=blocked_completion,
         permission_default="allow",
     )
+    if tool_spec is not None:
+        async def unused_tool(_: ToolContext, value: int) -> int:
+            return value
+
+        seed.tools.register(tool_spec, unused_tool)
     session = await seed.sessions.create(workspaces=[])
     handle = await seed.runs.start(session.session_id, spec, "resolve model")
     await asyncio.wait_for(entered.wait(), timeout=10)
@@ -547,14 +580,20 @@ async def _final_completion(
 
 async def _seed_pending_model_reconciliation(
     store: Any,
+    tool_spec: ToolSpec | None = None,
 ) -> tuple[str, AgentSpec, str, Any]:
-    run_id, spec, operation_id = await _seed_real_model_in_flight(store)
+    run_id, spec, operation_id = await _seed_real_model_in_flight(store, tool_spec)
     admitter = AgentSDK.for_test(
         store=store,
         acompletion=lambda **_: _final_completion([]),
         permission_default="allow",
     )
     admitter.agents.define(spec)
+    if tool_spec is not None:
+        async def unused_tool(_: ToolContext, value: int) -> int:
+            return value
+
+        admitter.tools.register(tool_spec, unused_tool)
     try:
         waiting = await admitter.recovery.recover_run(run_id)
         with pytest.raises(AgentSDKError, match="recovery required"):
@@ -652,6 +691,690 @@ async def _resolution_domain_state(store: Any) -> tuple[Any, ...]:
         ) as cursor:
             state.append(tuple(tuple(row) for row in await cursor.fetchall()))
     return tuple(state)
+
+
+def _confirmed_provider_result(
+    *,
+    text: str = "confirmed",
+    tool_call: dict[str, object] | None = None,
+) -> dict[str, object]:
+    return {
+        "disposition": "completed",
+        "finish_reason": "tool_calls" if tool_call is not None else "stop",
+        "text": text,
+        "tool_call": tool_call,
+        "usage": {
+            "prompt_tokens": 5,
+            "completion_tokens": 2,
+            "total_tokens": 7,
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize("projection", ("text", "tool_call", "failed"))
+async def test_confirm_completed_model_projects_exact_durable_outcome(
+    backend: str,
+    projection: str,
+    tmp_path: Path,
+) -> None:
+    store: Any
+    if backend == "memory":
+        store = InMemoryStore()
+    else:
+        store = await SQLiteStore.open(tmp_path / f"confirm-model-{projection}.db")
+    tool_spec = _unsafe_tool_spec()
+    run_id, spec, operation_id, request = await _seed_pending_model_reconciliation(
+        store,
+        tool_spec if projection == "tool_call" else None,
+    )
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def forbidden_provider(**_: object) -> Any:
+        provider_calls.append(1)
+        raise AssertionError("resolution must not call the provider")
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        tool_calls.append(1)
+        raise AssertionError("resolution must not call a tool")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    if projection == "tool_call":
+        sdk.tools.register(tool_spec, forbidden_tool)
+    try:
+        if projection == "failed":
+            provider_result: dict[str, object] = {
+                "disposition": "failed",
+                "error_code": "internal",
+                "retryable": True,
+            }
+        else:
+            raw_call = (
+                {
+                    "index": 0,
+                    "call_id": "call_confirmed",
+                    "name": tool_spec.name,
+                    "arguments_json": '{"value":7}',
+                }
+                if projection == "tool_call"
+                else None
+            )
+            provider_result = _confirmed_provider_result(
+                text="confirmed",
+                tool_call=raw_call,
+            )
+
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "test"},
+            evidence={"provider_result": provider_result},
+        )
+
+        assert resolved.status.value == "resolved"
+        assert provider_calls == []
+        assert tool_calls == []
+        operation = next(
+            item
+            for item in await store.list_external_operations(run_id)
+            if item.operation_id == operation_id
+        )
+        assert isinstance(operation, ModelCallOperation)
+        checkpoint = await store.get_run_checkpoint(run_id)
+        assert checkpoint is not None
+        run = await sdk.runs.get(run_id)
+        session = await sdk.sessions.get(run.session_id)
+        event_types = tuple(
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            or (
+                stored.event.run_id is None
+                and stored.event.session_id == run.session_id
+                and stored.event.type in {"session.run.detached", "session.closed"}
+            )
+        )
+
+        if projection == "tool_call":
+            assert operation.status is ExternalOperationStatus.COMPLETED
+            assert operation.outcome == {
+                "finish_reason": "tool_calls",
+                "text": "confirmed",
+                "tool_calls": (
+                    {
+                        "index": 0,
+                        "call_id": "call_confirmed",
+                        "name": tool_spec.name,
+                        "arguments_json": '{"value":7}',
+                    },
+                ),
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
+            }
+            assert checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL
+            assert checkpoint.operation_id is None
+            assert checkpoint.output_parts == ("confirmed",)
+            assert run.status is RunStatus.INTERRUPTED
+            assert run_id in session.active_run_ids
+            assert event_types[-3:] == (
+                "reconciliation.resolved",
+                "model.usage.reported",
+                "model.call.completed",
+            )
+        elif projection == "text":
+            assert operation.status is ExternalOperationStatus.COMPLETED
+            assert checkpoint.phase is RunCheckpointPhase.TERMINAL
+            assert run.status is RunStatus.COMPLETED
+            assert run.output_text == "confirmed"
+            assert run.usage is not None and run.usage.total_tokens == 7
+            assert run_id not in session.active_run_ids
+            assert event_types[-6:] == (
+                "reconciliation.resolved",
+                "model.usage.reported",
+                "model.call.completed",
+                "step.completed",
+                "run.completed",
+                "session.run.detached",
+            )
+        else:
+            assert operation.status is ExternalOperationStatus.FAILED
+            assert operation.outcome == {
+                "error": {"code": "internal", "message": "model call failed"}
+            }
+            assert checkpoint.phase is RunCheckpointPhase.TERMINAL
+            assert run.status is RunStatus.FAILED
+            assert run.error is not None
+            assert run.error.code == "internal"
+            assert run.error.message == "model call failed"
+            assert run.error.retryable is True
+            assert run_id not in session.active_run_ids
+            assert event_types[-5:] == (
+                "reconciliation.resolved",
+                "model.call.failed",
+                "step.failed",
+                "run.failed",
+                "session.run.detached",
+            )
+        exact_replay = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "test"},
+            evidence={"provider_result": provider_result},
+        )
+        assert exact_replay == resolved
+        with pytest.raises(AgentSDKError) as changed_replay:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "different"},
+                evidence={"provider_result": provider_result},
+            )
+        assert changed_replay.value.code is ErrorCode.CONFLICT
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_terminalization_gap_preserves_model_outcome(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        store: Any = _RejectCompletedTerminalResolutionMemoryStore()
+    else:
+        store = await _RejectCompletedTerminalResolutionSQLiteStore.open(
+            tmp_path / "confirm-terminal-gap.db"
+        )
+    provider_calls: list[int] = []
+
+    async def completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_calls.append(1)
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "durable"}, "finish_reason": "stop"}
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "total_tokens": 4,
+                },
+            }
+
+        return chunks()
+
+    spec = AgentSpec(name=f"terminal-gap-{backend}", model="fake/terminal-gap")
+    first = AgentSDK.for_test(
+        store=store,
+        acompletion=completion,
+        permission_default="allow",
+    )
+    session = await first.sessions.create(workspaces=[])
+    handle = await first.runs.start(session.session_id, spec, "terminal gap")
+    with pytest.raises(AgentSDKError) as terminal_failure:
+        await handle.result()
+    assert terminal_failure.value.code is ErrorCode.INTERNAL
+    operations_before = await store.list_external_operations(handle.run_id)
+    assert len(operations_before) == 1
+    operation_before = operations_before[0]
+    assert isinstance(operation_before, ModelCallOperation)
+    assert operation_before.outcome is not None
+    await first.close()
+    store.reject_terminal = False
+
+    await _mark_interrupted(store)
+    second = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    second.agents.define(spec)
+    try:
+        waiting = await second.recovery.recover_run(handle.run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await waiting.result()
+        request = (await second.recovery.pending_requests(handle.run_id))[0]
+        event_types_before = tuple(
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == handle.run_id
+        )
+        outcome = operation_before.model_dump(mode="json")["outcome"]
+        assert isinstance(outcome, dict)
+        resolved = await second.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "gap"},
+            evidence={
+                "provider_result": {
+                    "disposition": "completed",
+                    "finish_reason": outcome["finish_reason"],
+                    "text": outcome["text"],
+                    "tool_call": None,
+                    "usage": outcome["usage"],
+                }
+            },
+        )
+
+        assert resolved.status.value == "resolved"
+        run = await second.runs.get(handle.run_id)
+        assert run.status is RunStatus.COMPLETED
+        assert run.output_text == "durable"
+        operations_after = await store.list_external_operations(handle.run_id)
+        assert operations_after == operations_before
+        checkpoint = await store.get_run_checkpoint(handle.run_id)
+        assert checkpoint is not None
+        assert checkpoint.phase is RunCheckpointPhase.TERMINAL
+        event_types_after = tuple(
+            stored.event.type
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == handle.run_id
+        )
+        assert event_types_after.count("model.usage.reported") == 1
+        assert event_types_after.count("model.call.completed") == 1
+        assert event_types_after.count("step.completed") == 1
+        assert event_types_after[: len(event_types_before)] == event_types_before
+        assert event_types_after[-2:] == (
+            "reconciliation.resolved",
+            "run.completed",
+        )
+        assert provider_calls == [1]
+        exact_replay = await second.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "gap"},
+            evidence={
+                "provider_result": {
+                    "disposition": "completed",
+                    "finish_reason": outcome["finish_reason"],
+                    "text": outcome["text"],
+                    "tool_call": None,
+                    "usage": outcome["usage"],
+                }
+            },
+        )
+        assert exact_replay == resolved
+    finally:
+        await second.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirmed_model_tool_call_resumes_only_on_explicit_recovery(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "confirm-tool-resume.db")
+    )
+    tool_spec = _unsafe_tool_spec()
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store,
+        tool_spec,
+    )
+    resolver = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolve must not call provider")
+        ),
+        permission_default="allow",
+    )
+    resolver.agents.define(spec)
+
+    async def forbidden_tool(_: ToolContext, value: int) -> int:
+        del value
+        raise AssertionError("resolve must not call tool")
+
+    resolver.tools.register(tool_spec, forbidden_tool)
+    await resolver.recovery.resolve(
+        request.request_id,
+        ReconciliationAction.CONFIRM_COMPLETED,
+        actor={"operator": "resume"},
+        evidence={
+            "provider_result": _confirmed_provider_result(
+                text="confirmed",
+                tool_call={
+                    "index": 0,
+                    "call_id": "call_resume",
+                    "name": tool_spec.name,
+                    "arguments_json": '{"value":7}',
+                },
+            )
+        },
+    )
+    assert (await resolver.runs.get(run_id)).status is RunStatus.INTERRUPTED
+    await resolver.close()
+
+    provider_calls: list[int] = []
+    tool_calls: list[int] = []
+
+    async def final_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        provider_calls.append(1)
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {"choices": [{"delta": {"content": "after"}, "finish_reason": "stop"}]}
+
+        return chunks()
+
+    async def handler(_: ToolContext, value: int) -> int:
+        tool_calls.append(value)
+        return value + 1
+
+    recovery = AgentSDK.for_test(
+        store=store,
+        acompletion=final_completion,
+        permission_default="allow",
+    )
+    recovery.agents.define(spec)
+    recovery.tools.register(tool_spec, handler)
+    try:
+        recovered = await recovery.recovery.recover_run(run_id)
+        result = await recovered.result()
+        assert result.output_text == "confirmedafter"
+        assert tool_calls == [7]
+        assert provider_calls == [1]
+        assert (await recovery.runs.get(run_id)).status is RunStatus.COMPLETED
+    finally:
+        await recovery.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+@pytest.mark.parametrize(
+    "invalid_result",
+    (
+        {"disposition": "pending"},
+        {
+            "disposition": "completed",
+            "text": "ok",
+            "usage": {
+                "prompt_tokens": "1",
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        },
+        {
+            "disposition": "completed",
+            "text": "ok",
+            "usage": {},
+            "extra": True,
+        },
+        {
+            "disposition": "completed",
+            "text": "x" * (64 * 1024 + 1),
+            "usage": {},
+        },
+        {
+            "disposition": "completed",
+            "finish_reason": "x" * 129,
+            "text": "ok",
+            "usage": {},
+        },
+        {
+            "disposition": "completed",
+            "text": "ok",
+            "tool_call": {
+                "index": 0,
+                "call_id": "call_invalid",
+                "name": "resolution_tool",
+                "arguments_json": '{"value":NaN}',
+            },
+            "usage": {},
+        },
+        {
+            "disposition": "completed",
+            "text": "ok",
+            "tool_call": {
+                "index": 0,
+                "call_id": "call_invalid",
+                "name": "resolution_tool",
+                "arguments_json": "[]",
+            },
+            "usage": {},
+        },
+        {
+            "disposition": "failed",
+            "error_code": "not_public",
+            "retryable": False,
+        },
+        {
+            "disposition": "failed",
+            "error_code": "internal",
+            "retryable": 1,
+        },
+    ),
+    ids=(
+        "unsupported-disposition",
+        "coerced-usage",
+        "extra-field",
+        "unbounded-text",
+        "unbounded-finish-reason",
+        "non-finite-tool-arguments",
+        "non-object-tool-arguments",
+        "non-public-error-code",
+        "coerced-retryable",
+    ),
+)
+async def test_confirm_completed_rejects_invalid_provider_result_without_mutation(
+    backend: str,
+    invalid_result: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "invalid-confirmed-model.db")
+    )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("invalid resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        before = await _resolution_domain_state(store)
+        with pytest.raises(AgentSDKError) as caught:
+            await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "invalid"},
+                evidence={"provider_result": invalid_result},
+            )
+        assert caught.value.code is ErrorCode.INVALID_STATE
+        assert caught.value.message == "reconciliation decision is invalid"
+        assert caught.value.retryable is False
+        assert await _resolution_domain_state(store) == before
+        assert (await sdk.runs.get(run_id)).status is RunStatus.WAITING_RECONCILIATION
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_post_commit_ambiguity_converges_exactly_once(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        store: Any = _AmbiguousResolutionMemoryStore()
+    else:
+        opened = await SQLiteStore.open(tmp_path / "ambiguous-confirmed-model.db")
+        store = _AmbiguousResolutionSQLiteStore(opened._connection)
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        before = await store.latest_cursor()
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "ambiguous"},
+            evidence={"provider_result": _confirmed_provider_result()},
+        )
+        assert resolved.status.value == "resolved"
+        assert store.resolution_batches == 2
+        assert await store.latest_cursor() == before + 6
+        events = await store.read_events(after_cursor=0)
+        assert sum(
+            stored.event.type == "reconciliation.resolved" for stored in events
+        ) == 1
+        assert (await sdk.runs.get(run_id)).status is RunStatus.COMPLETED
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_two_sdk_confirm_completed_converges_on_same_terminal_projection(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    if backend == "memory":
+        owner_store: Any = _ResolutionBarrierMemoryStore()
+        follower_store: Any = owner_store
+    else:
+        opened = await SQLiteStore.open(tmp_path / "two-sdk-confirmed-model.db")
+        owner_store = _ResolutionBarrierSQLiteStore(opened._connection)
+        follower_store = await SQLiteStore.open(
+            tmp_path / "two-sdk-confirmed-model.db"
+        )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        owner_store
+    )
+    owner = AgentSDK.for_test(
+        store=owner_store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    follower = AgentSDK.for_test(
+        store=follower_store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    owner.agents.define(spec)
+    follower.agents.define(spec)
+    evidence = {"provider_result": _confirmed_provider_result()}
+    owner_store.resolution_barrier_enabled = True
+    try:
+        first = asyncio.create_task(
+            owner.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "concurrent"},
+                evidence=evidence,
+            )
+        )
+        await asyncio.wait_for(owner_store.resolution_reached.wait(), timeout=10)
+        second = asyncio.create_task(
+            follower.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.CONFIRM_COMPLETED,
+                actor={"operator": "concurrent"},
+                evidence=evidence,
+            )
+        )
+        await asyncio.sleep(0)
+        owner_store.allow_resolution.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result == second_result
+        assert (await owner.runs.get(run_id)).status is RunStatus.COMPLETED
+        events = await owner_store.read_events(after_cursor=0)
+        assert sum(
+            stored.event.type == "reconciliation.resolved" for stored in events
+        ) == 1
+    finally:
+        owner_store.allow_resolution.set()
+        await asyncio.gather(owner.close(), follower.close())
+        if backend == "sqlite":
+            await owner_store.close()
+            await follower_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_confirm_completed_closes_a_closing_session_atomically(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    store: Any = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(tmp_path / "closing-confirmed-model.db")
+    )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: (_ for _ in ()).throw(
+            AssertionError("resolution must not call provider")
+        ),
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    try:
+        run = await sdk.runs.get(run_id)
+        closing = await sdk.sessions.close(run.session_id)
+        assert closing.status is SessionStatus.CLOSING
+        await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.CONFIRM_COMPLETED,
+            actor={"operator": "close"},
+            evidence={"provider_result": _confirmed_provider_result()},
+        )
+        closed = await sdk.sessions.get(run.session_id)
+        assert closed.status is SessionStatus.CLOSED
+        assert closed.active_run_ids == ()
+        events = await store.read_events(after_cursor=0)
+        assert sum(stored.event.type == "session.closed" for stored in events) == 1
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
 
 
 async def _insert_duplicate_run_event_before_paired_interrupt(
@@ -1060,10 +1783,7 @@ async def test_resolution_replay_and_unsupported_actions_are_zero_mutation(
         request = (await sdk.recovery.pending_requests(run_id))[0]
         initial_cursor = await store.latest_cursor()
 
-        for unsupported in (
-            ReconciliationAction.CONFIRM_COMPLETED,
-            ReconciliationAction.TERMINATE,
-        ):
+        for unsupported in (ReconciliationAction.TERMINATE,):
             with pytest.raises(AgentSDKError) as caught:
                 await sdk.recovery.resolve(
                     request.request_id,
@@ -2623,8 +3343,10 @@ async def test_resolution_rejects_corrupt_request_operation_or_checkpoint(
         "duplicate_pending",
     ),
 )
+@pytest.mark.parametrize("decision", ("safe", "confirmed"))
 async def test_resolution_rejects_capability_drift_or_corrupt_durable_state(
     backend: str,
+    decision: str,
     admission_case: str,
     tmp_path: Path,
 ) -> None:
@@ -2759,9 +3481,17 @@ async def test_resolution_rejects_capability_drift_or_corrupt_durable_state(
         with pytest.raises(AgentSDKError) as caught:
             await sdk.recovery.resolve(
                 request.request_id,
-                ReconciliationAction.CONFIRM_NOT_EXECUTED,
+                (
+                    ReconciliationAction.CONFIRM_COMPLETED
+                    if decision == "confirmed"
+                    else ReconciliationAction.CONFIRM_NOT_EXECUTED
+                ),
                 actor={"type": "operator"},
-                evidence={"disposition": "not_executed"},
+                evidence=(
+                    {"provider_result": _confirmed_provider_result()}
+                    if decision == "confirmed"
+                    else {"disposition": "not_executed"}
+                ),
             )
 
         if admission_case == "capability_drift":
@@ -2833,7 +3563,11 @@ async def test_resolution_rejects_malformed_or_unsupported_decision_secret_free(
         )
         actor = {"type": "operator", "secret": actor_secret}
         evidence = {"secret": evidence_secret}
-        expected_message = "reconciliation action is not supported"
+        expected_message = (
+            "reconciliation decision is invalid"
+            if admission_case == "confirm_completed"
+            else "reconciliation action is not supported"
+        )
         secrets = (actor_secret, evidence_secret)
 
     provider_calls: list[int] = []
