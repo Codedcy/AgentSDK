@@ -237,3 +237,128 @@ release matrix; Python 3.12 plus 3.13 release gates; wheel/sdist and clean-wheel
 imports; reference CLI help; final M02-T002 report; whole-task independent
 review; and progress-ledger transition. This slice does not claim or implement
 any of those items.
+
+## Independent review closure addendum
+
+This addendum is authoritative over the earlier verification counts and scope
+summary. Independent review found two blocking gaps. Both are closed in
+implementation commit `069ec71` (`fix(recovery): close workflow projection
+review gaps`) and are ready for re-review; this report does not self-approve the
+independent review.
+
+### I1: terminal projection certification TOCTOU
+
+The first RED barrier paused the Workflow node commit after terminal Run
+certification, then changed either the durable Run terminal data or Session
+Workflow ownership without changing its version. Memory and SQLite both
+projected the stale terminal result for completed and failed Runs:
+
+```text
+Run/Session x completed/failed x Memory/SQLite: 8 failed
+```
+
+A second RED proved the same gap for child parent evidence. Removing the parent
+precondition made both Stores project the child despite same-version parent Run
+corruption:
+
+```text
+child parent mutation x Memory/SQLite: 2 failed
+```
+
+Root cause: terminal certification and `complete_node`/`fail_node` were separate
+durable boundaries. The node batch required only Session existence plus
+Workflow/node versions, so it did not bind the projected value to the exact
+certified Run, exact current Session ownership, or exact child parent.
+
+The fix reloads and exactly compares the terminal Run after certification,
+reloads and validates current Session ownership, revalidates child parent and
+live capabilities, and carries exact Session, terminal Run, and optional parent
+Run preconditions into the same atomic node batch. The batch also uses exact
+Workflow and node data preconditions. A concurrent winning SDK is distinguished
+from lost ownership by reloading the authoritative Workflow and retrying only
+when it actually changed; this preserved two-SDK convergence.
+
+```text
+I1 Run/Session/parent barriers: 10 passed
+```
+
+No stale node result, Workflow terminal event, Session detach, callback, or
+cursor advance survives a rejected projection.
+
+### I2: confirmed Model ToolCall followed by later reconciliation
+
+The public production path starts a Workflow, interrupts its first Model call,
+confirms a Model result containing one ToolCall, executes that Tool normally
+exactly once, interrupts the following Model call, and admits a second
+reconciliation. Before the fix, both possible second decisions conflicted on
+both Stores:
+
+```text
+second CONFIRM_NOT_EXECUTED/CONFIRM_COMPLETED x Memory/SQLite: 4 failed
+```
+
+Root cause was cumulative evidence normalization, not Workflow logic:
+
+- stripping a prior Model `reconciliation.resolved` marker for current-attempt
+  certification left non-contiguous normalized event sequences/cursors;
+- terminal closed-world validation required a single reconciliation before it
+  considered the exact normalized terminal history;
+- `_effective_resolved_evidence` normalized confirmed Model ToolCalls but not a
+  later confirmed terminal Model result; and
+- terminal lifecycle validation could identify only one operator-confirmed
+  Model operation.
+
+The fix re-sequences the exact certification projection, validates terminal
+closed-world history before applying the single-record shortcut, normalizes a
+later confirmed terminal Model result, and passes the set of individually exact
+confirmed Model operation IDs into the existing lifecycle FSM. This does not
+introduce a new state machine or relax the Model, Tool, permission, event, or
+terminal grammars.
+
+Canonical CNE and CC paths now complete the Run and Workflow with the exact
+durable Tool result, one Tool call, the expected zero-or-one final Provider
+call, and stable replay of the first decision. A schema-valid corruption of the
+prior confirmed Model outcome makes the second decision return the exact public
+conflict with unchanged Workflow, node, Run, checkpoint, operations,
+reconciliation records, cursor, and callbacks:
+
+```text
+canonical/corrupt x CNE/CC x Memory/SQLite: 8 passed
+```
+
+### Fresh post-review verification
+
+All commands used the explicit `uv.exe` runtime with Python 3.13.
+
+```text
+new Workflow projection file:                         44 passed
+reconciliation + Store focus:                        394 passed
+Phase 5 Provider/Tool/RecoveryAPI focus:             772 passed
+Workflow recovery/admission/ownership:               203 passed
+Store/lease/Session/Workflow/observability neighbors: 688 passed
+full suite after the final security tightening:     2027 passed in 135.87s
+
+ruff check .
+All checks passed!
+
+mypy src
+Success: no issues found in 75 source files
+
+import/signature/schema smoke
+103 unique root exports; public signatures unchanged; SQLite schema version 3
+
+git diff --check
+exit 0; only Windows LF-to-CRLF informational warnings
+```
+
+The review closure changes only:
+
+- `src/agent_sdk/runtime/recovery.py`
+- `src/agent_sdk/workflow/executor.py`
+- `src/agent_sdk/workflow/state.py`
+- `tests/integration/workflow/test_workflow_reconciliation_projection.py`
+- this report
+
+There is still no public API, dependency, lockfile, migration, schema version,
+root export, event contract, design, roadmap, progress ledger, or task-index
+change. Phase 5C scope remains unchanged.
