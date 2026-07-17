@@ -1052,6 +1052,57 @@ async def test_corrupt_database_classification_is_consistent_across_public_paths
         assert secret not in str(captured.value)
 
 
+@pytest.mark.parametrize("public_operation", ["plan", "applied"])
+@pytest.mark.parametrize(
+    ("primary_code", "extension"),
+    [
+        (sqlite3.SQLITE_IOERR, 1),
+        (sqlite3.SQLITE_BUSY, 2),
+        (sqlite3.SQLITE_LOCKED, 1),
+    ],
+    ids=["ioerr-read", "busy-snapshot", "locked-shared-cache"],
+)
+@pytest.mark.asyncio
+async def test_inspection_extended_operational_errors_use_public_io_boundary(
+    public_operation: str,
+    primary_code: int,
+    extension: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = tmp_path / f"secret-inspection-{primary_code}-{public_operation}.db"
+    runner = await MigrationRunner.open(supplied)
+    await runner.apply()
+    backend_message = "inspection backend leaked secret credential"
+    opened_connections: list[Any] = []
+
+    async def fail_inspection(connection: Any, migrations: Any) -> Any:
+        del migrations
+        assert connection._connection is not None
+        opened_connections.append(connection)
+        error = sqlite3.DatabaseError(backend_message)
+        error.sqlite_errorcode = primary_code | (extension << 8)
+        raise error
+
+    monkeypatch.setattr(
+        migration_storage,
+        "_inspect_connection_applied",
+        fail_inspection,
+    )
+    with pytest.raises(migration_storage.MigrationIOError) as captured:
+        if public_operation == "plan":
+            await runner.plan()
+        else:
+            await runner.applied()
+
+    _assert_sanitized_database_io_error(
+        captured.value,
+        secrets=(str(supplied), "secret-inspection", backend_message),
+    )
+    assert len(opened_connections) == 1
+    assert opened_connections[0]._connection is None
+
+
 @pytest.mark.asyncio
 async def test_packaged_resource_read_failure_has_separate_stable_error(
     tmp_path: Path,
@@ -1353,6 +1404,71 @@ def test_sqlite_parameter_tokens_preserve_boundaries(
         f"SELECT\t{parameter} "
     )
     assert not _sql_shapes_equal(f"SELECT {parameter}", f"SELECT {split}")
+
+
+@pytest.mark.parametrize(
+    ("parameter", "binding_name", "expected"),
+    [
+        ("$foo(bar)", "foo(bar)", 11),
+        ("$foo::bar", "foo::bar", 12),
+        ("$foo::bar(baz)", "foo::bar(baz)", 13),
+        ("$foo::", "foo::", 14),
+        ("$foo::(bar)", "foo::(bar)", 15),
+        ("$foo::::bar", "foo::::bar", 16),
+    ],
+)
+def test_sqlite_tcl_variables_bind_as_complete_longest_match_tokens(
+    parameter: str,
+    binding_name: str,
+    expected: int,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute(
+            f"SELECT {parameter}",
+            {binding_name: expected},
+        ).fetchone() == (expected,)
+
+    assert _normalized_sql(f"SELECT {parameter}") == _normalized_sql(
+        f" select\n{parameter} "
+    )
+
+
+@pytest.mark.parametrize(
+    ("whole", "split"),
+    [
+        ("$foo(bar)", "$foo (bar)"),
+        ("$foo(bar)", "$foo/* split */(bar)"),
+        ("$foo::bar", "$foo ::bar"),
+        ("$foo::bar", "$foo/* split */::bar"),
+        ("$foo::bar(baz)", "$foo::bar (baz)"),
+    ],
+)
+def test_sqlite_tcl_variable_whitespace_and_comments_end_the_token(
+    whole: str,
+    split: str,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(sqlite3.Error):
+            connection.execute(
+                f"SELECT {split}",
+                {"foo": 7, "foo::bar": 7},
+            )
+
+    assert not _sql_shapes_equal(f"SELECT {whole}", f"SELECT {split}")
+    assert not _sql_shapes_equal(f"SELECT {whole.upper()}", f"SELECT {whole}")
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    ["$foo(", "$foo(bar", "$foo::bar(", "$foo(bar baz)", "$foo(bar\tbaz)"],
+)
+def test_sqlite_tcl_variable_unclosed_suffixes_fail_closed(parameter: str) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(sqlite3.Error):
+            connection.execute(f"SELECT {parameter}", {})
+
+    with pytest.raises(ValueError, match="malformed SQLite SQL"):
+        _normalized_sql(f"SELECT {parameter}")
 
 
 def test_sqlite_comments_normalize_only_when_complete() -> None:

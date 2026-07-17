@@ -601,7 +601,7 @@ async def _inspect_applied(
     try:
         return await _inspect_connection_applied(connection, migrations)
     except sqlite3.Error as error:
-        raise MigrationSchemaError("incompatible database schema") from error
+        raise _database_boundary_error(error) from error
     finally:
         await _close_connection(connection)
 
