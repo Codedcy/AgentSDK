@@ -296,8 +296,9 @@ Success: no issues found in 84 source files
 ```
 v0.1 R2 Task 1: complete (commits e3494ae and 1fc9c72; final review Spec approved / Quality approved; fresh 82 focused and schema-v1 compiler tests passed; strict mypy and Ruff clean)
 v0.1 R2 Task 2: complete (commits 9b23e5a and cfdf43a; final review Spec approved / Quality approved; fresh 120 unit/descriptor and 253 Workflow integration tests passed; strict mypy and Ruff clean)
+v0.1 R2 Task 3: complete (commits e4624f7 and 36a7268; final review Spec approved / Quality approved; fresh 19 focused and 370 Workflow unit/integration tests passed; strict mypy and Ruff clean)
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md`
-v0.1 next required action: R2 Task 3 Step 1, creating `tests/unit/workflow/test_program.py`
-v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/workflow/test_program.py -q`
-v0.1 R2 remains in progress; Tasks 3-5 have not started
+v0.1 next required action: R2 Task 4 Steps 1-2, creating `tests/integration/workflow/test_control_execution.py` and `tests/integration/workflow/test_control_recovery.py`
+v0.1 first RED command after those files exist: `.\.venv\Scripts\python.exe -m pytest tests/integration/workflow/test_control_execution.py tests/integration/workflow/test_control_recovery.py -q`
+v0.1 R2 remains in progress; Tasks 4-5 have not started

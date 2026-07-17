@@ -31,15 +31,23 @@ All checks passed!
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk
 Success: no issues found in 84 source files"""
 R1_FINAL_COMMITS = ("d4cd336", "2f0e922")
-R2_TASK_COMMITS = ("e3494ae", "1fc9c72", "9b23e5a", "cfdf43a")
+R2_TASK_COMMITS = (
+    "e3494ae",
+    "1fc9c72",
+    "9b23e5a",
+    "cfdf43a",
+    "e4624f7",
+    "36a7268",
+)
 R2_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
 R2_RESUME_COMMAND = (
     r"Get-Content docs\superpowers\plans"
     r"\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
 )
-R2_FIRST_TEST = "tests/unit/workflow/test_program.py"
+R2_FIRST_TEST = "tests/integration/workflow/test_control_execution.py"
 R2_FIRST_RED = (
-    rf".\.venv\Scripts\python.exe -m pytest {R2_FIRST_TEST} -q"
+    rf".\.venv\Scripts\python.exe -m pytest {R2_FIRST_TEST} "
+    "tests/integration/workflow/test_control_recovery.py -q"
 )
 
 
@@ -60,11 +68,11 @@ def _assert_r1_checkpoint_and_r2_resume(document: str) -> None:
     assert "Ready to proceed to R2: Yes" in document
     assert R2_PLAN in document
     assert R2_RESUME_COMMAND in document
-    assert "R2 Task 3 Step 1" in document
+    assert "R2 Task 4 Steps 1-2" in document
     assert R2_FIRST_TEST in document
     assert R2_FIRST_RED in document
     assert "R2 remains in progress" in document
-    assert "Tasks 3-5 have not started" in document
+    assert "Tasks 4-5 have not started" in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
