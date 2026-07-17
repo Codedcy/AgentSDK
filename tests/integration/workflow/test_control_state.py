@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,8 +9,9 @@ from pydantic import ValidationError
 
 from agent_sdk.api import AgentSDK
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import TokenUsage
+from agent_sdk.runtime.models import RunResult, TokenUsage
 from agent_sdk.storage.memory import InMemoryStore
+from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.workflow.compiler import WorkflowCompiler
 from agent_sdk.workflow.models import (
     WorkflowControlState,
@@ -19,6 +21,8 @@ from agent_sdk.workflow.models import (
     WorkflowNodeStatus,
     WorkflowRunSnapshot,
 )
+from agent_sdk.workflow.program import CompleteWorkflow, next_action
+from agent_sdk.workflow.program import PersistControl
 from agent_sdk.workflow.state import WorkflowState
 
 
@@ -294,3 +298,149 @@ def test_schema_v2_validates_control_references_and_allows_unselected_pending() 
         payload["version"] = control.revision + 2
         with pytest.raises(ValidationError):
             WorkflowRunSnapshot.model_validate(payload)
+
+    corrupted_marker = valid.model_dump(mode="json")
+    corrupted_marker["control"]["last_output_node_id"] = "selected"
+    with pytest.raises(ValidationError):
+        WorkflowRunSnapshot.model_validate(corrupted_marker)
+
+
+@pytest.mark.asyncio
+async def test_last_output_marker_survives_sqlite_roundtrip(
+    tmp_path: Path,
+) -> None:
+    workflow = WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(
+            {
+                "api_version": "agent-sdk/v1",
+                "kind": "Workflow",
+                "name": "sqlite-output-order",
+                "steps": [
+                    {
+                        "id": "repeat",
+                        "kind": "loop",
+                        "until": {
+                            "path": "outputs.a",
+                            "op": "exists",
+                        },
+                        "max_iterations": 2,
+                        "body": [
+                            {
+                                "id": "choose",
+                                "kind": "condition",
+                                "when": {"path": "outputs.b", "op": "exists"},
+                                "then_steps": [
+                                    {
+                                        "id": "a",
+                                        "kind": "agent",
+                                        "agent_revision": "worker@1",
+                                        "input": "a",
+                                    }
+                                ],
+                                "else_steps": [
+                                    {
+                                        "id": "b",
+                                        "kind": "agent",
+                                        "agent_revision": "worker@1",
+                                        "input": "b",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+    database = tmp_path / "workflow-output-order.db"
+    store = await SQLiteStore.open(database)
+    sdk = AgentSDK.for_test(store=store, acompletion=_provider)
+    session = await sdk.sessions.create(workspaces=[])
+    state = WorkflowState(store)
+    snapshot = (await state.create(session.session_id, workflow)).value
+    snapshot = await state.start_node(snapshot, 1, "run_b")
+    snapshot = await state.complete_node(
+        snapshot,
+        1,
+        RunResult(
+            run_id="run_b",
+            output_text="B-first",
+            usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    )
+    snapshot = await state.start_node(snapshot, 0, "run_a")
+    snapshot = await state.complete_node(
+        snapshot,
+        0,
+        RunResult(
+            run_id="run_a",
+            output_text="A-last",
+            usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        ),
+    )
+    completed = {node.node_id: node for node in snapshot.nodes}
+    merged_b = next_action(
+        workflow,
+        snapshot.control.model_copy(update={"program_counter": 4}),
+        completed_nodes=completed,
+    )
+    assert isinstance(merged_b, PersistControl)
+    snapshot = await state.advance_control(
+        snapshot,
+        merged_b.control,
+        event_type=merged_b.event_type,
+        event_payload=merged_b.event_payload,
+    )
+    snapshot = await state.advance_control(
+        snapshot,
+        snapshot.control.model_copy(
+            update={
+                "program_counter": 2,
+                "revision": snapshot.control.revision + 1,
+            }
+        ),
+        event_type="workflow.condition.selected",
+        event_payload={"condition_id": "choose", "branch": "then"},
+    )
+    merged_a = next_action(
+        workflow,
+        snapshot.control,
+        completed_nodes=completed,
+    )
+    assert isinstance(merged_a, PersistControl)
+    snapshot = await state.advance_control(
+        snapshot,
+        merged_a.control,
+        event_type=merged_a.event_type,
+        event_payload=merged_a.event_payload,
+    )
+    while snapshot.control.program_counter != len(workflow.instructions) - 1:
+        action = next_action(
+            workflow,
+            snapshot.control,
+            completed_nodes=completed,
+        )
+        assert isinstance(action, PersistControl)
+        snapshot = await state.advance_control(
+            snapshot,
+            action.control,
+            event_type=action.event_type,
+            event_payload=action.event_payload,
+        )
+
+    await sdk.close()
+    await store.close()
+
+    reopened = await SQLiteStore.open(database)
+    try:
+        restored = await WorkflowState(reopened).load(snapshot.workflow_run_id)
+        assert restored.control is not None
+        assert restored.control.last_output_node_id == "a"
+        action = next_action(
+            workflow,
+            restored.control,
+            completed_nodes={node.node_id: node for node in restored.nodes},
+        )
+        assert action == CompleteWorkflow(output_text="A-last")
+    finally:
+        await reopened.close()

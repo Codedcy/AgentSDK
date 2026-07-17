@@ -127,3 +127,77 @@ git diff --check
 
 `git diff --check` completed successfully; only line-ending normalization
 warnings were emitted.
+
+## Independent Review Fix
+
+The independent review's one Important and one Minor finding were corrected
+without entering R2 Task 4.
+
+### Durable last-output attribution
+
+`WorkflowControlState` now has the minimal durable field
+`last_output_node_id: str | None = None`. The default is omitted from serialized
+payloads, so pre-field schema-v2 control payloads and all schema-v1 snapshots
+remain loadable. Control revision and Workflow version formulas are unchanged.
+
+The reducer sets the marker only when it first merges a completed Agent's
+output. Revisiting an already-recorded completed Agent advances control without
+changing the marker. `complete` uses the marker rather than flattened static
+node order. Schema-v2 snapshots reject a non-null marker unless it identifies
+an output already recorded for a completed node.
+
+The regression program has static Agent order `(a, b)` and durable execution
+merge order `b -> a`. It verifies:
+
+- the first merge records `b`;
+- the second merge records `a`;
+- revisiting completed `b` does not replace `a`;
+- canonical sorted JSON round trips preserve `a`;
+- a real SQLite close/reopen round trip preserves `a`;
+- completion returns `A-last`, not static-order `B-first`;
+- a corrupted marker is rejected.
+
+The SQLite regression also exposed that reducer output payloads contain frozen
+nested mappings. `advance_control` now thaws its typed JSON event payload before
+the atomic write, allowing the same reducer action to persist on SQLite as on
+the in-memory store.
+
+### Expression failure regression
+
+A permanent reducer test now asserts that a missing expression value returns an
+event-free `FailWorkflow` with the exact durable failure:
+
+```text
+code: workflow_expression_error
+message: workflow expression value is missing
+retryable: false
+```
+
+### Review-fix TDD and verification
+
+The last-output test first failed because `WorkflowControlState` had no
+`last_output_node_id`. After the minimal implementation, the focused review
+matrix passed:
+
+```text
+4 passed in 2.97s
+```
+
+Fresh complete Task 3 focused tests:
+
+```text
+19 passed in 3.28s
+```
+
+Fresh complete Workflow regression:
+
+```text
+370 passed in 39.44s
+```
+
+Static verification remained clean:
+
+```text
+Success: no issues found in 3 source files
+All checks passed!
+```

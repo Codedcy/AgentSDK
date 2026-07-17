@@ -423,12 +423,26 @@ class WorkflowControlState(BaseModel):
         default_factory=dict,
         validate_default=True,
     )
+    last_output_node_id: str | None = Field(
+        default=None,
+        max_length=128,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("program_counter", "revision", mode="before")
     @classmethod
     def _validate_counter_type(cls, value: Any) -> int:
         if type(value) is not int:
             raise ValueError("workflow control counters must be integers")
+        return value
+
+    @field_validator("last_output_node_id", mode="before")
+    @classmethod
+    def _validate_last_output_node_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value:
+            raise ValueError("workflow last output node id must be a nonempty string")
         return value
 
     @field_validator(
@@ -747,6 +761,11 @@ def _validate_control_state(
         for node_id in control.outputs
     ):
         raise ValueError("workflow control output does not belong to a completed node")
+    if (
+        control.last_output_node_id is not None
+        and control.last_output_node_id not in control.outputs
+    ):
+        raise ValueError("workflow last output node id is not a recorded output")
 
 
 def _sum_node_usage(nodes: tuple[WorkflowNodeSnapshot, ...]) -> TokenUsage:

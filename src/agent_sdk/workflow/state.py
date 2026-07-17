@@ -34,6 +34,7 @@ from agent_sdk.storage.idempotency import (
     fingerprint_command,
     validate_replay,
 )
+from agent_sdk.tools.models import thaw_json
 from agent_sdk.workflow.models import (
     JsonValue,
     WorkflowControlState,
@@ -332,7 +333,7 @@ class WorkflowState:
             session_id=current.session_id,
             run_id=current.workflow_run_id,
             sequence=advanced.version,
-            payload=dict(event_payload),
+            payload=dict(thaw_json(event_payload)),
         )
         await self._commit(
             CommitBatch(

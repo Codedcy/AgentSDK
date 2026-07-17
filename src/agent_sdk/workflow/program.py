@@ -71,11 +71,15 @@ def next_action(
             raise ValueError("completed node map contains a non-completed node")
         output = _parse_node_output(cast(str, completed.output_text))
         outputs = dict(control.outputs)
+        first_merge = node_id not in outputs
         outputs[node_id] = output
         updated = _updated_control(
             control,
             program_counter=control.program_counter + 1,
             outputs=outputs,
+            last_output_node_id=(
+                node_id if first_merge else control.last_output_node_id
+            ),
         )
         return PersistControl(
             control=updated,
@@ -180,6 +184,16 @@ def next_action(
         )
 
     if instruction.op == "complete":
+        if control.last_output_node_id is not None:
+            completed = completed_nodes.get(control.last_output_node_id)
+            if (
+                completed is None
+                or completed.status is not WorkflowNodeStatus.COMPLETED
+            ):
+                raise ValueError(
+                    "workflow last output node is not completed"
+                )
+            return CompleteWorkflow(output_text=cast(str, completed.output_text))
         for node in reversed(workflow.nodes):
             completed = completed_nodes.get(node.id)
             if (
@@ -227,6 +241,7 @@ def _updated_control(
     selected_branches: Mapping[str, str] | None = None,
     loop_iterations: Mapping[str, int] | None = None,
     outputs: Mapping[str, JsonValue] | None = None,
+    last_output_node_id: str | None = None,
 ) -> WorkflowControlState:
     return WorkflowControlState.model_validate(
         {
@@ -243,6 +258,11 @@ def _updated_control(
                 else loop_iterations
             ),
             "outputs": current.outputs if outputs is None else outputs,
+            "last_output_node_id": (
+                current.last_output_node_id
+                if last_output_node_id is None
+                else last_output_node_id
+            ),
         }
     )
 

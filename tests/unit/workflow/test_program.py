@@ -99,6 +99,55 @@ def _completed(node_id: str, output_text: str) -> WorkflowNodeSnapshot:
     )
 
 
+def _reverse_execution_program():
+    return WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(
+            {
+                "api_version": "agent-sdk/v1",
+                "kind": "Workflow",
+                "name": "reverse-execution-order",
+                "steps": [
+                    {
+                        "id": "repeat",
+                        "kind": "loop",
+                        "until": {
+                            "path": "outputs.a",
+                            "op": "exists",
+                        },
+                        "max_iterations": 2,
+                        "body": [
+                            {
+                                "id": "choose",
+                                "kind": "condition",
+                                "when": {
+                                    "path": "outputs.b",
+                                    "op": "exists",
+                                },
+                                "then_steps": [
+                                    {
+                                        "id": "a",
+                                        "kind": "agent",
+                                        "agent_revision": "worker@1",
+                                        "input": "a",
+                                    }
+                                ],
+                                "else_steps": [
+                                    {
+                                        "id": "b",
+                                        "kind": "agent",
+                                        "agent_revision": "worker@1",
+                                        "input": "b",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+
 def test_branch_decision_is_recorded_and_advances() -> None:
     ir = _program()
 
@@ -318,6 +367,93 @@ def test_complete_without_agent_uses_canonical_inputs() -> None:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+        )
+    )
+
+
+def test_complete_uses_durable_merge_order_not_static_node_order() -> None:
+    ir = _reverse_execution_program()
+    assert tuple(node.id for node in ir.nodes) == ("a", "b")
+    completed = {
+        "b": _completed("b", "B-first"),
+        "a": _completed("a", "A-last"),
+    }
+
+    merged_b = next_action(
+        ir,
+        WorkflowControlState(program_counter=4),
+        completed_nodes=completed,
+    )
+    assert isinstance(merged_b, PersistControl)
+    assert merged_b.control.last_output_node_id == "b"
+    restored_b = WorkflowControlState.model_validate_json(
+        json.dumps(
+            merged_b.control.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+    merged_a = next_action(
+        ir,
+        restored_b.model_copy(
+            update={
+                "program_counter": 2,
+                "revision": restored_b.revision + 1,
+            }
+        ),
+        completed_nodes=completed,
+    )
+    assert isinstance(merged_a, PersistControl)
+    assert merged_a.control.last_output_node_id == "a"
+    restored_a = WorkflowControlState.model_validate_json(
+        json.dumps(
+            merged_a.control.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    revisited_b = next_action(
+        ir,
+        restored_a.model_copy(
+            update={
+                "program_counter": 4,
+                "revision": restored_a.revision + 1,
+            }
+        ),
+        completed_nodes=completed,
+    )
+    assert isinstance(revisited_b, PersistControl)
+    assert revisited_b.control.last_output_node_id == "a"
+
+    action = next_action(
+        ir,
+        revisited_b.control.model_copy(
+            update={
+                "program_counter": len(ir.instructions) - 1,
+                "revision": revisited_b.control.revision + 1,
+            }
+        ),
+        completed_nodes=completed,
+    )
+
+    assert action == CompleteWorkflow(output_text="A-last")
+
+
+def test_expression_error_returns_stable_event_free_failure_action() -> None:
+    ir = _program()
+
+    action = next_action(
+        ir,
+        WorkflowControlState(program_counter=4),
+        completed_nodes={},
+    )
+
+    assert action == FailWorkflow(
+        failure=WorkflowFailure(
+            code="workflow_expression_error",
+            message="workflow expression value is missing",
+            retryable=False,
         )
     )
 
