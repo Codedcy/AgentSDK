@@ -235,3 +235,13 @@ M02-T003 Phase A fourth fix: paused at a safe checkpoint; Phase B remains blocke
 M02-T003 Phase A fourth-fix checkpoint: leading-empty Tcl variable code/tests implemented; exact16, Tcl32, lexer/schema/public-boundary90, and migration/v3/review271 passed; root re-ran Tcl32 passed; diff-check clean
 M02-T003 Phase A fourth-fix pending gates: complete storage, full Python3.13, Ruff, strict mypy, py_compile, build/wheel/import/resources/scope; then append report, commit final evidence, and run a fresh independent C0/I0 review
 Next action on resume: read M02-T003-phaseA-leading-empty-variable-fix-brief.md, verify checkpoint commit, start with complete tests/integration/storage; do not redo the completed RED/GREEN or enter Phase B
+
+v0.1 release convergence decision (2026-07-17): approved in conversation; written specification pending user review
+v0.1 design: docs/superpowers/specs/2026-07-17-agent-sdk-v0.1-release-design.md
+v0.1 goal: release a usable functional closed loop before further production-grade hardening
+v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
+v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
+v0.1 current implementation status: not started; existing code remains at clean checkpoint d707adc and is reused as the baseline
+v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
+v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
+v0.1 next action: review and approve the written v0.1 specification, then replace the implementation roadmap with detailed R0-R5 plans before changing production code
