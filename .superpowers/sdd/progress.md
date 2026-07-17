@@ -225,4 +225,8 @@ M02-T003 Phase A second-fix gates: focused 43 passed; migration/review 233 passe
 M02-T003 Phase A second re-review: Not Approved; Spec C0/I1/M0 and Quality C0/I1/M0
 M02-T003 Phase A second re-review findings: SQLite Tcl-style $ parameter suffixes are not longest-matched and collide with whitespace-split SQL; plan/applied inspection-time numeric SQLite I/O is misclassified as schema corruption
 M02-T003 Phase A third-fix brief: .superpowers/sdd/M02-T003-phaseA-second-rereview-fix-brief.md
-M02-T003 Phase A third fix: in progress; Phase B remains blocked
+M02-T003 Phase A third-fix implementation: 3bceab5
+M02-T003 Phase A third fixes: complete SQLite Tcl-style $ variable longest matching; consistent numeric inspection-time IOERR/BUSY/LOCKED public I/O classification
+M02-T003 Phase A third-fix gates: exact 22 passed; lexical/boundary 74 passed; migration/review 255 passed; storage 655 passed; full Python3.13 2365 passed; Ruff clean; strict mypy77 clean; py_compile/build/import/isolated-wheel resources/diff/scope clean
+M02-T003 Phase A third fix: complete; fresh independent re-review is required and Phase B remains blocked
+Next action: run a fresh independent M02-T003 Phase A re-review for Spec C0/I0 and Quality C0/I0 before any Phase B work

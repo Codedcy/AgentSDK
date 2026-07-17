@@ -242,3 +242,90 @@ All commands ran from
     files: the two migration/SQLite modules, new private DDL lexer, and three
     migration/busy regression-test modules. No unrelated formatting or scope
     expansion was included.
+
+## Third repair for the second re-review (2026-07-17)
+
+### Status and scope
+
+DONE at implementation commit `3bceab5`. This final surgical repair closes the
+two findings in `M02-T003-phaseA-second-rereview-fix-brief.md`. Its production
+diff is limited to the private SQLite lexer and the migration inspection error
+boundary. Phase B and M02-T004 remain blocked pending a fresh independent
+Spec C0/I0 and Quality C0/I0 review; no task checkbox or task index changed.
+
+### SQLite 3.53.1 Tcl-variable probe
+
+The pre-test real SQLite probe established the tokenizer behavior used by the
+regressions:
+
+- `$foo(bar)`, `$foo::bar`, and `$foo::bar(baz)` each bind as one complete
+  variable and return the exact supplied value.
+- SQLite longest matching also accepts empty `::` name segments:
+  `$foo::`, `$foo::(bar)`, and `$foo::::bar` each bind as one variable.
+- Whitespace or a comment before an adjacent `::` or `(` ends the prior
+  variable token; the required split examples fail SQLite parsing rather than
+  becoming the complete variable.
+- A Tcl suffix terminates at its first `)`. ASCII whitespace before that close
+  produces an unclosed/illegal token; an adjacent suffix without a close also
+  fails. These cases now fail closed in the comparison lexer.
+
+### Implemented repairs
+
+1. The `$` branch of `_parameter_sql_token()` retains the required initial
+   identifier segment, consumes every adjacent `::` segment using SQLite
+   longest matching, and consumes one adjacent Tcl suffix through its first
+   close. It preserves exact spelling/case and rejects NUL, SQLite ASCII
+   whitespace inside the suffix, or a missing close. `?NNN`, `:name`, and
+   `@name` are unchanged.
+2. `_inspect_applied()` now routes caught `sqlite3.Error` through the existing
+   numeric `_database_boundary_error()` classifier. Extended IOERR/BUSY/LOCKED
+   from inspection map to the exact sanitized I/O error. Existing NOTADB and
+   CORRUPT classification remains the exact schema error; explicit migration
+   errors and cancellation remain outside the catch.
+
+### Strict RED/GREEN evidence
+
+- Tcl-variable RED against the `7ed2465` production baseline:
+  `11 failed, 5 passed, 104 deselected in 3.29s`. The failures comprised five
+  valid `::`/suffix longest-match forms rejected by the lexer, two
+  whitespace/comment collisions, and four unclosed suffixes accepted by the
+  normalizer.
+- Inspection-boundary RED against the same baseline:
+  `6 failed, 120 deselected in 4.27s`. Extended IOERR, BUSY, and LOCKED for
+  both `plan()` and `applied()` were all misclassified as schema errors after a
+  real read-only connection had opened.
+- Exact two-finding GREEN:
+  `22 passed, 104 deselected in 3.84s`.
+- Complete lexical/schema plus public stat/connect/config/WAL/busy/resource/
+  cancellation/corrupt boundary selection:
+  `74 passed, 52 deselected in 6.74s`.
+
+### Authoritative completion gates
+
+All commands ran from
+`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` with explicit
+`--python 3.13`; the interpreter was `Python 3.13.14`.
+
+1. Complete migration, v3 migration, and review-fix suite:
+   `255 passed in 65.26s`.
+2. Complete `tests/integration/storage` suite:
+   `655 passed in 101.61s`.
+3. Complete project suite: `2365 passed in 307.09s`.
+4. `ruff check src tests examples`: `All checks passed!`.
+5. `mypy --strict src`:
+   `Success: no issues found in 77 source files`.
+6. `python -m py_compile` over all Python files under `src`, `tests`, and
+   `examples`: exit 0.
+7. `git diff --check`: exit 0.
+8. `uv build --wheel`: built
+   `dist/agent_sdk-0.1.0.dev0-py3-none-any.whl` successfully.
+9. Source public import loaded `AgentSDK`, `MigrationRunner`,
+   `MigrationIOError`, `MigrationSchemaError`, and `SQLiteStore` successfully.
+10. An isolated install from the wheel imported successfully. The wheel
+    contains private `_sqlite_ddl.py` and exactly numbered migrations
+    0001-0004; loaded versions were `(1, 2, 3, 4)` with all four trusted
+    release-manifest SHA-256 checksums.
+11. The implementation diff contains only `_sqlite_ddl.py`, the one-line
+    `_inspect_applied()` boundary change, and their review-fix tests: three
+    files, 131 insertions, one deletion. No unrelated formatting, Artifact
+    lifecycle, Phase B, or M02-T004 change was included.
