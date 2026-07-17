@@ -385,8 +385,14 @@ def test_idle_database_coordinator_is_reclaimed() -> None:
 async def test_waiting_database_coordinator_cannot_split_into_a_second_lock() -> None:
     identity = "test-waiting-coordinator"
     lock = migration_storage._coordinator(identity)
-    await lock.acquire()
+    holder_started = asyncio.Event()
+    release_holder = asyncio.Event()
     waiter_started = asyncio.Event()
+
+    async def hold_lock() -> None:
+        async with lock:
+            holder_started.set()
+            await release_holder.wait()
 
     async def wait_for_lock() -> None:
         waiting_lock = migration_storage._coordinator(identity)
@@ -394,10 +400,13 @@ async def test_waiting_database_coordinator_cannot_split_into_a_second_lock() ->
         async with waiting_lock:
             assert waiting_lock is lock
 
+    holder = asyncio.create_task(hold_lock())
+    await asyncio.wait_for(holder_started.wait(), timeout=1)
     waiter = asyncio.create_task(wait_for_lock())
     await asyncio.wait_for(waiter_started.wait(), timeout=1)
     assert migration_storage._coordinator(identity) is lock
-    lock.release()
+    release_holder.set()
+    await asyncio.wait_for(holder, timeout=1)
     await asyncio.wait_for(waiter, timeout=1)
 
 

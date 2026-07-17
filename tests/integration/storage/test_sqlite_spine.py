@@ -22,6 +22,7 @@ from agent_sdk.context.models import (
 from agent_sdk.evaluation.models import EvaluationResult, EvaluationVerdict
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
+from agent_sdk.storage.migrations import MigrationIOError
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot, TokenUsage
@@ -809,7 +810,9 @@ async def test_v1_upgrade_requires_old_writer_to_be_quiesced(
     old_writer.execute("BEGIN IMMEDIATE")
     monkeypatch.setattr(sqlite_storage, "_OPEN_RETRY_SECONDS", 0.05)
     try:
-        with pytest.raises(RuntimeError, match="open conflict"):
+        with pytest.raises(
+            MigrationIOError, match="^migration database I/O failed$"
+        ):
             await SQLiteStore.open(path)
     finally:
         old_writer.rollback()
@@ -1024,7 +1027,7 @@ async def test_open_rejects_and_closes_when_wal_cannot_be_enabled(
 
     monkeypatch.setattr(aiosqlite, "connect", connect_to_memory)
 
-    with pytest.raises(RuntimeError, match="journal_mode"):
+    with pytest.raises(MigrationIOError, match="^migration database I/O failed$"):
         await SQLiteStore.open(tmp_path / "state.db")
 
     with pytest.raises(ValueError, match="no active connection"):
@@ -1058,7 +1061,7 @@ async def test_open_rejects_and_closes_when_foreign_keys_cannot_be_enabled(
 
     monkeypatch.setattr(aiosqlite, "connect", connect_with_authorizer)
 
-    with pytest.raises(RuntimeError, match="foreign_keys"):
+    with pytest.raises(MigrationIOError, match="^migration database I/O failed$"):
         await SQLiteStore.open(database_path)
 
     with pytest.raises(ValueError, match="no active connection"):
@@ -1094,7 +1097,7 @@ async def test_open_converts_pragma_setter_errors_stably(
 
     monkeypatch.setattr(aiosqlite, "connect", connect_with_authorizer)
 
-    with pytest.raises(RuntimeError, match=pragma):
+    with pytest.raises(MigrationIOError, match="^migration database I/O failed$"):
         await SQLiteStore.open(database_path)
 
     with pytest.raises(ValueError, match="no active connection"):

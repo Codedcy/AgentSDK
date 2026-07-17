@@ -5,17 +5,22 @@ import hashlib
 import os
 import re
 import sqlite3
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from time import monotonic
-from typing import Any, cast
+from types import TracebackType
+from typing import Any, TypeVar, cast
 from weakref import WeakValueDictionary
 
 import aiosqlite
 
 
+_T = TypeVar("_T")
 _MIGRATION_2_TRANSFORM_ID = "session-ownership-v1-to-v2"
 _NUMBERED_SQL = re.compile(r"^(?P<version>[0-9]{4})_[a-z0-9_]+\.sql$")
 _RELEASE_MANIFEST = (
@@ -44,7 +49,8 @@ _RELEASE_MANIFEST = (
         (),
     ),
 )
-_COORDINATORS: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+_COORDINATORS: WeakValueDictionary[str, _DatabaseCoordinator]
+_COORDINATORS_LOCK = threading.RLock()
 _ARTIFACT_TABLES = (
     "artifact_generations",
     "artifact_heads",
@@ -65,6 +71,10 @@ class MigrationError(ValueError):
 
 class MigrationResourceError(MigrationError):
     """The packaged migration release manifest is incomplete or untrusted."""
+
+
+class MigrationIOError(MigrationError):
+    """A database filesystem or SQLite open operation failed safely."""
 
 
 class MigrationChecksumError(MigrationError):
@@ -101,9 +111,15 @@ def _migration_checksum(sql_bytes: bytes, identity_inputs: tuple[str, ...]) -> s
 
 
 def _packaged_migrations() -> tuple[Migration, ...]:
-    root = resources.files(__package__)
+    try:
+        root = resources.files(__package__)
+        children = tuple(root.iterdir())
+    except OSError as error:
+        raise MigrationResourceError(
+            "packaged migration resource is unavailable"
+        ) from error
     numbered: dict[int, str] = {}
-    for child in root.iterdir():
+    for child in children:
         match = _NUMBERED_SQL.fullmatch(child.name)
         if match is None:
             if child.name.endswith(".sql"):
@@ -120,7 +136,12 @@ def _packaged_migrations() -> tuple[Migration, ...]:
     migrations: list[Migration] = []
     for version, name, expected_checksum, manifest_identity_inputs in _RELEASE_MANIFEST:
         identity_inputs = (_MIGRATION_2_TRANSFORM_ID,) if version == 2 else manifest_identity_inputs
-        sql_bytes = root.joinpath(name).read_bytes()
+        try:
+            sql_bytes = root.joinpath(name).read_bytes()
+        except OSError as error:
+            raise MigrationResourceError(
+                "packaged migration resource is unavailable"
+            ) from error
         checksum = _migration_checksum(sql_bytes, identity_inputs)
         if checksum != expected_checksum:
             raise MigrationChecksumError("packaged migration checksum changed")
@@ -140,12 +161,58 @@ def _packaged_migrations() -> tuple[Migration, ...]:
     return tuple(migrations)
 
 
-def _coordinator(identity: str) -> asyncio.Lock:
-    lock = _COORDINATORS.get(identity)
-    if lock is None:
-        lock = asyncio.Lock()
-        _COORDINATORS[identity] = lock
-    return lock
+class _DatabaseCoordinator:
+    _POLL_SECONDS = 0.01
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    async def __aenter__(self) -> _DatabaseCoordinator:
+        cancel_acquire = threading.Event()
+
+        def acquire() -> bool:
+            while not cancel_acquire.is_set():
+                if self._lock.acquire(timeout=self._POLL_SECONDS):
+                    return True
+            return False
+
+        acquire_task = asyncio.create_task(asyncio.to_thread(acquire))
+        try:
+            acquired = await asyncio.shield(acquire_task)
+        except asyncio.CancelledError as cancellation:
+            cancel_acquire.set()
+            while not acquire_task.done():
+                try:
+                    await asyncio.shield(acquire_task)
+                except asyncio.CancelledError:
+                    continue
+            if acquire_task.result():
+                self._lock.release()
+            raise cancellation
+        if not acquired:  # pragma: no cover - only cancellation sets the stop event
+            raise RuntimeError("database coordinator acquisition stopped")
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        del exc_type, exc, traceback
+        self._lock.release()
+
+
+_COORDINATORS = WeakValueDictionary()
+
+
+def _coordinator(identity: str) -> _DatabaseCoordinator:
+    with _COORDINATORS_LOCK:
+        coordinator = _COORDINATORS.get(identity)
+        if coordinator is None:
+            coordinator = _DatabaseCoordinator()
+            _COORDINATORS[identity] = coordinator
+        return coordinator
 
 
 async def _close_connection(connection: aiosqlite.Connection) -> None:
@@ -155,14 +222,95 @@ async def _close_connection(connection: aiosqlite.Connection) -> None:
     await SQLiteStore._await_cleanup(close)
 
 
+async def _settle_awaitable(
+    operation: Callable[[], Awaitable[_T]],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    async def run() -> _T:
+        return await operation()
+
+    task = asyncio.create_task(run())
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+        except BaseException:
+            break
+    return task.result(), cancellation
+
+
+async def _rollback_if_active(connection: aiosqlite.Connection) -> None:
+    if not connection.in_transaction:
+        return
+    await _settle_awaitable(connection.rollback)
+
+
+@asynccontextmanager
+async def _migration_transaction(
+    connection: aiosqlite.Connection,
+    *,
+    immediate: bool,
+    message: str,
+) -> AsyncIterator[None]:
+    async def begin() -> None:
+        if immediate:
+            import agent_sdk.storage.sqlite as sqlite_storage
+
+            async def begin_immediate() -> None:
+                await connection.execute("BEGIN IMMEDIATE")
+
+            await sqlite_storage._with_busy_retry(
+                begin_immediate,
+                deadline=monotonic() + sqlite_storage._OPEN_RETRY_SECONDS,
+                message=message,
+            )
+        else:
+            await connection.execute("BEGIN")
+
+    try:
+        _, begin_cancellation = await _settle_awaitable(begin)
+    except BaseException:
+        await _rollback_if_active(connection)
+        raise
+    if begin_cancellation is not None:
+        await _rollback_if_active(connection)
+        raise begin_cancellation
+
+    try:
+        yield
+    except BaseException:
+        await _rollback_if_active(connection)
+        raise
+    else:
+        try:
+            _, commit_cancellation = await _settle_awaitable(connection.commit)
+        except BaseException:
+            await _rollback_if_active(connection)
+            raise
+        if commit_cancellation is not None:
+            await _rollback_if_active(connection)
+            raise commit_cancellation
+
+
 async def _readonly_connection(path: Path) -> aiosqlite.Connection:
     wal_path = path.parent / f"{path.name}-wal"
-    immutable = not wal_path.exists() or wal_path.stat().st_size == 0
+    try:
+        immutable = not wal_path.exists() or wal_path.stat().st_size == 0
+    except OSError as error:
+        raise MigrationIOError("migration database I/O failed") from error
     query = "mode=ro&immutable=1" if immutable else "mode=ro"
-    connection = await aiosqlite.connect(f"{path.as_uri()}?{query}", uri=True)
+    try:
+        connection = await aiosqlite.connect(f"{path.as_uri()}?{query}", uri=True)
+    except (OSError, sqlite3.Error) as error:
+        raise MigrationIOError("migration database I/O failed") from error
     try:
         await connection.execute("PRAGMA query_only=ON")
         await connection.execute("PRAGMA foreign_keys=ON")
+    except (OSError, sqlite3.Error) as error:
+        await _close_connection(connection)
+        raise MigrationIOError("migration database I/O failed") from error
     except BaseException:
         await _close_connection(connection)
         raise
@@ -293,9 +441,9 @@ async def _validate_v4_schema(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
     ) as cursor:
         migration_sql_row = await cursor.fetchone()
-    if migration_sql_row is None or sqlite_storage._normalized_sql(
-        cast(str, migration_sql_row[0])
-    ) != sqlite_storage._normalized_sql(expected_migration_sql):
+    if migration_sql_row is None or not sqlite_storage._sql_shapes_equal(
+        cast(str, migration_sql_row[0]), expected_migration_sql
+    ):
         raise MigrationSchemaError("incompatible database migration table")
 
     expected_table_sql = {
@@ -307,8 +455,8 @@ async def _validate_v4_schema(
             (table_name,),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None or sqlite_storage._normalized_sql(cast(str, row[0])) != (
-            sqlite_storage._normalized_sql(expected_sql.rstrip(";"))
+        if row is None or not sqlite_storage._sql_shapes_equal(
+            cast(str, row[0]), expected_sql.rstrip(";")
         ):
             raise MigrationSchemaError("incompatible Artifact database schema")
 
@@ -321,8 +469,8 @@ async def _validate_v4_schema(
             (index_name,),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None or sqlite_storage._normalized_sql(cast(str, row[0])) != (
-            sqlite_storage._normalized_sql(expected_sql.rstrip(";"))
+        if row is None or not sqlite_storage._sql_shapes_equal(
+            cast(str, row[0]), expected_sql.rstrip(";")
         ):
             raise MigrationSchemaError("incompatible Artifact database schema")
 
@@ -347,8 +495,8 @@ async def _validate_v4_schema(
             (table_name,),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None or sqlite_storage._normalized_sql(cast(str, row[0])) != (
-            sqlite_storage._normalized_sql(sqlite_storage._EXPECTED_TABLE_SQL[table_name])
+        if row is None or not sqlite_storage._sql_shapes_equal(
+            cast(str, row[0]), sqlite_storage._EXPECTED_TABLE_SQL[table_name]
         ):
             raise MigrationSchemaError("incompatible database schema")
 
@@ -358,8 +506,8 @@ async def _validate_v4_schema(
             (index_name,),
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None or sqlite_storage._normalized_sql(cast(str, row[0])) != (
-            sqlite_storage._normalized_sql(expected_sql)
+        if row is None or not sqlite_storage._sql_shapes_equal(
+            cast(str, row[0]), expected_sql
         ):
             raise MigrationSchemaError("incompatible database schema")
 
@@ -400,7 +548,11 @@ async def _validate_v4_schema(
 async def _inspect_applied(
     path: Path, migrations: tuple[Migration, ...]
 ) -> tuple[AppliedMigration, ...]:
-    if not path.exists() or path.stat().st_size == 0:
+    try:
+        missing_or_empty = not path.exists() or path.stat().st_size == 0
+    except OSError as error:
+        raise MigrationIOError("migration database I/O failed") from error
+    if missing_or_empty:
         return ()
     connection = await _readonly_connection(path)
     try:
@@ -415,6 +567,26 @@ async def _inspect_connection_applied(
     connection: aiosqlite.Connection,
     migrations: tuple[Migration, ...],
 ) -> tuple[AppliedMigration, ...]:
+    if connection.in_transaction:
+        raise RuntimeError("managed migration inspection requires no transaction")
+    async with _migration_transaction(
+        connection,
+        immediate=False,
+        message="SQLite migration inspection conflict",
+    ):
+        return await _inspect_connection_applied_in_current_transaction(
+            connection, migrations
+        )
+
+
+async def _inspect_connection_applied_in_current_transaction(
+    connection: aiosqlite.Connection,
+    migrations: tuple[Migration, ...],
+) -> tuple[AppliedMigration, ...]:
+    if not connection.in_transaction:
+        raise RuntimeError(
+            "transaction-local migration inspection requires a transaction"
+        )
     tables = await _table_names(connection)
     if not tables:
         return ()
@@ -463,33 +635,19 @@ async def _schema_generation(
     return tuple(generation)
 
 
-async def _settle_transaction(connection: aiosqlite.Connection, operation: str) -> None:
-    from agent_sdk.storage.sqlite import SQLiteStore
-
-    task = asyncio.create_task(getattr(connection, operation)())
-    await SQLiteStore._await_cleanup(task)
-
-
 async def _apply_v4(
     connection: aiosqlite.Connection,
     migrations: tuple[Migration, ...],
     checkpoint: Any,
 ) -> None:
-    import agent_sdk.storage.sqlite as sqlite_storage
-
-    async def begin() -> None:
-        await connection.execute("BEGIN IMMEDIATE")
-
-    await sqlite_storage._with_busy_retry(
-        begin,
-        deadline=monotonic() + sqlite_storage._OPEN_RETRY_SECONDS,
+    async with _migration_transaction(
+        connection,
+        immediate=True,
         message="SQLite migration apply conflict",
-    )
-    try:
+    ):
         state = await _legacy_state(connection)
         if state is None:
             await _validate_v4_schema(connection, migrations)
-            await _settle_transaction(connection, "commit")
             return
         if state != "v3":
             raise MigrationSchemaError("migration 4 requires exact schema version 3")
@@ -535,10 +693,6 @@ async def _apply_v4(
         await checkpoint("migration-4-version-insert-after")
         await _validate_v4_schema(connection, migrations)
         await checkpoint("migration-4-final-validation")
-        await _settle_transaction(connection, "commit")
-    except BaseException:
-        await _settle_transaction(connection, "rollback")
-        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,7 +702,10 @@ class MigrationRunner:
 
     @classmethod
     async def open(cls, path: str | Path) -> MigrationRunner:
-        database_path = Path(path).expanduser().resolve(strict=False)
+        try:
+            database_path = Path(path).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            raise MigrationIOError("migration database I/O failed") from error
         identity = os.path.normcase(str(database_path))
         return cls(path=database_path, database_identity=identity)
 
@@ -576,13 +733,25 @@ class MigrationRunner:
     ) -> aiosqlite.Connection | None:
         import agent_sdk.storage.sqlite as sqlite_storage
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = await aiosqlite.connect(self.path)
         try:
-            await sqlite_storage.SQLiteStore._configure_connection(connection)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            connection = await aiosqlite.connect(self.path)
+        except (OSError, sqlite3.Error) as error:
+            raise MigrationIOError("migration database I/O failed") from error
+        try:
+            try:
+                await sqlite_storage.SQLiteStore._configure_connection(connection)
+            except (OSError, sqlite3.Error, RuntimeError) as error:
+                raise MigrationIOError("migration database I/O failed") from error
             current = await _inspect_connection_applied(connection, migrations)
             if len(current) < 3:
-                await sqlite_storage.SQLiteStore._migrate(connection)
+                await sqlite_storage.SQLiteStore._migrate(
+                    connection,
+                    cast(
+                        tuple[str, str, str],
+                        tuple(migration.sql for migration in migrations[:3]),
+                    ),
+                )
             current = await _inspect_connection_applied(connection, migrations)
             if len(current) == 3:
                 await _apply_v4(
@@ -610,6 +779,7 @@ __all__ = [
     "Migration",
     "MigrationChecksumError",
     "MigrationError",
+    "MigrationIOError",
     "MigrationResourceError",
     "MigrationRunner",
     "MigrationSchemaError",

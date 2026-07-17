@@ -6,7 +6,6 @@ import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from enum import Enum
-from importlib import resources
 from pathlib import Path
 from time import monotonic
 from typing import Any, NamedTuple, cast
@@ -421,7 +420,75 @@ def _json_object(value: str) -> dict[str, Any]:
 
 
 def _normalized_sql(value: str) -> str:
-    return "".join(value.casefold().split())
+    tokens: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character in {"'", '"', "`", "["}:
+            start = index
+            closing = "]" if character == "[" else character
+            index += 1
+            while index < len(value):
+                if value[index] != closing:
+                    index += 1
+                    continue
+                if (
+                    character != "["
+                    and index + 1 < len(value)
+                    and value[index + 1] == closing
+                ):
+                    index += 2
+                    continue
+                index += 1
+                tokens.append(f"quoted:{value[start:index]}")
+                break
+            else:
+                raise ValueError("malformed SQLite SQL")
+            continue
+        if character.isdigit():
+            start = index
+            index += 1
+            while index < len(value) and value[index].isdigit():
+                index += 1
+            tokens.append(f"number:{value[start:index]}")
+            continue
+        if character.isalpha() or character in {"_", "$"}:
+            start = index
+            index += 1
+            while index < len(value) and (
+                value[index].isalnum() or value[index] in {"_", "$"}
+            ):
+                index += 1
+            tokens.append(f"word:{value[start:index].casefold()}")
+            continue
+        three_characters = value[index : index + 3]
+        two_characters = value[index : index + 2]
+        if three_characters == "->>":
+            tokens.append("operator:->>")
+            index += 3
+            continue
+        if two_characters in {"<=", ">=", "<>", "!=", "==", "||", "->"}:
+            tokens.append(f"operator:{two_characters}")
+            index += 2
+            continue
+        token_kind = (
+            "operator"
+            if character in {"+", "-", "*", "/", "%", "<", ">", "=", "~"}
+            else "punctuation"
+        )
+        tokens.append(f"{token_kind}:{character}")
+        index += 1
+    return "\x1f".join(tokens)
+
+
+def _sql_shapes_equal(actual: str, expected: str) -> bool:
+    try:
+        return _normalized_sql(actual) == _normalized_sql(expected)
+    except ValueError:
+        return False
 
 
 def _complete_sql_statements(script: str) -> tuple[str, ...]:
@@ -727,9 +794,12 @@ async def _execute_script_statements(
     connection: aiosqlite.Connection,
     script: str,
     *,
+    before_statement: Callable[[int], Awaitable[None]] | None = None,
     after_statement: Callable[[int], Awaitable[None]] | None = None,
 ) -> None:
     for index, statement in enumerate(_complete_sql_statements(script), start=1):
+        if before_statement is not None:
+            await before_statement(index)
         await connection.execute(statement)
         if after_statement is not None:
             await after_statement(index)
@@ -3152,93 +3222,133 @@ class SQLiteStore:
         return StoredEvent(cursor=cast(int, row[0]), event=event)
 
     @classmethod
-    async def _migrate(cls, connection: aiosqlite.Connection) -> None:
-        deadline = monotonic() + _OPEN_RETRY_SECONDS
-
-        async def begin() -> None:
-            await connection.execute("BEGIN IMMEDIATE")
+    async def _migrate(
+        cls,
+        connection: aiosqlite.Connection,
+        migration_sql: tuple[str, str, str],
+    ) -> None:
+        import agent_sdk.storage.migrations as migration_storage
 
         await cls._migration_checkpoint("migration-lock-requested")
-        await _with_busy_retry(
-            begin,
-            deadline=deadline,
-            message="SQLite open conflict",
-        )
-        try:
-            state = await cls._discover_schema_state(connection)
-            await cls._migration_checkpoint(
-                f"migration-schema-discovered-{state.value}"
-            )
-            empty_database = state is _SchemaState.EMPTY
-            if empty_database:
-                migration_one = resources.files("agent_sdk.storage").joinpath(
-                    "migrations", "0001_initial.sql"
-                )
-                await _execute_script_statements(
-                    connection, migration_one.read_text(encoding="utf-8")
-                )
-                await connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (1, datetime.now(UTC).isoformat()),
-                )
-                state = _SchemaState.V1
+        reported_discovery = False
+        while True:
+            async with migration_storage._migration_transaction(
+                connection,
+                immediate=True,
+                message="SQLite open conflict",
+            ):
+                state = await cls._discover_schema_state(connection)
+                if not reported_discovery:
+                    await cls._migration_checkpoint(
+                        f"migration-schema-discovered-{state.value}"
+                    )
+                    reported_discovery = True
 
-            if state is _SchemaState.V1:
-                await cls._validate_schema(connection, expected_version=1)
-                migration_two = resources.files("agent_sdk.storage").joinpath(
-                    "migrations", "0002_idempotency.sql"
-                )
+                if state is _SchemaState.EMPTY:
 
-                async def after_migration_statement(index: int) -> None:
-                    await cls._migration_checkpoint(f"migration-2-statement-{index}")
+                    async def before_migration_one_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-1-statement-{index}-before"
+                        )
 
-                await _execute_script_statements(
-                    connection,
-                    migration_two.read_text(encoding="utf-8"),
-                    after_statement=after_migration_statement,
-                )
-                if not empty_database:
+                    async def after_migration_one_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-1-statement-{index}-after"
+                        )
+
+                    await _execute_script_statements(
+                        connection,
+                        migration_sql[0],
+                        before_statement=before_migration_one_statement,
+                        after_statement=after_migration_one_statement,
+                    )
+                    await cls._migration_checkpoint("migration-1-version-insert-before")
+                    await connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (1, datetime.now(UTC).isoformat()),
+                    )
+                    await cls._migration_checkpoint("migration-1-version-insert-after")
+                    await cls._validate_schema(connection, expected_version=1)
+                    await _validated_v1_projection_transforms(connection)
+                    await cls._migration_checkpoint("migration-1-final-validation")
+                    continue
+
+                if state is _SchemaState.V1:
+                    await cls._validate_schema(connection, expected_version=1)
+                    await _validated_v1_projection_transforms(connection)
+
+                    async def before_migration_two_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-2-statement-{index}-before"
+                        )
+
+                    async def after_migration_two_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-2-statement-{index}-after"
+                        )
+                        await cls._migration_checkpoint(
+                            f"migration-2-statement-{index}"
+                        )
+
+                    await _execute_script_statements(
+                        connection,
+                        migration_sql[1],
+                        before_statement=before_migration_two_statement,
+                        after_statement=after_migration_two_statement,
+                    )
                     await cls._validate_and_backfill_v1_projections(connection)
-                await connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (2, datetime.now(UTC).isoformat()),
-                )
-                await cls._migration_checkpoint("migration-2-version-inserted")
-                state = _SchemaState.V2
+                    await cls._migration_checkpoint("migration-2-version-insert-before")
+                    await connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (2, datetime.now(UTC).isoformat()),
+                    )
+                    await cls._migration_checkpoint("migration-2-version-insert-after")
+                    await cls._migration_checkpoint("migration-2-version-inserted")
+                    await cls._validate_schema(connection, expected_version=2)
+                    await cls._validate_v2_projections(connection)
+                    await cls._migration_checkpoint("migration-2-final-validation")
+                    continue
 
-            if state is _SchemaState.V2:
-                await cls._validate_schema(connection, expected_version=2)
+                if state is _SchemaState.V2:
+                    await cls._validate_schema(connection, expected_version=2)
+                    await cls._validate_v2_projections(connection)
+
+                    async def before_migration_three_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-3-statement-{index}-before"
+                        )
+
+                    async def after_migration_three_statement(index: int) -> None:
+                        await cls._migration_checkpoint(
+                            f"migration-3-statement-{index}-after"
+                        )
+                        await cls._migration_checkpoint(
+                            f"migration-3-statement-{index}"
+                        )
+
+                    await _execute_script_statements(
+                        connection,
+                        migration_sql[2],
+                        before_statement=before_migration_three_statement,
+                        after_statement=after_migration_three_statement,
+                    )
+                    await cls._migration_checkpoint("migration-3-version-insert-before")
+                    await connection.execute(
+                        "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                        (3, datetime.now(UTC).isoformat()),
+                    )
+                    await cls._migration_checkpoint("migration-3-version-insert-after")
+                    await cls._migration_checkpoint("migration-3-version-inserted")
+                    await cls._validate_schema(connection, expected_version=3)
+                    await cls._validate_v2_projections(connection)
+                    await cls._validate_v3_rows(connection)
+                    await cls._migration_checkpoint("migration-3-final-validation")
+                    continue
+
+                await cls._validate_schema(connection, expected_version=3)
                 await cls._validate_v2_projections(connection)
-                await cls._migration_checkpoint("migration-2-final-validation")
-                migration_three = resources.files("agent_sdk.storage").joinpath(
-                    "migrations", "0003_leases.sql"
-                )
-
-                async def after_migration_three_statement(index: int) -> None:
-                    await cls._migration_checkpoint(f"migration-3-statement-{index}")
-
-                await _execute_script_statements(
-                    connection,
-                    migration_three.read_text(encoding="utf-8"),
-                    after_statement=after_migration_three_statement,
-                )
-                await connection.execute(
-                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    (3, datetime.now(UTC).isoformat()),
-                )
-                await cls._migration_checkpoint("migration-3-version-inserted")
-                state = _SchemaState.V3
-
-            await cls._validate_schema(connection, expected_version=3)
-            await cls._validate_v2_projections(connection)
-            await cls._validate_v3_rows(connection)
-            await cls._migration_checkpoint("migration-3-final-validation")
-            commit_task = asyncio.create_task(connection.commit())
-            await cls._await_cleanup(commit_task)
-        except BaseException:
-            rollback_task = asyncio.create_task(connection.rollback())
-            await cls._await_cleanup(rollback_task)
-            raise
+                await cls._validate_v3_rows(connection)
+                return
 
     @staticmethod
     async def _migration_checkpoint(stage: str) -> None:
@@ -3354,8 +3464,8 @@ class SQLiteStore:
                 (table_name,),
             ) as cursor:
                 table_sql = await cursor.fetchone()
-            if table_sql is None or _normalized_sql(cast(str, table_sql[0])) != (
-                _normalized_sql(_EXPECTED_TABLE_SQL[table_name])
+            if table_sql is None or not _sql_shapes_equal(
+                cast(str, table_sql[0]), _EXPECTED_TABLE_SQL[table_name]
             ):
                 raise ValueError("incompatible database schema")
 
@@ -3430,8 +3540,8 @@ class SQLiteStore:
                 (index_name,),
             ) as cursor:
                 index_sql = await cursor.fetchone()
-            if index_sql is None or _normalized_sql(cast(str, index_sql[0])) != (
-                _normalized_sql(_EXPECTED_INDEX_SQL[index_name])
+            if index_sql is None or not _sql_shapes_equal(
+                cast(str, index_sql[0]), _EXPECTED_INDEX_SQL[index_name]
             ):
                 raise ValueError("incompatible database schema")
 
@@ -3440,8 +3550,8 @@ class SQLiteStore:
             ("events_aggregate_sequence",),
         ) as cursor:
             aggregate_index = await cursor.fetchone()
-        if aggregate_index is None or _normalized_sql(cast(str, aggregate_index[0])) != (
-            _normalized_sql(_AGGREGATE_INDEX_SQL)
+        if aggregate_index is None or not _sql_shapes_equal(
+            cast(str, aggregate_index[0]), _AGGREGATE_INDEX_SQL
         ):
             raise ValueError("incompatible database schema")
 

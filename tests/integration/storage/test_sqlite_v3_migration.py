@@ -10,6 +10,7 @@ import aiosqlite
 import agent_sdk.storage.sqlite as sqlite_storage
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.leases import LeaseManager
+from agent_sdk.storage.migrations import MigrationIOError
 from agent_sdk.storage.sqlite import SQLiteStore
 
 from datetime import UTC, datetime, timedelta
@@ -328,7 +329,9 @@ async def test_real_write_lock_busy_exhaustion_leaves_exact_v2_and_reopens(
     blocker = sqlite3.connect(path, timeout=0)
     try:
         blocker.execute("BEGIN IMMEDIATE")
-        with pytest.raises(RuntimeError, match="SQLite .*open conflict"):
+        with pytest.raises(
+            MigrationIOError, match="^migration database I/O failed$"
+        ):
             await SQLiteStore.open(path)
         _assert_exact_v2(path)
     finally:
