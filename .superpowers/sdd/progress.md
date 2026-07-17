@@ -216,4 +216,7 @@ M02-T003 Phase A review-fix implementation: db7cd77
 M02-T003 Phase A review-fix report: .superpowers/sdd/M02-T003-phaseA-review-fix-report.md
 M02-T003 Phase A review fixes: loop-neutral per-database coordination; one explicit WAL-safe read snapshot; quoted-token-preserving SQL lexer; one cancellation-safe transaction per migration; stable sanitized public filesystem/open/resource errors
 M02-T003 Phase A review-fix gates: focused 144 passed; storage 593 passed; full Python3.13 2303 passed; Ruff clean; mypy76 and focused2 clean; py_compile/build/import/wheel resources/diff/scope clean
-M02-T003 Phase A review fix: implementation complete; independent re-review required; Phase B remains blocked
+M02-T003 Phase A first re-review: Not Approved; Spec C0/I2/M0 and Quality C0/I3/M0
+M02-T003 Phase A first re-review findings: legacy cross-process peers fail when a competitor reaches v4; SQL lexer merges blob/numeric/NBSP token boundaries; post-WAL busy exhaustion leaks RuntimeError; corrupt apply/open is misclassified as I/O; non-OSError resource backend failures leak
+M02-T003 Phase A second-fix brief: .superpowers/sdd/M02-T003-phaseA-rereview-fix-brief.md
+M02-T003 Phase A second fix: in progress; Phase B remains blocked
