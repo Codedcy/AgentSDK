@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ from agent_sdk.models.litellm_gateway import ToolCallCompleted
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.permissions.rules import PermissionRule
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.tools import (
@@ -20,9 +23,11 @@ from agent_sdk.tools import (
     ToolRegistry,
     ToolResult,
     ToolResultStatus,
+    ToolSpec,
     register_builtin_tools,
 )
 from agent_sdk.tools.models import thaw_json
+from agent_sdk.tools.builtins.files import _atomic_write
 
 
 async def _noop_emit(_: str, __: dict[str, Any]) -> None:
@@ -37,9 +42,10 @@ async def _noop_transition(
 
 
 async def _harness(
-    workspace: Path,
+    workspace: Path | None,
     *,
     permission_default: str = "allow",
+    permission_rules: Iterable[PermissionRule] = (),
     output_limit: int = 4096,
 ) -> tuple[
     ToolExecutor,
@@ -47,7 +53,8 @@ async def _harness(
     InProcessPermissionBridge,
 ]:
     store = InMemoryStore()
-    session = await RuntimeCommands(store).create_session(workspaces=(workspace,))
+    workspaces = () if workspace is None else (workspace,)
+    session = await RuntimeCommands(store).create_session(workspaces=workspaces)
     registry = ToolRegistry()
     register_builtin_tools(
         registry=registry,
@@ -57,7 +64,10 @@ async def _harness(
     bridge = InProcessPermissionBridge()
     executor = ToolExecutor(
         registry,
-        PolicyEngine(permission_default),  # type: ignore[arg-type]
+        PolicyEngine(
+            permission_default,  # type: ignore[arg-type]
+            permission_rules,
+        ),
         bridge,
     )
     return (
@@ -74,7 +84,12 @@ async def _execute(
     arguments: dict[str, object],
     *,
     call_id: str,
+    events: list[tuple[str, dict[str, Any]]] | None = None,
 ) -> ToolResult:
+    async def emit(event_type: str, payload: dict[str, Any]) -> None:
+        if events is not None:
+            events.append((event_type, payload))
+
     return await executor.execute(
         ToolCallCompleted(
             index=0,
@@ -83,7 +98,7 @@ async def _execute(
             arguments_json=json.dumps(arguments),
         ),
         context,
-        emit=_noop_emit,
+        emit=emit if events is not None else _noop_emit,
         on_permission_requested=_noop_transition,
         on_permission_resolved=_noop_transition,
     )
@@ -147,9 +162,142 @@ async def test_ask_read_waits_for_existing_permission_resolution(
     await asyncio.wait_for(resolution, timeout=1)
 
     assert request.tool_name == "read"
-    assert request.arguments["path"] == "hello.txt"
+    assert request.arguments["path"] == str((workspace / "hello.txt").resolve())
     assert result.status is ToolResultStatus.SUCCEEDED
     assert thaw_json(result.value)["content"] == "hello"
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    (
+        ("read", {"path": "secret.txt"}),
+        (
+            "write",
+            {
+                "path": "created.txt",
+                "content": "must not be created",
+            },
+        ),
+        (
+            "bash",
+            {
+                "argv": [sys.executable, "-c", "print('must not run')"],
+                "cwd": "child",
+            },
+        ),
+        (
+            "bash",
+            {
+                "argv": [sys.executable, "-c", "print('must not run')"],
+            },
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_canonical_workspace_rule_denies_relative_and_default_resources(
+    tmp_path: Path,
+    name: str,
+    arguments: dict[str, object],
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "secret.txt").write_text("secret", encoding="utf-8")
+    (workspace / "child").mkdir()
+    executor, context, _ = await _harness(
+        workspace,
+        permission_default="allow",
+        permission_rules=(
+            PermissionRule(
+                outcome="deny",
+                tool=name,
+                path_prefix=workspace,
+            ),
+        ),
+    )
+
+    result = await _execute(
+        executor,
+        context,
+        name,
+        arguments,
+        call_id=f"call-canonical-deny-{name}",
+    )
+
+    assert result.status is ToolResultStatus.DENIED
+    assert not (workspace / "created.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_path_specific_ask_uses_canonical_workspace_resource(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "hello.txt"
+    target.write_text("hello", encoding="utf-8")
+    executor, context, bridge = await _harness(
+        workspace,
+        permission_default="deny",
+        permission_rules=(
+            PermissionRule(
+                outcome="ask",
+                tool="read",
+                path_prefix=workspace,
+            ),
+        ),
+    )
+
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "read",
+            {"path": "hello.txt"},
+            call_id="call-path-ask",
+        )
+    )
+    request = await asyncio.wait_for(
+        bridge.next_request(context.run_id),
+        timeout=1,
+    )
+    resolution = asyncio.create_task(
+        bridge.resolve(request.request_id, PermissionDecision.allow_once())
+    )
+    result = await asyncio.wait_for(execution, timeout=1)
+    await asyncio.wait_for(resolution, timeout=1)
+
+    assert request.arguments["path"] == str(target.resolve())
+    assert result.status is ToolResultStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_path_specific_allow_uses_canonical_workspace_resource(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor, context, _ = await _harness(
+        workspace,
+        permission_default="deny",
+        permission_rules=(
+            PermissionRule(
+                outcome="allow",
+                tool="write",
+                path_prefix=workspace,
+            ),
+        ),
+    )
+
+    result = await _execute(
+        executor,
+        context,
+        "write",
+        {"path": "allowed.txt", "content": "allowed"},
+        call_id="call-path-allow",
+    )
+
+    assert result.status is ToolResultStatus.SUCCEEDED
+    assert (workspace / "allowed.txt").read_text(encoding="utf-8") == "allowed"
 
 
 @pytest.mark.asyncio
@@ -201,6 +349,7 @@ async def test_global_allow_cannot_escape_workspace(
     else:
         arguments["cwd"] = str(outside_dir)
     executor, context, _ = await _harness(workspace)
+    events: list[tuple[str, dict[str, Any]]] = []
 
     result = await _execute(
         executor,
@@ -208,12 +357,64 @@ async def test_global_allow_cannot_escape_workspace(
         name,
         arguments,
         call_id=f"call-outside-{name}",
+        events=events,
     )
 
     assert result.status is ToolResultStatus.DENIED
     assert result.error == "tool access denied"
     assert str(tmp_path) not in result.content
+    assert [event_type for event_type, _ in events] == ["tool.call.completed"]
+    assert str(tmp_path) not in json.dumps(events)
     assert outside_file.read_text(encoding="utf-8") == "untouched"
+
+
+@pytest.mark.asyncio
+async def test_application_tool_without_permission_resolver_keeps_raw_arguments() -> None:
+    observed: list[str] = []
+
+    async def handler(_: ToolContext, path: str) -> str:
+        observed.append(path)
+        return path
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="application.inspect",
+            description="Inspect one application path.",
+            input_schema={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        ),
+        handler,
+    )
+    bridge = InProcessPermissionBridge()
+    executor = ToolExecutor(registry, PolicyEngine("ask"), bridge)
+    context = ToolContext(run_id="run-application", session_id="session-application")
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "application.inspect",
+            {"path": "relative.txt"},
+            call_id="call-application",
+        )
+    )
+    request = await asyncio.wait_for(
+        bridge.next_request(context.run_id),
+        timeout=1,
+    )
+    resolution = asyncio.create_task(
+        bridge.resolve(request.request_id, PermissionDecision.allow_once())
+    )
+    result = await asyncio.wait_for(execution, timeout=1)
+    await asyncio.wait_for(resolution, timeout=1)
+
+    assert request.arguments["path"] == "relative.txt"
+    assert observed == ["relative.txt"]
+    assert result.status is ToolResultStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -249,6 +450,64 @@ async def test_write_replaces_atomically_only_when_overwrite_is_enabled(
     }
     assert target.read_text(encoding="utf-8") == "replacement"
     assert list(workspace.iterdir()) == [target]
+
+
+def test_write_no_clobber_is_atomic_against_concurrent_creator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "note.txt"
+    real_link = os.link
+
+    def install_competitor(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        destination: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+        follow_symlinks: bool = True,
+    ) -> None:
+        target.write_text("competitor", encoding="utf-8")
+        real_link(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(os, "link", install_competitor)
+
+    with pytest.raises(FileExistsError):
+        _atomic_write(target, b"sdk-content", overwrite=False)
+
+    assert target.read_text(encoding="utf-8") == "competitor"
+    assert list(workspace.iterdir()) == [target]
+
+
+def test_write_failure_removes_only_its_owned_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "note.txt"
+    unrelated = workspace / ".agent-sdk-unrelated.tmp"
+    unrelated.write_text("keep", encoding="utf-8")
+
+    def fail_replace(_: Path, __: Path) -> None:
+        raise OSError("injected install failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="injected install failure"):
+        _atomic_write(target, b"sdk-content", overwrite=True)
+
+    assert not target.exists()
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert list(workspace.iterdir()) == [unrelated]
 
 
 @pytest.mark.asyncio
@@ -310,6 +569,98 @@ async def test_bash_timeout_is_normalized(tmp_path: Path) -> None:
 
     assert result.status is ToolResultStatus.TIMED_OUT
     assert result.error == "tool execution timed out"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    (
+        ([], ToolResultStatus.INVALID_ARGUMENTS),
+        (["bad\0argv"], ToolResultStatus.DENIED),
+    ),
+)
+@pytest.mark.asyncio
+async def test_bash_rejects_empty_or_nul_argv(
+    tmp_path: Path,
+    argv: list[str],
+    expected: ToolResultStatus,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor, context, _ = await _harness(workspace)
+
+    result = await _execute(
+        executor,
+        context,
+        "bash",
+        {"argv": argv},
+        call_id="call-invalid-bash",
+    )
+
+    assert result.status is expected
+
+
+@pytest.mark.asyncio
+async def test_bash_empty_workspace_is_denied() -> None:
+    executor, context, _ = await _harness(None)
+
+    result = await _execute(
+        executor,
+        context,
+        "bash",
+        {"argv": [sys.executable, "-c", "print('must not run')"]},
+        call_id="call-empty-workspace",
+    )
+
+    assert result.status is ToolResultStatus.DENIED
+    assert result.error == "tool access denied"
+
+
+@pytest.mark.asyncio
+async def test_bash_cancellation_waits_for_child_termination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor, context, _ = await _harness(workspace)
+    created = asyncio.Event()
+    process: asyncio.subprocess.Process | None = None
+    real_create = asyncio.create_subprocess_exec
+
+    async def capture_process(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        nonlocal process
+        process = await real_create(*args, **kwargs)
+        created.set()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture_process)
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "bash",
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(10)",
+                ]
+            },
+            call_id="call-cancel-bash",
+        )
+    )
+    await asyncio.wait_for(created.wait(), timeout=1)
+
+    execution.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+    assert process is not None
+    for _ in range(100):
+        if process.returncode is not None:
+            break
+        await asyncio.sleep(0.01)
+
+    assert process.returncode is not None
 
 
 @pytest.mark.asyncio

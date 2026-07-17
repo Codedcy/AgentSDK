@@ -3,8 +3,12 @@ from __future__ import annotations
 from functools import partial
 
 from agent_sdk.storage.base import StateStore
-from agent_sdk.tools.builtins.bash import run_bash
-from agent_sdk.tools.builtins.files import read_file, write_file
+from agent_sdk.tools.builtins.bash import bash_permission_arguments, run_bash
+from agent_sdk.tools.builtins.files import (
+    file_permission_arguments,
+    read_file,
+    write_file,
+)
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.tools.registry import ToolRegistry
 
@@ -32,6 +36,11 @@ def register_builtin_tools(
             effects=("filesystem.read",),
         ),
         partial(read_file, store=store, output_limit=output_limit),
+        permission_arguments=partial(
+            file_permission_arguments,
+            store=store,
+            for_write=False,
+        ),
     )
     registry.register(
         ToolSpec(
@@ -51,6 +60,11 @@ def register_builtin_tools(
             effects=("filesystem.write",),
         ),
         partial(write_file, store=store, output_limit=output_limit),
+        permission_arguments=partial(
+            file_permission_arguments,
+            store=store,
+            for_write=True,
+        ),
     )
     registry.register(
         ToolSpec(
@@ -77,6 +91,10 @@ def register_builtin_tools(
             effects=("process.execute",),
         ),
         partial(run_bash, store=store, output_limit=output_limit),
+        permission_arguments=partial(
+            bash_permission_arguments,
+            store=store,
+        ),
     )
 
 

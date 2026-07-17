@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -11,19 +11,30 @@ from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.tools.models import ToolContext, ToolSpec, thaw_json
 
 ToolHandler: TypeAlias = Callable[..., Awaitable[Any]]
+PermissionArgumentsResolver: TypeAlias = Callable[
+    [ToolContext, Mapping[str, Any]],
+    Awaitable[Mapping[str, Any]],
+]
 
 
 @dataclass(frozen=True)
 class RegisteredTool:
     spec: ToolSpec
     handler: ToolHandler
+    permission_arguments: PermissionArgumentsResolver | None = None
 
 
 class ToolRegistry:
     def __init__(self) -> None:
         self._registered: dict[str, RegisteredTool] = {}
 
-    def register(self, spec: ToolSpec, handler: ToolHandler) -> RegisteredTool:
+    def register(
+        self,
+        spec: ToolSpec,
+        handler: ToolHandler,
+        *,
+        permission_arguments: PermissionArgumentsResolver | None = None,
+    ) -> RegisteredTool:
         if spec.name in self._registered:
             raise AgentSDKError(
                 ErrorCode.CONFLICT,
@@ -38,7 +49,7 @@ class ToolRegistry:
                 "tool schema is invalid",
                 retryable=False,
             ) from error
-        registered = RegisteredTool(spec, handler)
+        registered = RegisteredTool(spec, handler, permission_arguments)
         self._registered[spec.name] = registered
         return registered
 
@@ -81,4 +92,10 @@ class ToolRegistry:
         )
 
 
-__all__ = ["RegisteredTool", "ToolHandler", "ToolRegistry", "ToolContext"]
+__all__ = [
+    "PermissionArgumentsResolver",
+    "RegisteredTool",
+    "ToolHandler",
+    "ToolRegistry",
+    "ToolContext",
+]

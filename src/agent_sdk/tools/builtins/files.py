@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from agent_sdk.runtime.models import SessionSnapshot
 from agent_sdk.storage.base import StateStore
@@ -64,6 +66,25 @@ async def read_file(
     }
 
 
+async def file_permission_arguments(
+    context: ToolContext,
+    arguments: Mapping[str, Any],
+    *,
+    store: StateStore,
+    for_write: bool,
+) -> Mapping[str, Any]:
+    roots = await workspace_roots(store, context.session_id)
+    requested = arguments.get("path")
+    if not isinstance(requested, str):
+        raise ToolAccessDenied("invalid workspace path")
+    target = resolve_workspace_path(
+        roots,
+        requested,
+        for_write=for_write,
+    )
+    return {**arguments, "path": str(target)}
+
+
 async def write_file(
     context: ToolContext,
     path: str,
@@ -95,8 +116,6 @@ def _atomic_write(
     content: bytes,
     overwrite: bool,
 ) -> None:
-    if target.exists() and not overwrite:
-        raise FileExistsError
     descriptor = -1
     owned_temporary: Path | None = None
     try:
@@ -111,9 +130,11 @@ def _atomic_write(
             destination.write(content)
             destination.flush()
             os.fsync(destination.fileno())
-        if target.exists() and not overwrite:
-            raise FileExistsError
-        os.replace(owned_temporary, target)
+        if overwrite:
+            os.replace(owned_temporary, target)
+        else:
+            os.link(owned_temporary, target)
+            owned_temporary.unlink()
         owned_temporary = None
     finally:
         if descriptor >= 0:
@@ -127,6 +148,7 @@ def _atomic_write(
 
 __all__ = [
     "read_file",
+    "file_permission_arguments",
     "relative_display_path",
     "workspace_roots",
     "write_file",

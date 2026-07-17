@@ -52,7 +52,7 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
         timeout=2,
     )
     assert permission.tool_name == "read"
-    assert permission.arguments["path"] == "keep.txt"
+    assert permission.arguments["path"] == str(workspace_file.resolve())
     await asyncio.wait_for(
         sdk.permissions.resolve(
             permission.request_id,
@@ -91,7 +91,7 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     assert event_types.count("permission.requested") == 1
     assert event_types.count("permission.resolved") == 1
     assert event_types.count("tool.call.completed") == 4
-    assert event_types.count("tool.call.started") == 4
+    assert event_types.count("tool.call.started") == 3
     await asyncio.wait_for(sdk.close(), timeout=5)
 
     provider_calls = 0

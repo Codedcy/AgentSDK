@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from agent_sdk.storage.base import StateStore
 from agent_sdk.tools.builtins.files import workspace_roots
@@ -46,14 +48,7 @@ async def run_bash(
         raise ToolAccessDenied("invalid process arguments")
 
     roots = await workspace_roots(store, context.session_id)
-    requested_cwd: str | Path = cwd if cwd is not None else roots[0]
-    canonical_cwd = resolve_workspace_path(
-        roots,
-        requested_cwd,
-        for_write=False,
-    )
-    if not canonical_cwd.is_dir():
-        raise ToolAccessDenied("process cwd is unavailable")
+    canonical_cwd = _resolve_bash_cwd(roots, cwd)
 
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -94,6 +89,48 @@ async def run_bash(
     }
 
 
+async def bash_permission_arguments(
+    context: ToolContext,
+    arguments: Mapping[str, Any],
+    *,
+    store: StateStore,
+) -> Mapping[str, Any]:
+    argv = arguments.get("argv")
+    if (
+        not isinstance(argv, (list, tuple))
+        or not argv
+        or any(not isinstance(item, str) or "\0" in item for item in argv)
+    ):
+        raise ToolAccessDenied("invalid process arguments")
+    cwd = arguments.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        raise ToolAccessDenied("invalid process cwd")
+    roots = await workspace_roots(store, context.session_id)
+    canonical_cwd = _resolve_bash_cwd(roots, cwd)
+    return {**arguments, "cwd": str(canonical_cwd)}
+
+
+def _resolve_bash_cwd(
+    roots: tuple[Path, ...],
+    cwd: str | None,
+) -> Path:
+    requested: str | Path
+    if cwd is not None:
+        requested = cwd
+    elif roots:
+        requested = roots[0]
+    else:
+        requested = Path(".")
+    canonical = resolve_workspace_path(
+        roots,
+        requested,
+        for_write=False,
+    )
+    if not canonical.is_dir():
+        raise ToolAccessDenied("process cwd is unavailable")
+    return canonical
+
+
 async def _drain_bounded(
     stream: asyncio.StreamReader,
     budget: _OutputBudget,
@@ -113,4 +150,4 @@ def _decode_bounded(value: bytes) -> str:
     )
 
 
-__all__ = ["run_bash"]
+__all__ = ["bash_permission_arguments", "run_bash"]

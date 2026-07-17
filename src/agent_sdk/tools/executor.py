@@ -77,14 +77,6 @@ class ToolExecutor:
                 raise ValueError("tool arguments must be an object")
             arguments = cast(dict[str, Any], decoded)
             Draft202012Validator(thaw_json(registered.spec.input_schema)).validate(arguments)
-            request = PermissionRequest(
-                request_id=new_id("prm"),
-                run_id=context.run_id,
-                session_id=context.session_id,
-                tool_name=call.name,
-                arguments=arguments,
-                effects=registered.spec.effects,
-            )
         except (
             json.JSONDecodeError,
             ValueError,
@@ -95,6 +87,43 @@ class ToolExecutor:
                 call,
                 ToolResultStatus.INVALID_ARGUMENTS,
                 "invalid tool arguments",
+                emit,
+                on_call_completed,
+                on_preflight,
+            )
+
+        if on_preflight is not None:
+            await on_preflight()
+
+        try:
+            permission_arguments: Mapping[str, Any] = arguments
+            if registered.permission_arguments is not None:
+                permission_arguments = await registered.permission_arguments(
+                    context,
+                    arguments,
+                )
+            request = PermissionRequest(
+                request_id=new_id("prm"),
+                run_id=context.run_id,
+                session_id=context.session_id,
+                tool_name=call.name,
+                arguments=permission_arguments,
+                effects=registered.spec.effects,
+            )
+        except ToolAccessDenied:
+            return await self._complete_error(
+                call,
+                ToolResultStatus.DENIED,
+                "tool access denied",
+                emit,
+                on_call_completed,
+                on_preflight,
+            )
+        except Exception:
+            return await self._complete_error(
+                call,
+                ToolResultStatus.FAILED,
+                "tool permission preflight failed",
                 emit,
                 on_call_completed,
                 on_preflight,

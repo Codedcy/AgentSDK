@@ -128,3 +128,71 @@ Success: no issues found in 13 source files
 This is workspace containment and command policy, not an OS sandbox. A process
 allowed by policy can use its own capabilities after launch. That is the
 explicit R1/v0.1 boundary; no broader sandbox was added.
+
+## Review Fix
+
+The Task 3 review found one canonical permission-resource mismatch, one
+no-clobber race, and one empty-workspace normalization gap. This follow-up stays
+inside Task 3 and does not start the R1 checkpoint.
+
+### Review RED
+
+The focused regression set first produced eight expected failures:
+
+```text
+8 failed, 15 passed in 5.08s
+```
+
+- relative `read`, relative `write`, relative `bash.cwd`, and omitted
+  `bash.cwd` all incorrectly succeeded under an absolute workspace deny rule;
+- a path-specific ask rule never produced a request;
+- a path-specific allow rule incorrectly denied;
+- the controlled concurrent creator was overwritten by `overwrite=False`;
+- empty-workspace bash returned `failed` instead of `denied`.
+
+The existing empty/NUL argv, child cancellation, and post-temp cleanup behavior
+was also locked with focused regressions.
+
+### Review Implementation
+
+- `RegisteredTool` now has an optional private asynchronous
+  `permission_arguments` resolver. It is not part of `ToolSpec`, model schemas,
+  or durable execution descriptors.
+- `ToolExecutor` invokes that resolver after schema validation but before the
+  existing `PermissionBroker`. The resulting canonical arguments are used only
+  for `PermissionRequest`; handler invocation retains the original validated
+  arguments.
+- Built-in file resolvers canonicalize relative `path` against the Session
+  workspace. The bash resolver canonicalizes explicit cwd and injects the
+  canonical first workspace root when cwd is omitted.
+- Containment failure during permission normalization completes as a bounded,
+  non-leaking `DENIED` result before authorization or handler-start events.
+- An application Tool without a resolver retains its original request and
+  handler arguments; MCP/descriptor behavior remains unchanged.
+- `overwrite=False` now installs the closed, fsynced, same-directory owned
+  temporary through atomic hard-link creation. A destination that appears
+  concurrently causes `FileExistsError` and is preserved. `overwrite=True`
+  continues to use atomic replace.
+- Empty-workspace bash reaches the shared containment denial path.
+
+### Review GREEN
+
+Task 3, application permission, and v0.1 acceptance set:
+
+```text
+58 passed in 6.12s
+```
+
+MCP, execution descriptor, provider recovery, exact descriptor, and related
+access-denial recovery set:
+
+```text
+74 passed in 5.77s
+```
+
+Static checks:
+
+```text
+All checks passed!
+Success: no issues found in 17 source files
+```
