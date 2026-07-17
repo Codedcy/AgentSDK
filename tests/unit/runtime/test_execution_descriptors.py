@@ -105,6 +105,39 @@ def test_policy_hash_covers_permission_default() -> None:
     assert allow.policy_hash != deny.policy_hash
 
 
+def test_policy_hash_covers_detached_permission_rules() -> None:
+    source_rule = {
+        "outcome": "allow",
+        "tool": "bash",
+        "path_prefix": "workspace",
+        "command_prefix": ["git", "status"],
+    }
+    with_rules = ExecutionPolicyDescriptor.create(
+        permission_default="deny",
+        permission_rules=(source_rule,),
+    )
+    without_rules = ExecutionPolicyDescriptor.create(permission_default="deny")
+
+    source_rule["tool"] = "write"
+
+    assert with_rules.policy_hash != without_rules.policy_hash
+    assert with_rules.permission_rules[0]["tool"] == "bash"
+    with pytest.raises(TypeError):
+        with_rules.permission_rules[0]["tool"] = "read"  # type: ignore[index]
+
+
+def test_persisted_policy_without_rules_defaults_to_empty_tuple() -> None:
+    legacy = {
+        "permission_default": "ask",
+        "policy_hash": _canonical_hash({"permission_default": "ask"}),
+    }
+
+    restored = ExecutionPolicyDescriptor.model_validate(legacy)
+
+    assert restored.permission_rules == ()
+    assert "permission_rules" not in restored.model_dump(mode="json")
+
+
 def test_execution_descriptor_is_immutable_and_revalidates_hashes() -> None:
     agent = AgentSpec(name="coder", model="openai/test", model_params={"temperature": 0})
     capability = ToolCapabilityDescriptor.from_spec(_tool())

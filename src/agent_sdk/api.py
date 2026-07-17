@@ -26,6 +26,7 @@ from agent_sdk.models.litellm_gateway import LiteLLMGateway, ModelRequest
 from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.permissions.rules import PermissionRule
 from agent_sdk.observability import (
     EventFilter,
     EventQueryResult,
@@ -519,7 +520,8 @@ class RunAPI:
                         for spec in self._tools.list()
                     ),
                     policy=ExecutionPolicyDescriptor.create(
-                        permission_default=config["permission_default"]
+                        permission_default=config["permission_default"],
+                        permission_rules=config["permission_rules"],
                     ),
                 )
                 request = ModelRequest(
@@ -993,6 +995,7 @@ class AgentSDK:
             store,
             LiteLLMGateway(),
             permission_default=config.permission_default,
+            permission_rules=config.permission_rules,
             permission_bridge=InProcessPermissionBridge(),
             owned_close=store.close,
             provider_recovery_timeout_seconds=30.0,
@@ -1006,6 +1009,7 @@ class AgentSDK:
         store: StateStore | None = None,
         database_path: str | Path | None = None,
         permission_default: _PermissionDefault = "ask",
+        permission_rules: tuple[PermissionRule, ...] = (),
         permission_bridge: InProcessPermissionBridge | None | object = (
             _DEFAULT_PERMISSION_BRIDGE
         ),
@@ -1037,6 +1041,7 @@ class AgentSDK:
             selected_store,
             LiteLLMGateway._for_test(acompletion),
             permission_default=permission_default,
+            permission_rules=permission_rules,
             permission_bridge=bridge,
             owned_close=owned_close,
             provider_recovery_timeout_seconds=provider_recovery_timeout_seconds,
@@ -1049,6 +1054,7 @@ class AgentSDK:
         models: LiteLLMGateway,
         *,
         permission_default: _PermissionDefault,
+        permission_rules: tuple[PermissionRule, ...],
         permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
         provider_recovery_timeout_seconds: float,
@@ -1061,7 +1067,7 @@ class AgentSDK:
         commands = RuntimeCommands(store)
         tools = ToolRegistry()
         provider_recovery = ProviderRecoveryRegistry()
-        policy = PolicyEngine(permission_default)
+        policy = PolicyEngine(permission_default, permission_rules)
         engine = RunEngine(
             store,
             models,

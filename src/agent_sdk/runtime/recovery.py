@@ -19,6 +19,7 @@ from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.permissions.rules import PermissionRule
 from agent_sdk.runtime._recovery_observability import hashed_identity
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import (
@@ -3245,7 +3246,14 @@ class RunRecoveryService:
         if descriptor is None:
             return None
         try:
-            return PolicyEngine(descriptor.policy.permission_default).evaluate(request)
+            rules = tuple(
+                PermissionRule.model_validate(rule)
+                for rule in descriptor.policy.permission_rules
+            )
+            return PolicyEngine(
+                descriptor.policy.permission_default,
+                rules,
+            ).evaluate(request)
         except AgentSDKError:
             return None
 
@@ -4401,8 +4409,10 @@ class RunRecoveryService:
             registered_agent = self._agents.resolve(run.agent_revision)
         except AgentSDKError:
             raise self._capability_error() from None
+        policy_config = self._policy.execution_config()
         live_policy = ExecutionPolicyDescriptor.create(
-            permission_default=self._policy.execution_config()["permission_default"]
+            permission_default=policy_config["permission_default"],
+            permission_rules=policy_config["permission_rules"],
         )
         live_tools = tuple(
             ToolCapabilityDescriptor.from_spec(spec) for spec in self._tools.list()

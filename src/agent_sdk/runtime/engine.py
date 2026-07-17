@@ -1331,7 +1331,8 @@ class RunEngine:
             return
         policy_config = self._policy.execution_config()
         live_policy = ExecutionPolicyDescriptor.create(
-            permission_default=policy_config["permission_default"]
+            permission_default=policy_config["permission_default"],
+            permission_rules=policy_config["permission_rules"],
         )
         live_tools = tuple(ToolCapabilityDescriptor.from_spec(spec) for spec in self._tools.list())
         request_messages = tuple(deepcopy(message) for message in request.messages)

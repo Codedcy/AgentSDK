@@ -79,7 +79,8 @@ class SubagentService:
                 for spec in self._tool_specs()
             ),
             policy=ExecutionPolicyDescriptor.create(
-                permission_default=config["permission_default"]
+                permission_default=config["permission_default"],
+                permission_rules=config["permission_rules"],
             ),
         )
         outcome = await self._commands.start_run(

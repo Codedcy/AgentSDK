@@ -4,7 +4,8 @@ from agent_sdk.permissions.models import (
     PermissionEffect,
     PermissionRequest,
 )
-from agent_sdk.permissions.policy import PermissionOutcome, PolicyEngine
+from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.permissions.rules import PermissionOutcome, PermissionRule
 
 __all__ = [
     "InProcessPermissionBridge",
@@ -13,5 +14,6 @@ __all__ = [
     "PermissionEffect",
     "PermissionOutcome",
     "PermissionRequest",
+    "PermissionRule",
     "PolicyEngine",
 ]

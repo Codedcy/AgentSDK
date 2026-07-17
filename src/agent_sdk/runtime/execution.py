@@ -178,16 +178,57 @@ class ExecutionPolicyDescriptor(_RevalidatedDescriptor):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     permission_default: Literal["allow", "deny", "ask"]
+    permission_rules: tuple[Mapping[str, Any], ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     policy_hash: str
 
     @classmethod
-    def create(cls, *, permission_default: Literal["allow", "deny", "ask"]) -> Self:
-        content = {"permission_default": permission_default}
-        return cls(**content, policy_hash=_hash(content))
+    def create(
+        cls,
+        *,
+        permission_default: Literal["allow", "deny", "ask"],
+        permission_rules: tuple[Mapping[str, Any], ...] = (),
+    ) -> Self:
+        canonical_rules = tuple(
+            cast(dict[str, Any], _thaw_json(_freeze_json(rule)))
+            for rule in permission_rules
+        )
+        content: dict[str, Any] = {"permission_default": permission_default}
+        if canonical_rules:
+            content["permission_rules"] = list(canonical_rules)
+        return cls(
+            permission_default=permission_default,
+            permission_rules=canonical_rules,
+            policy_hash=_hash(content),
+        )
+
+    @field_validator("permission_rules", mode="after")
+    @classmethod
+    def _permission_rules(
+        cls,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        return tuple(cast(Mapping[str, Any], _freeze_json(rule)) for rule in value)
+
+    @field_serializer("permission_rules")
+    def _serialize_permission_rules(
+        self,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> list[dict[str, Any]]:
+        return [_thaw_json(rule) for rule in value]
 
     @model_validator(mode="after")
     def _validate_hash(self) -> Self:
-        if self.policy_hash != _hash({"permission_default": self.permission_default}):
+        content: dict[str, Any] = {
+            "permission_default": self.permission_default,
+        }
+        if self.permission_rules:
+            content["permission_rules"] = [
+                _thaw_json(rule) for rule in self.permission_rules
+            ]
+        if self.policy_hash != _hash(content):
             raise ValueError("execution policy hash mismatch")
         return self
 

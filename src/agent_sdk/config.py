@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from agent_sdk.permissions.rules import PermissionRule
+
 
 class CaptureLevel(StrEnum):
     METADATA = "metadata"
@@ -17,3 +19,4 @@ class AgentSDKConfig(BaseModel):
     database_path: Path
     capture_level: CaptureLevel = CaptureLevel.PREVIEW
     permission_default: Literal["allow", "deny", "ask"] = "ask"
+    permission_rules: tuple[PermissionRule, ...] = ()

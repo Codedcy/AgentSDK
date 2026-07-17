@@ -1,17 +1,25 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from types import MappingProxyType
-from collections.abc import Mapping
-from typing import Literal
+from typing import Any
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
-
-PermissionOutcome = Literal["allow", "deny", "ask"]
+from agent_sdk.permissions.rules import (
+    PermissionOutcome,
+    PermissionRule,
+    match_rule,
+)
+from agent_sdk.tools.models import freeze_json
 
 
 class PolicyEngine:
-    def __init__(self, default_outcome: PermissionOutcome = "ask") -> None:
+    def __init__(
+        self,
+        default_outcome: PermissionOutcome = "ask",
+        rules: Iterable[PermissionRule] = (),
+    ) -> None:
         if default_outcome not in {"allow", "deny", "ask"}:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
@@ -19,15 +27,35 @@ class PolicyEngine:
                 retryable=False,
             )
         self._default_outcome = default_outcome
+        self._rules = tuple(rules)
 
     def evaluate(self, request: PermissionRequest) -> PermissionDecision:
-        del request
-        if self._default_outcome == "allow":
+        matches = tuple(
+            match
+            for rule in self._rules
+            if (match := match_rule(rule, request)) is not None
+        )
+        denials = tuple(match for match in matches if match.rule.outcome == "deny")
+        selected = max(
+            denials or matches,
+            key=lambda item: item.specificity,
+            default=None,
+        )
+        outcome = selected.rule.outcome if selected else self._default_outcome
+        if outcome == "allow":
             return PermissionDecision.allow_once()
-        if self._default_outcome == "deny":
+        if outcome == "deny":
             return PermissionDecision.deny()
         return PermissionDecision.ask()
 
-    def execution_config(self) -> Mapping[str, PermissionOutcome]:
+    def execution_config(self) -> Mapping[str, Any]:
         """Return a detached snapshot of every execution-affecting setting."""
-        return MappingProxyType({"permission_default": self._default_outcome})
+        rules = tuple(
+            freeze_json(rule.model_dump(mode="json")) for rule in self._rules
+        )
+        return MappingProxyType(
+            {
+                "permission_default": self._default_outcome,
+                "permission_rules": rules,
+            }
+        )

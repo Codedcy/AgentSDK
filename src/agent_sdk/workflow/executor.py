@@ -808,7 +808,8 @@ class WorkflowExecutor:
         )
         config = self._policy.execution_config()
         policy = ExecutionPolicyDescriptor.create(
-            permission_default=config["permission_default"]
+            permission_default=config["permission_default"],
+            permission_rules=config["permission_rules"],
         )
         agents: list[WorkflowAgentDescriptor] = []
         seen: set[str] = set()
@@ -1061,7 +1062,8 @@ class WorkflowExecutor:
                 for spec in self._tool_specs()
             ),
             policy=ExecutionPolicyDescriptor.create(
-                permission_default=config["permission_default"]
+                permission_default=config["permission_default"],
+                permission_rules=config["permission_rules"],
             ),
         )
 
