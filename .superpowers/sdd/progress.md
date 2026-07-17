@@ -228,5 +228,7 @@ M02-T003 Phase A third-fix brief: .superpowers/sdd/M02-T003-phaseA-second-rerevi
 M02-T003 Phase A third-fix implementation: 3bceab5
 M02-T003 Phase A third fixes: complete SQLite Tcl-style $ variable longest matching; consistent numeric inspection-time IOERR/BUSY/LOCKED public I/O classification
 M02-T003 Phase A third-fix gates: exact 22 passed; lexical/boundary 74 passed; migration/review 255 passed; storage 655 passed; full Python3.13 2365 passed; Ruff clean; strict mypy77 clean; py_compile/build/import/isolated-wheel resources/diff/scope clean
-M02-T003 Phase A third fix: complete; fresh independent re-review is required and Phase B remains blocked
-Next action: run a fresh independent M02-T003 Phase A re-review for Spec C0/I0 and Quality C0/I0 before any Phase B work
+M02-T003 Phase A third re-review: Not Approved; Spec C0/I1/M0 and Quality C0/I1/M0
+M02-T003 Phase A third re-review finding: real SQLite accepts leading-empty Tcl variable `$::foo`, but the lexer requires a non-empty initial identifier segment and the GREEN matrix omitted the boundary
+M02-T003 Phase A fourth-fix brief: .superpowers/sdd/M02-T003-phaseA-leading-empty-variable-fix-brief.md
+M02-T003 Phase A fourth fix: in progress; Phase B remains blocked
