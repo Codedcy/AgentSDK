@@ -265,8 +265,8 @@ v0.1 R0 final independent review: Approved; Critical 0 / Important 0 / Minor 0; 
 v0.1 R1 Task 1: complete (commits 8fc36ad and 8c2982b; final review Spec approved / Quality approved; fresh 61 focused tests and 127 regression tests passed; strict mypy and Ruff clean)
 v0.1 R1 Task 2: complete (commits e6d9f3b and 2b145a7; final review Spec approved / Quality approved; fresh 60 focused tests with 1 platform skip and 147 recovery tests passed; strict mypy and Ruff clean)
 v0.1 R1 Task 3: complete (commits e8ce3db, 8fb3836, and cd82a6f; final review Spec approved / Quality approved; workspace-scoped built-in Tools, canonical permission resources, and isolated recovery capabilities)
-v0.1 R1 checkpoint: complete (2026-07-17; Tasks 1-3 through cd82a6f)
-v0.1 R1 checkpoint exact fresh evidence:
+v0.1 R1 checkpoint: complete (2026-07-17; final hardening through 2f0e922)
+v0.1 R1 initial checkpoint historical evidence:
 ```text
 $ .\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py tests/unit/tools/test_workspace_paths.py tests/integration/tools/test_builtin_tools.py tests/integration/tools/test_permissioned_tool_slice.py tests/e2e/test_v01_release.py -q
 ..............s......................................................... [ 83%]
@@ -278,6 +278,21 @@ All checks passed!
 
 $ .\.venv\Scripts\python.exe -m mypy --strict src/agent_sdk/config.py src/agent_sdk/permissions src/agent_sdk/tools
 Success: no issues found in 16 source files
+```
+v0.1 R1 final hardening: commits d4cd336 and 2f0e922; canonical built-in permission-resource binding, exact durable recovery, and repeatable pending-permission recovery
+v0.1 R1 final independent review: Approved; Critical 0 / Important 0 / Minor 0; Ready to proceed to R2: Yes
+v0.1 R1 final checkpoint exact fresh evidence:
+```text
+$ .\.venv\Scripts\python.exe -m pytest tests\unit\permissions\test_policy_rules.py tests\unit\tools\test_workspace_paths.py tests\unit\runtime\test_session_workspace_roots.py tests\integration\tools\test_builtin_tools.py tests\integration\tools\test_permissioned_tool_slice.py tests\integration\runtime\test_builtin_tool_recovery.py tests\e2e\test_v01_release.py -q
+..............s............ss........................................... [ 72%]
+............................                                             [100%]
+97 passed, 3 skipped in 7.94s
+
+$ .\.venv\Scripts\python.exe -m ruff check src\agent_sdk tests\unit\permissions tests\unit\tools tests\unit\runtime\test_session_workspace_roots.py tests\integration\tools tests\integration\runtime\test_builtin_tool_recovery.py tests\e2e\test_v01_release.py
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk
+Success: no issues found in 84 source files
 ```
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md`
