@@ -3337,6 +3337,18 @@ class RunRecoveryService:
         )
 
     @staticmethod
+    def _is_normalized_tool_access_denial(
+        call: ToolCallCompleted,
+        result: ToolResult,
+    ) -> bool:
+        return result == ToolResult.normalized_error(
+            call.call_id,
+            call.name,
+            ToolResultStatus.DENIED,
+            "tool access denied",
+        )
+
+    @staticmethod
     def _is_authoritative_historical_tool_result(
         evidence: _RecoveryEvidence,
         *,
@@ -3458,6 +3470,11 @@ class RunRecoveryService:
                     ToolResultStatus.TIMED_OUT,
                     "tool execution timed out",
                 )
+            elif (
+                not operator_confirmed
+                and RunRecoveryService._is_normalized_tool_access_denial(call, result)
+            ):
+                normalized_result = result
             elif (
                 not operator_confirmed
                 and result.status is ToolResultStatus.DENIED
@@ -6265,6 +6282,12 @@ class RunRecoveryService:
                                 result,
                             )
                         )
+                        normalized_access_denial = (
+                            RunRecoveryService._is_normalized_tool_access_denial(
+                                call,
+                                result,
+                            )
+                        )
                         if (
                             tool_operation.status is ExternalOperationStatus.STARTED
                             or tool_operation.outcome is None
@@ -6275,6 +6298,7 @@ class RunRecoveryService:
                                     ToolResultStatus.INVALID_ARGUMENTS,
                                 }
                                 and not operator_confirmed
+                                and not normalized_access_denial
                             )
                         ):
                             return None

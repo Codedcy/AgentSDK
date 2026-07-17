@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -29,10 +29,12 @@ from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools import (
     ToolContext,
+    ToolResult,
     ToolResultStatus,
     ToolRetryPolicy,
     ToolSpec,
 )
+from agent_sdk.tools.errors import ToolAccessDenied
 
 
 class _ToolRecoveryAuditFaultStore(InMemoryStore):
@@ -85,6 +87,35 @@ class _LeaseAssertBarrier:
             self.reached.set()
             await self.release.wait()
         await self._delegate.assert_current(lease, now=now)
+
+
+def _fail_twice_after_access_denial_commit(store: Any) -> Callable[[], None]:
+    original = store.commit_run_progress
+    failures = 0
+
+    async def faulty(batch: RunProgressBatch) -> CommitResult:
+        nonlocal failures
+        result = cast(CommitResult, await original(batch))
+        completed = tuple(
+            event for event in batch.events if event.type == "tool.call.completed"
+        )
+        if len(completed) == 1:
+            tool_result = ToolResult.model_validate(completed[0].payload)
+            if (
+                tool_result.status is ToolResultStatus.DENIED
+                and tool_result.error == "tool access denied"
+                and failures < 2
+            ):
+                failures += 1
+                raise RuntimeError("private postcommit response failure")
+        return result
+
+    store.commit_run_progress = faulty
+
+    def restore() -> None:
+        store.commit_run_progress = original
+
+    return restore
 
 
 def _sdk_traceback_locals(error: BaseException) -> tuple[dict[str, Any], ...]:
@@ -1317,6 +1348,144 @@ async def test_recovered_tool_uses_normalized_handler_failure_semantics(
         assert operation.status is ExternalOperationStatus.FAILED
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_access_denial_postcommit_failure_recovers_without_rerunning_handler(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"access-denial-{backend}.sqlite3"
+    store: StateStore = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(path)
+    )
+    initial_model_calls = 0
+    handler_calls = 0
+
+    async def first_completion(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal initial_model_calls
+        initial_model_calls += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_access_denied",
+                                    "function": {
+                                        "name": "recoverable",
+                                        "arguments": '{"value":7}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    async def denied_handler(_: ToolContext, value: int) -> None:
+        nonlocal handler_calls
+        del value
+        handler_calls += 1
+        raise ToolAccessDenied("outside absolute path must stay private")
+
+    spec = AgentSpec(name="access-denial-recovery", model="fake/tool-recovery")
+    tool_spec = _tool_spec(ToolRetryPolicy.SAFE_RETRY)
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=first_completion,
+        permission_default="allow",
+    )
+    sdk.tools.register(tool_spec, denied_handler)
+    session = await sdk.sessions.create(workspaces=[])
+    restore = _fail_twice_after_access_denial_commit(store)
+    handle = await sdk.runs.start(session.session_id, spec, "deny workspace escape")
+    run_id = handle.run_id
+    try:
+        with pytest.raises(AgentSDKError, match="failed to persist run"):
+            await handle.result()
+        assert initial_model_calls == 1
+        assert handler_calls == 1
+        events = [
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+        ]
+        completed = [event for event in events if event.type == "tool.call.completed"]
+        assert len(completed) == 1
+        persisted = ToolResult.model_validate(completed[0].payload)
+        assert persisted == ToolResult.normalized_error(
+            "call_access_denied",
+            "recoverable",
+            ToolResultStatus.DENIED,
+            "tool access denied",
+        )
+        operations = tuple(
+            operation
+            for operation in await store.list_external_operations(run_id)
+            if isinstance(operation, ToolCallOperation)
+        )
+        assert len(operations) == 1
+        operation = operations[0]
+        assert isinstance(operation, ToolCallOperation)
+        assert operation.status is ExternalOperationStatus.FAILED
+        assert operation.model_dump(mode="json")["outcome"] == persisted.model_dump(
+            mode="json"
+        )
+    finally:
+        restore()
+        await sdk.close()
+
+    if isinstance(store, SQLiteStore):
+        await store.close()
+        store = await SQLiteStore.open(path)
+
+    recovered_handler_calls = 0
+    continuation_calls = 0
+
+    async def must_not_run(_: ToolContext, value: int) -> None:
+        nonlocal recovered_handler_calls
+        del value
+        recovered_handler_calls += 1
+        raise AssertionError("durably completed handler must not rerun")
+
+    async def continuation(**_: object) -> AsyncIterator[dict[str, object]]:
+        nonlocal continuation_calls
+        continuation_calls += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": "done"}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    reopened = AgentSDK.for_test(
+        store=store,
+        acompletion=continuation,
+        permission_default="allow",
+    )
+    reopened.agents.define(spec)
+    reopened.tools.register(tool_spec, must_not_run)
+    try:
+        result = await (await reopened.recovery.recover_run(run_id)).result()
+        assert result.output_text == "done"
+        assert result.tool_results == (persisted,)
+        assert recovered_handler_calls == 0
+        assert continuation_calls == 1
+    finally:
+        await reopened.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
 
 
 @pytest.mark.asyncio

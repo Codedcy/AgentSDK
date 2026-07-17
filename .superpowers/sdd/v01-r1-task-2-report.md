@@ -104,3 +104,57 @@ Exit code 0 (line-ending notice only)
   existing-junction and dangling-junction cases both ran and passed.
 - This is path/cwd containment only; it intentionally does not claim hardened
   race-free OS sandboxing.
+
+## Review Fix: Recover Durable Access Denials
+
+The Task 2 review found that an exact normalized workspace access denial could
+be durably committed with its failed `ToolCallOperation`, while both caller-side
+commit attempts still reported a storage failure. Recovery rejected that new
+source of `DENIED` and required operator reconciliation.
+
+The regression uses the real Agent loop and injects the failure after the
+`tool.call.completed`, checkpoint, and operation transaction commits. It covers
+both retained `InMemoryStore` state and an actual SQLite close/reopen.
+
+Focused RED:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests\integration\runtime\test_tool_recovery_execution.py::test_access_denial_postcommit_failure_recovers_without_rerunning_handler -q
+```
+
+```text
+Memory: AgentSDKError: recovery required
+SQLite: AgentSDKError: recovery required
+2 failed
+```
+
+Minimal fix:
+
+- Both historical/authoritative recovery validators recognize only the exact
+  normalized `DENIED / "tool access denied"` result.
+- Acceptance still requires the normal capability identity, request
+  fingerprint, recovery metadata, `FAILED` operation status, and exact
+  operation-outcome/result equality.
+- Permission denial and operator-confirmed reconciliation paths remain
+  unchanged; arbitrary `DENIED` results are not accepted.
+
+Focused GREEN:
+
+```text
+2 passed in 3.15s
+```
+
+Recovery regression:
+
+```text
+tests/integration/runtime/test_tool_recovery_execution.py
+tests/integration/storage/test_sqlite_recovery_validation.py
+147 passed in 16.01s
+```
+
+Review-fix files:
+
+- `src/agent_sdk/runtime/recovery.py`
+- `tests/integration/runtime/test_tool_recovery_execution.py`
+
+No Task 3 production behavior was introduced.
