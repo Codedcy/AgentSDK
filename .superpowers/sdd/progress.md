@@ -249,7 +249,7 @@ v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/syn
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
 v0.1 R0 plan ordering correction: 83dce26
 v0.1 R0 Task 2: complete (commits 908fe01 and 1a59ad2; review Spec approved / Quality approved; fresh 3 tests passed and Ruff clean)
-v0.1 R0 checkpoint: complete (2026-07-17; commit: docs: record v0.1 R0 checkpoint)
+v0.1 R0 checkpoint: complete (2026-07-17; commit: 74c1e3b)
 v0.1 R0 checkpoint exact fresh evidence:
 ```text
 $ .\.venv\Scripts\python.exe -m pytest tests\docs\test_v01_release_ledger.py tests\e2e\test_v01_release.py tests\e2e\test_vertical_slice.py -q
@@ -261,4 +261,7 @@ All checks passed!
 ```
 v0.1 R0 Task 3: complete (commits 7036622 and 74c1e3b; review Spec approved / Quality approved; exact checkpoint evidence retained)
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r1-tools-policy.md
-v0.1 next action: create and run the first R1 RED test `tests/unit/permissions/test_policy_rules.py` with `.\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py -q`; do not start R1 before that RED test
+v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r1-tools-policy.md`
+v0.1 next required action: R1 Task 1 Step 1, creating `tests/unit/permissions/test_policy_rules.py`
+v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py tests/unit/test_core_config.py -q`
+v0.1 R1 remains pending and has not started

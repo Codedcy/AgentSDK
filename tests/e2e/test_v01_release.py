@@ -42,7 +42,11 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     assert (await sdk.queries.timeline(handle.run_id)).run_id == handle.run_id
     await sdk.close()
 
+    provider_calls = 0
+
     async def must_not_call(**_: object) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
         raise AssertionError("completed Run must not call LiteLLM after reopen")
 
     reopened = v01_harness.reopen(must_not_call)
@@ -55,3 +59,4 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     assert deleted.value.code is ErrorCode.NOT_FOUND
     assert workspace_file.read_text(encoding="utf-8") == "application-owned"
     await reopened.close()
+    assert provider_calls == 0
