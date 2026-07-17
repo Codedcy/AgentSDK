@@ -243,7 +243,7 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: R0-R1 completed; R2 pending; deterministic permission rules, workspace containment, and built-in read/write/bash Tool handlers complete
+v0.1 current implementation status: R0-R1 completed; R2 in progress; restricted expressions complete
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
@@ -294,8 +294,9 @@ All checks passed!
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk
 Success: no issues found in 84 source files
 ```
+v0.1 R2 Task 1: complete (commits e3494ae and 1fc9c72; final review Spec approved / Quality approved; fresh 82 focused and schema-v1 compiler tests passed; strict mypy and Ruff clean)
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md`
-v0.1 next required action: R2 Task 1 Step 1, creating `tests/unit/workflow/test_expressions.py`
-v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/workflow/test_expressions.py -q`
-v0.1 R2 remains pending and has not started
+v0.1 next required action: R2 Task 2 Step 1, creating `tests/unit/workflow/test_control_compiler.py`
+v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/workflow/test_control_compiler.py tests/unit/workflow/test_workflow_compiler.py -q`
+v0.1 R2 remains in progress; Tasks 2-5 have not started

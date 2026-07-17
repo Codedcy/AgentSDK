@@ -31,14 +31,16 @@ All checks passed!
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk
 Success: no issues found in 84 source files"""
 R1_FINAL_COMMITS = ("d4cd336", "2f0e922")
+R2_TASK_1_COMMITS = ("e3494ae", "1fc9c72")
 R2_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
 R2_RESUME_COMMAND = (
     r"Get-Content docs\superpowers\plans"
     r"\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
 )
-R2_FIRST_TEST = "tests/unit/workflow/test_expressions.py"
+R2_FIRST_TEST = "tests/unit/workflow/test_control_compiler.py"
 R2_FIRST_RED = (
-    rf".\.venv\Scripts\python.exe -m pytest {R2_FIRST_TEST} -q"
+    rf".\.venv\Scripts\python.exe -m pytest {R2_FIRST_TEST} "
+    "tests/unit/workflow/test_workflow_compiler.py -q"
 )
 
 
@@ -53,15 +55,17 @@ def _assert_r1_checkpoint_and_r2_resume(document: str) -> None:
     assert R1_FINAL_CHECKPOINT in normalized_document
     for commit in R1_FINAL_COMMITS:
         assert commit in document
+    for commit in R2_TASK_1_COMMITS:
+        assert commit in document
     assert "Critical 0 / Important 0 / Minor 0" in document
     assert "Ready to proceed to R2: Yes" in document
     assert R2_PLAN in document
     assert R2_RESUME_COMMAND in document
-    assert "R2 Task 1 Step 1" in document
+    assert "R2 Task 2 Step 1" in document
     assert R2_FIRST_TEST in document
     assert R2_FIRST_RED in document
-    assert "R2 remains pending" in document
-    assert "has not started" in document
+    assert "R2 remains in progress" in document
+    assert "Tasks 2-5 have not started" in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
@@ -81,7 +85,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     ) in ledger
     assert "R1 is complete through final hardening commit `2f0e922`" in ledger
     assert "final review approved" in ledger
-    for slice_id in ("R2", "R3", "R4", "R5"):
+    assert "| R2 | in_progress |" in ledger
+    for slice_id in ("R3", "R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
@@ -102,7 +107,10 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
-    assert "v0.1 current implementation status: R0-R1 completed; R2 pending" in progress
+    assert (
+        "v0.1 current implementation status: R0-R1 completed; "
+        "R2 in progress; restricted expressions complete"
+    ) in progress
     _assert_r1_checkpoint_and_r2_resume(ledger)
     _assert_r1_checkpoint_and_r2_resume(progress)
 
