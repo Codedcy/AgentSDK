@@ -15,6 +15,7 @@ from agent_sdk.models.litellm_gateway import ToolCallCompleted
 from agent_sdk.permissions.broker import InProcessPermissionBridge, PermissionBroker
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.tools.errors import ToolAccessDenied, ToolExecutionTimedOut
 from agent_sdk.tools.models import (
     ToolContext,
     ToolResult,
@@ -175,6 +176,20 @@ class ToolExecutor:
                     )
         except asyncio.CancelledError:
             raise
+        except ToolAccessDenied:
+            result = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.DENIED,
+                "tool access denied",
+            )
+        except ToolExecutionTimedOut:
+            result = ToolResult.normalized_error(
+                call.call_id,
+                call.name,
+                ToolResultStatus.TIMED_OUT,
+                "tool execution timed out",
+            )
         except Exception:
             result = ToolResult.normalized_error(
                 call.call_id,
