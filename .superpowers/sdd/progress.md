@@ -260,6 +260,8 @@ $ .\.venv\Scripts\python.exe -m ruff check tests\fixtures\v01_runtime.py tests\e
 All checks passed!
 ```
 v0.1 R0 Task 3: complete (commits 7036622 and 74c1e3b; review Spec approved / Quality approved; exact checkpoint evidence retained)
+v0.1 R0 final hardening: 35ace95; background non-replay assertion, deterministic R1 resume handoff, immutable checkpoint evidence, and release-ledger contract checks
+v0.1 R0 final independent review: Approved; Critical 0 / Important 0 / Minor 0; fresh 4 tests passed and Ruff clean; ready to proceed to R1
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r1-tools-policy.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r1-tools-policy.md`
 v0.1 next required action: R1 Task 1 Step 1, creating `tests/unit/permissions/test_policy_rules.py`
