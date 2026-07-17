@@ -180,14 +180,14 @@ was also locked with focused regressions.
 Task 3, application permission, and v0.1 acceptance set:
 
 ```text
-58 passed in 6.12s
+58 passed in 5.15s
 ```
 
 MCP, execution descriptor, provider recovery, exact descriptor, and related
 access-denial recovery set:
 
 ```text
-74 passed in 5.77s
+74 passed in 4.55s
 ```
 
 Static checks:
@@ -195,4 +195,28 @@ Static checks:
 ```text
 All checks passed!
 Success: no issues found in 17 source files
+```
+
+## Exact Provider-Recovery Fixture Compatibility
+
+A wider controller run found that
+`tests/integration/runtime/test_provider_recovery_execution.py` manually seeds
+empty or application-only Tool capability descriptors, but its SDK fixtures
+had started adding the default built-ins. Production correctly rejected those
+different capability hashes:
+
+```text
+67 failed, 39 passed in 18.17s
+AgentSDKError: recovery capabilities unavailable
+```
+
+The entire file is an exact-capability recovery fixture; it contains no test of
+production default built-in registration. Its fifteen `AgentSDK.for_test`
+construction sites now explicitly use `enable_builtin_tools=False`. Production
+recovery validation and SDK defaults are unchanged.
+
+Focused GREEN:
+
+```text
+106 passed in 11.71s
 ```

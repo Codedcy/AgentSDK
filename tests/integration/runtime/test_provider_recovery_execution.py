@@ -475,6 +475,7 @@ async def _sdk(
         store=store,
         acompletion=acompletion,
         permission_default="allow",
+        enable_builtin_tools=False,
         provider_recovery_timeout_seconds=provider_recovery_timeout_seconds,
     )
     sdk.agents.define(spec)
@@ -1630,6 +1631,7 @@ async def test_sqlite_close_reopen_applies_authoritative_terminal_outcome(
         database_path=path,
         acompletion=_unused_acompletion,
         permission_default="allow",
+        enable_builtin_tools=False,
     )
     sdk.agents.define(spec)
     sdk.recovery.register_adapter(_adapter(query, None))
@@ -1860,7 +1862,11 @@ async def test_provider_recovery_to_interrupted_tool_can_cross_kind_recover(
     with pytest.raises(AgentSDKError):
         await first_handle.result()
 
-    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        enable_builtin_tools=False,
+    )
     try:
         await scanner.recovery.scan()
         assert (await scanner.runs.get(run_id)).status is RunStatus.INTERRUPTED
@@ -1895,6 +1901,7 @@ async def test_provider_recovery_to_interrupted_tool_can_cross_kind_recover(
         store=store,
         acompletion=final_completion,
         permission_default="allow",
+        enable_builtin_tools=False,
     )
     second.agents.define(spec)
     second.tools.register(tool_spec, recovered_handler)
@@ -1994,6 +2001,7 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
         store=store,
         acompletion=initial_completion,
         permission_default="allow",
+        enable_builtin_tools=False,
     )
     seed.tools.register(tool_spec, first_handler)
     session = await seed.sessions.create(workspaces=[])
@@ -2005,7 +2013,11 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
     await asyncio.wait_for(first_handler_cancelled.wait(), timeout=1)
     await seed.close()
 
-    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        enable_builtin_tools=False,
+    )
     try:
         await scanner.recovery.scan()
         assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
@@ -2049,6 +2061,7 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
         store=store,
         acompletion=interrupted_model,
         permission_default="allow",
+        enable_builtin_tools=False,
     )
     second.agents.define(spec)
     second.tools.register(tool_spec, recovered_tool)
@@ -2060,7 +2073,11 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
     with pytest.raises(AgentSDKError):
         await second_handle.result()
 
-    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        enable_builtin_tools=False,
+    )
     try:
         await scanner.recovery.scan()
         assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
@@ -2071,6 +2088,7 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
         store=store,
         acompletion=_unused_acompletion,
         permission_default="allow",
+        enable_builtin_tools=False,
     )
     third.agents.define(spec)
     third.tools.register(tool_spec, recovered_tool)
@@ -2187,6 +2205,7 @@ async def test_provider_historical_permission_request_is_strictly_reconstructed(
         store=store,
         acompletion=completion,
         permission_default="ask",
+        enable_builtin_tools=False,
     )
     seed.tools.register(tool_spec, handler)
     seed.recovery.register_adapter(_adapter(unused_query, None))
@@ -2207,7 +2226,11 @@ async def test_provider_historical_permission_request_is_strictly_reconstructed(
     await asyncio.wait_for(current_model_cancelled.wait(), timeout=1)
     await seed.close()
 
-    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        enable_builtin_tools=False,
+    )
     try:
         await scanner.recovery.scan()
         assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
@@ -2263,6 +2286,7 @@ async def test_provider_historical_permission_request_is_strictly_reconstructed(
         store=store,
         acompletion=unexpected_completion,
         permission_default="ask",
+        enable_builtin_tools=False,
     )
     recovered.agents.define(spec)
     recovered.tools.register(tool_spec, handler)
@@ -2400,6 +2424,7 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
         store=store,
         acompletion=completion,
         permission_default=recorded_default,  # type: ignore[arg-type]
+        enable_builtin_tools=False,
     )
     seed.tools.register(tool_spec, handler)
     seed.recovery.register_adapter(_adapter(unused_query, unused_resend))
@@ -2423,7 +2448,11 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
     await asyncio.wait_for(current_model_cancelled.wait(), timeout=1)
     await seed.close()
 
-    scanner = AgentSDK.for_test(store=store, acompletion=_unused_acompletion)
+    scanner = AgentSDK.for_test(
+        store=store,
+        acompletion=_unused_acompletion,
+        enable_builtin_tools=False,
+    )
     try:
         await scanner.recovery.scan()
         assert (await scanner.runs.get(seed_handle.run_id)).status is RunStatus.INTERRUPTED
@@ -2515,6 +2544,7 @@ async def test_provider_historical_tool_result_is_authoritatively_reconstructed(
         store=store,
         acompletion=unexpected_completion,
         permission_default=recorded_default,  # type: ignore[arg-type]
+        enable_builtin_tools=False,
     )
     recovered.agents.define(spec)
     recovered.tools.register(tool_spec, handler)
