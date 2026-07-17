@@ -87,6 +87,18 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "5.05s" not in ledger
     assert "74c1e3b" in ledger
     assert "R1 Tasks 1-3 are complete" in ledger
+    historical_marker = "Historical initial checkpoint evidence:"
+    canonical_marker = "Current canonical checkpoint evidence:"
+    assert ledger.count(historical_marker) == 1
+    assert ledger.count(canonical_marker) == 1
+    historical_index = ledger.index(historical_marker)
+    canonical_index = ledger.index(canonical_marker)
+    assert historical_index < canonical_index
+    assert "85 passed, 1 skipped in 6.12s" in ledger[
+        historical_index:canonical_index
+    ]
+    assert "85 passed, 1 skipped in 6.12s" not in ledger[canonical_index:]
+    assert "97 passed, 3 skipped in 7.94s" in ledger[canonical_index:]
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress

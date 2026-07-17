@@ -13,7 +13,7 @@ No production code was modified and R2 was not started.
 - R1 Task 2: `e6d9f3b`, `2b145a7`
 - R1 Task 3: `e8ce3db`, `8fb3836`, `cd82a6f`
 
-## Fresh checkpoint evidence
+## Historical initial checkpoint evidence
 
 ```text
 $ .\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py tests/unit/tools/test_workspace_paths.py tests/integration/tools/test_builtin_tools.py tests/integration/tools/test_permissioned_tool_slice.py tests/e2e/test_v01_release.py -q
@@ -27,6 +27,10 @@ All checks passed!
 $ .\.venv\Scripts\python.exe -m mypy --strict src/agent_sdk/config.py src/agent_sdk/permissions src/agent_sdk/tools
 Success: no issues found in 16 source files
 ```
+
+This was the initial R1 Task 4 capture. It is retained only as historical
+evidence; the current canonical final checkpoint is recorded later in this
+report.
 
 The plan's `uv run` commands were executed with the repository virtual
 environment because `uv` is unavailable in this environment.
@@ -89,7 +93,9 @@ FAILED tests/docs/test_v01_release_ledger.py::test_v01_release_ledger_names_ever
 ```
 
 The contract now removes only that structural Markdown indentation before
-comparing the evidence verbatim. Fresh GREEN and review-fix gates:
+comparing the evidence verbatim. The following GREEN and review-fix gates were
+fresh for the historical initial checkpoint; they are not the current
+canonical final checkpoint:
 
 ```text
 $ .\.venv\Scripts\python.exe -m pytest tests/docs/test_v01_release_ledger.py -q
@@ -181,3 +187,36 @@ This re-record changed only:
 - `.superpowers/sdd/v01-r1-task-4-report.md`
 
 R2 remains pending, and its existing deterministic resume point is unchanged.
+
+## Final checkpoint history clarification
+
+The final checkpoint rereview found one documentation-only ambiguity: the
+initial 85-passed/1-skipped evidence near the start of this report was still
+titled "Fresh", despite the later 97-passed/3-skipped block being the current
+canonical final checkpoint.
+
+The initial block and its review-fix rerun are now explicitly labeled
+historical. The ledger contract also independently requires the ledger's
+`Historical initial checkpoint evidence` marker to precede
+`Current canonical checkpoint evidence`, and rejects the old 85-passed result
+inside the current canonical section. The progress historical label and exact
+97-passed final block remain protected.
+
+Only this report and `tests/docs/test_v01_release_ledger.py` changed. The
+release ledger text, progress record, production code, and R2 remain untouched.
+
+Fresh clarification verification:
+
+```text
+$ .\.venv\Scripts\python.exe -m pytest tests/docs/test_v01_release_ledger.py -q
+..                                                                       [100%]
+2 passed in 0.19s
+
+$ .\.venv\Scripts\python.exe -m ruff check tests/docs/test_v01_release_ledger.py
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m pytest tests/docs/test_v01_release_ledger.py tests\unit\permissions\test_policy_rules.py tests\unit\tools\test_workspace_paths.py tests\unit\runtime\test_session_workspace_roots.py tests\integration\tools\test_builtin_tools.py tests\integration\tools\test_permissioned_tool_slice.py tests\integration\runtime\test_builtin_tool_recovery.py tests\e2e\test_v01_release.py -q
+................s............ss......................................... [ 70%]
+..............................                                           [100%]
+99 passed, 3 skipped in 6.94s
+```
