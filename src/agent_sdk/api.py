@@ -80,6 +80,7 @@ from agent_sdk.storage.base import (
 from agent_sdk.storage.idempotency import IdempotencyRecord
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.registry import ToolRegistry
+from agent_sdk.tools.builtins.registration import register_builtin_tools
 from agent_sdk.workflow import (
     WorkflowCompiler,
     WorkflowDefinition,
@@ -996,6 +997,8 @@ class AgentSDK:
             LiteLLMGateway(),
             permission_default=config.permission_default,
             permission_rules=config.permission_rules,
+            enable_builtin_tools=config.enable_builtin_tools,
+            builtin_tool_output_bytes=config.builtin_tool_output_bytes,
             permission_bridge=InProcessPermissionBridge(),
             owned_close=store.close,
             provider_recovery_timeout_seconds=30.0,
@@ -1010,6 +1013,8 @@ class AgentSDK:
         database_path: str | Path | None = None,
         permission_default: _PermissionDefault = "ask",
         permission_rules: tuple[PermissionRule, ...] = (),
+        enable_builtin_tools: bool = True,
+        builtin_tool_output_bytes: int = 64 * 1024,
         permission_bridge: InProcessPermissionBridge | None | object = (
             _DEFAULT_PERMISSION_BRIDGE
         ),
@@ -1042,6 +1047,8 @@ class AgentSDK:
             LiteLLMGateway._for_test(acompletion),
             permission_default=permission_default,
             permission_rules=permission_rules,
+            enable_builtin_tools=enable_builtin_tools,
+            builtin_tool_output_bytes=builtin_tool_output_bytes,
             permission_bridge=bridge,
             owned_close=owned_close,
             provider_recovery_timeout_seconds=provider_recovery_timeout_seconds,
@@ -1055,6 +1062,8 @@ class AgentSDK:
         *,
         permission_default: _PermissionDefault,
         permission_rules: tuple[PermissionRule, ...],
+        enable_builtin_tools: bool,
+        builtin_tool_output_bytes: int,
         permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
         provider_recovery_timeout_seconds: float,
@@ -1066,6 +1075,12 @@ class AgentSDK:
         self._startup_scan_task: asyncio.Task[None] | None = None
         commands = RuntimeCommands(store)
         tools = ToolRegistry()
+        if enable_builtin_tools:
+            register_builtin_tools(
+                registry=tools,
+                store=store,
+                output_limit=builtin_tool_output_bytes,
+            )
         provider_recovery = ProviderRecoveryRegistry()
         policy = PolicyEngine(permission_default, permission_rules)
         engine = RunEngine(

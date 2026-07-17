@@ -380,6 +380,7 @@ async def test_tool_waits_for_permission_then_runs_second_model_step() -> None:
         store=store,
         acompletion=scripted_acompletion,
         permission_default="ask",
+        enable_builtin_tools=False,
     )
     try:
         sdk.tools.register(

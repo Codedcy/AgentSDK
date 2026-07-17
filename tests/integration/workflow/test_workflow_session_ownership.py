@@ -294,6 +294,7 @@ async def test_workflow_persists_current_complete_execution_descriptor() -> None
         store=InMemoryStore(),
         acompletion=provider,
         permission_default="deny",
+        enable_builtin_tools=False,
     )
     sdk.agents.define(
         AgentSpec(

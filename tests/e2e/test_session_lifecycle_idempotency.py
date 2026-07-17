@@ -134,7 +134,11 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
             await release_provider.wait()
         return _text_stream("done")
 
-    first = AgentSDK.for_test(database_path=database, acompletion=script)
+    first = AgentSDK.for_test(
+        database_path=database,
+        acompletion=script,
+        enable_builtin_tools=False,
+    )
     first.agents.define(worker)
     first.tools.register(TOOL, tool_handler)
     try:
@@ -199,7 +203,11 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
         reopen_calls += 1
         raise AssertionError("durable replay must not execute the provider")
 
-    reopened = AgentSDK.for_test(database_path=database, acompletion=must_not_call)
+    reopened = AgentSDK.for_test(
+        database_path=database,
+        acompletion=must_not_call,
+        enable_builtin_tools=False,
+    )
     reopened.agents.define(worker)
     reopened.tools.register(TOOL, tool_handler)
     try:
@@ -272,6 +280,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
         changed = AgentSDK.for_test(
             database_path=database,
             acompletion=conflict_provider,
+            enable_builtin_tools=False,
         )
         changed.agents.define(worker)
         changed.tools.register(TOOL.model_copy(update={"version": "2"}), tool_handler)

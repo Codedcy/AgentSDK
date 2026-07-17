@@ -11,6 +11,7 @@ from agent_sdk.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from agent_sdk.tools.executor import ToolExecutor
+    from agent_sdk.tools.builtins.registration import register_builtin_tools
 
 
 def __getattr__(name: str) -> Any:
@@ -18,6 +19,10 @@ def __getattr__(name: str) -> Any:
         from agent_sdk.tools.executor import ToolExecutor
 
         return ToolExecutor
+    if name == "register_builtin_tools":
+        from agent_sdk.tools.builtins.registration import register_builtin_tools
+
+        return register_builtin_tools
     raise AttributeError(name)
 
 __all__ = [
@@ -28,4 +33,5 @@ __all__ = [
     "ToolResultStatus",
     "ToolRetryPolicy",
     "ToolSpec",
+    "register_builtin_tools",
 ]
