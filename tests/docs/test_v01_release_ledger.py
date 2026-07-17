@@ -21,10 +21,10 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     ) in ledger
     assert (
         r".\.venv\Scripts\python.exe -m pytest "
-        "tests/unit/tools/test_workspace_paths.py -q"
+        "tests/integration/tools/test_builtin_tools.py -q"
     ) in ledger
-    assert "R1 Task 1 is complete" in ledger
-    assert "`8c2982b`" in ledger
+    assert "R1 Tasks 1-2 are complete" in ledger
+    assert "`2b145a7`" in ledger
     assert "R1 remains in progress" in ledger
 
 
