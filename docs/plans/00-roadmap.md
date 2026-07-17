@@ -1,5 +1,7 @@
 # Agent SDK Roadmap Implementation Plan
 
+> **Active v0.1 track:** Execution follows the [v0.1 implementation plan index](../superpowers/plans/2026-07-17-agent-sdk-v0.1-implementation-index.md). Existing milestones remain hardening backlog unless referenced by a release slice.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver a recoverable, observable Agent SDK by building one thin vertical slice across every approved capability, then hardening each subsystem without losing end-to-end operability.

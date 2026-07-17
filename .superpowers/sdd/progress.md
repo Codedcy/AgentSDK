@@ -243,7 +243,10 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: implementation not started; production code remains at checkpoint d707adc and is reused as the baseline
+v0.1 current implementation status: R0 in progress; Task 1 release baseline is implemented and reviewed, production runtime remains unchanged
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 next action: execute R0 from docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r0-release-harness.md; first command is `uv run pytest tests/e2e/test_v01_release.py -q` after writing the RED baseline test
+v0.1 R0 Task 1: complete (commits efebb30..723f118, review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
+v0.1 R0 Task 2: complete — release ledger established, active roadmap/task-index links added, and focused documentation plus R0 baseline tests passed (3 passed); the Task 2 commit hash is intentionally captured by R0 Task 3
+v0.1 next action: R0 Task 3 checkpoint — `.\venv\Scripts\python.exe -m pytest tests/docs/test_v01_release_ledger.py tests/e2e/test_v01_release.py tests/e2e/test_vertical_slice.py -q`, then Ruff on the R0 test files; do not start R1

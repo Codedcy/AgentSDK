@@ -1,5 +1,7 @@
 # Task Index
 
+> **Active v0.1 track:** Execution follows the [v0.1 implementation plan index](../../superpowers/plans/2026-07-17-agent-sdk-v0.1-implementation-index.md). Existing milestones remain hardening backlog unless referenced by a release slice.
+
 Status values: `pending`, `in_progress`, `blocked`, `done`.
 
 | ID | Task | Milestone | Depends on | Status |
