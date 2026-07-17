@@ -143,3 +143,102 @@ with `C:\Users\10176\AppData\Roaming\Python\Python314\Scripts\uv.exe`.
 Two earlier long-running test invocations were terminated only by undersized
 outer command timeouts. Both were rerun with sufficient time; the authoritative
 results are the successful storage and full-project runs above.
+
+## Second re-review repair (2026-07-17)
+
+### Status and scope
+
+DONE at implementation commit `f6e6b8f`. This second surgical repair closes
+all five findings in `M02-T003-phaseA-rereview-fix-brief.md`. Phase B remains
+blocked until a fresh independent review reports Spec C0/I0 and Quality C0/I0.
+No Artifact publish/read/delete behavior, Phase B implementation, M02-T004
+control behavior, task checkbox, or task index was changed.
+
+### Implemented repairs
+
+1. Legacy migration transactions now repeat trusted applied-migration
+   inspection after obtaining `BEGIN IMMEDIATE`. EMPTY/v1/v2/v3 waiters accept
+   a peer-completed exact v4 only after full schema and checksum validation.
+2. DDL comparison now uses SQLite lexical boundaries for ASCII whitespace,
+   complete comments, blobs, complete numeric forms including underscores,
+   parameters, identifiers, quoted tokens, longest-match operators, and
+   punctuation. Malformed input fails closed. The pure comparison code is
+   isolated in private `_sqlite_ddl.py`; `sqlite.py` explicitly re-exports the
+   two existing private entry points.
+3. Exhausted BUSY/LOCKED retries use private
+   `_SQLiteBusyExhaustedError(RuntimeError)`. Busy detection uses numeric SQLite
+   primary codes, including extended-code masking, and never exception text.
+   Public apply/open maps only the private operational types to the exact
+   sanitized I/O error; arbitrary `RuntimeError` still propagates.
+4. NOTADB/CORRUPT classification walks the exception cause/context chain and
+   checks numeric primary codes. Real NOTADB and injected extended CORRUPT now
+   produce the exact schema error on plan/applied/apply/store-open, while
+   operational I/O and busy failures retain the exact I/O error.
+5. Small synchronous resource listing/read boundaries map ordinary
+   `Exception` failures from files, enumeration, child-name, joinpath, and
+   read-bytes operations to the exact resource-unavailable error. They reject
+   non-string names and non-bytes contents before validation. Manifest,
+   checksum, and UTF-8 validation remain outside those catches, and
+   `BaseException` is not caught.
+
+### Strict RED evidence
+
+- Repair 1 EMPTY/v1/v2 subprocess race: `3 failed in 21.79s`; each waiter
+  leaked raw `ValueError` after the peer reached trusted v4.
+- Repair 2 initial lexical selection:
+  `10 failed, 1 passed, 67 deselected in 3.07s`. The added runtime edge audit
+  then failed numeric underscore tokenization: `1 failed in 3.08s`.
+- Repair 3 public WAL/busy plus internal type and arbitrary-runtime selection:
+  `10 failed, 79 deselected in 5.27s`; the public paths leaked generic
+  `RuntimeError`, and configuration swallowed an unrelated runtime failure.
+- Repair 4 real NOTADB plus extended CORRUPT four-path matrix:
+  `6 failed, 2 passed, 89 deselected in 3.49s`.
+- Repair 5 ordinary backend boundary matrix:
+  `5 failed, 97 deselected in 3.37s`. The follow-up invalid name/content type
+  audit was `2 failed, 102 deselected in 3.17s`, both as raw `TypeError`.
+
+### Focused GREEN evidence
+
+- Repair 1 EMPTY/v1/v2 plus existing v3 cross-process and same-process
+  coordinator coverage: `5 passed in 29.85s`.
+- Repair 2 final lexer/schema selection:
+  `17 passed, 70 deselected in 3.36s`; after private-module extraction the
+  same lexer/schema selection remained `17 passed, 87 deselected in 4.13s`.
+- Repair 3 busy/configuration coverage across review, SQLite spine, and lease
+  fixtures: `13 passed, 139 deselected in 5.31s`.
+- Repair 4 corrupt-content plus existing public-boundary coverage:
+  `20 passed, 77 deselected in 5.44s`.
+- Repair 5 resource failure/value coverage:
+  `8 passed, 96 deselected in 2.75s`.
+- Final five-finding selection, including existing v3 cross-process and
+  same-process coordinator tests:
+  `43 passed, 141 deselected in 32.25s`.
+
+### Authoritative completion gates
+
+All commands ran from
+`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` with explicit
+`--python 3.13`; the interpreter was `Python 3.13.14`.
+
+1. Complete migration, v3 migration, and review-fix suite:
+   `233 passed in 67.83s`.
+2. Complete `tests/integration/storage` suite:
+   `633 passed in 105.61s`.
+3. Complete project suite: `2343 passed in 310.87s`.
+4. `ruff check src tests examples`: `All checks passed!`.
+5. `mypy --strict src`:
+   `Success: no issues found in 77 source files`.
+6. `python -m py_compile` over all Python files under `src`, `tests`, and
+   `examples`: exit 0.
+7. `uv build --wheel`: built
+   `dist/agent_sdk-0.1.0.dev0-py3-none-any.whl` successfully.
+8. Source public import loaded `AgentSDK`, `MigrationRunner`,
+   `MigrationSchemaError`, and `SQLiteStore` successfully.
+9. An isolated install from the built wheel imported successfully. The wheel
+   contains private `_sqlite_ddl.py` and exactly the trusted numbered SQL
+   resources 0001-0004; loaded versions were `(1, 2, 3, 4)` with the four
+   release-manifest SHA-256 checksums.
+10. `git diff --check`: exit 0. The implementation commit contains six scoped
+    files: the two migration/SQLite modules, new private DDL lexer, and three
+    migration/busy regression-test modules. No unrelated formatting or scope
+    expansion was included.

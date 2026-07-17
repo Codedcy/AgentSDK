@@ -219,4 +219,8 @@ M02-T003 Phase A review-fix gates: focused 144 passed; storage 593 passed; full 
 M02-T003 Phase A first re-review: Not Approved; Spec C0/I2/M0 and Quality C0/I3/M0
 M02-T003 Phase A first re-review findings: legacy cross-process peers fail when a competitor reaches v4; SQL lexer merges blob/numeric/NBSP token boundaries; post-WAL busy exhaustion leaks RuntimeError; corrupt apply/open is misclassified as I/O; non-OSError resource backend failures leak
 M02-T003 Phase A second-fix brief: .superpowers/sdd/M02-T003-phaseA-rereview-fix-brief.md
-M02-T003 Phase A second fix: in progress; Phase B remains blocked
+M02-T003 Phase A second-fix implementation: f6e6b8f
+M02-T003 Phase A second fixes: trusted cross-process v4 convergence; complete SQLite lexical DDL comparison; typed busy exhaustion and exact public I/O mapping; numeric NOTADB/CORRUPT schema classification; sanitized ordinary resource backend boundaries
+M02-T003 Phase A second-fix gates: focused 43 passed; migration/review 233 passed; storage 633 passed; full Python3.13 2343 passed; Ruff clean; strict mypy77 clean; py_compile/build/import/isolated-wheel resources/diff/scope clean
+M02-T003 Phase A second fix: complete; fresh independent re-review is required and Phase B remains blocked
+Next action: run a fresh independent M02-T003 Phase A re-review for Spec C0/I0 and Quality C0/I0 before any Phase B work
