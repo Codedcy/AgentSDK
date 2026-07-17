@@ -89,6 +89,32 @@ class SchemaGenerationChangedError(RuntimeError):
     """A Store write was fenced because its opened schema generation is stale."""
 
 
+def _is_corrupt_database_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, sqlite3.Error):
+            code = getattr(current, "sqlite_errorcode", None)
+            if isinstance(code, int) and code & 0xFF in {
+                sqlite3.SQLITE_CORRUPT,
+                sqlite3.SQLITE_NOTADB,
+            }:
+                return True
+        current = (
+            current.__cause__
+            if current.__cause__ is not None
+            else current.__context__
+        )
+    return False
+
+
+def _database_boundary_error(error: BaseException) -> MigrationError:
+    if _is_corrupt_database_error(error):
+        return MigrationSchemaError("incompatible database schema")
+    return MigrationIOError("migration database I/O failed")
+
+
 @dataclass(frozen=True, slots=True)
 class Migration:
     version: int
@@ -110,25 +136,47 @@ def _migration_checksum(sql_bytes: bytes, identity_inputs: tuple[str, ...]) -> s
     return hashlib.sha256(sql_bytes + identity).hexdigest()
 
 
-def _packaged_migrations() -> tuple[Migration, ...]:
+def _migration_resource_listing() -> tuple[Any, tuple[str, ...]]:
     try:
         root = resources.files(__package__)
-        children = tuple(root.iterdir())
-    except OSError as error:
+        names: list[str] = []
+        for child in root.iterdir():
+            name = child.name
+            if not isinstance(name, str):
+                raise TypeError("packaged migration resource name is not text")
+            names.append(name)
+    except Exception as error:
         raise MigrationResourceError(
             "packaged migration resource is unavailable"
         ) from error
+    return root, tuple(names)
+
+
+def _read_migration_resource(root: Any, name: str) -> bytes:
+    try:
+        contents = root.joinpath(name).read_bytes()
+        if not isinstance(contents, bytes):
+            raise TypeError("packaged migration resource contents are not bytes")
+    except Exception as error:
+        raise MigrationResourceError(
+            "packaged migration resource is unavailable"
+        ) from error
+    return contents
+
+
+def _packaged_migrations() -> tuple[Migration, ...]:
+    root, names = _migration_resource_listing()
     numbered: dict[int, str] = {}
-    for child in children:
-        match = _NUMBERED_SQL.fullmatch(child.name)
+    for name in names:
+        match = _NUMBERED_SQL.fullmatch(name)
         if match is None:
-            if child.name.endswith(".sql"):
+            if name.endswith(".sql"):
                 raise MigrationResourceError("packaged migration resource name is malformed")
             continue
         version = int(match.group("version"))
         if version in numbered:
             raise MigrationResourceError("duplicate packaged migration version")
-        numbered[version] = child.name
+        numbered[version] = name
     expected_names = {version: name for version, name, _, _ in _RELEASE_MANIFEST}
     if numbered != expected_names:
         raise MigrationResourceError("packaged migration manifest is incompatible")
@@ -136,12 +184,7 @@ def _packaged_migrations() -> tuple[Migration, ...]:
     migrations: list[Migration] = []
     for version, name, expected_checksum, manifest_identity_inputs in _RELEASE_MANIFEST:
         identity_inputs = (_MIGRATION_2_TRANSFORM_ID,) if version == 2 else manifest_identity_inputs
-        try:
-            sql_bytes = root.joinpath(name).read_bytes()
-        except OSError as error:
-            raise MigrationResourceError(
-                "packaged migration resource is unavailable"
-            ) from error
+        sql_bytes = _read_migration_resource(root, name)
         checksum = _migration_checksum(sql_bytes, identity_inputs)
         if checksum != expected_checksum:
             raise MigrationChecksumError("packaged migration checksum changed")
@@ -304,13 +347,13 @@ async def _readonly_connection(path: Path) -> aiosqlite.Connection:
     try:
         connection = await aiosqlite.connect(f"{path.as_uri()}?{query}", uri=True)
     except (OSError, sqlite3.Error) as error:
-        raise MigrationIOError("migration database I/O failed") from error
+        raise _database_boundary_error(error) from error
     try:
         await connection.execute("PRAGMA query_only=ON")
         await connection.execute("PRAGMA foreign_keys=ON")
     except (OSError, sqlite3.Error) as error:
         await _close_connection(connection)
-        raise MigrationIOError("migration database I/O failed") from error
+        raise _database_boundary_error(error) from error
     except BaseException:
         await _close_connection(connection)
         raise
@@ -737,21 +780,20 @@ class MigrationRunner:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             connection = await aiosqlite.connect(self.path)
         except (OSError, sqlite3.Error) as error:
-            raise MigrationIOError("migration database I/O failed") from error
+            raise _database_boundary_error(error) from error
         try:
             try:
                 await sqlite_storage.SQLiteStore._configure_connection(connection)
-            except (OSError, sqlite3.Error, RuntimeError) as error:
-                raise MigrationIOError("migration database I/O failed") from error
+            except (
+                OSError,
+                sqlite3.Error,
+                sqlite_storage._SQLiteBusyExhaustedError,
+                sqlite_storage._SQLiteConfigurationError,
+            ) as error:
+                raise _database_boundary_error(error) from error
             current = await _inspect_connection_applied(connection, migrations)
             if len(current) < 3:
-                await sqlite_storage.SQLiteStore._migrate(
-                    connection,
-                    cast(
-                        tuple[str, str, str],
-                        tuple(migration.sql for migration in migrations[:3]),
-                    ),
-                )
+                await sqlite_storage.SQLiteStore._migrate(connection, migrations)
             current = await _inspect_connection_applied(connection, migrations)
             if len(current) == 3:
                 await _apply_v4(
@@ -761,6 +803,12 @@ class MigrationRunner:
                 )
             elif len(current) != 4:
                 raise MigrationSchemaError("incompatible database migration history")
+        except sqlite_storage._SQLiteBusyExhaustedError as error:
+            await _close_connection(connection)
+            raise MigrationIOError("migration database I/O failed") from error
+        except sqlite3.Error as error:
+            await _close_connection(connection)
+            raise _database_boundary_error(error) from error
         except BaseException:
             await _close_connection(connection)
             raise

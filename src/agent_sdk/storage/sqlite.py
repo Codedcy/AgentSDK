@@ -8,9 +8,12 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from time import monotonic
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import aiosqlite
+
+if TYPE_CHECKING:
+    from agent_sdk.storage.migrations import Migration
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.leases import (
@@ -40,6 +43,10 @@ from agent_sdk.runtime.reconciliation import (
     _valid_confirmed_model_resolution_batch,
     _valid_confirmed_model_terminalization_batch,
     _valid_confirmed_tool_resolution_batch,
+)
+from agent_sdk.storage._sqlite_ddl import (
+    _normalized_sql as _normalized_sql,
+    _sql_shapes_equal as _sql_shapes_equal,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -419,78 +426,6 @@ def _json_object(value: str) -> dict[str, Any]:
     return cast(dict[str, Any], decoded)
 
 
-def _normalized_sql(value: str) -> str:
-    tokens: list[str] = []
-    index = 0
-    while index < len(value):
-        character = value[index]
-        if character.isspace():
-            index += 1
-            continue
-        if character in {"'", '"', "`", "["}:
-            start = index
-            closing = "]" if character == "[" else character
-            index += 1
-            while index < len(value):
-                if value[index] != closing:
-                    index += 1
-                    continue
-                if (
-                    character != "["
-                    and index + 1 < len(value)
-                    and value[index + 1] == closing
-                ):
-                    index += 2
-                    continue
-                index += 1
-                tokens.append(f"quoted:{value[start:index]}")
-                break
-            else:
-                raise ValueError("malformed SQLite SQL")
-            continue
-        if character.isdigit():
-            start = index
-            index += 1
-            while index < len(value) and value[index].isdigit():
-                index += 1
-            tokens.append(f"number:{value[start:index]}")
-            continue
-        if character.isalpha() or character in {"_", "$"}:
-            start = index
-            index += 1
-            while index < len(value) and (
-                value[index].isalnum() or value[index] in {"_", "$"}
-            ):
-                index += 1
-            tokens.append(f"word:{value[start:index].casefold()}")
-            continue
-        three_characters = value[index : index + 3]
-        two_characters = value[index : index + 2]
-        if three_characters == "->>":
-            tokens.append("operator:->>")
-            index += 3
-            continue
-        if two_characters in {"<=", ">=", "<>", "!=", "==", "||", "->"}:
-            tokens.append(f"operator:{two_characters}")
-            index += 2
-            continue
-        token_kind = (
-            "operator"
-            if character in {"+", "-", "*", "/", "%", "<", ">", "=", "~"}
-            else "punctuation"
-        )
-        tokens.append(f"{token_kind}:{character}")
-        index += 1
-    return "\x1f".join(tokens)
-
-
-def _sql_shapes_equal(actual: str, expected: str) -> bool:
-    try:
-        return _normalized_sql(actual) == _normalized_sql(expected)
-    except ValueError:
-        return False
-
-
 def _complete_sql_statements(script: str) -> tuple[str, ...]:
     statements: list[str] = []
     pending = ""
@@ -506,12 +441,20 @@ def _complete_sql_statements(script: str) -> tuple[str, ...]:
     return tuple(statements)
 
 
+class _SQLiteBusyExhaustedError(RuntimeError):
+    pass
+
+
+class _SQLiteConfigurationError(RuntimeError):
+    pass
+
+
 def _is_busy(error: sqlite3.Error) -> bool:
     code = getattr(error, "sqlite_errorcode", None)
-    if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-        return True
-    message = str(error).casefold()
-    return "database is locked" in message or "database table is locked" in message
+    return isinstance(code, int) and code & 0xFF in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
 
 
 def _lease_from_row(row: sqlite3.Row | tuple[Any, ...]) -> Lease:
@@ -785,7 +728,7 @@ async def _with_busy_retry(
         except sqlite3.OperationalError as error:
             if not _is_busy(error) or monotonic() >= deadline:
                 if _is_busy(error):
-                    raise RuntimeError(message) from error
+                    raise _SQLiteBusyExhaustedError(message) from error
                 raise
             await asyncio.sleep(0)
 
@@ -3225,7 +3168,7 @@ class SQLiteStore:
     async def _migrate(
         cls,
         connection: aiosqlite.Connection,
-        migration_sql: tuple[str, str, str],
+        migrations: tuple[Migration, ...],
     ) -> None:
         import agent_sdk.storage.migrations as migration_storage
 
@@ -3237,7 +3180,19 @@ class SQLiteStore:
                 immediate=True,
                 message="SQLite open conflict",
             ):
-                state = await cls._discover_schema_state(connection)
+                applied = await (
+                    migration_storage._inspect_connection_applied_in_current_transaction(
+                        connection, migrations
+                    )
+                )
+                if len(applied) == 4:
+                    return
+                state = (
+                    _SchemaState.EMPTY,
+                    _SchemaState.V1,
+                    _SchemaState.V2,
+                    _SchemaState.V3,
+                )[len(applied)]
                 if not reported_discovery:
                     await cls._migration_checkpoint(
                         f"migration-schema-discovered-{state.value}"
@@ -3258,7 +3213,7 @@ class SQLiteStore:
 
                     await _execute_script_statements(
                         connection,
-                        migration_sql[0],
+                        migrations[0].sql,
                         before_statement=before_migration_one_statement,
                         after_statement=after_migration_one_statement,
                     )
@@ -3292,7 +3247,7 @@ class SQLiteStore:
 
                     await _execute_script_statements(
                         connection,
-                        migration_sql[1],
+                        migrations[1].sql,
                         before_statement=before_migration_two_statement,
                         after_statement=after_migration_two_statement,
                     )
@@ -3328,7 +3283,7 @@ class SQLiteStore:
 
                     await _execute_script_statements(
                         connection,
-                        migration_sql[2],
+                        migrations[2].sql,
                         before_statement=before_migration_three_statement,
                         after_statement=after_migration_three_statement,
                     )
@@ -3359,16 +3314,20 @@ class SQLiteStore:
         try:
             await connection.execute(f"PRAGMA busy_timeout={_OPEN_BUSY_TIMEOUT_MS}")
         except sqlite3.Error as error:
-            raise RuntimeError("failed to configure SQLite busy_timeout") from error
+            raise _SQLiteConfigurationError(
+                "failed to configure SQLite busy_timeout"
+            ) from error
 
         try:
             await connection.execute("PRAGMA foreign_keys=ON")
             async with connection.execute("PRAGMA foreign_keys") as cursor:
                 foreign_keys = await cursor.fetchone()
         except sqlite3.Error as error:
-            raise RuntimeError("failed to enable SQLite foreign_keys") from error
+            raise _SQLiteConfigurationError(
+                "failed to enable SQLite foreign_keys"
+            ) from error
         if foreign_keys != (1,):
-            raise RuntimeError("failed to enable SQLite foreign_keys")
+            raise _SQLiteConfigurationError("failed to enable SQLite foreign_keys")
 
         async def enable_wal() -> tuple[Any, ...] | None:
             async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
@@ -3381,9 +3340,13 @@ class SQLiteStore:
                 message="SQLite journal_mode open conflict",
             )
         except sqlite3.Error as error:
-            raise RuntimeError("failed to enable SQLite journal_mode=WAL") from error
+            raise _SQLiteConfigurationError(
+                "failed to enable SQLite journal_mode=WAL"
+            ) from error
         if journal_mode is None or cast(str, journal_mode[0]).lower() != "wal":
-            raise RuntimeError("failed to enable SQLite journal_mode=WAL")
+            raise _SQLiteConfigurationError(
+                "failed to enable SQLite journal_mode=WAL"
+            )
 
     @classmethod
     async def _discover_schema_state(

@@ -5,6 +5,7 @@ import sqlite3
 import sys
 import threading
 import time
+import zipfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,9 @@ import pytest
 from aiosqlite.context import Result
 
 import agent_sdk.storage.migrations as migration_storage
+import agent_sdk.storage.sqlite as sqlite_storage
 from agent_sdk.storage.migrations import MigrationRunner
-from agent_sdk.storage.sqlite import SQLiteStore, _normalized_sql
+from agent_sdk.storage.sqlite import SQLiteStore, _normalized_sql, _sql_shapes_equal
 
 
 _MIGRATION_ROOT = (
@@ -103,6 +105,17 @@ async def _apply_in_subprocess(path: Path) -> None:
     )
     _, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
     assert process.returncode == 0, stderr.decode(errors="replace")
+
+
+async def _terminate_processes(
+    processes: list[asyncio.subprocess.Process],
+) -> None:
+    for process in processes:
+        if process.returncode is None:
+            process.terminate()
+    for process in processes:
+        if process.returncode is None:
+            await asyncio.wait_for(process.wait(), timeout=5)
 
 
 def _thread_loop(
@@ -955,7 +968,7 @@ async def test_configure_and_wal_failures_are_stable_and_sanitized(
 
         async def fail_configure(connection: Any) -> None:
             del connection
-            raise RuntimeError(os_message)
+            raise sqlite_storage._SQLiteConfigurationError(os_message)
 
         monkeypatch.setattr(SQLiteStore, "_configure_connection", fail_configure)
     else:
@@ -992,6 +1005,53 @@ async def test_corrupt_sqlite_failure_is_stable_and_sanitized(tmp_path: Path) ->
     assert "not a database" not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    "public_operation",
+    ["plan", "applied", "apply", "store-open"],
+)
+@pytest.mark.parametrize("corrupt_kind", ["real-notadb", "extended-corrupt"])
+@pytest.mark.asyncio
+async def test_corrupt_database_classification_is_consistent_across_public_paths(
+    public_operation: str,
+    corrupt_kind: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = tmp_path / f"secret-{corrupt_kind}-{public_operation}.db"
+    backend_message = "corrupt backend leaked secret credential"
+    supplied.write_bytes(b"not a SQLite database; credential=do-not-leak")
+    if corrupt_kind == "extended-corrupt":
+
+        async def fail_connect(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            error = sqlite3.DatabaseError(backend_message)
+            error.sqlite_errorcode = sqlite3.SQLITE_CORRUPT | (1 << 8)
+            raise error
+
+        monkeypatch.setattr(migration_storage.aiosqlite, "connect", fail_connect)
+
+    runner = await MigrationRunner.open(supplied)
+    with pytest.raises(migration_storage.MigrationSchemaError) as captured:
+        if public_operation == "plan":
+            await runner.plan()
+        elif public_operation == "applied":
+            await runner.applied()
+        elif public_operation == "apply":
+            await runner.apply()
+        else:
+            await SQLiteStore.open(supplied)
+
+    assert type(captured.value).__name__ == "MigrationSchemaError"
+    assert str(captured.value) == "incompatible database schema"
+    for secret in (
+        str(supplied),
+        "secret-",
+        backend_message,
+        "not a database",
+    ):
+        assert secret not in str(captured.value)
+
+
 @pytest.mark.asyncio
 async def test_packaged_resource_read_failure_has_separate_stable_error(
     tmp_path: Path,
@@ -1026,6 +1086,114 @@ async def test_packaged_resource_read_failure_has_separate_stable_error(
     assert os_message not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    ("boundary", "exception_type"),
+    [
+        ("files", ModuleNotFoundError),
+        ("enumeration", zipfile.BadZipFile),
+        ("name", EOFError),
+        ("joinpath", ModuleNotFoundError),
+        ("read", zipfile.BadZipFile),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_os_resource_backend_failures_are_sanitized(
+    boundary: str,
+    exception_type: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = migration_storage.resources.files(migration_storage.__package__)
+    backend_message = f"{boundary} backend leaked secret path"
+
+    def failure() -> Exception:
+        return exception_type(backend_message)
+
+    class FailingChild:
+        @property
+        def name(self) -> str:
+            raise failure()
+
+    class FailingResource:
+        def read_bytes(self) -> bytes:
+            raise failure()
+
+    class FailingRoot:
+        def iterdir(self) -> Any:
+            if boundary == "enumeration":
+
+                def failing_children() -> Any:
+                    raise failure()
+                    yield None
+
+                return failing_children()
+            if boundary == "name":
+                return (FailingChild(),)
+            return root.iterdir()
+
+        def joinpath(self, name: str) -> Any:
+            if boundary == "joinpath" and name == "0001_initial.sql":
+                raise failure()
+            if boundary == "read" and name == "0001_initial.sql":
+                return FailingResource()
+            return root.joinpath(name)
+
+    def files(package: str | None) -> Any:
+        del package
+        if boundary == "files":
+            raise failure()
+        return FailingRoot()
+
+    monkeypatch.setattr(migration_storage.resources, "files", files)
+    runner = await MigrationRunner.open(tmp_path / "resource-backend.db")
+    with pytest.raises(migration_storage.MigrationResourceError) as captured:
+        await runner.plan()
+
+    assert type(captured.value).__name__ == "MigrationResourceError"
+    assert str(captured.value) == "packaged migration resource is unavailable"
+    assert backend_message not in str(captured.value)
+
+
+@pytest.mark.parametrize("boundary", ["name-type", "read-type"])
+@pytest.mark.asyncio
+async def test_invalid_resource_backend_values_are_sanitized(
+    boundary: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = migration_storage.resources.files(migration_storage.__package__)
+
+    class InvalidChild:
+        name = 1
+
+    class InvalidResource:
+        def read_bytes(self) -> str:
+            return "backend path must not reach checksum code"
+
+    class InvalidRoot:
+        def iterdir(self) -> Any:
+            if boundary == "name-type":
+                return (InvalidChild(),)
+            return root.iterdir()
+
+        def joinpath(self, name: str) -> Any:
+            if boundary == "read-type" and name == "0001_initial.sql":
+                return InvalidResource()
+            return root.joinpath(name)
+
+    monkeypatch.setattr(
+        migration_storage.resources,
+        "files",
+        lambda package: InvalidRoot(),
+    )
+    runner = await MigrationRunner.open(tmp_path / "invalid-resource-value.db")
+    with pytest.raises(migration_storage.MigrationResourceError) as captured:
+        await runner.plan()
+
+    assert type(captured.value).__name__ == "MigrationResourceError"
+    assert str(captured.value) == "packaged migration resource is unavailable"
+
+
 @pytest.mark.asyncio
 async def test_database_boundary_preserves_cancellation(
     tmp_path: Path,
@@ -1038,3 +1206,274 @@ async def test_database_boundary_preserves_cancellation(
     monkeypatch.setattr(SQLiteStore, "_configure_connection", cancel_configure)
     with pytest.raises(asyncio.CancelledError):
         await (await MigrationRunner.open(tmp_path / "cancel.db")).apply()
+
+
+@pytest.mark.parametrize("initial_version", [0, 1, 2])
+@pytest.mark.asyncio
+async def test_cross_process_legacy_waiter_converges_after_peer_reaches_v4(
+    initial_version: int,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / f"peer-converges-v{initial_version}.db"
+    if initial_version:
+        _create_legacy_database(path, initial_version)
+    inspected = tmp_path / f"waiter-inspected-v{initial_version}"
+    release = tmp_path / f"release-waiter-v{initial_version}"
+    waiter_code = "\n".join(
+        (
+            "import asyncio, sys",
+            "from pathlib import Path",
+            "from agent_sdk.storage.migrations import MigrationRunner",
+            "from agent_sdk.storage.sqlite import SQLiteStore",
+            "original_migrate = SQLiteStore._migrate",
+            "async def paused_migrate(cls, connection, migration_sql):",
+            "    inspected, release = map(Path, sys.argv[2:])",
+            "    inspected.touch()",
+            "    while not release.exists():",
+            "        await asyncio.sleep(0.01)",
+            "    await original_migrate(connection, migration_sql)",
+            "SQLiteStore._migrate = classmethod(paused_migrate)",
+            "async def main():",
+            "    await (await MigrationRunner.open(sys.argv[1])).apply()",
+            "asyncio.run(main())",
+        )
+    )
+    peer_code = "\n".join(
+        (
+            "import asyncio, sys",
+            "from agent_sdk.storage.migrations import MigrationRunner",
+            "async def main():",
+            "    await (await MigrationRunner.open(sys.argv[1])).apply()",
+            "asyncio.run(main())",
+        )
+    )
+    processes: list[asyncio.subprocess.Process] = []
+    try:
+        waiter = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            waiter_code,
+            str(path),
+            str(inspected),
+            str(release),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        processes.append(waiter)
+        await asyncio.wait_for(_wait_for_file(inspected), timeout=5)
+        peer = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            peer_code,
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        processes.append(peer)
+        _, peer_stderr = await asyncio.wait_for(peer.communicate(), timeout=10)
+        assert peer.returncode == 0, peer_stderr.decode(errors="replace")
+        release.touch()
+        _, waiter_stderr = await asyncio.wait_for(waiter.communicate(), timeout=10)
+        assert waiter.returncode == 0, waiter_stderr.decode(errors="replace")
+    finally:
+        release.touch(exist_ok=True)
+        await _terminate_processes(processes)
+
+    migrations = migration_storage._packaged_migrations()
+    applied = await (await MigrationRunner.open(path)).applied()
+    assert tuple((item.version, item.checksum) for item in applied) == tuple(
+        (migration.version, migration.checksum) for migration in migrations
+    )
+
+
+async def _wait_for_file(path: Path) -> None:
+    while not path.exists():
+        await asyncio.sleep(0.01)
+
+
+def test_sqlite_blob_numeric_and_non_ascii_boundaries_match_real_sqlite() -> None:
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute("SELECT X'41'").fetchone() == (b"A",)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT X '41'")
+        assert connection.execute("SELECT 1e2").fetchone() == (100.0,)
+        assert connection.execute("SELECT 1 e2").fetchone() == (1,)
+        assert connection.execute("SELECT 0x10").fetchone() == (16,)
+        assert connection.execute("SELECT 0 x10").fetchone() == (0,)
+        assert connection.execute("SELECT 1 + 2").fetchone() == (3,)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT 1\N{NO-BREAK SPACE}+ 2")
+
+    assert not _sql_shapes_equal("SELECT X'41'", "SELECT X '41'")
+    assert not _sql_shapes_equal("SELECT 1e2", "SELECT 1 e2")
+    assert not _sql_shapes_equal("SELECT 0x10", "SELECT 0 x10")
+    assert not _sql_shapes_equal("SELECT 1 + 2", "SELECT 1\N{NO-BREAK SPACE}+ 2")
+
+
+@pytest.mark.parametrize(
+    ("whole", "split"),
+    [
+        ("1.0", "1 .0"),
+        (".5", ". 5"),
+        ("1e+2", "1 e+2"),
+        ("1E-2", "1 E-2"),
+        ("0xCAFE", "0 xCAFE"),
+    ],
+)
+def test_sqlite_numeric_tokens_are_complete_and_adjacency_sensitive(
+    whole: str,
+    split: str,
+) -> None:
+    assert _normalized_sql(f"SELECT {whole}") == _normalized_sql(
+        f" select\n{whole} "
+    )
+    assert not _sql_shapes_equal(f"SELECT {whole}", f"SELECT {split}")
+
+
+@pytest.mark.parametrize(
+    ("parameter", "split", "bindings"),
+    [
+        ("?1", "? 1", (7,)),
+        (":name", ": name", {"name": 7}),
+        ("@name", "@ name", {"name": 7}),
+        ("$name", "$ name", {"name": 7}),
+    ],
+)
+def test_sqlite_parameter_tokens_preserve_boundaries(
+    parameter: str,
+    split: str,
+    bindings: object,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute(f"SELECT {parameter}", bindings).fetchone() == (7,)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute(f"SELECT {split}", bindings)
+
+    assert _normalized_sql(f"SELECT {parameter}") == _normalized_sql(
+        f"SELECT\t{parameter} "
+    )
+    assert not _sql_shapes_equal(f"SELECT {parameter}", f"SELECT {split}")
+
+
+def test_sqlite_comments_normalize_only_when_complete() -> None:
+    assert _sql_shapes_equal("SELECT 1/* complete */+2", "SELECT 1 + 2")
+    assert _sql_shapes_equal("SELECT 1 -- complete\n + 2", "SELECT 1 + 2")
+    assert not _sql_shapes_equal("SELECT 1 / * 2", "SELECT 1 /* 2 */")
+    for malformed in (
+        "SELECT 1 /* unterminated",
+        "SELECT X'4'",
+        "SELECT X'GG'",
+        "SELECT 1e",
+        "SELECT 0x",
+        "SELECT :",
+        "SELECT @",
+        "SELECT $",
+    ):
+        with pytest.raises(ValueError, match="malformed SQLite SQL"):
+            _normalized_sql(malformed)
+
+
+def test_sqlite_runtime_lexical_edges_preserve_actual_token_boundaries() -> None:
+    non_ascii_digit = chr(0x0661)
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute("SELECT 1_000").fetchone() == (1000,)
+        assert connection.execute("SELECT 1 _000").fetchone() == (1,)
+        assert connection.execute("SELECT 0xCA_FE").fetchone() == (0xCAFE,)
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute("SELECT 123abc")
+        assert connection.execute("SELECT 123 abc").fetchone() == (123,)
+        assert connection.execute("SELECT ?1foo", (7,)).fetchone() == (7,)
+        assert connection.execute("SELECT ?1 foo", (7,)).fetchone() == (7,)
+        assert connection.execute("SELECT x'41'").fetchone() == (b"A",)
+        assert connection.execute("SELECT X'41'").fetchone() == (b"A",)
+
+    assert not _sql_shapes_equal("SELECT 1_000", "SELECT 1 _000")
+    assert _sql_shapes_equal("SELECT ?1foo", "SELECT ?1 foo")
+    assert _sql_shapes_equal("SELECT x'41'", "SELECT X'41'")
+    assert not _sql_shapes_equal("SELECT X'AF'", "SELECT x'af'")
+    assert not _sql_shapes_equal(
+        f"SELECT {non_ascii_digit}abc",
+        f"SELECT {non_ascii_digit} abc",
+    )
+    with pytest.raises(ValueError, match="malformed SQLite SQL"):
+        _normalized_sql("SELECT 123abc")
+
+
+@pytest.mark.parametrize("initial_version", [0, 1, 2, 3])
+@pytest.mark.parametrize("public_operation", ["runner-apply", "store-open"])
+@pytest.mark.asyncio
+async def test_wal_writer_busy_exhaustion_is_sanitized_and_recoverable(
+    initial_version: int,
+    public_operation: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / f"busy-v{initial_version}-{public_operation}.db"
+    if initial_version:
+        _create_legacy_database(path, initial_version)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    blocker = sqlite3.connect(path, timeout=0)
+    blocker.execute("BEGIN IMMEDIATE")
+    monkeypatch.setattr(sqlite_storage, "_OPEN_RETRY_SECONDS", 0.01)
+    runner = await MigrationRunner.open(path)
+    try:
+        with pytest.raises(migration_storage.MigrationIOError) as captured:
+            if public_operation == "runner-apply":
+                await runner.apply()
+            else:
+                await SQLiteStore.open(path)
+        _assert_sanitized_database_io_error(
+            captured.value,
+            secrets=(str(path), "database is locked", "SQLite open conflict"),
+        )
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    if public_operation == "runner-apply":
+        await runner.apply()
+    else:
+        store = await SQLiteStore.open(path)
+        await store.close()
+    assert tuple(item.version for item in await runner.applied()) == (1, 2, 3, 4)
+    with sqlite3.connect(path, timeout=0) as writer:
+        writer.execute("BEGIN IMMEDIATE")
+        writer.rollback()
+
+
+@pytest.mark.asyncio
+async def test_busy_retry_exhaustion_uses_private_runtime_subtype() -> None:
+    busy = sqlite3.OperationalError("sensitive lock details")
+    busy.sqlite_errorcode = sqlite3.SQLITE_BUSY
+
+    async def always_busy() -> None:
+        raise busy
+
+    with pytest.raises(RuntimeError) as captured:
+        await sqlite_storage._with_busy_retry(
+            always_busy,
+            deadline=0,
+            message="stable busy failure",
+        )
+
+    assert type(captured.value).__name__ == "_SQLiteBusyExhaustedError"
+    assert str(captured.value) == "stable busy failure"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_configure_runtime_error_is_not_publicly_reclassified(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = RuntimeError("application checkpoint failure")
+
+    async def fail_configure(connection: Any) -> None:
+        del connection
+        raise failure
+
+    monkeypatch.setattr(SQLiteStore, "_configure_connection", fail_configure)
+    with pytest.raises(RuntimeError) as captured:
+        await (await MigrationRunner.open(tmp_path / "checkpoint.db")).apply()
+
+    assert captured.value is failure

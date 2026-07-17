@@ -400,7 +400,9 @@ async def test_sqlite_lease_begin_retries_transient_busy_and_bounds_exhaustion(
             attempts += 1
 
             async def busy() -> None:
-                raise sqlite3.OperationalError("database is locked")
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
 
             return busy()
         return execute(sql, *args, **kwargs)
@@ -415,7 +417,9 @@ async def test_sqlite_lease_begin_retries_transient_busy_and_bounds_exhaustion(
             if sql == "BEGIN IMMEDIATE":
 
                 async def busy() -> None:
-                    raise sqlite3.OperationalError("database is locked")
+                    error = sqlite3.OperationalError("database is locked")
+                    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                    raise error
 
                 return busy()
             return execute(sql, *args, **kwargs)

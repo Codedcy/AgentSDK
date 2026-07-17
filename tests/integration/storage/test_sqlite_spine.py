@@ -747,7 +747,9 @@ async def test_open_retries_transient_busy_for_wal_and_writer_lock(
             attempts += 1
 
             async def busy() -> Any:
-                raise sqlite3.OperationalError("database is locked")
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
 
             return Result(busy())
         return original_execute(sql, *args, **kwargs)
@@ -778,7 +780,9 @@ async def test_busy_deadline_is_bounded_and_leaves_database_empty(
     def always_busy(sql: str, *args: Any, **kwargs: Any) -> Any:
         if sql == "BEGIN IMMEDIATE":
             async def busy() -> Any:
-                raise sqlite3.OperationalError("database is locked")
+                error = sqlite3.OperationalError("database is locked")
+                error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+                raise error
 
             return Result(busy())
         return original_execute(sql, *args, **kwargs)
@@ -791,7 +795,7 @@ async def test_busy_deadline_is_bounded_and_leaves_database_empty(
 
     monkeypatch.setattr(aiosqlite, "connect", connect_existing)
     monkeypatch.setattr(sqlite_storage, "_OPEN_RETRY_SECONDS", 0.0)
-    with pytest.raises(RuntimeError, match="SQLite open conflict"):
+    with pytest.raises(MigrationIOError, match="^migration database I/O failed$"):
         await SQLiteStore.open(path)
     with sqlite3.connect(path) as check:
         assert check.execute(
