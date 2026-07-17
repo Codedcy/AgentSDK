@@ -9,7 +9,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "0.1.0" in ledger
     assert "post-v0.1" in ledger
     assert "| R0 | completed |" in ledger
-    for slice_id in ("R1", "R2", "R3", "R4", "R5"):
+    assert "| R1 | in_progress |" in ledger
+    for slice_id in ("R2", "R3", "R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
@@ -20,10 +21,11 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     ) in ledger
     assert (
         r".\.venv\Scripts\python.exe -m pytest "
-        "tests/unit/permissions/test_policy_rules.py "
-        "tests/unit/test_core_config.py -q"
+        "tests/unit/tools/test_workspace_paths.py -q"
     ) in ledger
-    assert "R1 has not started." in ledger
+    assert "R1 Task 1 is complete" in ledger
+    assert "`8c2982b`" in ledger
+    assert "R1 remains in progress" in ledger
 
 
 def test_active_roadmap_links_the_v01_plan_index() -> None:

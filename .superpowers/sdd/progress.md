@@ -243,7 +243,7 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: R0 completed; production runtime remains unchanged; R1 has not started
+v0.1 current implementation status: R0 completed; R1 in progress; deterministic permission rules complete; built-in Tools not started
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
@@ -262,8 +262,9 @@ All checks passed!
 v0.1 R0 Task 3: complete (commits 7036622 and 74c1e3b; review Spec approved / Quality approved; exact checkpoint evidence retained)
 v0.1 R0 final hardening: 35ace95; background non-replay assertion, deterministic R1 resume handoff, immutable checkpoint evidence, and release-ledger contract checks
 v0.1 R0 final independent review: Approved; Critical 0 / Important 0 / Minor 0; fresh 4 tests passed and Ruff clean; ready to proceed to R1
+v0.1 R1 Task 1: complete (commits 8fc36ad and 8c2982b; final review Spec approved / Quality approved; fresh 61 focused tests and 127 regression tests passed; strict mypy and Ruff clean)
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r1-tools-policy.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r1-tools-policy.md`
-v0.1 next required action: R1 Task 1 Step 1, creating `tests/unit/permissions/test_policy_rules.py`
-v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py tests/unit/test_core_config.py -q`
-v0.1 R1 remains pending and has not started
+v0.1 next required action: R1 Task 2 Step 1, creating `tests/unit/tools/test_workspace_paths.py`
+v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/tools/test_workspace_paths.py -q`
+v0.1 R1 remains in progress; Tasks 2-4 have not started
