@@ -4,12 +4,53 @@ import hashlib
 import json
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 from agent_sdk.runtime.models import TokenUsage
 from agent_sdk.runtime.execution import WorkflowExecutionDescriptor
+from agent_sdk.tools.models import freeze_json, thaw_json
+
+
+type JsonValue = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | tuple[JsonValue, ...]
+    | Mapping[str, JsonValue]
+)
+
+
+class WorkflowExpression(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str
+    op: Literal["eq", "ne", "gt", "gte", "lt", "lte", "contains", "exists"]
+    value: JsonValue = None
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _validate_json_value(cls, value: Any) -> JsonValue:
+        return cast(JsonValue, freeze_json(value))
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _freeze_value(cls, value: JsonValue) -> JsonValue:
+        return cast(JsonValue, freeze_json(value))
+
+    @field_serializer("value")
+    def _serialize_value(self, value: JsonValue) -> Any:
+        return thaw_json(value)
 
 
 class AgentNode(BaseModel):
