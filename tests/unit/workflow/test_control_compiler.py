@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Callable
 
 import pytest
 from pydantic import ValidationError
 
+from agent_sdk.runtime.execution import DurableWorkflowIR
 from agent_sdk.workflow.compiler import WorkflowCompiler
-from agent_sdk.workflow.models import WorkflowDefinition
+from agent_sdk.workflow.models import AgentNode, WorkflowDefinition, WorkflowIR
 
 
 CONTROL_DATA: dict[str, object] = {
@@ -85,6 +88,40 @@ steps:
       - {id: review, kind: agent, agent_revision: reviewer@1, input: review}
   - {id: finish, kind: agent, agent_revision: writer@1, input: finish}
 """
+
+
+def _hash_content(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _rehash(payload: dict[str, object]) -> dict[str, object]:
+    if payload.get("schema_version") == 2:
+        content = {
+            key: payload[key]
+            for key in (
+                "schema_version",
+                "name",
+                "inputs",
+                "nodes",
+                "instructions",
+            )
+        }
+    else:
+        content = {
+            key: value
+            for key, value in payload.items()
+            if key != "definition_hash"
+        }
+    payload["definition_hash"] = _hash_content(content)
+    return payload
 
 
 def test_nested_control_compiles_to_exact_stable_program() -> None:
@@ -298,3 +335,97 @@ def test_definition_requires_exactly_one_definition_shape() -> None:
     for candidate in (both, neither):
         with pytest.raises(ValidationError, match="exactly one"):
             WorkflowDefinition.model_validate(candidate)
+
+
+def test_omitted_inputs_are_deeply_frozen_across_public_round_trips() -> None:
+    definition = WorkflowDefinition.model_validate(
+        {
+            "api_version": "agent-sdk/v1",
+            "kind": "Workflow",
+            "name": "omitted",
+            "nodes": [
+                {
+                    "id": "work",
+                    "kind": "agent",
+                    "agent_revision": "writer@1",
+                    "input": "work",
+                }
+            ],
+        }
+    )
+    schema_v1 = WorkflowIR.create(
+        name="persisted",
+        nodes=(
+            AgentNode(
+                id="work",
+                agent_revision="writer@1",
+                input="work",
+            ),
+        ),
+        edges=(),
+    )
+    schema_v2 = WorkflowCompiler().compile(definition)
+    restored_v1 = WorkflowIR.model_validate(schema_v1.model_dump(mode="json"))
+    restored_v2 = WorkflowIR.model_validate(schema_v2.model_dump(mode="json"))
+
+    for inputs in (
+        definition.inputs,
+        schema_v1.inputs,
+        restored_v1.inputs,
+        schema_v2.inputs,
+        restored_v2.inputs,
+    ):
+        with pytest.raises(TypeError):
+            inputs["tampered"] = "yes"  # type: ignore[index]
+
+    assert schema_v1.definition_hash == restored_v1.definition_hash
+    assert schema_v2.definition_hash == restored_v2.definition_hash
+
+
+def _insert_early_complete(instructions: list[dict[str, object]]) -> None:
+    early = dict(instructions[-1])
+    early["id"] = "early-complete"
+    instructions.insert(0, early)
+
+
+def _make_branch_self_target(instructions: list[dict[str, object]]) -> None:
+    instructions[0]["true_pc"] = 0
+
+
+def _make_loop_back_edge_target_agent(
+    instructions: list[dict[str, object]],
+) -> None:
+    instructions[6]["target_pc"] = 5
+
+
+def _insert_orphan_jump(instructions: list[dict[str, object]]) -> None:
+    orphan = dict(instructions[2])
+    orphan["id"] = "orphan"
+    orphan["target_pc"] = len(instructions)
+    instructions.insert(len(instructions) - 1, orphan)
+
+
+@pytest.mark.parametrize(
+    ("corrupt", "message"),
+    (
+        (_insert_early_complete, "one final complete"),
+        (_make_branch_self_target, "target itself"),
+        (_make_loop_back_edge_target_agent, "back-edge"),
+        (_insert_orphan_jump, "orphan"),
+    ),
+)
+def test_rehashed_noncanonical_v2_program_is_rejected_public_and_durable(
+    corrupt: Callable[[list[dict[str, object]]], None],
+    message: str,
+) -> None:
+    valid = WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(CONTROL_DATA)
+    )
+    payload = json.loads(json.dumps(valid.model_dump(mode="json")))
+    corrupt(payload["instructions"])
+    _rehash(payload)
+
+    with pytest.raises(ValidationError, match=message):
+        WorkflowIR.model_validate(payload)
+    with pytest.raises(ValidationError, match=message):
+        DurableWorkflowIR.model_validate(payload)

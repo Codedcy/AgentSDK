@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_sdk.runtime.execution import (
+    DurableWorkflowIR,
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
     ToolCapabilityDescriptor,
@@ -283,6 +284,93 @@ def test_workflow_descriptor_round_trips_schema_v2_program() -> None:
         "agent",
         "complete",
     )
+    for inputs in (
+        descriptor.workflow.inputs,
+        restored.workflow.inputs,
+    ):
+        with pytest.raises(TypeError):
+            inputs["tampered"] = "yes"  # type: ignore[index]
+
+
+def test_durable_workflow_defaults_omitted_version_to_legacy_schema_v1() -> None:
+    node = AgentNode(id="one", agent_revision="coder:1", input="work")
+    content = {
+        "schema_version": 1,
+        "name": "legacy",
+        "nodes": [node.model_dump(mode="json")],
+        "edges": [],
+    }
+    payload = {
+        "name": "legacy",
+        "nodes": content["nodes"],
+        "edges": [],
+        "definition_hash": _canonical_hash(content),
+    }
+
+    restored = DurableWorkflowIR.model_validate(payload)
+    round_tripped = DurableWorkflowIR.model_validate(
+        restored.model_dump(mode="json")
+    )
+
+    assert restored.schema_version == 1
+    for inputs in (restored.inputs, round_tripped.inputs):
+        with pytest.raises(TypeError):
+            inputs["tampered"] = "yes"  # type: ignore[index]
+
+
+def test_legacy_workflow_descriptor_accepts_omitted_nested_schema_version() -> None:
+    workflow = WorkflowIR.create(
+        name="legacy",
+        nodes=(AgentNode(id="one", agent_revision="coder:1", input="work"),),
+        edges=(),
+    )
+    execution = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(WorkflowAgentDescriptor.create("coder:1", execution),),
+        tools=(),
+        policy=execution.policy,
+    )
+    payload = descriptor.model_dump(mode="json")
+    del payload["workflow"]["schema_version"]
+
+    restored = WorkflowExecutionDescriptor.model_validate(payload)
+
+    assert restored.workflow.schema_version == 1
+    assert restored.workflow.definition_hash == workflow.definition_hash
+    assert restored.descriptor_hash == descriptor.descriptor_hash
+    with pytest.raises(TypeError):
+        restored.workflow.inputs["tampered"] = "yes"  # type: ignore[index]
+
+
+def test_unversioned_durable_v2_program_is_rejected() -> None:
+    workflow = WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(
+            {
+                "api_version": "agent-sdk/v1",
+                "kind": "Workflow",
+                "name": "controlled",
+                "steps": [
+                    {
+                        "id": "work",
+                        "kind": "agent",
+                        "agent_revision": "coder:1",
+                        "input": "work",
+                    }
+                ],
+            }
+        )
+    )
+    payload = workflow.model_dump(mode="json")
+    del payload["schema_version"]
+
+    with pytest.raises(ValidationError):
+        DurableWorkflowIR.model_validate(payload)
 
 
 def test_workflow_descriptor_rejects_rehashed_noncanonical_workflow() -> None:

@@ -120,3 +120,52 @@ from:
 
 `git diff --check` is clean. Self-review found no out-of-scope production
 changes.
+
+## Independent Review Fixes
+
+The three Important findings from the first independent review were corrected
+without entering R2 Task 3:
+
+1. `inputs` defaults now use Pydantic default validation, so omitted and empty
+   values pass through the same recursive JSON freezer as explicit values.
+   This covers `WorkflowDefinition`, schema-v1 and schema-v2 `WorkflowIR`,
+   JSON round trips, `DurableWorkflowIR`, and nested
+   `WorkflowExecutionDescriptor` values.
+2. `DurableWorkflowIR` again defaults a missing `schema_version` to legacy
+   schema 1. An omitted-version legacy IR and outer descriptor preserve their
+   original definition/descriptor hashes; unversioned v2 instruction payloads
+   are rejected. Public compiler output remains explicitly schema 2.
+3. Public and durable schema-v2 validation now share one private, pure static
+   structure validator. It requires exactly one final `complete`, compiler-form
+   branch/loop regions, forward control targets, a loop back-edge to its owning
+   `loop_check`, no self-targets or orphan jumps, complete reachability, and one
+   Agent instruction per Agent-table entry.
+
+Review-fix RED evidence:
+
+```text
+3 failed, 33 passed in 3.18s
+```
+
+for omitted-input freezing and durable version compatibility, plus:
+
+```text
+4 failed in 3.15s
+```
+
+for correctly rehashed early/multiple-complete, self-branch, invalid loop
+back-edge, and orphan-jump payloads.
+
+Final review-fix verification:
+
+```text
+65 passed in 3.15s
+98 passed in 3.17s
+253 passed in 41.96s
+Success: no issues found in 4 source files
+All checks passed!
+```
+
+The commands covered the focused compiler/descriptor matrix, all Workflow unit
+tests, all existing Workflow integration tests, strict mypy including the
+shared private validator, Ruff, and `git diff --check`.

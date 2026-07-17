@@ -10,6 +10,7 @@ from typing import Any, Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from agent_sdk.tools.models import ToolSpec
+from agent_sdk._workflow_validation import validate_canonical_workflow_program
 
 
 def _freeze_json(value: Any) -> Any:
@@ -195,13 +196,14 @@ class DurableWorkflowIR(_RevalidatedDescriptor):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1, 2] = 2
+    schema_version: Literal[1, 2] = 1
     name: str
     nodes: tuple[DurableAgentNode, ...]
     edges: tuple[DurableWorkflowEdge, ...] = ()
     inputs: Mapping[str, Any] = Field(
         default_factory=dict,
         exclude_if=lambda value: not value,
+        validate_default=True,
     )
     instructions: tuple[DurableWorkflowInstruction, ...] = Field(
         default=(),
@@ -273,37 +275,8 @@ class DurableWorkflowIR(_RevalidatedDescriptor):
     def _validate_schema_v2(self) -> None:
         if self.edges:
             raise ValueError("schema-v2 workflow IR cannot contain edges")
-        if not self.nodes:
-            raise ValueError("workflow IR must contain at least one node")
         node_ids = tuple(node.id for node in self.nodes)
-        if len(set(node_ids)) != len(node_ids):
-            raise ValueError("workflow IR node ids must be unique")
-        if not self.instructions or self.instructions[-1].op != "complete":
-            raise ValueError("schema-v2 workflow program must end in complete")
-        instruction_ids = tuple(item.id for item in self.instructions)
-        if len(set(instruction_ids)) != len(instruction_ids):
-            raise ValueError("workflow instruction ids must be unique")
-        agent_ids = tuple(
-            item.agent_node_id
-            for item in self.instructions
-            if item.op == "agent"
-        )
-        if agent_ids != node_ids:
-            raise ValueError(
-                "workflow program must reference each agent node exactly once"
-            )
-        instruction_count = len(self.instructions)
-        if any(
-            target >= instruction_count
-            for instruction in self.instructions
-            for target in (
-                instruction.true_pc,
-                instruction.false_pc,
-                instruction.target_pc,
-            )
-            if target is not None
-        ):
-            raise ValueError("workflow instruction target is out of range")
+        validate_canonical_workflow_program(node_ids, self.instructions)
 
 
 class ToolCapabilityDescriptor(_RevalidatedDescriptor):

@@ -18,6 +18,7 @@ from pydantic import (
 from agent_sdk.runtime.models import TokenUsage
 from agent_sdk.runtime.execution import WorkflowExecutionDescriptor
 from agent_sdk.tools.models import freeze_json, thaw_json
+from agent_sdk._workflow_validation import validate_canonical_workflow_program
 
 
 type JsonValue = (
@@ -106,7 +107,10 @@ class WorkflowDefinition(BaseModel):
     api_version: Literal["agent-sdk/v1"]
     kind: Literal["Workflow"]
     name: str = Field(min_length=1, max_length=256)
-    inputs: Mapping[str, JsonValue] = Field(default_factory=dict)
+    inputs: Mapping[str, JsonValue] = Field(
+        default_factory=dict,
+        validate_default=True,
+    )
     steps: tuple[WorkflowStep, ...] = ()
     nodes: tuple[AgentNode, ...] = ()
     edges: tuple[WorkflowEdge, ...] = ()
@@ -216,6 +220,7 @@ class WorkflowIR(BaseModel):
     inputs: Mapping[str, JsonValue] = Field(
         default_factory=dict,
         exclude_if=lambda value: not value,
+        validate_default=True,
     )
     instructions: tuple[WorkflowInstruction, ...] = Field(
         default=(),
@@ -375,34 +380,8 @@ def _validate_canonical_program(
 ) -> None:
     if edges:
         raise ValueError("schema-v2 workflow IR cannot contain edges")
-    if not nodes:
-        raise ValueError("workflow IR must contain at least one node")
     node_ids = tuple(node.id for node in nodes)
-    if len(set(node_ids)) != len(node_ids):
-        raise ValueError("workflow IR node ids must be unique")
-    if not instructions or instructions[-1].op != "complete":
-        raise ValueError("schema-v2 workflow program must end in complete")
-    instruction_ids = tuple(instruction.id for instruction in instructions)
-    if len(set(instruction_ids)) != len(instruction_ids):
-        raise ValueError("workflow instruction ids must be unique")
-    agent_ids = tuple(
-        cast(str, instruction.agent_node_id)
-        for instruction in instructions
-        if instruction.op == "agent"
-    )
-    if agent_ids != node_ids:
-        raise ValueError(
-            "workflow program must reference each agent node exactly once"
-        )
-    instruction_count = len(instructions)
-    for instruction in instructions:
-        for target in (
-            instruction.true_pc,
-            instruction.false_pc,
-            instruction.target_pc,
-        ):
-            if target is not None and target >= instruction_count:
-                raise ValueError("workflow instruction target is out of range")
+    validate_canonical_workflow_program(node_ids, instructions)
 
 
 class WorkflowRunStatus(StrEnum):
