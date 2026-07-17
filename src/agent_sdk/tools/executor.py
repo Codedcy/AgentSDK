@@ -53,6 +53,7 @@ class ToolExecutor:
         on_call_completed: _CompleteCall | None = None,
         on_preflight: _Preflight | None = None,
         sanitize_permission_denial: bool = False,
+        recovered_permission_request: PermissionRequest | None = None,
     ) -> ToolResult:
         if on_preflight is not None:
             await on_preflight()
@@ -97,18 +98,61 @@ class ToolExecutor:
 
         try:
             permission_arguments: Mapping[str, Any] = arguments
-            if registered.permission_arguments is not None:
+            invocation_arguments: Mapping[str, Any] = arguments
+            if recovered_permission_request is not None:
+                if (
+                    recovered_permission_request.run_id != context.run_id
+                    or recovered_permission_request.session_id != context.session_id
+                    or recovered_permission_request.tool_name != call.name
+                    or recovered_permission_request.effects != registered.spec.effects
+                ):
+                    raise ValueError("recovered permission request is invalid")
+                permission_arguments = recovered_permission_request.arguments
+                if registered.permission_arguments is None:
+                    if dict(permission_arguments) != arguments:
+                        raise ValueError("recovered permission request is invalid")
+                else:
+                    names = set(registered.permission_argument_names)
+                    if (
+                        any(name not in permission_arguments for name in names)
+                        or {
+                            key: value
+                            for key, value in permission_arguments.items()
+                            if key not in names
+                        }
+                        != {
+                            key: value
+                            for key, value in arguments.items()
+                            if key not in names
+                        }
+                    ):
+                        raise ValueError("recovered permission request is invalid")
+                    bound = dict(arguments)
+                    for name in registered.permission_argument_names:
+                        bound[name] = permission_arguments[name]
+                    invocation_arguments = bound
+            elif registered.permission_arguments is not None:
                 permission_arguments = await registered.permission_arguments(
                     context,
                     arguments,
                 )
-            request = PermissionRequest(
-                request_id=new_id("prm"),
-                run_id=context.run_id,
-                session_id=context.session_id,
-                tool_name=call.name,
-                arguments=permission_arguments,
-                effects=registered.spec.effects,
+                bound = dict(arguments)
+                for name in registered.permission_argument_names:
+                    if name not in permission_arguments:
+                        raise ValueError("permission binding is incomplete")
+                    bound[name] = permission_arguments[name]
+                invocation_arguments = bound
+            request = (
+                recovered_permission_request
+                if recovered_permission_request is not None
+                else PermissionRequest(
+                    request_id=new_id("prm"),
+                    run_id=context.run_id,
+                    session_id=context.session_id,
+                    tool_name=call.name,
+                    arguments=permission_arguments,
+                    effects=registered.spec.effects,
+                )
             )
         except ToolAccessDenied:
             return await self._complete_error(
@@ -163,11 +207,11 @@ class ToolExecutor:
                 {"call_id": call.call_id, "tool_name": call.name},
             )
         else:
-            await on_before_handler(call, registered, arguments)
+            await on_before_handler(call, registered, invocation_arguments)
         try:
             invocation = registered.handler(
                 context,
-                **cast(dict[str, Any], thaw_json(arguments)),
+                **cast(dict[str, Any], thaw_json(invocation_arguments)),
             )
             handler_task = asyncio.ensure_future(invocation)
             handler_task.add_done_callback(_consume_handler_completion)

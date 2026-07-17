@@ -481,7 +481,6 @@ class _RunEmitter:
             self._ensure_lease_current()
             assert self._checkpoint is not None
             capability = ToolCapabilityDescriptor.from_spec(registered.spec)
-            retry_policy = registered.spec.retry_policy
             operation = ToolCallOperation(
                 operation_id=new_id("op_tool"),
                 session_id=self._run.session_id,
@@ -491,14 +490,7 @@ class _RunEmitter:
                 lease_generation=self._lease.generation,
                 status=ExternalOperationStatus.STARTED,
                 tool_identity=capability.capability_hash,
-                recovery_metadata=(
-                    {"safe_retry": False, "retry_class": "unsafe"}
-                    if retry_policy is ToolRetryPolicy.NEVER
-                    else {
-                        "safe_retry": True,
-                        "retry_class": retry_policy.value,
-                    }
-                ),
+                recovery_metadata=_tool_recovery_metadata(registered, arguments),
             )
             checkpoint = self._checkpoint.model_copy(
                 update={
@@ -1121,6 +1113,30 @@ class RunEngine:
             recovered_tool=(operation, call, registered),
         )
 
+    async def resume_pending_permission(
+        self,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        call: ToolCallCompleted,
+        registered: RegisteredTool,
+        permission_request: PermissionRequest,
+        request: ModelRequest,
+        lease: Lease,
+        *,
+        sequence: int,
+    ) -> RunResult:
+        return await self._execute_owned(
+            run,
+            request,
+            lease,
+            lambda: None,
+            checkpoint=checkpoint,
+            sequence=sequence,
+            recovery_session=session,
+            recovered_permission=(call, registered, permission_request),
+        )
+
     async def fail_recovered_model(
         self,
         run: RunSnapshot,
@@ -1370,6 +1386,12 @@ class RunEngine:
             RegisteredTool,
         ]
         | None = None,
+        recovered_permission: tuple[
+            ToolCallCompleted,
+            RegisteredTool,
+            PermissionRequest,
+        ]
+        | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1403,6 +1425,27 @@ class RunEngine:
             self._permission_bridge,
         )
         try:
+            if recovered_permission is not None:
+                pending_call, pending_registered, permission_request = (
+                    recovered_permission
+                )
+                tool_result = await self._execute_tool_call(
+                    executor,
+                    emitter,
+                    pending_call,
+                    run_id=run_id,
+                    chunks=chunks,
+                    usage=usage,
+                    tool_results=tool_results,
+                    emit_proposed=False,
+                    expected_registered=pending_registered,
+                    recovered_permission_request=permission_request,
+                )
+                tool_results.append(tool_result)
+                await emitter.emit("step.completed")
+                messages = list(
+                    emitter.current_checkpoint.model_dump(mode="json")["messages"]
+                )
             if recovered_tool is not None:
                 recovered_operation, pending_call, recovered_registered = recovered_tool
                 tool_result = await self._execute_recovered_tool_call(
@@ -1642,11 +1685,15 @@ class RunEngine:
         chunks: list[str],
         usage: TokenUsage,
         tool_results: list[ToolResult],
+        emit_proposed: bool = True,
+        expected_registered: RegisteredTool | None = None,
+        recovered_permission_request: PermissionRequest | None = None,
     ) -> ToolResult:
-        await emitter.emit(
-            "tool.call.proposed",
-            {"call_id": call.call_id, "tool_name": call.name},
-        )
+        if emit_proposed:
+            await emitter.emit(
+                "tool.call.proposed",
+                {"call_id": call.call_id, "tool_name": call.name},
+            )
         tool_operation: ToolCallOperation | None = None
 
         async def before_handler(
@@ -1655,6 +1702,8 @@ class RunEngine:
             arguments: Mapping[str, Any],
         ) -> None:
             nonlocal tool_operation
+            if expected_registered is not None and registered is not expected_registered:
+                raise RecoveryStateConflictError
             tool_operation = await emitter.start_tool(
                 hook_call,
                 registered,
@@ -1667,6 +1716,19 @@ class RunEngine:
         ) -> None:
             await emitter.complete_tool(hook_call, result, tool_operation)
 
+        async def permission_requested(
+            permission: PermissionRequest,
+            decision: PermissionDecision | None,
+        ) -> None:
+            if recovered_permission_request is None:
+                await self._permission_transition(
+                    emitter,
+                    "permission.requested",
+                    RunStatus.WAITING_PERMISSION,
+                    permission,
+                    decision,
+                )
+
         try:
             return await executor.execute(
                 call,
@@ -1675,15 +1737,7 @@ class RunEngine:
                     session_id=emitter.current_snapshot.session_id,
                 ),
                 emit=emitter.emit,
-                on_permission_requested=lambda permission, decision: (
-                    self._permission_transition(
-                        emitter,
-                        "permission.requested",
-                        RunStatus.WAITING_PERMISSION,
-                        permission,
-                        decision,
-                    )
-                ),
+                on_permission_requested=permission_requested,
                 on_permission_resolved=lambda permission, decision: (
                     self._permission_transition(
                         emitter,
@@ -1695,6 +1749,7 @@ class RunEngine:
                 ),
                 on_before_handler=before_handler,
                 on_call_completed=call_completed,
+                recovered_permission_request=recovered_permission_request,
             )
         except asyncio.CancelledError:
             raise
@@ -1745,10 +1800,9 @@ class RunEngine:
         expected_capability = ToolCapabilityDescriptor.from_spec(
             expected_registered.spec
         )
-        expected_metadata = {
-            "safe_retry": True,
-            "retry_class": expected_registered.spec.retry_policy.value,
-        }
+        base_metadata = _tool_base_recovery_metadata(
+            expected_registered.spec.retry_policy
+        )
 
         def validate_registered_tool() -> None:
             try:
@@ -1762,7 +1816,9 @@ class RunEngine:
                 current.spec != expected_registered.spec
                 or capability != expected_capability
                 or operation.tool_identity != capability.capability_hash
-                or dict(operation.recovery_metadata) != expected_metadata
+                or not set(base_metadata.items()).issubset(
+                    dict(operation.recovery_metadata).items()
+                )
             ):
                 raise RecoveryStateConflictError
 
@@ -1782,6 +1838,8 @@ class RunEngine:
             if (
                 _tool_request_fingerprint(call, expected_capability, arguments)
                 != operation.request_fingerprint
+                or dict(operation.recovery_metadata)
+                != _tool_recovery_metadata(expected_registered, arguments)
             ):
                 raise RecoveryStateConflictError
 
@@ -2106,3 +2164,26 @@ def _tool_request_fingerprint(
         separators=(",", ":"),
     )
     return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _tool_base_recovery_metadata(
+    retry_policy: ToolRetryPolicy,
+) -> dict[str, object]:
+    if retry_policy is ToolRetryPolicy.NEVER:
+        return {"safe_retry": False, "retry_class": "unsafe"}
+    return {
+        "safe_retry": True,
+        "retry_class": retry_policy.value,
+    }
+
+
+def _tool_recovery_metadata(
+    registered: RegisteredTool,
+    arguments: Mapping[str, Any],
+) -> dict[str, object]:
+    metadata = _tool_base_recovery_metadata(registered.spec.retry_policy)
+    if registered.permission_argument_names:
+        metadata["permission_arguments"] = {
+            name: arguments[name] for name in registered.permission_argument_names
+        }
+    return metadata

@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from time import monotonic
+from pathlib import Path
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
@@ -26,6 +28,7 @@ from agent_sdk.runtime.engine import (
     RunEngine,
     _add_usage,
     _model_request_fingerprint,
+    _tool_base_recovery_metadata,
     _tool_request_fingerprint,
 )
 from agent_sdk.runtime.execution import (
@@ -89,7 +92,11 @@ from agent_sdk.storage.base import (
     StateStore,
 )
 from agent_sdk.tools.models import ToolResult, ToolResultStatus, ToolRetryPolicy, thaw_json
-from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
+from agent_sdk.tools.registry import (
+    RegisteredTool,
+    ToolRegistry,
+    builtin_permission_argument_names,
+)
 
 
 _SCANNER_LEASE_TTL = timedelta(seconds=30)
@@ -135,6 +142,7 @@ class RecoveryPlan:
         "reconcile",
         "provider_recovery",
         "tool_recovery",
+        "permission_recovery",
         "follow",
     ]
     run_id: str
@@ -144,6 +152,7 @@ class RecoveryPlan:
     operation_id: str | None = None
     details: tuple[tuple[str, str], ...] = ()
     provider_adapter: ProviderRecoveryAdapter | None = None
+    permission_request: PermissionRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +174,13 @@ class _RecoveryEvidence:
 class _CertifiedToolRecovery:
     call: ToolCallCompleted
     registered: RegisteredTool
+
+
+@dataclass(frozen=True)
+class _CertifiedPermissionRecovery:
+    call: ToolCallCompleted
+    registered: RegisteredTool
+    request: PermissionRequest
 
 
 @dataclass(frozen=True)
@@ -298,6 +314,18 @@ class RunRecoveryService:
                 details=(("run_status", run.status.value),),
             )
         if checkpoint.phase is RunCheckpointPhase.WAITING:
+            certified_permission = self._certified_pending_permission(
+                evidence,
+                request,
+            )
+            if certified_permission is not None:
+                return RecoveryPlan(
+                    "permission_recovery",
+                    run_id,
+                    request=request,
+                    checkpoint=checkpoint,
+                    permission_request=certified_permission.request,
+                )
             return RecoveryPlan(
                 "reconcile",
                 run_id,
@@ -2841,6 +2869,11 @@ class RunRecoveryService:
                 assert plan.checkpoint is not None
                 assert plan.operation_id is not None
                 return await self._coordinate_tool_recovery(plan)
+            if plan.kind == "permission_recovery":
+                assert plan.request is not None
+                assert plan.checkpoint is not None
+                assert plan.permission_request is not None
+                return await self._coordinate_permission_recovery(plan)
             if plan.kind == "follow":
                 return await self._follow_durable_run(plan.run_id)
             raise AgentSDKError(
@@ -3172,6 +3205,7 @@ class RunRecoveryService:
         evidence: _RecoveryEvidence,
         call: ToolCallCompleted,
         payload: Mapping[str, Any],
+        operation: ToolCallOperation | None = None,
     ) -> PermissionRequest | None:
         descriptor = evidence.run.execution_descriptor
         if descriptor is None or set(payload) != {"request"}:
@@ -3187,6 +3221,8 @@ class RunRecoveryService:
             evidence,
             call,
             request_id=request.request_id,
+            operation=operation,
+            recorded_arguments=request.arguments,
         )
         if (
             request.model_dump(mode="json") != request_payload
@@ -3202,6 +3238,8 @@ class RunRecoveryService:
         call: ToolCallCompleted,
         *,
         request_id: str,
+        operation: ToolCallOperation | None = None,
+        recorded_arguments: Mapping[str, Any] | None = None,
     ) -> PermissionRequest | None:
         descriptor = evidence.run.execution_descriptor
         if descriptor is None or not request_id.strip():
@@ -3212,15 +3250,47 @@ class RunRecoveryService:
         if len(capabilities) != 1:
             return None
         try:
-            arguments = json.loads(
+            raw_arguments = json.loads(
                 call.arguments_json,
                 parse_constant=_reject_json_constant,
             )
-            if not isinstance(arguments, dict):
+            if not isinstance(raw_arguments, dict):
                 return None
             Draft202012Validator(
                 thaw_json(capabilities[0].spec.input_schema)
-            ).validate(arguments)
+            ).validate(raw_arguments)
+            arguments = _bound_tool_arguments(
+                capabilities[0],
+                raw_arguments,
+                operation,
+            )
+            if arguments is None:
+                return None
+            if recorded_arguments is not None:
+                names = builtin_permission_argument_names(capabilities[0].spec)
+                recorded = dict(recorded_arguments)
+                if names and operation is None:
+                    if any(name not in recorded for name in names):
+                        return None
+                    expected_nonbinding = {
+                        key: value
+                        for key, value in raw_arguments.items()
+                        if key not in names
+                    }
+                    actual_nonbinding = {
+                        key: value for key, value in recorded.items() if key not in names
+                    }
+                    if expected_nonbinding != actual_nonbinding:
+                        return None
+                    arguments = recorded
+                elif recorded != arguments:
+                    return None
+            if not _bound_arguments_are_in_session(
+                capabilities[0],
+                arguments,
+                evidence.session,
+            ):
+                return None
             return PermissionRequest(
                 request_id=request_id,
                 run_id=evidence.run.run_id,
@@ -3417,14 +3487,13 @@ class RunRecoveryService:
         if operation is not None:
             if capability is None or arguments is None:
                 return False
-            expected_metadata = (
-                {"safe_retry": False, "retry_class": "unsafe"}
-                if capability.spec.retry_policy is ToolRetryPolicy.NEVER
-                else {
-                    "safe_retry": True,
-                    "retry_class": capability.spec.retry_policy.value,
-                }
+            bound_arguments = _bound_tool_arguments(
+                capability,
+                arguments,
+                operation,
             )
+            if bound_arguments is None:
+                return False
             expected_status = (
                 ExternalOperationStatus.COMPLETED
                 if result.status is ToolResultStatus.SUCCEEDED
@@ -3501,9 +3570,8 @@ class RunRecoveryService:
                 and operation.turn == turn
                 and operation.status is expected_status
                 and operation.tool_identity == capability.capability_hash
-                and dict(operation.recovery_metadata) == expected_metadata
                 and operation.request_fingerprint
-                == _tool_request_fingerprint(call, capability, arguments)
+                == _tool_request_fingerprint(call, capability, bound_arguments)
                 and operation.model_dump(mode="json")["outcome"]
                 == result.model_dump(mode="json")
             )
@@ -3706,6 +3774,13 @@ class RunRecoveryService:
                     return False
                 elif interrupted_state in {"ready_for_step", "tool_completed"}:
                     state = "ready_for_step"
+                elif (
+                    interrupted_state == "permission_pending"
+                    and current_tool is None
+                    and current_call is not None
+                    and pending_permission is not None
+                ):
+                    state = "permission_pending"
                 else:
                     state = "model_completed"
                     current_tool = None
@@ -3876,6 +3951,7 @@ class RunRecoveryService:
                     evidence,
                     current_call,
                     request_id="prm_recovery_replay",
+                    operation=tool_operations.get(turn),
                 )
                 initial_permission_decision = (
                     RunRecoveryService._recorded_permission_decision(
@@ -3891,8 +3967,10 @@ class RunRecoveryService:
                 if (
                     state not in {"tool_proposed", "tool_recovering"}
                     or current_call is None
-                    or initial_permission_decision is None
-                    or initial_permission_decision.action != "ask"
+                    or (
+                        initial_permission_decision is not None
+                        and initial_permission_decision.action != "ask"
+                    )
                 ):
                     return False
                 permission_recovery = state == "tool_recovering"
@@ -3910,6 +3988,7 @@ class RunRecoveryService:
                         evidence,
                         current_call,
                         payload,
+                        tool_operations.get(turn),
                     )
                     if request is None:
                         return False
@@ -3921,6 +4000,7 @@ class RunRecoveryService:
                     )
                     if recorded_decision is None or recorded_decision.action != "ask":
                         return False
+                    initial_permission_decision = recorded_decision
                 pending_permission = payload
                 permission_allowed = None
                 permission_decision = None
@@ -4140,12 +4220,28 @@ class RunRecoveryService:
         if current_kind is None:
             if checkpoint.operation_id is not None:
                 return False
-            if checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL:
+            if checkpoint.phase in {
+                RunCheckpointPhase.READY_FOR_TOOL,
+                RunCheckpointPhase.WAITING,
+            }:
+                expected_state = (
+                    "model_completed"
+                    if checkpoint.phase is RunCheckpointPhase.READY_FOR_TOOL
+                    else "permission_pending"
+                )
                 return (
-                    interrupted_state == "model_completed"
+                    interrupted_state == expected_state
                     and current_model is not None
                     and current_model.turn == checkpoint.turn
                     and current_model.status is ExternalOperationStatus.COMPLETED
+                    and (
+                        checkpoint.phase is not RunCheckpointPhase.WAITING
+                        or (
+                            current_call is not None
+                            and current_tool is None
+                            and pending_permission is not None
+                        )
+                    )
                 )
             return (
                 checkpoint.phase is RunCheckpointPhase.READY_FOR_MODEL
@@ -5074,19 +5170,17 @@ class RunRecoveryService:
             json.JSONDecodeError,
         ):
             return False
-        expected_metadata = (
-            {"safe_retry": False, "retry_class": "unsafe"}
-            if capability.spec.retry_policy is ToolRetryPolicy.NEVER
-            else {
-                "safe_retry": True,
-                "retry_class": capability.spec.retry_policy.value,
-            }
+        bound_arguments = _bound_tool_arguments(
+            capability,
+            arguments,
+            operation,
         )
+        if bound_arguments is None:
+            return False
         return (
             operation.tool_identity == capability.capability_hash
-            and dict(operation.recovery_metadata) == expected_metadata
             and operation.request_fingerprint
-            == _tool_request_fingerprint(call, capability, arguments)
+            == _tool_request_fingerprint(call, capability, bound_arguments)
         )
 
     @staticmethod
@@ -5233,6 +5327,65 @@ class RunRecoveryService:
             return False
         return self._is_certified_safe_checkpoint(effective, base_request)
 
+    def _certified_pending_permission(
+        self,
+        evidence: _RecoveryEvidence,
+        base_request: ModelRequest,
+    ) -> _CertifiedPermissionRecovery | None:
+        checkpoint = evidence.checkpoint
+        descriptor = evidence.run.execution_descriptor
+        if (
+            checkpoint is None
+            or descriptor is None
+            or checkpoint.phase is not RunCheckpointPhase.WAITING
+            or checkpoint.operation_id is not None
+            or evidence.pending
+            or evidence.run.status is not RunStatus.INTERRUPTED
+            or any(
+                operation.status is ExternalOperationStatus.STARTED
+                for operation in evidence.operations
+            )
+            or not self._is_exact_ready_tool_relation(evidence, base_request)
+            or len(evidence.run_events) < 2
+            or evidence.run_events[-1].type != "run.interrupted"
+            or evidence.run_events[-2].type != "permission.requested"
+        ):
+            return None
+        requested = tuple(
+            event for event in evidence.run_events if event.type == "permission.requested"
+        )
+        resolved = tuple(
+            event for event in evidence.run_events if event.type == "permission.resolved"
+        )
+        if len(requested) != len(resolved) + 1 or requested[-1] != evidence.run_events[-2]:
+            return None
+        try:
+            call = self._engine._tool_call_from_checkpoint(checkpoint)
+            registered = self._tools.get(call.name)
+        except AgentSDKError:
+            return None
+        capabilities = tuple(
+            capability
+            for capability in descriptor.tools
+            if capability.spec.name == call.name
+        )
+        live_capability = ToolCapabilityDescriptor.from_spec(registered.spec)
+        if capabilities != (live_capability,):
+            return None
+        request = self._validated_permission_request(
+            evidence,
+            call,
+            requested[-1].payload,
+        )
+        decision = (
+            None
+            if request is None
+            else self._recorded_permission_decision(evidence, request)
+        )
+        if request is None or decision is None or decision.action != "ask":
+            return None
+        return _CertifiedPermissionRecovery(call, registered, request)
+
     def _is_certified_safe_checkpoint(
         self,
         evidence: _RecoveryEvidence,
@@ -5276,7 +5429,11 @@ class RunRecoveryService:
         descriptor = evidence.run.execution_descriptor
         if (
             descriptor is None
-            or checkpoint.phase is not RunCheckpointPhase.READY_FOR_TOOL
+            or checkpoint.phase
+            not in {
+                RunCheckpointPhase.READY_FOR_TOOL,
+                RunCheckpointPhase.WAITING,
+            }
             or checkpoint.operation_id is not None
             or len(checkpoint.tool_results) != checkpoint.turn
             or not RunRecoveryService._is_valid_run_event_envelope(evidence)
@@ -6168,18 +6325,19 @@ class RunRecoveryService:
                         or not arguments_valid
                     ):
                         return None
-                    expected_metadata = (
-                        {"safe_retry": False, "retry_class": "unsafe"}
-                        if registered.spec.retry_policy is ToolRetryPolicy.NEVER
-                        else {
-                            "safe_retry": True,
-                            "retry_class": registered.spec.retry_policy.value,
-                        }
+                    bound_arguments = _bound_tool_arguments(
+                        capability,
+                        decoded,
+                        tool_operation,
                     )
                     if (
-                        tool_operation.tool_identity != capability.capability_hash
-                        or dict(tool_operation.recovery_metadata) != expected_metadata
-                        or _tool_request_fingerprint(call, capability, decoded)
+                        bound_arguments is None
+                        or tool_operation.tool_identity != capability.capability_hash
+                        or _tool_request_fingerprint(
+                            call,
+                            capability,
+                            bound_arguments,
+                        )
                         != tool_operation.request_fingerprint
                     ):
                         return None
@@ -6188,6 +6346,7 @@ class RunRecoveryService:
                     evidence,
                     call,
                     request_id="prm_tool_history_replay",
+                    operation=tool_operation,
                 )
                 initial_permission = (
                     self._recorded_permission_decision(
@@ -6579,6 +6738,7 @@ class RunRecoveryService:
                     evidence,
                     turn.call,
                     requested_payload,
+                    turn.operation,
                 )
                 decision = self._validated_permission_decision(
                     requested_payload.get("request", {}),
@@ -7057,6 +7217,78 @@ class RunRecoveryService:
             details={"checkpoint_phase": checkpoint.phase.value},
             checkpoint=checkpoint,
         )
+
+    async def _coordinate_permission_recovery(
+        self,
+        plan: RecoveryPlan,
+    ) -> RunResult:
+        lease = await self._leases.acquire(
+            plan.run_id,
+            new_id("coord"),
+            now=self._clock(),
+        )
+        owner = asyncio.current_task()
+        assert owner is not None
+        heartbeat_error: BaseException | None = None
+        heartbeat = asyncio.create_task(self._heartbeat(lease))
+
+        def heartbeat_finished(task: asyncio.Task[None]) -> None:
+            nonlocal heartbeat_error
+            if task.cancelled():
+                return
+            heartbeat_error = task.exception()
+            if heartbeat_error is not None and not owner.done():
+                owner.cancel()
+
+        heartbeat.add_done_callback(heartbeat_finished)
+        try:
+            run = await self._load_run(plan.run_id)
+            if run.status is not RunStatus.INTERRUPTED:
+                raise RecoveryStateConflictError
+            evidence = await self._load_evidence(run)
+            checkpoint = plan.checkpoint
+            if checkpoint is None or evidence.checkpoint != checkpoint:
+                raise RecoveryStateConflictError
+            base_request = await self._validated_request(evidence)
+            if base_request is None:
+                raise RecoveryStateConflictError
+            certified = self._certified_pending_permission(
+                evidence,
+                base_request,
+            )
+            if (
+                certified is None
+                or certified.request != plan.permission_request
+                or self._tools.get(certified.call.name) is not certified.registered
+            ):
+                raise RecoveryStateConflictError
+            sequence = await self._store.latest_run_event_sequence(run.run_id)
+            if sequence is None:
+                raise RecoveryStateConflictError
+            return await self._engine.resume_pending_permission(
+                run,
+                evidence.session,
+                checkpoint,
+                certified.call,
+                certified.registered,
+                certified.request,
+                base_request,
+                lease,
+                sequence=sequence + 1,
+            )
+        except asyncio.CancelledError:
+            if heartbeat_error is not None:
+                raise LeaseLostError from None
+            raise
+        finally:
+            active_error = sys.exception()
+            heartbeat.cancel()
+            heartbeat_cancellation = await _settle_task(heartbeat)
+            release = asyncio.create_task(self._leases.release(lease))
+            release_cancellation = await _settle_task(release)
+            cancellation = release_cancellation or heartbeat_cancellation
+            if active_error is None and cancellation is not None:
+                raise cancellation from None
 
     async def _coordinate_tool_recovery(
         self,
@@ -7847,3 +8079,75 @@ def _detach_strict_json_value(value: object) -> object:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _bound_tool_arguments(
+    capability: ToolCapabilityDescriptor,
+    arguments: Mapping[str, Any],
+    operation: ToolCallOperation | None,
+) -> dict[str, Any] | None:
+    detached = dict(arguments)
+    if operation is None:
+        return detached
+    base = _tool_base_recovery_metadata(capability.spec.retry_policy)
+    metadata = dict(operation.recovery_metadata)
+    if metadata == base:
+        return detached
+    names = builtin_permission_argument_names(capability.spec)
+    if not names or set(metadata) != {*base, "permission_arguments"}:
+        return None
+    raw_binding = metadata.get("permission_arguments")
+    if not isinstance(raw_binding, Mapping) or set(raw_binding) != set(names):
+        return None
+    binding = dict(raw_binding)
+    if any(
+        not isinstance(binding[name], str)
+        or not _is_canonical_bound_path(binding[name])
+        for name in names
+    ):
+        return None
+    detached.update(binding)
+    expected = {
+        **base,
+        "permission_arguments": {name: detached[name] for name in names},
+    }
+    return detached if metadata == expected else None
+
+
+def _bound_arguments_are_in_session(
+    capability: ToolCapabilityDescriptor,
+    arguments: Mapping[str, Any],
+    session: SessionSnapshot,
+) -> bool:
+    names = builtin_permission_argument_names(capability.spec)
+    if not names:
+        return True
+    roots = tuple(Path(root) for root in session.workspaces)
+    if not roots or any(not root.is_absolute() for root in roots):
+        return False
+    for name in names:
+        value = arguments.get(name)
+        if not isinstance(value, str) or not _is_canonical_bound_path(value):
+            return False
+        candidate = Path(value)
+        if not candidate.is_absolute() or not any(
+            candidate.is_relative_to(root) for root in roots
+        ):
+            return False
+    return True
+
+
+def _is_canonical_bound_path(value: str) -> bool:
+    candidate = Path(value)
+    parts = candidate.parts[1:] if candidate.anchor else candidate.parts
+    return (
+        bool(value)
+        and "\0" not in value
+        and candidate.is_absolute()
+        and os.path.normpath(value) == value
+        and all(part not in {"", ".", ".."} for part in parts)
+        and (
+            os.name != "nt"
+            or all(not part.endswith((".", " ")) for part in parts)
+        )
+    )

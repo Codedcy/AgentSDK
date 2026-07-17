@@ -10,6 +10,7 @@ import pytest
 
 from agent_sdk.models.litellm_gateway import ToolCallCompleted
 from agent_sdk.permissions.policy import PolicyEngine
+from agent_sdk.tools.builtins.bash import _resolve_bash_cwd
 from agent_sdk.tools.builtins.workspace import resolve_workspace_path
 from agent_sdk.tools.errors import ToolAccessDenied, ToolExecutionTimedOut
 from agent_sdk.tools.executor import ToolExecutor
@@ -184,6 +185,28 @@ def test_resolve_workspace_path_rejects_ambiguous_or_unsafe_input(
 
     with pytest.raises(ToolAccessDenied, match=expected_message):
         resolve_workspace_path((root,), requested, for_write=True)
+
+
+def test_configured_filesystem_root_is_a_valid_default_bash_cwd(
+    tmp_path: Path,
+) -> None:
+    filesystem_root = Path(tmp_path.anchor)
+
+    assert _resolve_bash_cwd((filesystem_root,), None) == filesystem_root.resolve()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX filename semantics only")
+@pytest.mark.parametrize("name", ("trailing.", "trailing "))
+def test_posix_trailing_dot_and_space_names_remain_valid(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    resolved = resolve_workspace_path((root,), name, for_write=True)
+
+    assert resolved == root.resolve() / name
 
 
 async def _noop_emit(_: str, __: dict[str, Any]) -> None:

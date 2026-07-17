@@ -29,7 +29,10 @@ async def workspace_roots(
         session = SessionSnapshot.model_validate(data)
     except Exception as error:
         raise ToolAccessDenied("session workspace is unavailable") from error
-    return tuple(Path(root) for root in session.workspaces)
+    roots = tuple(Path(root) for root in session.workspaces)
+    if any(not root.is_absolute() for root in roots):
+        raise ToolAccessDenied("session workspace is unavailable")
+    return roots
 
 
 def relative_display_path(target: Path, roots: tuple[Path, ...]) -> str:

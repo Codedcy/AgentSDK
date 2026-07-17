@@ -220,7 +220,10 @@ async def test_matching_concurrent_create_returns_one_durable_session() -> None:
         )
 
         assert first == second
-        assert first.workspaces == ("one", "two")
+        assert first.workspaces == (
+            str(Path("one").resolve()),
+            str(Path("two").resolve()),
+        )
         assert store.create_commit_attempts == 2
         assert sorted(store.create_applied) == [False, True]
         events = await store.read_events(after_cursor=0)

@@ -77,6 +77,42 @@ async def _harness(
     )
 
 
+async def _multi_root_harness(
+    roots: tuple[Path, ...],
+    *,
+    permission_default: str = "ask",
+    permission_rules: Iterable[PermissionRule] = (),
+) -> tuple[
+    ToolExecutor,
+    ToolContext,
+    InProcessPermissionBridge,
+    InMemoryStore,
+]:
+    store = InMemoryStore()
+    session = await RuntimeCommands(store).create_session(workspaces=roots)
+    registry = ToolRegistry()
+    register_builtin_tools(
+        registry=registry,
+        store=store,
+        output_limit=4096,
+    )
+    bridge = InProcessPermissionBridge()
+    executor = ToolExecutor(
+        registry,
+        PolicyEngine(
+            permission_default,  # type: ignore[arg-type]
+            permission_rules,
+        ),
+        bridge,
+    )
+    return (
+        executor,
+        ToolContext(run_id="run-bound-builtins", session_id=session.session_id),
+        bridge,
+        store,
+    )
+
+
 async def _execute(
     executor: ToolExecutor,
     context: ToolContext,
@@ -165,6 +201,175 @@ async def test_ask_read_waits_for_existing_permission_resolution(
     assert request.arguments["path"] == str((workspace / "hello.txt").resolve())
     assert result.status is ToolResultStatus.SUCCEEDED
     assert thaw_json(result.value)["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_ask_read_never_switches_to_a_second_workspace(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "value.txt").write_text("first", encoding="utf-8")
+    (second / "value.txt").write_text("second", encoding="utf-8")
+    executor, context, bridge, _ = await _multi_root_harness((first, second))
+
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "read",
+            {"path": "value.txt"},
+            call_id="call-bound-read",
+        )
+    )
+    request = await asyncio.wait_for(bridge.next_request(context.run_id), timeout=1)
+    assert request.arguments["path"] == str((first / "value.txt").resolve())
+    (first / "value.txt").unlink()
+    await bridge.resolve(request.request_id, PermissionDecision.allow_once())
+
+    result = await asyncio.wait_for(execution, timeout=1)
+    assert result.status is ToolResultStatus.DENIED
+    assert "second" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_ask_write_never_switches_to_a_second_workspace(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    archived = tmp_path / "archived"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    executor, context, bridge, _ = await _multi_root_harness((first, second))
+
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "write",
+            {"path": "created.txt", "content": "bound"},
+            call_id="call-bound-write",
+        )
+    )
+    request = await asyncio.wait_for(bridge.next_request(context.run_id), timeout=1)
+    assert request.arguments["path"] == str((first / "created.txt").resolve())
+    first.rename(archived)
+    await bridge.resolve(request.request_id, PermissionDecision.allow_once())
+
+    result = await asyncio.wait_for(execution, timeout=1)
+    assert result.status is ToolResultStatus.DENIED
+    assert not (second / "created.txt").exists()
+    assert not (archived / "created.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_ask_explicit_bash_cwd_never_switches_workspaces(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    archived = tmp_path / "archived"
+    second = tmp_path / "second"
+    (first / "work").mkdir(parents=True)
+    (second / "work").mkdir(parents=True)
+    executor, context, bridge, _ = await _multi_root_harness((first, second))
+
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "bash",
+            {
+                "argv": [sys.executable, "-c", "import os; print(os.getcwd())"],
+                "cwd": "work",
+            },
+            call_id="call-bound-explicit-cwd",
+        )
+    )
+    request = await asyncio.wait_for(bridge.next_request(context.run_id), timeout=1)
+    assert request.arguments["cwd"] == str((first / "work").resolve())
+    first.rename(archived)
+    await bridge.resolve(request.request_id, PermissionDecision.allow_once())
+
+    result = await asyncio.wait_for(execution, timeout=5)
+    assert result.status is ToolResultStatus.DENIED
+    assert str(second / "work") not in result.content
+
+
+@pytest.mark.asyncio
+async def test_ask_default_bash_cwd_uses_the_authorized_workspace(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    executor, context, bridge, store = await _multi_root_harness((first, second))
+
+    execution = asyncio.create_task(
+        _execute(
+            executor,
+            context,
+            "bash",
+            {"argv": [sys.executable, "-c", "import os; print(os.getcwd())"]},
+            call_id="call-bound-default-cwd",
+        )
+    )
+    request = await asyncio.wait_for(bridge.next_request(context.run_id), timeout=1)
+    assert request.arguments["cwd"] == str(first.resolve())
+
+    key = ("session", context.session_id)
+    snapshot = store._snapshots[key]
+    data = dict(snapshot.data)
+    data["workspaces"] = [str(second.resolve()), str(first.resolve())]
+    store._snapshots[key] = snapshot._replace(data=data)
+    await bridge.resolve(request.request_id, PermissionDecision.allow_once())
+
+    result = await asyncio.wait_for(execution, timeout=5)
+    assert result.status is ToolResultStatus.SUCCEEDED
+    value = thaw_json(result.value)
+    assert Path(str(value["stdout"]).strip()).resolve() == first.resolve()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path alias semantics")
+@pytest.mark.parametrize("alias", ("secret.txt.", "secret.txt "))
+@pytest.mark.asyncio
+async def test_windows_ambiguous_path_alias_is_denied_before_policy_and_io(
+    tmp_path: Path,
+    alias: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / "protected"
+    protected.mkdir(parents=True)
+    normalized_target = protected / "secret.txt"
+    executor, context, _ = await _harness(
+        workspace,
+        permission_default="allow",
+        permission_rules=(
+            PermissionRule(
+                outcome="deny",
+                tool="write",
+                path_prefix=normalized_target,
+            ),
+        ),
+    )
+
+    result = await _execute(
+        executor,
+        context,
+        "write",
+        {
+            "path": f"protected/{alias}",
+            "content": "must-not-write",
+            "overwrite": True,
+        },
+        call_id=f"call-windows-alias-{alias!r}",
+    )
+
+    assert result.status is ToolResultStatus.DENIED
+    assert not normalized_target.exists()
 
 
 @pytest.mark.parametrize(

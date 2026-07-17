@@ -17,11 +17,22 @@ PermissionArgumentsResolver: TypeAlias = Callable[
 ]
 
 
+def builtin_permission_argument_names(spec: ToolSpec) -> tuple[str, ...]:
+    if spec.source != "builtin":
+        return ()
+    if spec.effects in {("filesystem.read",), ("filesystem.write",)}:
+        return ("path",)
+    if spec.effects == ("process.execute",):
+        return ("cwd",)
+    return ()
+
+
 @dataclass(frozen=True)
 class RegisteredTool:
     spec: ToolSpec
     handler: ToolHandler
     permission_arguments: PermissionArgumentsResolver | None = None
+    permission_argument_names: tuple[str, ...] = ()
 
 
 class ToolRegistry:
@@ -34,6 +45,7 @@ class ToolRegistry:
         handler: ToolHandler,
         *,
         permission_arguments: PermissionArgumentsResolver | None = None,
+        permission_argument_names: tuple[str, ...] = (),
     ) -> RegisteredTool:
         if spec.name in self._registered:
             raise AgentSDKError(
@@ -49,7 +61,32 @@ class ToolRegistry:
                 "tool schema is invalid",
                 retryable=False,
             ) from error
-        registered = RegisteredTool(spec, handler, permission_arguments)
+        if bool(permission_arguments) != bool(permission_argument_names):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "tool permission binding is invalid",
+                retryable=False,
+            )
+        if (
+            len(set(permission_argument_names)) != len(permission_argument_names)
+            or any(not name for name in permission_argument_names)
+            or (
+                permission_argument_names
+                and permission_argument_names
+                != builtin_permission_argument_names(spec)
+            )
+        ):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "tool permission binding is invalid",
+                retryable=False,
+            )
+        registered = RegisteredTool(
+            spec,
+            handler,
+            permission_arguments,
+            permission_argument_names,
+        )
         self._registered[spec.name] = registered
         return registered
 
@@ -98,4 +135,5 @@ __all__ = [
     "ToolHandler",
     "ToolRegistry",
     "ToolContext",
+    "builtin_permission_argument_names",
 ]

@@ -47,17 +47,26 @@ def _validated_path(requested: str | Path) -> Path:
 
     candidate = Path(raw)
     parts = candidate.parts[1:] if candidate.anchor else candidate.parts
-    if not parts or any(part in {"", "."} for part in parts):
+    filesystem_root = bool(candidate.anchor) and candidate == Path(candidate.anchor)
+    if (not parts and not filesystem_root) or any(
+        part in {"", "."} for part in parts
+    ):
         raise ToolAccessDenied("invalid workspace path")
     if any(part == ".." for part in parts):
         raise ToolAccessDenied("path is outside configured workspace")
     if any(":" in part for part in parts):
+        raise ToolAccessDenied("invalid workspace path")
+    if os.name == "nt" and any(part.endswith((".", " ")) for part in parts):
         raise ToolAccessDenied("invalid workspace path")
 
     alternate_parts = raw.replace("\\", "/").split("/")
     if any(part == ".." for part in alternate_parts):
         raise ToolAccessDenied("path is outside configured workspace")
     if any(part == "." for part in alternate_parts):
+        raise ToolAccessDenied("invalid workspace path")
+    if os.name == "nt" and any(
+        part.endswith((".", " ")) for part in alternate_parts if part
+    ):
         raise ToolAccessDenied("invalid workspace path")
     return candidate
 

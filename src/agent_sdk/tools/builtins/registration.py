@@ -41,6 +41,7 @@ def register_builtin_tools(
             store=store,
             for_write=False,
         ),
+        permission_argument_names=("path",),
     )
     registry.register(
         ToolSpec(
@@ -65,6 +66,7 @@ def register_builtin_tools(
             store=store,
             for_write=True,
         ),
+        permission_argument_names=("path",),
     )
     registry.register(
         ToolSpec(
@@ -95,6 +97,7 @@ def register_builtin_tools(
             bash_permission_arguments,
             store=store,
         ),
+        permission_argument_names=("cwd",),
     )
 
 

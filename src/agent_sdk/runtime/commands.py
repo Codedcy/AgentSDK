@@ -99,7 +99,17 @@ class RuntimeCommands:
         workspaces: Iterable[str | Path],
         idempotency_key: str | None = None,
     ) -> SessionSnapshot:
-        normalized_workspaces = tuple(str(workspace) for workspace in workspaces)
+        try:
+            normalized_workspaces = tuple(
+                str(Path(workspace).resolve(strict=False))
+                for workspace in workspaces
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "workspace root is invalid",
+                retryable=False,
+            ) from error
         snapshot = SessionSnapshot(
             session_id=new_id("ses"),
             workspaces=normalized_workspaces,
