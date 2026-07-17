@@ -5348,7 +5348,6 @@ class RunRecoveryService:
             or not self._is_exact_ready_tool_relation(evidence, base_request)
             or len(evidence.run_events) < 2
             or evidence.run_events[-1].type != "run.interrupted"
-            or evidence.run_events[-2].type != "permission.requested"
         ):
             return None
         requested = tuple(
@@ -5357,7 +5356,26 @@ class RunRecoveryService:
         resolved = tuple(
             event for event in evidence.run_events if event.type == "permission.resolved"
         )
-        if len(requested) != len(resolved) + 1 or requested[-1] != evidence.run_events[-2]:
+        if len(requested) != len(resolved) + 1:
+            return None
+        request_position = next(
+            index
+            for index, event in enumerate(evidence.run_events)
+            if event is requested[-1]
+        )
+        recovery_tail = tuple(
+            event.type for event in evidence.run_events[request_position + 1 :]
+        )
+        if (
+            not recovery_tail
+            or recovery_tail[0] != "run.interrupted"
+            or len(recovery_tail[1:]) % 2
+            or any(
+                recovery_tail[index : index + 2]
+                != ("run.recovery.started", "run.interrupted")
+                for index in range(1, len(recovery_tail), 2)
+            )
+        ):
             return None
         try:
             call = self._engine._tool_call_from_checkpoint(checkpoint)
