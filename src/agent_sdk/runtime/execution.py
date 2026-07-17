@@ -117,18 +117,123 @@ class DurableWorkflowEdge(_RevalidatedDescriptor):
     target: str = Field(min_length=1, max_length=128)
 
 
+class DurableWorkflowExpression(_RevalidatedDescriptor):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        arbitrary_types_allowed=True,
+    )
+
+    path: str
+    op: Literal["eq", "ne", "gt", "gte", "lt", "lte", "contains", "exists"]
+    value: Any = None
+
+    @field_validator("value", mode="after")
+    @classmethod
+    def _value(cls, value: Any) -> Any:
+        return _freeze_json(value)
+
+    @field_serializer("value")
+    def _serialize_value(self, value: Any) -> Any:
+        return _thaw_json(value)
+
+
+class DurableWorkflowInstruction(_RevalidatedDescriptor):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=256)
+    op: Literal["agent", "branch", "loop_check", "jump", "complete"]
+    agent_node_id: str | None = None
+    expression: DurableWorkflowExpression | None = None
+    true_pc: int | None = None
+    false_pc: int | None = None
+    target_pc: int | None = None
+    loop_id: str | None = None
+    max_iterations: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_operation_shape(self) -> Self:
+        values = {
+            "agent_node_id": self.agent_node_id,
+            "expression": self.expression,
+            "true_pc": self.true_pc,
+            "false_pc": self.false_pc,
+            "target_pc": self.target_pc,
+            "loop_id": self.loop_id,
+            "max_iterations": self.max_iterations,
+        }
+        required = {
+            "agent": frozenset({"agent_node_id"}),
+            "branch": frozenset({"expression", "true_pc", "false_pc"}),
+            "loop_check": frozenset(
+                {
+                    "expression",
+                    "true_pc",
+                    "false_pc",
+                    "loop_id",
+                    "max_iterations",
+                }
+            ),
+            "jump": frozenset({"target_pc"}),
+            "complete": frozenset(),
+        }
+        expected = required[self.op]
+        present = frozenset(key for key, value in values.items() if value is not None)
+        if present != expected:
+            raise ValueError(f"workflow {self.op} instruction fields are invalid")
+        for field in ("true_pc", "false_pc", "target_pc"):
+            value = values[field]
+            if isinstance(value, int) and value < 0:
+                raise ValueError("workflow instruction target must be non-negative")
+        if self.max_iterations is not None and self.max_iterations < 1:
+            raise ValueError("workflow loop limit must be positive")
+        return self
+
+
 class DurableWorkflowIR(_RevalidatedDescriptor):
     """Cycle-free, strict durable representation of ``WorkflowIR``."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     name: str
     nodes: tuple[DurableAgentNode, ...]
-    edges: tuple[DurableWorkflowEdge, ...]
+    edges: tuple[DurableWorkflowEdge, ...] = ()
+    inputs: Mapping[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    instructions: tuple[DurableWorkflowInstruction, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     definition_hash: str
 
+    @field_validator("inputs", mode="after")
+    @classmethod
+    def _inputs(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = _freeze_json(value)
+        assert isinstance(frozen, Mapping)
+        return frozen
+
+    @field_serializer("inputs")
+    def _serialize_inputs(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        result = _thaw_json(value)
+        assert isinstance(result, dict)
+        return result
+
     def _content(self) -> dict[str, object]:
+        if self.schema_version == 2:
+            return {
+                "schema_version": self.schema_version,
+                "name": self.name,
+                "inputs": _thaw_json(self.inputs),
+                "nodes": [node.model_dump(mode="json") for node in self.nodes],
+                "instructions": [
+                    instruction.model_dump(mode="json")
+                    for instruction in self.instructions
+                ],
+            }
         return {
             "schema_version": self.schema_version,
             "name": self.name,
@@ -138,6 +243,19 @@ class DurableWorkflowIR(_RevalidatedDescriptor):
 
     @model_validator(mode="after")
     def _validate_canonical_ir(self) -> Self:
+        if self.schema_version == 1:
+            if self.inputs or self.instructions:
+                raise ValueError(
+                    "schema-v1 workflow IR cannot contain inputs or instructions"
+                )
+            self._validate_schema_v1()
+        else:
+            self._validate_schema_v2()
+        if self.definition_hash != _hash(self._content()):
+            raise ValueError("workflow definition hash mismatch")
+        return self
+
+    def _validate_schema_v1(self) -> None:
         if not self.nodes:
             raise ValueError("workflow IR must contain at least one node")
         node_ids = tuple(node.id for node in self.nodes)
@@ -151,9 +269,41 @@ class DurableWorkflowIR(_RevalidatedDescriptor):
         actual_edges = tuple((edge.source, edge.target) for edge in self.edges)
         if actual_edges != expected_edges:
             raise ValueError("workflow IR must be a canonical sequential chain")
-        if self.definition_hash != _hash(self._content()):
-            raise ValueError("workflow definition hash mismatch")
-        return self
+
+    def _validate_schema_v2(self) -> None:
+        if self.edges:
+            raise ValueError("schema-v2 workflow IR cannot contain edges")
+        if not self.nodes:
+            raise ValueError("workflow IR must contain at least one node")
+        node_ids = tuple(node.id for node in self.nodes)
+        if len(set(node_ids)) != len(node_ids):
+            raise ValueError("workflow IR node ids must be unique")
+        if not self.instructions or self.instructions[-1].op != "complete":
+            raise ValueError("schema-v2 workflow program must end in complete")
+        instruction_ids = tuple(item.id for item in self.instructions)
+        if len(set(instruction_ids)) != len(instruction_ids):
+            raise ValueError("workflow instruction ids must be unique")
+        agent_ids = tuple(
+            item.agent_node_id
+            for item in self.instructions
+            if item.op == "agent"
+        )
+        if agent_ids != node_ids:
+            raise ValueError(
+                "workflow program must reference each agent node exactly once"
+            )
+        instruction_count = len(self.instructions)
+        if any(
+            target >= instruction_count
+            for instruction in self.instructions
+            for target in (
+                instruction.true_pc,
+                instruction.false_pc,
+                instruction.target_pc,
+            )
+            if target is not None
+        ):
+            raise ValueError("workflow instruction target is out of range")
 
 
 class ToolCapabilityDescriptor(_RevalidatedDescriptor):

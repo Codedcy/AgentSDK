@@ -320,6 +320,32 @@ def test_workflow_ir_model_validate_rejects_self_hashed_branching_graph() -> Non
         WorkflowIR.model_validate(payload)
 
 
+def test_persisted_schema_v1_canonical_bytes_and_hash_are_unchanged() -> None:
+    node = _agent_node("root")
+    content = {
+        "schema_version": 1,
+        "name": "persisted",
+        "nodes": [node.model_dump(mode="json")],
+        "edges": [],
+    }
+    definition_hash = hashlib.sha256(
+        json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    expected = json.dumps(
+        {**content, "definition_hash": definition_hash},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+    restored = WorkflowIR.model_validate(
+        {**content, "definition_hash": definition_hash}
+    )
+
+    assert restored.schema_version == 1
+    assert restored.canonical_bytes() == expected
+    assert restored.definition_hash == definition_hash
+
+
 def _pending_workflow_snapshot() -> WorkflowRunSnapshot:
     workflow = WorkflowCompiler().compile(
         WorkflowDefinition.model_validate(WORKFLOW_DATA)

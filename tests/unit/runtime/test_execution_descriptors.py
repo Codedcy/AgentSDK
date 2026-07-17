@@ -24,6 +24,7 @@ from agent_sdk.runtime.models import (
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.models import (
     AgentNode,
+    WorkflowDefinition,
     WorkflowEdge,
     WorkflowIR,
     WorkflowNodeSnapshot,
@@ -31,6 +32,7 @@ from agent_sdk.workflow.models import (
     WorkflowRunSnapshot,
     WorkflowRunStatus,
 )
+from agent_sdk.workflow.compiler import WorkflowCompiler
 
 
 def _canonical_hash(value: object) -> str:
@@ -237,6 +239,50 @@ def test_workflow_descriptor_covers_agents_workflow_tools_and_policy() -> None:
     )
     assert descriptor.workflow_definition_hash == workflow.definition_hash
     assert descriptor.descriptor_hash
+
+
+def test_workflow_descriptor_round_trips_schema_v2_program() -> None:
+    workflow = WorkflowCompiler().compile(
+        WorkflowDefinition.model_validate(
+            {
+                "api_version": "agent-sdk/v1",
+                "kind": "Workflow",
+                "name": "controlled",
+                "inputs": {"enabled": True},
+                "steps": [
+                    {
+                        "id": "work",
+                        "kind": "agent",
+                        "agent_revision": "coder:1",
+                        "input": "work",
+                    }
+                ],
+            }
+        )
+    )
+    execution = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "work"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+
+    descriptor = WorkflowExecutionDescriptor.create(
+        workflow=workflow,
+        agents=(WorkflowAgentDescriptor.create("coder:1", execution),),
+        tools=(),
+        policy=execution.policy,
+    )
+    restored = WorkflowExecutionDescriptor.model_validate(
+        descriptor.model_dump(mode="json")
+    )
+
+    assert restored == descriptor
+    assert restored.workflow.schema_version == 2
+    assert tuple(item.op for item in restored.workflow.instructions) == (
+        "agent",
+        "complete",
+    )
 
 
 def test_workflow_descriptor_rejects_rehashed_noncanonical_workflow() -> None:

@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Any, Literal, Self, cast
+from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
@@ -74,14 +74,72 @@ class WorkflowEdge(BaseModel):
     target: str = Field(min_length=1, max_length=128)
 
 
+class ConditionStep(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: Literal["condition"] = "condition"
+    when: WorkflowExpression
+    then_steps: tuple[WorkflowStep, ...] = Field(min_length=1)
+    else_steps: tuple[WorkflowStep, ...] = ()
+
+
+class LoopStep(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=128)
+    kind: Literal["loop"] = "loop"
+    until: WorkflowExpression
+    max_iterations: int = Field(ge=1)
+    body: tuple[WorkflowStep, ...] = Field(min_length=1)
+
+
+type WorkflowStep = Annotated[
+    AgentNode | ConditionStep | LoopStep,
+    Field(discriminator="kind"),
+]
+
+
 class WorkflowDefinition(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     api_version: Literal["agent-sdk/v1"]
     kind: Literal["Workflow"]
     name: str = Field(min_length=1, max_length=256)
-    nodes: tuple[AgentNode, ...]
+    inputs: Mapping[str, JsonValue] = Field(default_factory=dict)
+    steps: tuple[WorkflowStep, ...] = ()
+    nodes: tuple[AgentNode, ...] = ()
     edges: tuple[WorkflowEdge, ...] = ()
+
+    @field_validator("inputs", mode="before")
+    @classmethod
+    def _validate_inputs(cls, value: Any) -> Mapping[str, JsonValue]:
+        frozen = freeze_json(value)
+        if not isinstance(frozen, Mapping):
+            raise ValueError("workflow inputs must be an object")
+        return cast(Mapping[str, JsonValue], frozen)
+
+    @field_validator("inputs", mode="after")
+    @classmethod
+    def _freeze_inputs(
+        cls,
+        value: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], freeze_json(value))
+
+    @field_serializer("inputs")
+    def _serialize_inputs(self, value: Mapping[str, JsonValue]) -> Any:
+        return thaw_json(value)
+
+    @model_validator(mode="after")
+    def _validate_definition_shape(self) -> Self:
+        if bool(self.steps) == bool(self.nodes):
+            raise ValueError(
+                "workflow definition must contain exactly one of steps or nodes"
+            )
+        if self.steps and self.edges:
+            raise ValueError("workflow steps cannot contain legacy edges")
+        return self
 
 
 def _canonical_json(value: object) -> str:
@@ -93,16 +151,90 @@ def _canonical_json(value: object) -> str:
     )
 
 
+type InstructionOp = Literal["agent", "branch", "loop_check", "jump", "complete"]
+
+
+class WorkflowInstruction(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: str = Field(min_length=1, max_length=256)
+    op: InstructionOp
+    agent_node_id: str | None = None
+    expression: WorkflowExpression | None = None
+    true_pc: int | None = None
+    false_pc: int | None = None
+    target_pc: int | None = None
+    loop_id: str | None = None
+    max_iterations: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_operation_shape(self) -> Self:
+        values = {
+            "agent_node_id": self.agent_node_id,
+            "expression": self.expression,
+            "true_pc": self.true_pc,
+            "false_pc": self.false_pc,
+            "target_pc": self.target_pc,
+            "loop_id": self.loop_id,
+            "max_iterations": self.max_iterations,
+        }
+        required: dict[InstructionOp, frozenset[str]] = {
+            "agent": frozenset({"agent_node_id"}),
+            "branch": frozenset({"expression", "true_pc", "false_pc"}),
+            "loop_check": frozenset(
+                {
+                    "expression",
+                    "true_pc",
+                    "false_pc",
+                    "loop_id",
+                    "max_iterations",
+                }
+            ),
+            "jump": frozenset({"target_pc"}),
+            "complete": frozenset(),
+        }
+        expected = required[self.op]
+        present = frozenset(key for key, value in values.items() if value is not None)
+        if present != expected:
+            raise ValueError(f"workflow {self.op} instruction fields are invalid")
+        for field in ("true_pc", "false_pc", "target_pc"):
+            value = values[field]
+            if isinstance(value, int) and value < 0:
+                raise ValueError("workflow instruction target must be non-negative")
+        if self.max_iterations is not None and self.max_iterations < 1:
+            raise ValueError("workflow loop limit must be positive")
+        return self
+
+
 class WorkflowIR(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 2
     name: str
     nodes: tuple[AgentNode, ...]
-    edges: tuple[WorkflowEdge, ...]
+    edges: tuple[WorkflowEdge, ...] = ()
+    inputs: Mapping[str, JsonValue] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+    instructions: tuple[WorkflowInstruction, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
     definition_hash: str
 
     def _content(self) -> dict[str, object]:
+        if self.schema_version == 2:
+            return {
+                "schema_version": self.schema_version,
+                "name": self.name,
+                "inputs": thaw_json(self.inputs),
+                "nodes": [node.model_dump(mode="json") for node in self.nodes],
+                "instructions": [
+                    instruction.model_dump(mode="json")
+                    for instruction in self.instructions
+                ],
+            }
         return {
             "schema_version": self.schema_version,
             "name": self.name,
@@ -133,9 +265,71 @@ class WorkflowIR(BaseModel):
             definition_hash=definition_hash,
         )
 
+    @classmethod
+    def create_program(
+        cls,
+        *,
+        name: str,
+        inputs: Mapping[str, JsonValue],
+        nodes: tuple[AgentNode, ...],
+        instructions: tuple[WorkflowInstruction, ...],
+    ) -> Self:
+        frozen_inputs = freeze_json(inputs)
+        if not isinstance(frozen_inputs, Mapping):
+            raise ValueError("workflow inputs must be an object")
+        content: dict[str, object] = {
+            "schema_version": 2,
+            "name": name,
+            "inputs": thaw_json(frozen_inputs),
+            "nodes": [node.model_dump(mode="json") for node in nodes],
+            "instructions": [
+                instruction.model_dump(mode="json")
+                for instruction in instructions
+            ],
+        }
+        definition_hash = hashlib.sha256(
+            _canonical_json(content).encode("utf-8")
+        ).hexdigest()
+        return cls(
+            schema_version=2,
+            name=name,
+            nodes=nodes,
+            edges=(),
+            inputs=cast(Mapping[str, JsonValue], frozen_inputs),
+            instructions=instructions,
+            definition_hash=definition_hash,
+        )
+
+    @field_validator("inputs", mode="before")
+    @classmethod
+    def _validate_inputs(cls, value: Any) -> Mapping[str, JsonValue]:
+        frozen = freeze_json(value)
+        if not isinstance(frozen, Mapping):
+            raise ValueError("workflow inputs must be an object")
+        return cast(Mapping[str, JsonValue], frozen)
+
+    @field_validator("inputs", mode="after")
+    @classmethod
+    def _freeze_inputs(
+        cls,
+        value: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], freeze_json(value))
+
+    @field_serializer("inputs")
+    def _serialize_inputs(self, value: Mapping[str, JsonValue]) -> Any:
+        return thaw_json(value)
+
     @model_validator(mode="after")
     def _validate_hash(self) -> Self:
-        _validate_canonical_graph(self.nodes, self.edges)
+        if self.schema_version == 1:
+            if self.inputs or self.instructions:
+                raise ValueError(
+                    "schema-v1 workflow IR cannot contain inputs or instructions"
+                )
+            _validate_canonical_graph(self.nodes, self.edges)
+        else:
+            _validate_canonical_program(self.nodes, self.edges, self.instructions)
         expected = hashlib.sha256(
             _canonical_json(self._content()).encode("utf-8")
         ).hexdigest()
@@ -172,6 +366,43 @@ def _validate_canonical_graph(
     actual_edges = tuple((edge.source, edge.target) for edge in edges)
     if actual_edges != expected_edges:
         raise ValueError("workflow IR must be a canonical sequential chain")
+
+
+def _validate_canonical_program(
+    nodes: tuple[AgentNode, ...],
+    edges: tuple[WorkflowEdge, ...],
+    instructions: tuple[WorkflowInstruction, ...],
+) -> None:
+    if edges:
+        raise ValueError("schema-v2 workflow IR cannot contain edges")
+    if not nodes:
+        raise ValueError("workflow IR must contain at least one node")
+    node_ids = tuple(node.id for node in nodes)
+    if len(set(node_ids)) != len(node_ids):
+        raise ValueError("workflow IR node ids must be unique")
+    if not instructions or instructions[-1].op != "complete":
+        raise ValueError("schema-v2 workflow program must end in complete")
+    instruction_ids = tuple(instruction.id for instruction in instructions)
+    if len(set(instruction_ids)) != len(instruction_ids):
+        raise ValueError("workflow instruction ids must be unique")
+    agent_ids = tuple(
+        cast(str, instruction.agent_node_id)
+        for instruction in instructions
+        if instruction.op == "agent"
+    )
+    if agent_ids != node_ids:
+        raise ValueError(
+            "workflow program must reference each agent node exactly once"
+        )
+    instruction_count = len(instructions)
+    for instruction in instructions:
+        for target in (
+            instruction.true_pc,
+            instruction.false_pc,
+            instruction.target_pc,
+        ):
+            if target is not None and target >= instruction_count:
+                raise ValueError("workflow instruction target is out of range")
 
 
 class WorkflowRunStatus(StrEnum):
