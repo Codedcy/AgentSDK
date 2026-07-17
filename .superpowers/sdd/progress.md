@@ -259,5 +259,6 @@ $ .\.venv\Scripts\python.exe -m pytest tests\docs\test_v01_release_ledger.py tes
 $ .\.venv\Scripts\python.exe -m ruff check tests\fixtures\v01_runtime.py tests\e2e\test_v01_release.py tests\docs\test_v01_release_ledger.py
 All checks passed!
 ```
+v0.1 R0 Task 3: complete (commits 7036622 and 74c1e3b; review Spec approved / Quality approved; exact checkpoint evidence retained)
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r1-tools-policy.md
 v0.1 next action: create and run the first R1 RED test `tests/unit/permissions/test_policy_rules.py` with `.\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py -q`; do not start R1 before that RED test
