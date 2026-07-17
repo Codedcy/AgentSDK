@@ -10,6 +10,7 @@ from agent_sdk.permissions import (
     PermissionRule,
     PolicyEngine,
 )
+from agent_sdk.runtime.execution import ExecutionPolicyDescriptor
 
 
 def request(tool: str, arguments: dict[str, object]) -> PermissionRequest:
@@ -124,6 +125,49 @@ def test_path_prefix_respects_component_boundary(tmp_path: Path) -> None:
     assert (
         policy.evaluate(request("read", {"path": str(workspace_file)})).action
         == "deny"
+    )
+
+
+def test_relative_path_prefix_is_canonicalized_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_cwd = tmp_path / "initial"
+    later_cwd = tmp_path / "later"
+    initial_cwd.mkdir()
+    later_cwd.mkdir()
+    workspace = initial_cwd / "workspace"
+    monkeypatch.chdir(initial_cwd)
+    policy = PolicyEngine(
+        default_outcome="deny",
+        rules=(
+            PermissionRule(
+                outcome="allow",
+                tool="read",
+                path_prefix=Path("workspace"),
+            ),
+        ),
+    )
+    target = workspace / "notes.txt"
+    initial_config = policy.execution_config()
+    initial_descriptor = ExecutionPolicyDescriptor.create(
+        permission_default=initial_config["permission_default"],
+        permission_rules=initial_config["permission_rules"],
+    )
+
+    monkeypatch.chdir(later_cwd)
+
+    assert policy.evaluate(request("read", {"path": str(target)})).allowed
+    later_config = policy.execution_config()
+    later_descriptor = ExecutionPolicyDescriptor.create(
+        permission_default=later_config["permission_default"],
+        permission_rules=later_config["permission_rules"],
+    )
+    assert later_config == initial_config
+    assert later_descriptor == initial_descriptor
+    assert (
+        Path(initial_descriptor.permission_rules[0]["path_prefix"])
+        == workspace.resolve()
     )
 
 

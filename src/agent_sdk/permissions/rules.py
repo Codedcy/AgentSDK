@@ -38,11 +38,10 @@ def _match_path(prefix: Path | None, requested: object) -> int | None:
         return 0
     if not isinstance(requested, str) or not requested:
         return None
-    canonical_prefix = prefix.resolve(strict=False)
     canonical_requested = Path(requested).resolve(strict=False)
-    if not canonical_requested.is_relative_to(canonical_prefix):
+    if not canonical_requested.is_relative_to(prefix):
         return None
-    return len(canonical_prefix.parts)
+    return len(prefix.parts)
 
 
 def match_rule(

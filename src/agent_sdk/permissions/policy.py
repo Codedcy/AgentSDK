@@ -14,6 +14,17 @@ from agent_sdk.permissions.rules import (
 from agent_sdk.tools.models import freeze_json
 
 
+def _canonicalize_rule(rule: PermissionRule) -> PermissionRule:
+    if rule.path_prefix is None:
+        return rule
+    return PermissionRule.model_validate(
+        {
+            **rule.model_dump(mode="python"),
+            "path_prefix": rule.path_prefix.resolve(strict=False),
+        }
+    )
+
+
 class PolicyEngine:
     def __init__(
         self,
@@ -27,7 +38,7 @@ class PolicyEngine:
                 retryable=False,
             )
         self._default_outcome = default_outcome
-        self._rules = tuple(rules)
+        self._rules = tuple(_canonicalize_rule(rule) for rule in rules)
 
     def evaluate(self, request: PermissionRequest) -> PermissionDecision:
         matches = tuple(
