@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_sdk.subagents import ChildResult, TaskEnvelope
+from agent_sdk.workflow.models import WorkflowControlState
 from agent_sdk.workflow import (
     AgentNode,
     WorkflowCompiler,
@@ -368,6 +369,7 @@ def _pending_workflow_snapshot() -> WorkflowRunSnapshot:
         status=WorkflowRunStatus.RUNNING,
         workflow=workflow,
         nodes=nodes,
+        control=WorkflowControlState(),
     )
 
 

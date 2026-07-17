@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -405,6 +406,89 @@ class WorkflowFailure(BaseModel):
     retryable: bool
 
 
+class WorkflowControlState(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    program_counter: int = Field(default=0, ge=0)
+    revision: int = Field(default=1, ge=1)
+    selected_branches: Mapping[str, Literal["then", "else"]] = Field(
+        default_factory=dict,
+        validate_default=True,
+    )
+    loop_iterations: Mapping[str, int] = Field(
+        default_factory=dict,
+        validate_default=True,
+    )
+    outputs: Mapping[str, JsonValue] = Field(
+        default_factory=dict,
+        validate_default=True,
+    )
+
+    @field_validator("program_counter", "revision", mode="before")
+    @classmethod
+    def _validate_counter_type(cls, value: Any) -> int:
+        if type(value) is not int:
+            raise ValueError("workflow control counters must be integers")
+        return value
+
+    @field_validator(
+        "selected_branches",
+        "loop_iterations",
+        "outputs",
+        mode="before",
+    )
+    @classmethod
+    def _validate_mapping(
+        cls,
+        value: Any,
+        info: ValidationInfo,
+    ) -> Mapping[str, Any]:
+        if (
+            info.field_name == "loop_iterations"
+            and isinstance(value, Mapping)
+            and any(type(iteration) is not int for iteration in value.values())
+        ):
+            raise ValueError("workflow loop iterations must be integers")
+        frozen = freeze_json(value)
+        if not isinstance(frozen, Mapping):
+            raise ValueError("workflow control field must be an object")
+        return frozen
+
+    @field_validator("selected_branches", "loop_iterations", "outputs", mode="after")
+    @classmethod
+    def _freeze_mapping(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        for key in value:
+            if not key or len(key) > 128:
+                raise ValueError("workflow control ids must be nonempty and bounded")
+        return cast(Mapping[str, Any], freeze_json(value))
+
+    @field_validator("loop_iterations", mode="after")
+    @classmethod
+    def _validate_loop_iterations(
+        cls,
+        value: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        if any(iteration < 0 for iteration in value.values()):
+            raise ValueError("workflow loop iterations must be non-negative")
+        return value
+
+    @field_serializer("selected_branches", "loop_iterations", "outputs")
+    def _serialize_mapping(self, value: Mapping[str, Any]) -> Any:
+        return thaw_json(value)
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        del deep
+        data = self.model_dump(mode="json")
+        if update is not None:
+            data.update(update)
+        return type(self).model_validate(data)
+
+
 class WorkflowNodeSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -483,6 +567,10 @@ class WorkflowRunSnapshot(BaseModel):
     error: WorkflowFailure | None = None
     execution_compatibility: Literal["legacy_unknown", "current"] = "legacy_unknown"
     execution_descriptor: WorkflowExecutionDescriptor | None = None
+    control: WorkflowControlState | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
     @model_validator(mode="after")
     def _validate_aggregate(self) -> Self:
@@ -508,19 +596,34 @@ class WorkflowRunSnapshot(BaseModel):
                 raise ValueError("workflow snapshot node ownership is invalid")
 
         statuses = tuple(node.status for node in self.nodes)
-        first_incomplete = next(
-            (
-                index
-                for index, status in enumerate(statuses)
-                if status is not WorkflowNodeStatus.COMPLETED
-            ),
-            len(statuses),
-        )
-        if any(
-            status is not WorkflowNodeStatus.PENDING
-            for status in statuses[first_incomplete + 1 :]
-        ):
-            raise ValueError("workflow snapshot statuses are not a legal sequential prefix")
+        control_revision = 0
+        if self.workflow.schema_version == 1:
+            if self.control is not None:
+                raise ValueError("schema-v1 workflow cannot contain control state")
+            first_incomplete = next(
+                (
+                    index
+                    for index, status in enumerate(statuses)
+                    if status is not WorkflowNodeStatus.COMPLETED
+                ),
+                len(statuses),
+            )
+            if any(
+                status is not WorkflowNodeStatus.PENDING
+                for status in statuses[first_incomplete + 1 :]
+            ):
+                raise ValueError(
+                    "workflow snapshot statuses are not a legal sequential prefix"
+                )
+        else:
+            if self.control is None:
+                raise ValueError("schema-v2 workflow requires control state")
+            _validate_control_state(self.workflow, self.nodes, self.control)
+            control_revision = self.control.revision - 1
+            if statuses.count(WorkflowNodeStatus.RUNNING) > 1:
+                raise ValueError("workflow snapshot has multiple running nodes")
+            if statuses.count(WorkflowNodeStatus.FAILED) > 1:
+                raise ValueError("workflow snapshot has multiple failed nodes")
 
         if self.status is WorkflowRunStatus.RUNNING:
             if any(
@@ -528,29 +631,53 @@ class WorkflowRunSnapshot(BaseModel):
             ):
                 raise ValueError("running workflow contains terminal fields")
         elif self.status is WorkflowRunStatus.COMPLETED:
+            if self.workflow.schema_version == 1:
+                completed_shape_valid = (
+                    all(
+                        status is WorkflowNodeStatus.COMPLETED
+                        for status in statuses
+                    )
+                    and self.output_text == self.nodes[-1].output_text
+                )
+            else:
+                completed_shape_valid = all(
+                    status
+                    not in {WorkflowNodeStatus.RUNNING, WorkflowNodeStatus.FAILED}
+                    for status in statuses
+                )
             if (
-                any(status is not WorkflowNodeStatus.COMPLETED for status in statuses)
+                not completed_shape_valid
                 or self.output_text is None
                 or self.usage is None
                 or self.error is not None
-                or self.output_text != self.nodes[-1].output_text
                 or self.usage != _sum_node_usage(self.nodes)
             ):
                 raise ValueError("completed workflow state is invalid")
-        elif (
-            statuses.count(WorkflowNodeStatus.FAILED) != 1
-            or self.error is None
-            or self.output_text is not None
-            or self.usage is not None
-            or self.error
-            != next(
-                node.error
+        else:
+            failed_nodes = tuple(
+                node
                 for node in self.nodes
                 if node.status is WorkflowNodeStatus.FAILED
             )
-        ):
-            raise ValueError("failed workflow state is invalid")
-        base_version = 1 + sum(node.version - 1 for node in self.nodes)
+            failed_shape_valid = (
+                len(failed_nodes) == 1 and self.error == failed_nodes[0].error
+            )
+            if self.workflow.schema_version == 2 and not failed_nodes:
+                failed_shape_valid = all(
+                    status is not WorkflowNodeStatus.RUNNING for status in statuses
+                )
+            if (
+                not failed_shape_valid
+                or self.error is None
+                or self.output_text is not None
+                or self.usage is not None
+            ):
+                raise ValueError("failed workflow state is invalid")
+        base_version = (
+            1
+            + sum(node.version - 1 for node in self.nodes)
+            + control_revision
+        )
         expected_version = (
             base_version
             if self.status is WorkflowRunStatus.RUNNING
@@ -581,6 +708,45 @@ class WorkflowResult(BaseModel):
     nodes: tuple[WorkflowNodeSnapshot, ...]
     output_text: str
     usage: TokenUsage
+
+
+def _validate_control_state(
+    workflow: WorkflowIR,
+    nodes: tuple[WorkflowNodeSnapshot, ...],
+    control: WorkflowControlState,
+) -> None:
+    if control.program_counter >= len(workflow.instructions):
+        raise ValueError("workflow program counter is out of range")
+
+    branch_ids = {
+        instruction.id
+        for instruction in workflow.instructions
+        if instruction.op == "branch"
+    }
+    loop_limits = {
+        instruction.loop_id: instruction.max_iterations
+        for instruction in workflow.instructions
+        if instruction.op == "loop_check"
+        and instruction.loop_id is not None
+        and instruction.max_iterations is not None
+    }
+    node_statuses = {node.node_id: node.status for node in nodes}
+    if not set(control.selected_branches).issubset(branch_ids):
+        raise ValueError("workflow control contains an unknown branch id")
+    if not set(control.loop_iterations).issubset(loop_limits):
+        raise ValueError("workflow control contains an unknown loop id")
+    if any(
+        iterations > loop_limits[loop_id]
+        for loop_id, iterations in control.loop_iterations.items()
+    ):
+        raise ValueError("workflow control loop counter exceeds its limit")
+    if not set(control.outputs).issubset(node_statuses):
+        raise ValueError("workflow control contains an unknown output id")
+    if any(
+        node_statuses[node_id] is not WorkflowNodeStatus.COMPLETED
+        for node_id in control.outputs
+    ):
+        raise ValueError("workflow control output does not belong to a completed node")
 
 
 def _sum_node_usage(nodes: tuple[WorkflowNodeSnapshot, ...]) -> TokenUsage:

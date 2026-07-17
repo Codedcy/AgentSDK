@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from enum import Enum
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
@@ -34,6 +35,8 @@ from agent_sdk.storage.idempotency import (
     validate_replay,
 )
 from agent_sdk.workflow.models import (
+    JsonValue,
+    WorkflowControlState,
     WorkflowFailure,
     WorkflowIR,
     WorkflowNodeSnapshot,
@@ -100,6 +103,11 @@ class WorkflowState:
                 "current" if execution_descriptor is not None else "legacy_unknown"
             ),
             execution_descriptor=execution_descriptor,
+            control=(
+                WorkflowControlState()
+                if workflow.schema_version == 2
+                else None
+            ),
         )
         snapshot_data = snapshot.model_dump(mode="json")
         fingerprint: str | None = None
@@ -288,6 +296,58 @@ class WorkflowState:
             "workflow.node.started",
             {"node_id": node.node_id, "run_id": run_id},
         )
+
+    async def advance_control(
+        self,
+        current: WorkflowRunSnapshot,
+        updated: WorkflowControlState,
+        *,
+        event_type: str,
+        event_payload: Mapping[str, JsonValue],
+    ) -> WorkflowRunSnapshot:
+        if (
+            current.workflow.schema_version != 2
+            or current.control is None
+            or current.status is not WorkflowRunStatus.RUNNING
+        ):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "workflow control cannot advance from the current state",
+                retryable=False,
+            )
+        if updated.revision != current.control.revision + 1:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "workflow control revision is not the next revision",
+                retryable=False,
+            )
+        advanced = current.model_copy(
+            update={
+                "control": updated,
+                "version": current.version + 1,
+            }
+        )
+        event = EventEnvelope.new(
+            type=event_type,
+            session_id=current.session_id,
+            run_id=current.workflow_run_id,
+            sequence=advanced.version,
+            payload=dict(event_payload),
+        )
+        await self._commit(
+            CommitBatch(
+                events=(event,),
+                snapshots=(_workflow_write(advanced),),
+                preconditions=(
+                    SnapshotPrecondition("session", current.session_id),
+                    _exact_workflow_precondition(current),
+                ),
+            ),
+            current.session_id,
+            conflict_message="workflow state changed concurrently",
+            conflict_retryable=True,
+        )
+        return advanced
 
     async def complete_node(
         self,
@@ -514,6 +574,7 @@ class WorkflowState:
         session_id: str,
         *,
         conflict_message: str,
+        conflict_retryable: bool = False,
     ) -> None:
         result = await _commit_batch(self._store, batch)
         if result is None:
@@ -536,7 +597,7 @@ class WorkflowState:
                 raise AgentSDKError(
                     ErrorCode.CONFLICT,
                     conflict_message,
-                    retryable=False,
+                    retryable=conflict_retryable,
                 )
         raise AgentSDKError(
             ErrorCode.INTERNAL,
