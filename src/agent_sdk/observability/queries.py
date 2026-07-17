@@ -417,6 +417,7 @@ def _same_creation_identity(created: RunSnapshot, current: RunSnapshot) -> bool:
         and created.parent_run_id == current.parent_run_id
         and created.workflow_run_id == current.workflow_run_id
         and created.workflow_node_id == current.workflow_node_id
+        and created.workflow_node_execution == current.workflow_node_execution
         and created.task_envelope == current.task_envelope
     )
 

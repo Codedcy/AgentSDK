@@ -418,6 +418,12 @@ class WorkflowAPI:
         self._compiler = compiler
         self._lifecycle = lifecycle
 
+    def compile(
+        self,
+        definition: WorkflowIR | WorkflowDefinition | str,
+    ) -> WorkflowIR:
+        return self._compile(definition)
+
     async def start(
         self,
         session_id: str,

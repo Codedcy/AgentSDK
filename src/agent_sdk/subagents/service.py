@@ -58,6 +58,7 @@ class SubagentService:
         parent_run_id: str,
         workflow_run_id: str,
         workflow_node_id: str,
+        workflow_node_execution: int | None = None,
         agent_revision: str,
         task: TaskEnvelope,
     ) -> RunSnapshot:
@@ -91,6 +92,7 @@ class SubagentService:
             parent_run_id=parent_run_id,
             workflow_run_id=workflow_run_id,
             workflow_node_id=workflow_node_id,
+            workflow_node_execution=workflow_node_execution,
             task_envelope=task,
             execution_descriptor=descriptor,
         )

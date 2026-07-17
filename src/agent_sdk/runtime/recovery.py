@@ -3133,6 +3133,7 @@ class RunRecoveryService:
             parent_run_id=run.parent_run_id,
             workflow_run_id=run.workflow_run_id,
             workflow_node_id=run.workflow_node_id,
+            workflow_node_execution=run.workflow_node_execution,
             task_envelope=run.task_envelope,
             execution_compatibility=run.execution_compatibility,
             execution_descriptor=run.execution_descriptor,

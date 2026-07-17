@@ -425,6 +425,7 @@ class RuntimeCommands:
         parent_run_id: str | None = None,
         workflow_run_id: str | None = None,
         workflow_node_id: str | None = None,
+        workflow_node_execution: int | None = None,
         task_envelope: TaskEnvelope | None = None,
         execution_descriptor: ExecutionDescriptor | None = None,
         idempotency_key: str | None = None,
@@ -466,6 +467,7 @@ class RuntimeCommands:
                 "parent_run_id": parent_run_id,
                 "workflow_run_id": workflow_run_id,
                 "workflow_node_id": workflow_node_id,
+                "workflow_node_execution": workflow_node_execution,
                 "task_envelope": (
                     None
                     if task_envelope is None
@@ -533,6 +535,7 @@ class RuntimeCommands:
                     parent_run_id=parent_run_id,
                     workflow_run_id=workflow_run_id,
                     workflow_node_id=workflow_node_id,
+                    workflow_node_execution=workflow_node_execution,
                     task_envelope=task_envelope,
                     execution_compatibility=compatibility,
                     execution_descriptor=execution_descriptor,
@@ -620,6 +623,7 @@ class RuntimeCommands:
                 parent_run_id=parent_run_id,
                 workflow_run_id=workflow_run_id,
                 workflow_node_id=workflow_node_id,
+                workflow_node_execution=workflow_node_execution,
                 task_envelope=task_envelope,
                 execution_descriptor=execution_descriptor,
                 expected_run_id=run_id,
@@ -646,6 +650,7 @@ class RuntimeCommands:
         parent_run_id: str | None,
         workflow_run_id: str | None,
         workflow_node_id: str | None,
+        workflow_node_execution: int | None,
         task_envelope: TaskEnvelope | None,
         execution_descriptor: ExecutionDescriptor | None,
         expected_run_id: str | None,
@@ -680,6 +685,7 @@ class RuntimeCommands:
             or snapshot.parent_run_id != parent_run_id
             or snapshot.workflow_run_id != workflow_run_id
             or snapshot.workflow_node_id != workflow_node_id
+            or snapshot.workflow_node_execution != workflow_node_execution
             or snapshot.task_envelope != task_envelope
             or snapshot.execution_compatibility != "current"
             or snapshot.execution_descriptor != execution_descriptor

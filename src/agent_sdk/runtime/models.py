@@ -165,6 +165,12 @@ class RunSnapshot(BaseModel):
     parent_run_id: str | None = None
     workflow_run_id: str | None = None
     workflow_node_id: str | None = None
+    workflow_node_execution: int | None = Field(
+        default=None,
+        ge=1,
+        strict=True,
+        exclude_if=lambda value: value is None,
+    )
     task_envelope: TaskEnvelope | None = None
     error: RunFailure | None = None
     execution_compatibility: Literal["legacy_unknown", "current"] = "legacy_unknown"
@@ -173,6 +179,10 @@ class RunSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def _validate_status_fields(self) -> Self:
+        if self.workflow_node_execution is not None and (
+            self.workflow_run_id is None or self.workflow_node_id is None
+        ):
+            raise ValueError("workflow node execution has no workflow binding")
         if (self.execution_compatibility == "current") != (
             self.execution_descriptor is not None
         ):

@@ -6,10 +6,7 @@ from dataclasses import dataclass
 from typing import Literal, cast
 
 from agent_sdk.tools.models import freeze_json, thaw_json
-from agent_sdk.workflow.expressions import (
-    WorkflowExpressionError,
-    evaluate_expression,
-)
+from agent_sdk.workflow.expressions import WorkflowExpressionError, evaluate_expression
 from agent_sdk.workflow.models import (
     AgentNode,
     JsonValue,
@@ -69,26 +66,43 @@ def next_action(
             return ExecuteAgent(node=node)
         if completed.status is not WorkflowNodeStatus.COMPLETED:
             raise ValueError("completed node map contains a non-completed node")
+        consumed = control.node_execution_counts.get(node_id, 0)
+        if completed.execution_count > 0 and completed.execution_count == consumed:
+            return ExecuteAgent(node=node)
+        if (
+            completed.execution_count > 0
+            and completed.execution_count != consumed + 1
+        ):
+            raise ValueError("workflow node execution count is not reducible")
         output = _parse_node_output(cast(str, completed.output_text))
         outputs = dict(control.outputs)
         first_merge = node_id not in outputs
         outputs[node_id] = output
+        execution_counts = dict(control.node_execution_counts)
+        if completed.execution_count > 0:
+            execution_counts[node_id] = completed.execution_count
         updated = _updated_control(
             control,
             program_counter=control.program_counter + 1,
             outputs=outputs,
+            node_execution_counts=execution_counts,
             last_output_node_id=(
-                node_id if first_merge else control.last_output_node_id
+                node_id
+                if completed.execution_count > 0 or first_merge
+                else control.last_output_node_id
             ),
         )
+        payload: dict[str, JsonValue] = {
+            "node_id": node_id,
+            "output": output,
+            "program_counter": updated.program_counter,
+        }
+        if completed.execution_count > 0:
+            payload["execution_index"] = completed.execution_count
         return PersistControl(
             control=updated,
             event_type="workflow.node.output.recorded",
-            event_payload={
-                "node_id": node_id,
-                "output": output,
-                "program_counter": updated.program_counter,
-            },
+            event_payload=payload,
         )
 
     if instruction.op == "branch":
@@ -241,6 +255,7 @@ def _updated_control(
     selected_branches: Mapping[str, str] | None = None,
     loop_iterations: Mapping[str, int] | None = None,
     outputs: Mapping[str, JsonValue] | None = None,
+    node_execution_counts: Mapping[str, int] | None = None,
     last_output_node_id: str | None = None,
 ) -> WorkflowControlState:
     return WorkflowControlState.model_validate(
@@ -258,6 +273,11 @@ def _updated_control(
                 else loop_iterations
             ),
             "outputs": current.outputs if outputs is None else outputs,
+            "node_execution_counts": (
+                current.node_execution_counts
+                if node_execution_counts is None
+                else node_execution_counts
+            ),
             "last_output_node_id": (
                 current.last_output_node_id
                 if last_output_node_id is None
@@ -265,7 +285,6 @@ def _updated_control(
             ),
         }
     )
-
 
 def _parse_node_output(output_text: str) -> JsonValue:
     try:

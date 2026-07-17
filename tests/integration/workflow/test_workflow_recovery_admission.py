@@ -243,8 +243,12 @@ async def _create_selected_run(sdk: AgentSDK, workflow: Any) -> RunSnapshot:
         user_input=node.input,
         workflow_run_id=workflow.workflow_run_id,
         workflow_node_id=node.id,
+        workflow_node_execution=workflow.nodes[0].execution_count,
         execution_descriptor=descriptor,
-        idempotency_key=f"workflow-node:{workflow.workflow_run_id}:{node.id}",
+        idempotency_key=(
+            f"workflow-node:{workflow.workflow_run_id}:{node.id}:"
+            f"{workflow.nodes[0].execution_count}"
+        ),
     )
     return outcome.value
 

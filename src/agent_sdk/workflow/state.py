@@ -277,25 +277,55 @@ class WorkflowState:
         run_id: str,
     ) -> WorkflowRunSnapshot:
         current = snapshot.nodes[index]
-        if current.status is not WorkflowNodeStatus.PENDING:
+        can_repeat = (
+            snapshot.workflow.schema_version == 2
+            and snapshot.control is not None
+            and current.status is WorkflowNodeStatus.COMPLETED
+            and current.execution_count
+            == snapshot.control.node_execution_counts.get(current.node_id, 0)
+        )
+        if current.status is not WorkflowNodeStatus.PENDING and not can_repeat:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
                 "workflow node is not pending",
                 retryable=False,
             )
+        schema_v2 = snapshot.workflow.schema_version == 2
         node = current.model_copy(
             update={
                 "status": WorkflowNodeStatus.RUNNING,
                 "run_id": run_id,
+                "execution_count": (
+                    current.execution_count + 1
+                    if schema_v2
+                    else current.execution_count
+                ),
+                "output_text": None,
+                "accumulated_usage": (
+                    _add_usage(
+                        current.accumulated_usage,
+                        current.usage,
+                    )
+                    if schema_v2
+                    else current.accumulated_usage
+                ),
+                "usage": None,
+                "error": None,
                 "version": current.version + 1,
             }
         )
+        payload: dict[str, object] = {
+            "node_id": node.node_id,
+            "run_id": run_id,
+        }
+        if schema_v2:
+            payload["execution_index"] = node.execution_count
         return await self._node_transition(
             snapshot,
             index,
             node,
             "workflow.node.started",
-            {"node_id": node.node_id, "run_id": run_id},
+            payload,
         )
 
     async def advance_control(
@@ -370,17 +400,20 @@ class WorkflowState:
                 "version": current.version + 1,
             }
         )
+        payload: dict[str, object] = {
+            "node_id": node.node_id,
+            "run_id": node.run_id,
+            "output_text": result.output_text,
+            "usage": result.usage.model_dump(mode="json"),
+        }
+        if snapshot.workflow.schema_version == 2:
+            payload["execution_index"] = node.execution_count
         return await self._node_transition(
             snapshot,
             index,
             node,
             "workflow.node.completed",
-            {
-                "node_id": node.node_id,
-                "run_id": node.run_id,
-                "output_text": result.output_text,
-                "usage": result.usage.model_dump(mode="json"),
-            },
+            payload,
             related_preconditions=related_preconditions,
             recovery_evidence_precondition=recovery_evidence_precondition,
         )
@@ -417,14 +450,20 @@ class WorkflowState:
     async def complete_workflow(
         self,
         snapshot: WorkflowRunSnapshot,
+        *,
+        output_text: str | None = None,
     ) -> WorkflowRunSnapshot:
-        output_text = snapshot.nodes[-1].output_text or ""
+        selected_output = (
+            snapshot.nodes[-1].output_text or ""
+            if output_text is None
+            else output_text
+        )
         usage = _sum_usage(snapshot.nodes)
         completed = snapshot.model_copy(
             update={
                 "status": WorkflowRunStatus.COMPLETED,
                 "version": snapshot.version + 1,
-                "output_text": output_text,
+                "output_text": selected_output,
                 "usage": usage,
             }
         )
@@ -432,7 +471,10 @@ class WorkflowState:
             snapshot,
             completed,
             "workflow.completed",
-            {"output_text": output_text, "usage": usage.model_dump(mode="json")},
+            {
+                "output_text": selected_output,
+                "usage": usage.model_dump(mode="json"),
+            },
         )
         return completed
 
@@ -801,19 +843,43 @@ def _sum_usage(nodes: tuple[WorkflowNodeSnapshot, ...]) -> TokenUsage:
     prompt = completion = total = 0
     prompt_known = completion_known = total_known = False
     for node in nodes:
-        if node.usage is None:
-            continue
-        if node.usage.prompt_tokens is not None:
-            prompt += node.usage.prompt_tokens
-            prompt_known = True
-        if node.usage.completion_tokens is not None:
-            completion += node.usage.completion_tokens
-            completion_known = True
-        if node.usage.total_tokens is not None:
-            total += node.usage.total_tokens
-            total_known = True
+        for usage in (node.accumulated_usage, node.usage):
+            if usage is None:
+                continue
+            if usage.prompt_tokens is not None:
+                prompt += usage.prompt_tokens
+                prompt_known = True
+            if usage.completion_tokens is not None:
+                completion += usage.completion_tokens
+                completion_known = True
+            if usage.total_tokens is not None:
+                total += usage.total_tokens
+                total_known = True
     return TokenUsage(
         prompt_tokens=prompt if prompt_known else None,
         completion_tokens=completion if completion_known else None,
         total_tokens=total if total_known else None,
+    )
+
+
+def _add_usage(
+    previous: TokenUsage | None,
+    current: TokenUsage | None,
+) -> TokenUsage | None:
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+
+    def add(field: str) -> int | None:
+        left = getattr(previous, field)
+        right = getattr(current, field)
+        if left is None and right is None:
+            return None
+        return (left or 0) + (right or 0)
+
+    return TokenUsage(
+        prompt_tokens=add("prompt_tokens"),
+        completion_tokens=add("completion_tokens"),
+        total_tokens=add("total_tokens"),
     )

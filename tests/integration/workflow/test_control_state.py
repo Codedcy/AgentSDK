@@ -135,18 +135,23 @@ def test_control_state_is_deeply_immutable_and_json_bounded() -> None:
     source = {
         "selected_branches": {"choose": "then"},
         "loop_iterations": {"retry": 1},
+        "node_execution_counts": {"node": 1},
         "outputs": {"node": {"items": [1, 2]}},
     }
     control = WorkflowControlState.model_validate(source)
     source["selected_branches"]["choose"] = "else"
     source["loop_iterations"]["retry"] = 99
+    source["node_execution_counts"]["node"] = 99
     source["outputs"]["node"]["items"].append(3)
 
     assert control.selected_branches == {"choose": "then"}
     assert control.loop_iterations == {"retry": 1}
+    assert control.node_execution_counts == {"node": 1}
     assert control.outputs == {"node": {"items": (1, 2)}}
     with pytest.raises(TypeError):
         control.outputs["node"] = {"changed": True}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        control.node_execution_counts["node"] = 2  # type: ignore[index]
     with pytest.raises(ValidationError):
         control.model_copy(update={"program_counter": -1})
 
@@ -159,6 +164,9 @@ def test_control_state_is_deeply_immutable_and_json_bounded() -> None:
         {"loop_iterations": {"loop": -1}},
         {"loop_iterations": {"loop": True}},
         {"loop_iterations": {"": 1}},
+        {"node_execution_counts": {"node": -1}},
+        {"node_execution_counts": {"node": True}},
+        {"node_execution_counts": {"": 1}},
         {"outputs": {"": 1}},
         {"outputs": {"node": float("nan")}},
     ):
@@ -303,6 +311,14 @@ def test_schema_v2_validates_control_references_and_allows_unselected_pending() 
     corrupted_marker["control"]["last_output_node_id"] = "selected"
     with pytest.raises(ValidationError):
         WorkflowRunSnapshot.model_validate(corrupted_marker)
+
+    future_consumption = valid.model_dump(mode="json")
+    future_consumption["nodes"][1]["execution_count"] = 1
+    future_consumption["control"]["node_execution_counts"] = {
+        "unselected": 2
+    }
+    with pytest.raises(ValidationError):
+        WorkflowRunSnapshot.model_validate(future_consumption)
 
 
 @pytest.mark.asyncio
