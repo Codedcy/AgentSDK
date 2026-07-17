@@ -231,4 +231,7 @@ M02-T003 Phase A third-fix gates: exact 22 passed; lexical/boundary 74 passed; m
 M02-T003 Phase A third re-review: Not Approved; Spec C0/I1/M0 and Quality C0/I1/M0
 M02-T003 Phase A third re-review finding: real SQLite accepts leading-empty Tcl variable `$::foo`, but the lexer requires a non-empty initial identifier segment and the GREEN matrix omitted the boundary
 M02-T003 Phase A fourth-fix brief: .superpowers/sdd/M02-T003-phaseA-leading-empty-variable-fix-brief.md
-M02-T003 Phase A fourth fix: in progress; Phase B remains blocked
+M02-T003 Phase A fourth fix: paused at a safe checkpoint; Phase B remains blocked
+M02-T003 Phase A fourth-fix checkpoint: leading-empty Tcl variable code/tests implemented; exact16, Tcl32, lexer/schema/public-boundary90, and migration/v3/review271 passed; root re-ran Tcl32 passed; diff-check clean
+M02-T003 Phase A fourth-fix pending gates: complete storage, full Python3.13, Ruff, strict mypy, py_compile, build/wheel/import/resources/scope; then append report, commit final evidence, and run a fresh independent C0/I0 review
+Next action on resume: read M02-T003-phaseA-leading-empty-variable-fix-brief.md, verify checkpoint commit, start with complete tests/integration/storage; do not redo the completed RED/GREEN or enter Phase B

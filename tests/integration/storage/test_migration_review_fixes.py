@@ -1434,6 +1434,70 @@ def test_sqlite_tcl_variables_bind_as_complete_longest_match_tokens(
 
 
 @pytest.mark.parametrize(
+    ("parameter", "binding_name", "expected"),
+    [
+        ("$::foo", "::foo", 21),
+        ("$::foo(bar)", "::foo(bar)", 22),
+        ("$::::foo", "::::foo", 23),
+        ("$::::::foo", "::::::foo", 24),
+        ("$::::foo(bar)", "::::foo(bar)", 25),
+    ],
+)
+def test_sqlite_tcl_variables_allow_leading_empty_segments_before_identifier(
+    parameter: str,
+    binding_name: str,
+    expected: int,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        assert connection.execute(
+            f"SELECT {parameter}",
+            {binding_name: expected},
+        ).fetchone() == (expected,)
+
+    assert _normalized_sql(f"SELECT {parameter}") == _normalized_sql(
+        f" select\n{parameter} "
+    )
+    assert not _sql_shapes_equal(
+        f"SELECT {parameter.upper()}",
+        f"SELECT {parameter}",
+    )
+
+
+@pytest.mark.parametrize("parameter", ["$", "$::", "$::::", "$(bar)", "$::(bar)"])
+def test_sqlite_tcl_variables_require_an_identifier_in_some_segment(
+    parameter: str,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(sqlite3.Error):
+            connection.execute(f"SELECT {parameter}", {})
+
+    with pytest.raises(ValueError, match="malformed SQLite SQL"):
+        _normalized_sql(f"SELECT {parameter}")
+
+
+@pytest.mark.parametrize(
+    ("whole", "split"),
+    [
+        ("$::foo", "$ ::foo"),
+        ("$::foo", "$/* split */::foo"),
+        ("$::foo", "$:: foo"),
+        ("$::foo", "$::/* split */foo"),
+        ("$::::foo", "$:::: foo"),
+        ("$::foo(bar)", "$::foo (bar)"),
+    ],
+)
+def test_sqlite_leading_empty_tcl_variable_splits_do_not_collide(
+    whole: str,
+    split: str,
+) -> None:
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(sqlite3.Error):
+            connection.execute(f"SELECT {split}", {})
+
+    assert not _sql_shapes_equal(f"SELECT {whole}", f"SELECT {split}")
+
+
+@pytest.mark.parametrize(
     ("whole", "split"),
     [
         ("$foo(bar)", "$foo (bar)"),

@@ -110,13 +110,16 @@ def _parameter_sql_token(value: str, index: int) -> tuple[str, int]:
     name_start = index
     while index < len(value) and _sqlite_identifier_continue(value[index]):
         index += 1
-    if index == name_start:
-        raise ValueError("malformed SQLite SQL")
+    consumed_identifier = index > name_start
     if prefix == "$":
         while value.startswith("::", index):
             index += 2
+            segment_start = index
             while index < len(value) and _sqlite_identifier_continue(value[index]):
                 index += 1
+            consumed_identifier = consumed_identifier or index > segment_start
+        if not consumed_identifier:
+            raise ValueError("malformed SQLite SQL")
         if index < len(value) and value[index] == "(":
             index += 1
             while index < len(value) and value[index] != ")":
@@ -126,6 +129,8 @@ def _parameter_sql_token(value: str, index: int) -> tuple[str, int]:
             if index >= len(value):
                 raise ValueError("malformed SQLite SQL")
             index += 1
+    elif not consumed_identifier:
+        raise ValueError("malformed SQLite SQL")
     return f"parameter:{value[start:index]}", index
 
 
