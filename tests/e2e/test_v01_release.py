@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import pytest
-
 from typing import TYPE_CHECKING
+
+import pytest
 
 from agent_sdk import AgentSDK, AgentSDKError, AgentSpec, ErrorCode, RunStatus
 
@@ -20,7 +20,7 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     workspace_file = v01_harness.workspace / "keep.txt"
     workspace_file.write_text("application-owned", encoding="utf-8")
 
-    sdk = v01_harness.open()
+    sdk: AgentSDK = v01_harness.open()
     session = await sdk.sessions.create(
         workspaces=(v01_harness.workspace,),
         idempotency_key="v01-session",
