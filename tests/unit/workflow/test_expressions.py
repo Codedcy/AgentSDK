@@ -188,6 +188,24 @@ def test_exists_returns_false_for_missing_array_locations() -> None:
         )
 
 
+def test_oversized_decimal_array_index_is_normalized_without_integer_conversion() -> None:
+    scope = {"inputs": {}, "outputs": {"items": ("a", "b")}}
+    path = f"outputs.items.{'9' * 5_000}"
+
+    with pytest.raises(MissingWorkflowValue):
+        resolve_path(scope, path)
+    assert (
+        evaluate_expression(WorkflowExpression(path=path, op="exists"), scope)
+        is False
+    )
+    with pytest.raises(WorkflowExpressionError) as raised:
+        evaluate_expression(
+            WorkflowExpression(path=path, op="eq", value="unreachable"),
+            scope,
+        )
+    assert type(raised.value) is WorkflowExpressionError
+
+
 @pytest.mark.parametrize(
     "value",
     (

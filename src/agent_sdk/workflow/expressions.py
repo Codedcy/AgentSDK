@@ -40,9 +40,16 @@ def resolve_path(scope: Mapping[str, JsonValue], path: str) -> JsonValue:
         elif _is_json_array(current):
             if not part.isdecimal():
                 raise MissingWorkflowValue(path)
-            index = int(part)
-            if index >= len(current):
+            if not current:
                 raise MissingWorkflowValue(path)
+            normalized_index = part.lstrip("0") or "0"
+            maximum_index = str(len(current) - 1)
+            if len(normalized_index) > len(maximum_index) or (
+                len(normalized_index) == len(maximum_index)
+                and normalized_index > maximum_index
+            ):
+                raise MissingWorkflowValue(path)
+            index = int(normalized_index)
             current = current[index]
         else:
             raise MissingWorkflowValue(path)
