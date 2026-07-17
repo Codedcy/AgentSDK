@@ -38,20 +38,34 @@ R2_TASK_COMMITS = (
     "cfdf43a",
     "e4624f7",
     "36a7268",
+    "04d8ee2",
 )
-R2_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
-R2_RESUME_COMMAND = (
+R2_CHECKPOINT = r"""$ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
+........................................................................ [ 18%]
+........................................................................ [ 37%]
+........................................................................ [ 56%]
+........................................................................ [ 75%]
+........................................................................ [ 94%]
+....................                                                     [100%]
+380 passed in 44.02s
+
+$ .\.venv\Scripts\python.exe -m ruff check src\agent_sdk\workflow src\agent_sdk\runtime\execution.py tests\unit\workflow tests\integration\workflow
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
+Success: no issues found in 10 source files"""
+R3_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
+R3_RESUME_COMMAND = (
     r"Get-Content docs\superpowers\plans"
-    r"\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md"
+    r"\2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
 )
-R2_FIRST_TEST = "tests/integration/workflow/test_control_execution.py"
-R2_FIRST_RED = (
-    rf".\.venv\Scripts\python.exe -m pytest {R2_FIRST_TEST} "
-    "tests/integration/workflow/test_control_recovery.py -q"
+R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
+R3_FIRST_RED = (
+    rf".\.venv\Scripts\python.exe -m pytest {R3_FIRST_TEST} -q"
 )
 
 
-def _assert_r1_checkpoint_and_r2_resume(document: str) -> None:
+def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     for commit in R1_COMMITS:
         assert commit in document
     normalized_document = "\n".join(
@@ -64,15 +78,19 @@ def _assert_r1_checkpoint_and_r2_resume(document: str) -> None:
         assert commit in document
     for commit in R2_TASK_COMMITS:
         assert commit in document
+    assert R2_CHECKPOINT in normalized_document
     assert "Critical 0 / Important 0 / Minor 0" in document
     assert "Ready to proceed to R2: Yes" in document
-    assert R2_PLAN in document
-    assert R2_RESUME_COMMAND in document
-    assert "R2 Task 4 Steps 1-2" in document
-    assert R2_FIRST_TEST in document
-    assert R2_FIRST_RED in document
-    assert "R2 remains in progress" in document
-    assert "Tasks 4-5 have not started" in document
+    assert "R2 Task 4" in document
+    assert "final review Spec approved / Quality approved" in document
+    assert R3_PLAN in document
+    assert R3_RESUME_COMMAND in document
+    assert "R3 Task 1 Step 1" in document
+    assert R3_FIRST_TEST in document
+    assert R3_FIRST_RED in document
+    assert "R3 remains pending" in document
+    assert "R3 implementation has not started" in document
+    assert "Tasks 4-5 have not started" not in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
@@ -92,7 +110,10 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     ) in ledger
     assert "R1 is complete through final hardening commit `2f0e922`" in ledger
     assert "final review approved" in ledger
-    assert "| R2 | in_progress |" in ledger
+    assert (
+        "| R2 | completed | condition and bounded loop | "
+        "2026-07-17 checkpoint: 380 passed in 44.02s; Ruff/mypy clean |"
+    ) in ledger
     for slice_id in ("R3", "R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
     assert "4 passed in 4.74s" in ledger
@@ -115,11 +136,11 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
     assert (
-        "v0.1 current implementation status: R0-R1 completed; "
-        "R2 in progress; restricted expressions complete"
+        "v0.1 current implementation status: R0-R2 completed; "
+        "R3 pending and unstarted"
     ) in progress
-    _assert_r1_checkpoint_and_r2_resume(ledger)
-    _assert_r1_checkpoint_and_r2_resume(progress)
+    _assert_release_checkpoint_and_r3_resume(ledger)
+    _assert_release_checkpoint_and_r3_resume(progress)
 
 
 def test_active_roadmap_links_the_v01_plan_index() -> None:

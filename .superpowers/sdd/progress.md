@@ -243,7 +243,7 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: R0-R1 completed; R2 in progress; restricted expressions complete
+v0.1 current implementation status: R0-R2 completed; R3 pending and unstarted
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
@@ -297,8 +297,27 @@ Success: no issues found in 84 source files
 v0.1 R2 Task 1: complete (commits e3494ae and 1fc9c72; final review Spec approved / Quality approved; fresh 82 focused and schema-v1 compiler tests passed; strict mypy and Ruff clean)
 v0.1 R2 Task 2: complete (commits 9b23e5a and cfdf43a; final review Spec approved / Quality approved; fresh 120 unit/descriptor and 253 Workflow integration tests passed; strict mypy and Ruff clean)
 v0.1 R2 Task 3: complete (commits e4624f7 and 36a7268; final review Spec approved / Quality approved; fresh 19 focused and 370 Workflow unit/integration tests passed; strict mypy and Ruff clean)
-v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r2-workflow-control.md
-v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r2-workflow-control.md`
-v0.1 next required action: R2 Task 4 Steps 1-2, creating `tests/integration/workflow/test_control_execution.py` and `tests/integration/workflow/test_control_recovery.py`
-v0.1 first RED command after those files exist: `.\.venv\Scripts\python.exe -m pytest tests/integration/workflow/test_control_execution.py tests/integration/workflow/test_control_recovery.py -q`
-v0.1 R2 remains in progress; Tasks 4-5 have not started
+v0.1 R2 Task 4: complete (commit 04d8ee2; final review Spec approved / Quality approved; fresh independent 380 Workflow unit/integration and v0.1 E2E tests passed; strict mypy and Ruff clean)
+v0.1 R2 checkpoint: complete (2026-07-17)
+v0.1 R2 checkpoint exact fresh evidence:
+```text
+$ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
+........................................................................ [ 18%]
+........................................................................ [ 37%]
+........................................................................ [ 56%]
+........................................................................ [ 75%]
+........................................................................ [ 94%]
+....................                                                     [100%]
+380 passed in 44.02s
+
+$ .\.venv\Scripts\python.exe -m ruff check src\agent_sdk\workflow src\agent_sdk\runtime\execution.py tests\unit\workflow tests\integration\workflow
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
+Success: no issues found in 10 source files
+```
+v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md
+v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r3-auto-context.md`
+v0.1 next required action: R3 Task 1 Step 1, creating `tests/unit/context/test_deterministic_strategies.py`
+v0.1 first RED command after that file exists: `.\.venv\Scripts\python.exe -m pytest tests/unit/context/test_deterministic_strategies.py -q`
+v0.1 R3 remains pending; R3 implementation has not started
