@@ -134,15 +134,18 @@ async def test_agent_loop_persists_stream_usage_and_result(store: InMemoryStore)
         ]
         assert [stored.event.sequence for stored in events] == list(range(1, 10))
         assert events[-1].event.payload["usage"] == usage.model_dump()
-        assert calls == [
-            {
-                "model": "fake/model",
-                "messages": [{"role": "user", "content": "say hello"}],
-                "tools": [],
-                "stream": True,
-                "temperature": 0.25,
-            }
-        ]
+        assert len(calls) == 1
+        assert calls[0]["model"] == "fake/model"
+        assert calls[0]["tools"] == list(sdk.tools.schemas())
+        assert calls[0]["stream"] is True
+        assert calls[0]["temperature"] == 0.25
+        provider_messages = calls[0]["messages"]
+        assert isinstance(provider_messages, list)
+        assert provider_messages[0]["role"] == "system"
+        assert provider_messages[-1] == {
+            "role": "user",
+            "content": "say hello",
+        }
     finally:
         await sdk.close()
 

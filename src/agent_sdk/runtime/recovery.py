@@ -73,6 +73,7 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpoint,
     RunCheckpointPhase,
     ToolCallOperation,
+    deserialize_model_request,
 )
 from agent_sdk.runtime.session_lifecycle import (
     detach_run_transition,
@@ -1818,15 +1819,12 @@ class RunRecoveryService:
         )
         if messages_before is None:
             return False
-        try:
-            reconstructed = ModelRequest(
-                model=base_request.model,
-                messages=messages_before,
-                tools=base_request.tools,
-                params=dict(base_request.params),
-                purpose=base_request.purpose,
-            )
-        except Exception:
+        reconstructed = self._request_for_model_operation(
+            base_request=base_request,
+            messages=messages_before,
+            operation=operation,
+        )
+        if reconstructed is None:
             return False
         metadata = dict(operation.recovery_metadata)
         metadata_valid = metadata == {
@@ -2767,15 +2765,12 @@ class RunRecoveryService:
         if isinstance(operation, ModelCallOperation):
             if not self._is_valid_certified_provider_history(evidence):
                 return False
-            try:
-                reconstructed = ModelRequest(
-                    model=base_request.model,
-                    messages=tuple(checkpoint.model_dump(mode="json")["messages"]),
-                    tools=base_request.tools,
-                    params=base_request.params,
-                    purpose=base_request.purpose,
-                )
-            except Exception:
+            reconstructed = self._request_for_model_operation(
+                base_request=base_request,
+                messages=tuple(checkpoint.model_dump(mode="json")["messages"]),
+                operation=operation,
+            )
+            if reconstructed is None:
                 return False
             metadata = dict(operation.recovery_metadata)
             metadata_valid = metadata == {
@@ -3809,7 +3804,11 @@ class RunRecoveryService:
                 if (
                     state != "model_starting"
                     or current_model is None
-                    or payload != {"model": descriptor.agent.model}
+                    or payload
+                    != RunRecoveryService._model_started_payload(
+                        current_model,
+                        model=descriptor.agent.model,
+                    )
                 ):
                     return False
                 state = "model_in_flight"
@@ -4350,6 +4349,12 @@ class RunRecoveryService:
             for event_type, expected in expected_counts.items()
         ):
             return False
+        started_events = tuple(
+            event for event in logical_events if event.type == "model.call.started"
+        )
+        ordered_model_operations = tuple(
+            sorted(model_operations, key=lambda operation: operation.turn)
+        )
         if (
             any(
                 event.payload != {}
@@ -4357,9 +4362,16 @@ class RunRecoveryService:
                 if event.type == "step.started"
             )
             or any(
-                event.payload != {"model": descriptor.agent.model}
-                for event in logical_events
-                if event.type == "model.call.started"
+                event.payload
+                != RunRecoveryService._model_started_payload(
+                    operation,
+                    model=descriptor.agent.model,
+                )
+                for event, operation in zip(
+                    started_events,
+                    ordered_model_operations,
+                    strict=True,
+                )
             )
             or sum(
                 event.type == "permission.requested" for event in logical_events
@@ -4375,6 +4387,58 @@ class RunRecoveryService:
             in {"model.recovery.query.started", "model.recovery.resend.started"}
             for event in events[last_interrupted + 1 :]
         )
+
+    @staticmethod
+    def _model_started_payload(
+        operation: ModelCallOperation,
+        *,
+        model: str,
+    ) -> dict[str, Any]:
+        if operation.prepared_request is None:
+            return {"model": model}
+        assert operation.context_view_id is not None
+        assert operation.prompt_manifest_id is not None
+        return {
+            "model": model,
+            "context_view_id": operation.context_view_id,
+            "prompt_manifest_id": operation.prompt_manifest_id,
+            "request_fingerprint": operation.request_fingerprint,
+        }
+
+    @staticmethod
+    def _request_for_model_operation(
+        *,
+        base_request: ModelRequest,
+        messages: tuple[dict[str, Any], ...],
+        operation: ModelCallOperation,
+    ) -> ModelRequest | None:
+        try:
+            if operation.prepared_request is not None:
+                request = deserialize_model_request(operation.prepared_request)
+                if (
+                    request.model != base_request.model
+                    or request.tools != base_request.tools
+                    or request.params != base_request.params
+                    or request.purpose != base_request.purpose
+                ):
+                    return None
+            else:
+                request = ModelRequest(
+                    model=base_request.model,
+                    messages=messages,
+                    tools=base_request.tools,
+                    params=dict(base_request.params),
+                    purpose=base_request.purpose,
+                )
+            if (
+                operation.provider_identity != base_request.model
+                or operation.request_fingerprint
+                != _model_request_fingerprint(request)
+            ):
+                return None
+            return request
+        except Exception:
+            return None
 
     @staticmethod
     def _is_valid_certified_terminal_provider_turns(
@@ -4414,21 +4478,12 @@ class RunRecoveryService:
         if messages_before is None:
             return False
         final_operation = model_operations[checkpoint.turn]
-        try:
-            final_request = ModelRequest(
-                model=base_request.model,
-                messages=messages_before,
-                tools=base_request.tools,
-                params=dict(base_request.params),
-                purpose=base_request.purpose,
-            )
-        except Exception:
-            return False
-        if (
-            final_operation.provider_identity != base_request.model
-            or final_operation.request_fingerprint
-            != _model_request_fingerprint(final_request)
-        ):
+        final_request = RunRecoveryService._request_for_model_operation(
+            base_request=base_request,
+            messages=messages_before,
+            operation=final_operation,
+        )
+        if final_request is None:
             return False
 
         output_parts: list[str] = []
@@ -5093,18 +5148,14 @@ class RunRecoveryService:
                 and type(metadata["authoritative_status"]) is bool
                 and type(metadata["same_operation_id_resend"]) is bool
             )
-            try:
-                expected_fingerprint = _model_request_fingerprint(
-                    ModelRequest(
-                        model=base_request.model,
-                        messages=messages,
-                        tools=base_request.tools,
-                        params=dict(base_request.params),
-                        purpose=base_request.purpose,
-                    )
-                )
-            except Exception:
+            reconstructed = RunRecoveryService._request_for_model_operation(
+                base_request=base_request,
+                messages=messages,
+                operation=operation,
+            )
+            if reconstructed is None:
                 return False
+            expected_fingerprint = _model_request_fingerprint(reconstructed)
             return (
                 metadata_valid
                 and operation.provider_identity == base_request.model
@@ -5211,18 +5262,12 @@ class RunRecoveryService:
                 if len(completed_operations) != 1:
                     return None
                 operation = completed_operations[0]
-                request = ModelRequest(
-                    model=base_request.model,
+                request = RunRecoveryService._request_for_model_operation(
+                    base_request=base_request,
                     messages=tuple(messages),
-                    tools=base_request.tools,
-                    params=dict(base_request.params),
-                    purpose=base_request.purpose,
+                    operation=operation,
                 )
-                if (
-                    operation.provider_identity != base_request.model
-                    or operation.request_fingerprint
-                    != _model_request_fingerprint(request)
-                ):
+                if request is None:
                     return None
                 completed = RunRecoveryService._completed_model_outcome(operation)
                 if completed is None or len(completed[2]) != 1:
@@ -5517,17 +5562,12 @@ class RunRecoveryService:
                     or len(turn_operations) != 1 + len(tool_operations)
                 ):
                     return False
-                request = ModelRequest(
-                    model=base_request.model,
+                request = RunRecoveryService._request_for_model_operation(
+                    base_request=base_request,
                     messages=tuple(reconstructed_messages),
-                    tools=base_request.tools,
-                    params=dict(base_request.params),
-                    purpose=base_request.purpose,
+                    operation=operation,
                 )
-                if (
-                    _model_request_fingerprint(request)
-                    != operation.request_fingerprint
-                ):
+                if request is None:
                     return False
                 outcome = RunRecoveryService._completed_model_outcome(operation)
                 if outcome is None or len(outcome[2]) != 1:
@@ -5617,7 +5657,11 @@ class RunRecoveryService:
                 len(started) != 1
                 or len(terminal) != 1
                 or started[0] >= terminal[0]
-                or segment[started[0]].payload != {"model": base_request.model}
+                or segment[started[0]].payload
+                != RunRecoveryService._model_started_payload(
+                    operation,
+                    model=base_request.model,
+                )
                 or segment[terminal[0]].payload
                 != {"finish_reason": finish_reason}
             ):
@@ -5746,17 +5790,12 @@ class RunRecoveryService:
                     )
                 ):
                     return False
-                request = ModelRequest(
-                    model=base_request.model,
+                request = RunRecoveryService._request_for_model_operation(
+                    base_request=base_request,
                     messages=tuple(reconstructed_messages),
-                    tools=base_request.tools,
-                    params=dict(base_request.params),
-                    purpose=base_request.purpose,
+                    operation=operation,
                 )
-                if (
-                    operation.request_fingerprint
-                    != _model_request_fingerprint(request)
-                ):
+                if request is None:
                     return False
                 outcome = RunRecoveryService._completed_model_outcome(operation)
                 if outcome is None or len(outcome[2]) != 1:
@@ -5861,7 +5900,11 @@ class RunRecoveryService:
                 len(started) != 1
                 or len(terminal) != 1
                 or started[0] >= terminal[0]
-                or segment[started[0]].payload != {"model": base_request.model}
+                or segment[started[0]].payload
+                != RunRecoveryService._model_started_payload(
+                    operation,
+                    model=base_request.model,
+                )
                 or segment[terminal[0]].payload
                 != {"finish_reason": finish_reason}
             ):
@@ -6119,16 +6162,14 @@ class RunRecoveryService:
         ):
             return None
         checkpoint_data = checkpoint.model_dump(mode="json")
-        reconstructed = ModelRequest(
-            model=base_request.model,
+        reconstructed = self._request_for_model_operation(
+            base_request=base_request,
             messages=tuple(checkpoint_data["messages"]),
-            tools=base_request.tools,
-            params=base_request.params,
-            purpose=base_request.purpose,
+            operation=operation,
         )
+        if reconstructed is None:
+            return None
         try:
-            if _model_request_fingerprint(reconstructed) != operation.request_fingerprint:
-                return None
             return ProviderRecoveryRequest(
                 session_id=operation.session_id,
                 run_id=operation.run_id,
@@ -6256,17 +6297,12 @@ class RunRecoveryService:
                     )
                 ):
                     return None
-                request = ModelRequest(
-                    model=base_request.model,
+                request = self._request_for_model_operation(
+                    base_request=base_request,
                     messages=tuple(reconstructed_messages),
-                    tools=base_request.tools,
-                    params=dict(base_request.params),
-                    purpose=base_request.purpose,
+                    operation=model_operation,
                 )
-                if (
-                    _model_request_fingerprint(request)
-                    != model_operation.request_fingerprint
-                ):
+                if request is None:
                     return None
                 completed = self._completed_model_outcome(model_operation)
                 if completed is None:
@@ -6687,13 +6723,27 @@ class RunRecoveryService:
                 model_completed[0][0],
                 proposed[0][0],
             )
+            model_operation = next(
+                (
+                    operation
+                    for operation in evidence.operations
+                    if isinstance(operation, ModelCallOperation)
+                    and operation.turn == index
+                ),
+                None,
+            )
             if base_positions != tuple(sorted(base_positions)) or len(
                 set(base_positions)
             ) != 4:
                 return False
             if (
                 events[start].payload != {}
-                or model_started[0][1].payload != {"model": descriptor.agent.model}
+                or model_operation is None
+                or model_started[0][1].payload
+                != self._model_started_payload(
+                    model_operation,
+                    model=descriptor.agent.model,
+                )
                 or model_completed[0][1].payload
                 != {"finish_reason": turn.finish_reason}
                 or proposed[0][1].payload != expected_identity
@@ -6704,18 +6754,8 @@ class RunRecoveryService:
                 for event in events[model_started[0][0] + 1 : model_completed[0][0]]
                 if event.type == "model.text.delta"
             )
-            model_operation = next(
-                (
-                    operation
-                    for operation in evidence.operations
-                    if isinstance(operation, ModelCallOperation)
-                    and operation.turn == index
-                ),
-                None,
-            )
             recovered_model = (
-                model_operation is not None
-                and model_operation.operation_id in recovered_model_operation_ids
+                model_operation.operation_id in recovered_model_operation_ids
             )
             if any(not isinstance(delta, str) for delta in deltas):
                 return False

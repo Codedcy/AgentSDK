@@ -1,11 +1,14 @@
-from importlib.util import find_spec
+import json
 from datetime import UTC, datetime, timedelta, timezone
+from importlib.util import find_spec
 from typing import Any
 
 import agent_sdk.runtime.reconciliation as reconciliation
 import pytest
 from pydantic import ValidationError
 
+from agent_sdk.errors import AgentSDKError
+from agent_sdk.models.litellm_gateway import ModelRequest
 from agent_sdk.runtime.models import TokenUsage
 from agent_sdk.tools.models import ToolResult
 
@@ -82,6 +85,125 @@ def _tool_operation(**updates: Any) -> Any:
     }
     values.update(updates)
     return reconciliation.ToolCallOperation(**values)
+
+
+def test_model_request_payload_is_canonical_and_round_trips_exactly() -> None:
+    request = ModelRequest(
+        model="provider:model",
+        messages=(
+            {"role": "system", "content": "general"},
+            {"role": "user", "content": "ship"},
+        ),
+        tools=(
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ),
+        params={"temperature": 0, "metadata": {"labels": ["release"]}},
+        purpose="agent_loop",
+    )
+
+    payload = reconciliation.serialize_model_request(request)
+
+    assert payload == {
+        "model": "provider:model",
+        "messages": [
+            {"role": "system", "content": "general"},
+            {"role": "user", "content": "ship"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        "params": {
+            "temperature": 0,
+            "metadata": {"labels": ["release"]},
+        },
+        "purpose": "agent_loop",
+    }
+    assert reconciliation.deserialize_model_request(payload) == request
+    assert (
+        reconciliation.model_request_fingerprint(request)
+        == reconciliation.model_request_fingerprint(
+            reconciliation.deserialize_model_request(payload)
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "model": "provider:model",
+            "messages": [],
+            "tools": [],
+            "params": {},
+            "purpose": None,
+            "extra": True,
+        },
+        {
+            "model": "provider:model",
+            "messages": {},
+            "tools": [],
+            "params": {},
+            "purpose": None,
+        },
+        {
+            "model": "provider:model",
+            "messages": [],
+            "tools": [],
+            "params": {"temperature": float("nan")},
+            "purpose": None,
+        },
+    ],
+)
+def test_stored_model_request_rejects_noncanonical_payloads(
+    payload: dict[str, Any],
+) -> None:
+    with pytest.raises(AgentSDKError, match="stored model request is invalid"):
+        reconciliation.deserialize_model_request(payload)
+
+
+def test_model_operation_accepts_legacy_records_and_rejects_prepared_mismatch() -> None:
+    legacy = {
+        "operation_id": "op_model",
+        "operation_kind": "model_call",
+        "session_id": "ses_1",
+        "run_id": "run_1",
+        "turn": 0,
+        "request_fingerprint": "sha256:model",
+        "lease_generation": 1,
+        "status": "started",
+        "provider_identity": "provider:model",
+        "tool_identity": None,
+        "outcome": None,
+        "recovery_metadata": {},
+    }
+    assert reconciliation.ModelCallOperation.model_validate_json(
+        json.dumps(legacy)
+    ) == _model_operation()
+
+    request = ModelRequest(
+        model="provider:model",
+        messages=({"role": "user", "content": "ship"},),
+    )
+    prepared = reconciliation.serialize_model_request(request)
+    with pytest.raises(ValidationError, match="fingerprint mismatch"):
+        _model_operation(
+            request_fingerprint="wrong",
+            context_view_id="view_1",
+            prompt_manifest_id="pmf_1",
+            prepared_request=prepared,
+        )
 
 
 def test_external_operation_models_are_strict_frozen_detached_and_exact() -> None:

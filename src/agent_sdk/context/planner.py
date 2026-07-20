@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from pydantic import ValidationError
@@ -15,16 +16,19 @@ from agent_sdk.context.models import (
     ContextBudget,
     ContextCapsule,
     ContextItem,
+    ContextRuntimeConfig,
     ContextView,
     SourceMessage,
 )
 from agent_sdk.context.rendering import render_level
 from agent_sdk.context.retrieval import ContextRetrieval
+from agent_sdk.context.sources import extract_sources
 from agent_sdk.context.strategies import StrategyResult
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
 from agent_sdk.models.litellm_gateway import LiteLLMGateway, UsageReported
+from agent_sdk.runtime.reconciliation import RunCheckpoint
 from agent_sdk.storage.base import (
     CommitBatch,
     SnapshotPrecondition,
@@ -37,6 +41,12 @@ from agent_sdk.tools.models import thaw_json
 
 _Role = Literal["system", "user", "assistant", "tool"]
 _APPLICATION_ROLES = frozenset({"system", "user", "assistant", "tool"})
+
+
+@dataclass(frozen=True)
+class PlannedContext:
+    view: ContextView
+    messages: tuple[dict[str, Any], ...]
 
 
 class ContextPlanner:
@@ -79,6 +89,284 @@ class ContextPlanner:
         self._token_counter = _token_counter
         self._compactor = ContextCompactor(models, model=model)
         self._retrieval = ContextRetrieval(store)
+
+    async def prepare(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        checkpoint: RunCheckpoint,
+        config: ContextRuntimeConfig,
+    ) -> PlannedContext:
+        if checkpoint.session_id != session_id or checkpoint.run_id != run_id:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "context checkpoint owner mismatch",
+                retryable=False,
+            )
+        session = await self._store.get_snapshot("session", session_id)
+        if session is None:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "session not found",
+                retryable=False,
+            )
+        try:
+            stored_events = await self._store.read_events(
+                after_cursor=0,
+                session_id=session_id,
+            )
+            sources = extract_sources(stored_events, checkpoint)
+        except AgentSDKError:
+            raise
+        except Exception as error:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "context sources are invalid",
+                retryable=False,
+            ) from error
+        items = self._context_items(sources)
+        budget = self._budget_messages(
+            [
+                cast(dict[str, Any], thaw_json(source.message))
+                for source in sources
+            ]
+        )
+        if budget.available_input_tokens <= 0:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "context budget has no input capacity",
+                retryable=False,
+            )
+        recommended = config.policy.recommend(budget.watermark_ratio)
+        requested = self._requested_level(config.force_level, recommended)
+        if not config.allow_lossy and requested in {
+            CompactionLevel.L3,
+            CompactionLevel.L4,
+        }:
+            requested = CompactionLevel.L2
+
+        if requested in {
+            CompactionLevel.L0,
+            CompactionLevel.L1,
+            CompactionLevel.L2,
+        }:
+            rendered = render_level(
+                requested,
+                sources,
+                recent_messages=config.recent_messages,
+                tool_preview_bytes=config.tool_preview_bytes,
+            )
+            view = await self._persist_runtime_deterministic(
+                session_id=session_id,
+                rendered=rendered,
+                budget=budget,
+                recommended=recommended,
+                applied=requested,
+            )
+            messages = self._strategy_messages(rendered)
+            await self._record_over_budget_if_needed(view)
+            return PlannedContext(view=view, messages=messages)
+
+        retained = {source.ref for source in sources if source.protected}
+        retained.update(source.ref for source in sources[-config.recent_messages :])
+        if requested is CompactionLevel.L3:
+            result = await self._compactor.summarize(items, retained)
+            prior_refs: tuple[str, ...] = ()
+        else:
+            records = await self._retrieval.list_capsule_records(
+                session_id=session_id
+            )
+            prior_refs = tuple(record[0] for record in records)
+            result = await self._compactor.rebase(
+                tuple(record[1] for record in records),
+                items,
+                retained,
+                capsule_ids=prior_refs,
+            )
+        if result.capsule is not None:
+            estimated_tokens = self._estimate_runtime_compacted_tokens(
+                sources,
+                retained,
+                result.capsule,
+            )
+            if estimated_tokens <= budget.available_input_tokens:
+                view = await self._persist_compacted(
+                    session_id=session_id,
+                    source=items,
+                    retained=retained,
+                    prior_refs=prior_refs,
+                    capsule=result.capsule,
+                    usage=result.usage,
+                    budget=budget,
+                    recommended=recommended,
+                    applied=requested,
+                    estimated_tokens=estimated_tokens,
+                )
+                return PlannedContext(
+                    view=view,
+                    messages=self._compacted_messages(
+                        sources,
+                        retained,
+                        result.capsule,
+                    ),
+                )
+
+        fallback = render_level(
+            CompactionLevel.L2,
+            sources,
+            recent_messages=config.recent_messages,
+            tool_preview_bytes=config.tool_preview_bytes,
+        )
+        view = await self._persist_fallback(
+            session_id=session_id,
+            rendered=fallback,
+            usage=result.usage,
+            budget=budget,
+            recommended=recommended,
+            requested=requested,
+        )
+        messages = self._strategy_messages(fallback)
+        await self._record_over_budget_if_needed(view)
+        return PlannedContext(view=view, messages=messages)
+
+    @staticmethod
+    def _context_items(
+        sources: tuple[SourceMessage, ...],
+    ) -> tuple[ContextItem, ...]:
+        items: list[ContextItem] = []
+        for cursor, source in enumerate(sources, start=1):
+            message = thaw_json(source.message)
+            assert isinstance(message, dict)
+            content = message.get("content")
+            if not isinstance(content, str):
+                content = json.dumps(
+                    message,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            items.append(
+                ContextItem(
+                    event_id=source.ref,
+                    cursor=cursor,
+                    event_type=source.event_type,
+                    role=source.role,
+                    content=content,
+                )
+            )
+        return tuple(items)
+
+    @staticmethod
+    def _strategy_messages(
+        rendered: StrategyResult,
+    ) -> tuple[dict[str, Any], ...]:
+        messages: list[dict[str, Any]] = []
+        for source in rendered.items:
+            message = thaw_json(source.message)
+            assert isinstance(message, dict)
+            messages.append(message)
+        return tuple(messages)
+
+    @staticmethod
+    def _compacted_messages(
+        sources: tuple[SourceMessage, ...],
+        retained: set[str],
+        capsule: ContextCapsule,
+    ) -> tuple[dict[str, Any], ...]:
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    capsule.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+        ]
+        for source in sources:
+            if source.ref not in retained:
+                continue
+            message = thaw_json(source.message)
+            assert isinstance(message, dict)
+            messages.append(message)
+        return tuple(messages)
+
+    def _estimate_runtime_compacted_tokens(
+        self,
+        sources: tuple[SourceMessage, ...],
+        retained: set[str],
+        capsule: ContextCapsule,
+    ) -> int:
+        return self._estimate_messages(
+            list(self._compacted_messages(sources, retained, capsule))
+        )
+
+    async def _persist_runtime_deterministic(
+        self,
+        *,
+        session_id: str,
+        rendered: StrategyResult,
+        budget: ContextBudget,
+        recommended: CompactionLevel,
+        applied: CompactionLevel,
+    ) -> ContextView:
+        view = self._rendered_view(
+            session_id=session_id,
+            rendered=rendered,
+            budget=budget,
+            recommended=recommended,
+            applied=applied,
+            fallback_from=None,
+        )
+        await self._persist_view(view, usage=None)
+        return view
+
+    async def _record_over_budget_if_needed(self, view: ContextView) -> None:
+        budget = view.budget
+        if budget is None or view.estimated_tokens <= budget.available_input_tokens:
+            return
+        sequence = 3 if view.fallback_from is not None else 2
+        await self._commit(
+            CommitBatch(
+                events=(
+                    self._event(
+                        view,
+                        sequence=sequence,
+                        event_type="context.over_budget",
+                        payload={
+                            "view_id": view.view_id,
+                            "applied_level": view.applied_level.value,
+                            "estimated_tokens": view.estimated_tokens,
+                            "available_input_tokens": budget.available_input_tokens,
+                        },
+                    ),
+                ),
+                preconditions=(
+                    SnapshotPrecondition(
+                        "context_view",
+                        view.view_id,
+                        session_id=view.session_id,
+                    ),
+                ),
+            )
+        )
+
+    def _budget_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> ContextBudget:
+        projected = self._estimate_messages(messages) if messages else 0
+        return ContextBudget.calculate(
+            model_window=self._model_window,
+            output_reserve=self._output_reserve,
+            tool_schema_tokens=self._tool_schema_tokens,
+            safety_reserve=self._safety_reserve,
+            projected_source_tokens=projected,
+        )
 
     async def build(
         self,

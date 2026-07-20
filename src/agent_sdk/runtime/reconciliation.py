@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import wraps
-from typing import Any, Literal, ParamSpec, Protocol, Self, TypeAlias, TypeVar
+from typing import Any, Literal, ParamSpec, Protocol, Self, TypeAlias, TypeVar, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictStr,
     field_serializer,
     field_validator,
     model_validator,
 )
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.models.litellm_gateway import ModelRequest
 from agent_sdk.runtime.models import (
     RunFailure,
     RunSnapshot,
@@ -127,6 +130,98 @@ def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return frozen
 
 
+class _ModelRequestPayload(_RecoveryModel):
+    model: StrictStr = Field(min_length=1)
+    messages: tuple[Mapping[str, Any], ...]
+    tools: tuple[Mapping[str, Any], ...] = ()
+    params: Mapping[str, Any] = Field(default_factory=dict)
+    purpose: StrictStr | None = None
+
+    @field_validator("messages", "tools", mode="after")
+    @classmethod
+    def _freeze_sequence(
+        cls,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        return tuple(_frozen_mapping(item) for item in value)
+
+    @field_validator("params", mode="after")
+    @classmethod
+    def _freeze_params(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        return _frozen_mapping(value)
+
+    @field_serializer("messages", "tools")
+    def _serialize_sequence(
+        self,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> list[dict[str, Any]]:
+        return [thaw_json(item) for item in value]
+
+    @field_serializer("params")
+    def _serialize_params(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        return cast(dict[str, Any], thaw_json(value))
+
+
+def serialize_model_request(request: ModelRequest) -> dict[str, Any]:
+    try:
+        payload = _ModelRequestPayload(
+            model=request.model,
+            messages=request.messages,
+            tools=request.tools,
+            params=request.params,
+            purpose=request.purpose,
+        ).model_dump(mode="json")
+        frozen = freeze_json(payload)
+        thawed = thaw_json(frozen)
+    except Exception as error:
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "model request must be canonical JSON",
+            retryable=False,
+        ) from error
+    assert isinstance(thawed, dict)
+    return thawed
+
+
+def deserialize_model_request(value: Mapping[str, Any]) -> ModelRequest:
+    try:
+        raw = thaw_json(freeze_json(value))
+        if not isinstance(raw, dict):
+            raise ValueError("model request payload must be an object")
+        messages = raw.get("messages")
+        tools = raw.get("tools")
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ValueError("model request sequences are invalid")
+        raw["messages"] = tuple(messages)
+        raw["tools"] = tuple(tools)
+        payload = _ModelRequestPayload.model_validate(raw)
+        data = payload.model_dump(mode="json")
+    except Exception as error:
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "stored model request is invalid",
+            retryable=False,
+        ) from error
+    return ModelRequest(
+        model=payload.model,
+        messages=tuple(dict(message) for message in data["messages"]),
+        tools=tuple(dict(tool) for tool in data["tools"]),
+        params=dict(data["params"]),
+        purpose=payload.purpose,
+    )
+
+
+def model_request_fingerprint(request: ModelRequest) -> str:
+    encoded = json.dumps(
+        serialize_model_request(request),
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 class _ExternalOperationBase(_RecoveryModel):
     operation_id: str
     operation_kind: ExternalOperationKind
@@ -193,6 +288,9 @@ class ModelCallOperation(_ExternalOperationBase):
     )
     provider_identity: str
     tool_identity: None = None
+    context_view_id: str | None = None
+    prompt_manifest_id: str | None = None
+    prepared_request: Mapping[str, Any] | None = None
 
     @field_validator("provider_identity")
     @classmethod
@@ -200,6 +298,49 @@ class ModelCallOperation(_ExternalOperationBase):
         if not value.strip():
             raise ValueError("provider identity must be nonempty")
         return value
+
+    @field_validator("context_view_id", "prompt_manifest_id")
+    @classmethod
+    def _validate_context_identity(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("model context identity must be nonempty")
+        return value
+
+    @field_validator("prepared_request", mode="after")
+    @classmethod
+    def _freeze_prepared_request(
+        cls,
+        value: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if value is None:
+            return None
+        request = deserialize_model_request(value)
+        return _frozen_mapping(serialize_model_request(request))
+
+    @field_serializer("prepared_request")
+    def _serialize_prepared_request(
+        self,
+        value: Mapping[str, Any] | None,
+    ) -> Any:
+        return None if value is None else thaw_json(value)
+
+    @model_validator(mode="after")
+    def _validate_prepared_request_identity(self) -> Self:
+        populated = (
+            self.context_view_id is not None,
+            self.prompt_manifest_id is not None,
+            self.prepared_request is not None,
+        )
+        if any(populated) and not all(populated):
+            raise ValueError("prepared model request references are incomplete")
+        if self.prepared_request is not None:
+            request = deserialize_model_request(self.prepared_request)
+            if (
+                request.model != self.provider_identity
+                or model_request_fingerprint(request) != self.request_fingerprint
+            ):
+                raise ValueError("prepared model request fingerprint mismatch")
+        return self
 
 
 class ToolCallOperation(_ExternalOperationBase):

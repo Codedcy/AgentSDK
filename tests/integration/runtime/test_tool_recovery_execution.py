@@ -2242,6 +2242,26 @@ async def test_historical_recovery_evidence_is_reconstructed_exactly(
     )
     sdk.agents.define(spec)
     sdk.tools.register(tool_spec, handler)
+    if corruption == "model_fingerprint":
+        try:
+            with pytest.raises(
+                AgentSDKError,
+                match="recovery state conflict",
+            ) as caught:
+                await sdk.recovery.recover_run(run_id)
+            assert handler_calls == 0
+            assert model_calls == []
+            assert secret not in repr(caught.value.to_dict())
+            reconciliation_events = [
+                stored.event.model_dump(mode="json")
+                for stored in await store.read_events(after_cursor=0)
+                if stored.event.run_id == run_id
+                and stored.event.type == "reconciliation.requested"
+            ]
+            assert reconciliation_events == []
+        finally:
+            await sdk.close()
+        return
     handle = await sdk.recovery.recover_run(run_id)
     try:
         with pytest.raises(AgentSDKError, match="recovery required") as caught:

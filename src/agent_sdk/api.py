@@ -15,6 +15,7 @@ from agent_sdk.context import (
     CompactionLevel,
     CompactionPolicy,
     ContextCapsule,
+    ContextMiddleware,
     ContextPlanner,
     ContextRetrieval,
     ContextView,
@@ -1103,6 +1104,7 @@ class AgentSDK:
             policy,
             permission_bridge,
             provider_recovery=provider_recovery,
+            context_middleware=ContextMiddleware(store, models, skills),
         )
         agents = AgentRegistry()
         recovery_scanner = RecoveryScanner(store)

@@ -8,6 +8,7 @@ from agent_sdk.context.models import (
     ContextView,
     SourceMessage,
 )
+from agent_sdk.context.middleware import ContextMiddleware, PreparedContext
 from agent_sdk.context.planner import ContextPlanner
 from agent_sdk.context.rendering import render_level
 from agent_sdk.context.retrieval import ContextRetrieval
@@ -25,10 +26,12 @@ __all__ = [
     "ContextBudget",
     "ContextCapsule",
     "ContextItem",
+    "ContextMiddleware",
     "ContextPlanner",
     "ContextRetrieval",
     "ContextRuntimeConfig",
     "ContextView",
+    "PreparedContext",
     "SourceMessage",
     "StrategyResult",
     "apply_l0",

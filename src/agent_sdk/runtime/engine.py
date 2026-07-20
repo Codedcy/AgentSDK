@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from typing import Any
 
+from agent_sdk.context.middleware import ContextMiddleware
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
@@ -57,6 +58,8 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpointPhase,
     RecoveryStateConflictError,
     ToolCallOperation,
+    model_request_fingerprint,
+    serialize_model_request,
 )
 from agent_sdk.storage.base import (
     CommitResult,
@@ -215,7 +218,13 @@ class _RunEmitter:
             self._run = snapshot
             self._sequence += 1
 
-    async def start_model(self, request: ModelRequest) -> ModelCallOperation:
+    async def start_model(
+        self,
+        request: ModelRequest,
+        *,
+        context_view_id: str | None = None,
+        prompt_manifest_id: str | None = None,
+    ) -> ModelCallOperation:
         async with self._lock:
             self._ensure_lease_current()
             assert self._checkpoint is not None
@@ -233,6 +242,11 @@ class _RunEmitter:
                     "authoritative_status": adapter.authoritative_status,
                     "same_operation_id_resend": adapter.same_operation_id_resend,
                 }
+            prepared_request = (
+                None
+                if context_view_id is None and prompt_manifest_id is None
+                else serialize_model_request(request)
+            )
             operation = ModelCallOperation(
                 operation_id=new_id("op_model"),
                 session_id=self._run.session_id,
@@ -243,6 +257,9 @@ class _RunEmitter:
                 status=ExternalOperationStatus.STARTED,
                 provider_identity=request.model,
                 recovery_metadata=recovery_metadata,
+                context_view_id=context_view_id,
+                prompt_manifest_id=prompt_manifest_id,
+                prepared_request=prepared_request,
             )
             checkpoint = self._checkpoint.model_copy(
                 update={
@@ -251,9 +268,20 @@ class _RunEmitter:
                     "operation_id": operation.operation_id,
                 }
             )
+            started_payload: dict[str, Any] = {"model": request.model}
+            if prepared_request is not None:
+                assert context_view_id is not None
+                assert prompt_manifest_id is not None
+                started_payload.update(
+                    {
+                        "context_view_id": context_view_id,
+                        "prompt_manifest_id": prompt_manifest_id,
+                        "request_fingerprint": operation.request_fingerprint,
+                    }
+                )
             events = (
                 self._new_event("step.started", {}),
-                self._new_event("model.call.started", {"model": request.model}, offset=1),
+                self._new_event("model.call.started", started_payload, offset=1),
             )
             await _commit_progress(
                 self._store,
@@ -1011,6 +1039,7 @@ class RunEngine:
         _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         _heartbeat_interval: float = _RUN_LEASE_TTL.total_seconds() / 3,
         provider_recovery: ProviderRecoveryRegistry | None = None,
+        context_middleware: ContextMiddleware | None = None,
     ) -> None:
         self._store = store
         self._models = models
@@ -1022,6 +1051,7 @@ class RunEngine:
         self._sleep = _sleep
         self._heartbeat_interval = _heartbeat_interval
         self._provider_recovery = provider_recovery or ProviderRecoveryRegistry()
+        self._context = context_middleware
 
     async def execute(self, run_id: str, request: ModelRequest) -> RunResult:
         public_error: tuple[ErrorCode, str, bool] | None = None
@@ -1521,8 +1551,33 @@ class RunEngine:
                         messages=tuple(deepcopy(messages)),
                         tools=request.tools,
                         params=dict(request.params),
+                        purpose=request.purpose,
                     )
-                    operation = await emitter.start_model(model_request)
+                    if self._context is not None:
+                        prepared = await self._context.prepare(
+                            run=emitter.current_snapshot,
+                            checkpoint=emitter.current_checkpoint,
+                            tools=model_request.tools,
+                        )
+                        model_request = ModelRequest(
+                            model=model_request.model,
+                            messages=tuple(
+                                deepcopy(message)
+                                for message in prepared.messages
+                            ),
+                            tools=model_request.tools,
+                            params=dict(model_request.params),
+                            purpose=model_request.purpose,
+                        )
+                        operation = await emitter.start_model(
+                            model_request,
+                            context_view_id=prepared.view.view_id,
+                            prompt_manifest_id=(
+                                prepared.prompt.manifest.manifest_id
+                            ),
+                        )
+                    else:
+                        operation = await emitter.start_model(model_request)
                     try:
                         async for event in self._models.stream(model_request):
                             if isinstance(event, TextDelta):
@@ -2130,20 +2185,7 @@ def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
 
 
 def _model_request_fingerprint(request: ModelRequest) -> str:
-    encoded = json.dumps(
-        {
-            "model": request.model,
-            "messages": request.messages,
-            "tools": request.tools,
-            "params": request.params,
-            "purpose": request.purpose,
-        },
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return sha256(encoded.encode("utf-8")).hexdigest()
+    return model_request_fingerprint(request)
 
 
 def _tool_request_fingerprint(

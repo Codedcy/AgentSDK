@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -10,8 +12,11 @@ from agent_sdk import (
     AgentSDK,
     AgentSDKError,
     AgentSpec,
+    ContextPlanner,
+    ContextRuntimeConfig,
     ErrorCode,
     PermissionDecision,
+    PromptManifest,
     RunStatus,
     ToolResultStatus,
     WorkflowRunStatus,
@@ -243,3 +248,186 @@ steps:
     assert event_types.count("workflow.loop.iteration") == 2
     assert event_types[-1] == "workflow.completed"
     await asyncio.wait_for(reopened.close(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_v01_runtime_automatically_compacts_l0_through_l4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_tokens = {
+        "stage-l0": 10,
+        "stage-l1": 70,
+        "stage-l2": 80,
+        "stage-l3-invalid": 90,
+        "stage-l3-valid": 90,
+        "stage-l4": 96,
+    }
+
+    def controlled_estimate(
+        _planner: ContextPlanner,
+        messages: list[dict[str, Any]],
+    ) -> int:
+        serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        latest = max(
+            (
+                (serialized.rfind(stage), tokens)
+                for stage, tokens in stage_tokens.items()
+            ),
+            key=lambda item: item[0],
+        )
+        return latest[1] if latest[0] >= 0 else 10
+
+    monkeypatch.setattr(
+        ContextPlanner,
+        "_estimate_messages",
+        controlled_estimate,
+    )
+
+    def text_stream() -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {"content": "completed"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    compaction_operations: list[str] = []
+
+    async def provider(**params: object) -> object:
+        if params.get("stream") is not False:
+            return text_stream()
+        messages = params["messages"]
+        assert isinstance(messages, list)
+        document = json.loads(str(messages[-1]["content"]))
+        operation = str(document["operation"])
+        compaction_operations.append(operation)
+        if len(compaction_operations) == 1:
+            return {
+                "choices": [{"message": {"content": "{invalid-json"}}],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            }
+        source_refs = [
+            str(source["event_id"])
+            for source in document.get("sources", [])
+        ]
+        capsule_refs = [
+            str(capsule_id)
+            for capsule_id in document.get("capsule_ids", [])
+        ]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "parsed": {
+                            "objective": "preserve runtime context",
+                            "constraints": ["retain durable evidence"],
+                            "decisions": [],
+                            "facts": [],
+                            "next_actions": ["continue"],
+                            "artifact_refs": [],
+                            "source_event_ids": [*capsule_refs, *source_refs],
+                        }
+                    }
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+            },
+        }
+
+    store = InMemoryStore()
+    skill_root = Path(__file__).parents[1] / "fixtures" / "skills"
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        skill_roots=(skill_root,),
+        enable_builtin_tools=False,
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        agent = AgentSpec(
+            name="automatic-context",
+            model="test/context",
+            system_prompt="Application runtime policy.",
+            skills=("demo",),
+            context=ContextRuntimeConfig(
+                model_window=100,
+                output_reserve=0,
+                safety_reserve=0,
+                recent_messages=2,
+            ),
+        )
+        run_ids: list[str] = []
+        for stage in stage_tokens:
+            handle = await sdk.runs.start(session.session_id, agent, stage)
+            result = await handle.result()
+            assert result.output_text == "completed"
+            run_ids.append(handle.run_id)
+
+        events = await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        views = [
+            item.event
+            for item in events
+            if item.event.type == "context.view.created"
+        ]
+        assert [
+            event.payload["recommended_level"] for event in views
+        ] == ["L0", "L1", "L2", "L3", "L3", "L4"]
+        assert [
+            event.payload["applied_level"] for event in views
+        ] == ["L0", "L1", "L2", "L2", "L3", "L4"]
+        assert views[3].payload["fallback_from"] == "L3"
+        assert compaction_operations == ["summarize", "summarize", "rebase"]
+
+        original = next(
+            item.event
+            for item in events
+            if item.event.type == "run.created"
+            and item.event.run_id == run_ids[0]
+        )
+        assert any(item.event.event_id == original.event_id for item in events)
+        final_view_id = str(views[-1].payload["view_id"])
+        final_view = await store.get_snapshot("context_view", final_view_id)
+        assert final_view is not None
+        capsule_id = final_view["capsule_id"]
+        assert isinstance(capsule_id, str)
+        recovered_sources = await sdk.context.read_sources(
+            capsule_id,
+            session_id=session.session_id,
+        )
+        assert original.event_id in {
+            observed.event.event_id for observed in recovered_sources
+        }
+
+        last_started = next(
+            item.event
+            for item in reversed(events)
+            if item.event.type == "model.call.started"
+            and item.event.run_id == run_ids[-1]
+        )
+        manifest_id = str(last_started.payload["prompt_manifest_id"])
+        raw_manifest = await store.get_snapshot("prompt_manifest", manifest_id)
+        assert raw_manifest is not None
+        manifest = PromptManifest.model_validate(raw_manifest)
+        assert manifest.context_view_id == final_view_id
+        assert manifest.layer_names == (
+            "profile:general",
+            "application",
+            "skill:demo",
+        )
+    finally:
+        await sdk.close()
