@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import Any, Literal, Self
+from types import MappingProxyType
+from typing import Any, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictFloat,
     StrictInt,
     StrictStr,
@@ -18,6 +21,72 @@ from pydantic import (
 )
 
 from agent_sdk.tools.models import freeze_json, thaw_json
+
+type JsonValue = (
+    None
+    | bool
+    | int
+    | float
+    | str
+    | tuple[JsonValue, ...]
+    | Mapping[str, JsonValue]
+)
+
+_SOURCE_MESSAGE_MAX_DEPTH = 32
+_SOURCE_MESSAGE_MAX_ENTRIES = 20_000
+_SOURCE_MESSAGE_MAX_BYTES = 256 * 1024
+
+
+def _bounded_json(
+    value: Any,
+    *,
+    depth: int,
+    entries: list[int],
+    active: set[int],
+) -> JsonValue:
+    if isinstance(value, (Mapping, list, tuple)):
+        if depth > _SOURCE_MESSAGE_MAX_DEPTH:
+            raise ValueError("message nesting exceeds 32")
+        identity = id(value)
+        if identity in active:
+            raise ValueError("message contains a cycle")
+        active.add(identity)
+        try:
+            entries[0] += len(value)
+            if entries[0] > _SOURCE_MESSAGE_MAX_ENTRIES:
+                raise ValueError("message exceeds 20000 container entries")
+            if isinstance(value, Mapping):
+                frozen: dict[str, JsonValue] = {}
+                for key, item in value.items():
+                    if not isinstance(key, str):
+                        raise ValueError("JSON object keys must be strings")
+                    frozen[key] = _bounded_json(
+                        item,
+                        depth=depth + 1,
+                        entries=entries,
+                        active=active,
+                    )
+                return MappingProxyType(frozen)
+            return tuple(
+                _bounded_json(
+                    item,
+                    depth=depth + 1,
+                    entries=entries,
+                    active=active,
+                )
+                for item in value
+            )
+        finally:
+            active.remove(identity)
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("JSON numbers must be finite")
+        return value
+    raise ValueError("value must be JSON-compatible")
 
 
 class _DetachedModel(BaseModel):
@@ -97,25 +166,74 @@ class SourceMessage(_DetachedModel):
         extra="forbid",
         validate_default=True,
         arbitrary_types_allowed=True,
+        strict=True,
     )
 
-    ref: StrictStr = Field(min_length=1)
-    message: Mapping[str, Any]
-    protected: bool = False
-    current: bool = False
+    ref: StrictStr = Field(min_length=1, max_length=512)
+    role: Literal["system", "user", "assistant", "tool"]
+    message: Mapping[str, JsonValue]
+    event_type: StrictStr = Field(min_length=1, max_length=128)
+    protected: StrictBool = False
+    current: StrictBool = False
+
+    @field_validator("message", mode="before")
+    @classmethod
+    def _validate_message(cls, value: Any) -> Mapping[str, JsonValue]:
+        if not isinstance(value, Mapping):
+            raise ValueError("source message must be a JSON object")
+        entries = [0]
+        frozen = _bounded_json(
+            value,
+            depth=0,
+            entries=entries,
+            active=set(),
+        )
+        assert isinstance(frozen, Mapping)
+        encoded = json.dumps(
+            thaw_json(frozen),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _SOURCE_MESSAGE_MAX_BYTES:
+            raise ValueError("serialized message exceeds 262144 bytes")
+        return frozen
 
     @field_validator("message", mode="after")
     @classmethod
-    def _freeze_message(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        frozen = freeze_json(value)
-        assert isinstance(frozen, Mapping)
-        return frozen
+    def _freeze_message(
+        cls,
+        value: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        return cast(Mapping[str, JsonValue], freeze_json(value))
 
     @field_serializer("message")
-    def _serialize_message(self, value: Mapping[str, Any]) -> dict[str, Any]:
+    def _serialize_message(
+        self,
+        value: Mapping[str, JsonValue],
+    ) -> dict[str, Any]:
         thawed = thaw_json(value)
         assert isinstance(thawed, dict)
         return thawed
+
+    @model_validator(mode="after")
+    def _validate_provider_message(self) -> SourceMessage:
+        message_role = self.message.get("role")
+        if message_role != self.role:
+            raise ValueError("message role must match source role")
+        content = self.message.get("content")
+        if self.role in {"system", "user", "tool"}:
+            if not isinstance(content, str):
+                raise ValueError(f"{self.role} content must be a string")
+        elif content is None:
+            tool_calls = self.message.get("tool_calls")
+            if not isinstance(tool_calls, tuple) or not tool_calls:
+                raise ValueError(
+                    "assistant null content requires tool-call protocol data"
+                )
+        elif not isinstance(content, str):
+            raise ValueError("assistant content must be a string or null")
+        return self
 
 
 class _BudgetInputs(_DetachedModel):

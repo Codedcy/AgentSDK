@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections import defaultdict, deque
 from collections.abc import Iterable, Mapping
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from agent_sdk.context.models import SourceMessage
 from agent_sdk.runtime.reconciliation import RunCheckpoint
 from agent_sdk.storage.base import StoredEvent
+
+type _Role = Literal["system", "user", "assistant", "tool"]
 
 
 def checkpoint_ref(run_id: str, checkpoint_version: int, index: int) -> str:
@@ -44,7 +47,9 @@ def extract_sources(
         historical.append(
             SourceMessage(
                 ref=stored.event.event_id,
+                role=cast(_Role, message.get("role")),
                 message=message,
+                event_type=stored.event.type,
                 protected=stored.event.event_id in protected_refs,
             )
         )
@@ -65,12 +70,15 @@ def extract_sources(
     )
     current: list[SourceMessage] = []
     for index, message in enumerate(checkpoint_messages):
-        ref = correlated.get(
+        ref, event_type = correlated.get(
             index,
-            checkpoint_ref(
-                checkpoint.run_id,
-                checkpoint.checkpoint_version,
-                index,
+            (
+                checkpoint_ref(
+                    checkpoint.run_id,
+                    checkpoint.checkpoint_version,
+                    index,
+                ),
+                "checkpoint.message",
             ),
         )
         role = message.get("role")
@@ -80,7 +88,9 @@ def extract_sources(
         current.append(
             SourceMessage(
                 ref=ref,
+                role=cast(_Role, role),
                 message=message,
+                event_type=event_type,
                 protected=(
                     index == latest_user
                     or protocol_message
@@ -146,7 +156,7 @@ def _historical_message(stored: StoredEvent) -> Mapping[str, Any] | None:
 def _correlated_checkpoint_refs(
     current_events: tuple[StoredEvent, ...],
     checkpoint_messages: tuple[dict[str, Any], ...],
-) -> dict[int, str]:
+) -> dict[int, tuple[str, str]]:
     run_created = next(
         (
             stored.event
@@ -156,18 +166,18 @@ def _correlated_checkpoint_refs(
         None,
     )
     model_completed = iter(
-        stored.event.event_id
+        (stored.event.event_id, stored.event.type)
         for stored in current_events
         if stored.event.type == "model.call.completed"
     )
-    tool_completed = {
-        call_id: stored.event.event_id
-        for stored in current_events
-        if stored.event.type == "tool.call.completed"
-        for call_id in (stored.event.payload.get("call_id"),)
-        if isinstance(call_id, str)
-    }
-    refs: dict[int, str] = {}
+    tool_completed: dict[str, deque[tuple[str, str]]] = defaultdict(deque)
+    for stored in current_events:
+        call_id = stored.event.payload.get("call_id")
+        if stored.event.type == "tool.call.completed" and isinstance(call_id, str):
+            tool_completed[call_id].append(
+                (stored.event.event_id, stored.event.type)
+            )
+    refs: dict[int, tuple[str, str]] = {}
     user_correlated = False
     for index, message in enumerate(checkpoint_messages):
         role = message.get("role")
@@ -177,14 +187,14 @@ def _correlated_checkpoint_refs(
             and run_created is not None
             and message.get("content") == run_created.payload.get("user_input")
         ):
-            refs[index] = run_created.event_id
+            refs[index] = (run_created.event_id, run_created.type)
             user_correlated = True
         elif role == "assistant":
-            event_id = next(model_completed, None)
-            if event_id is not None:
-                refs[index] = event_id
+            correlated = next(model_completed, None)
+            if correlated is not None:
+                refs[index] = correlated
         elif role == "tool":
             call_id = message.get("tool_call_id")
-            if isinstance(call_id, str) and call_id in tool_completed:
-                refs[index] = tool_completed[call_id]
+            if isinstance(call_id, str) and tool_completed[call_id]:
+                refs[index] = tool_completed[call_id].popleft()
     return refs

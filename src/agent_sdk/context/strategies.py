@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from typing import Any, Never
 
 from agent_sdk.context.models import SourceMessage
-from agent_sdk.tools.models import freeze_json, thaw_json
+from agent_sdk.tools.models import thaw_json
 
 
 @dataclass(frozen=True)
@@ -71,15 +72,18 @@ def apply_l2(
     recent_messages: int,
     tool_preview_bytes: int,
 ) -> StrategyResult:
-    refs = _source_refs(sources)
     _validate_non_negative_int(recent_messages, "recent_messages")
     _validate_non_negative_int(tool_preview_bytes, "tool_preview_bytes")
+    l1 = apply_l1(sources, tool_preview_bytes=tool_preview_bytes)
+    refs = l1.source_refs
     recent_start = max(0, len(sources) - recent_messages)
     rendered: list[SourceMessage] = []
-    transformations: list[str] = []
-    for index, source in enumerate(sources):
+    transformations = list(l1.transformations)
+    for index, (source, l1_source) in enumerate(
+        zip(sources, l1.items, strict=True)
+    ):
         if source.protected or source.current or index >= recent_start:
-            rendered.append(source)
+            rendered.append(l1_source)
             continue
         role = _role(source)
         kind = "tool_result" if role == "tool" else "exchange"
@@ -97,7 +101,7 @@ def apply_l2(
         }
         rendered.append(
             _replace_content(
-                source,
+                l1_source,
                 json.dumps(
                     outcome,
                     ensure_ascii=False,
@@ -124,8 +128,7 @@ def _validate_non_negative_int(value: int, name: str) -> None:
 
 
 def _role(source: SourceMessage) -> str:
-    role = source.message.get("role")
-    return role if isinstance(role, str) else "unknown"
+    return source.role
 
 
 def _replace_content(source: SourceMessage, content: str) -> SourceMessage:
@@ -136,28 +139,75 @@ def _replace_content(source: SourceMessage, content: str) -> SourceMessage:
 
 
 def _tool_digest(content: Any) -> str:
-    canonical_value: Any = content
     if isinstance(content, str):
         try:
             canonical_value = json.loads(
                 content,
                 parse_constant=_reject_json_constant,
+                object_pairs_hook=_unique_object,
             )
+            _validate_canonical_json(
+                canonical_value,
+                depth=0,
+                entries=[0],
+            )
+            canonical = json.dumps(
+                canonical_value,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(b"json\0" + canonical).hexdigest()
         except (ValueError, RecursionError):
-            canonical_value = content
-    frozen = freeze_json(canonical_value)
-    canonical = json.dumps(
-        thaw_json(frozen),
+            return hashlib.sha256(
+                b"raw\0" + content.encode("utf-8")
+            ).hexdigest()
+    raw = json.dumps(
+        content,
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    ).encode("utf-8")
+    return hashlib.sha256(b"raw\0" + raw).hexdigest()
 
 
 def _reject_json_constant(_: str) -> Never:
     raise ValueError("nonstandard JSON constant")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _validate_canonical_json(
+    value: Any,
+    *,
+    depth: int,
+    entries: list[int],
+) -> None:
+    if isinstance(value, (dict, list)):
+        if depth > 32:
+            raise ValueError("JSON nesting exceeds canonicalization limit")
+        entries[0] += len(value)
+        if entries[0] > 20_000:
+            raise ValueError("JSON entries exceed canonicalization limit")
+        items = value.values() if isinstance(value, dict) else value
+        for item in items:
+            _validate_canonical_json(
+                item,
+                depth=depth + 1,
+                entries=entries,
+            )
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("JSON numbers must be finite")
 
 
 def _tool_preview(content: str, *, ref: str, preview_bytes: int) -> str:

@@ -26,9 +26,17 @@ def _source(
     current: bool = False,
     **message_fields: Any,
 ) -> SourceMessage:
+    event_type = {
+        "system": "context.message.appended",
+        "user": "run.created",
+        "assistant": "model.call.completed",
+        "tool": "tool.call.completed",
+    }[role]
     return SourceMessage(
         ref=ref,
+        role=role,
         message={"role": role, "content": content, **message_fields},
+        event_type=event_type,
         protected=protected,
         current=current,
     )
@@ -162,6 +170,40 @@ def test_l1_treats_nonstandard_json_constants_as_plain_tool_text() -> None:
     assert rendered.items[1].message["content"] == "[duplicate:evt-nan]"
 
 
+@pytest.mark.parametrize(
+    ("first", "second", "duplicate"),
+    [
+        ("alpha", '"alpha"', False),
+        ('{"a":1,"a":2}', '{"a":2}', False),
+        ('{"b":2,"a":1}', '{"a":1,"b":2}', True),
+        ("[1,2]", "[1,2]", True),
+        ("[1,2]", "[2,1]", False),
+        ("1", "1.0", False),
+        ("true", "false", False),
+        ("NaN", "NaN", True),
+        ("Infinity", '"Infinity"', False),
+    ],
+)
+def test_l1_uses_collision_safe_json_and_raw_hash_domains(
+    first: str,
+    second: str,
+    duplicate: bool,
+) -> None:
+    sources = (
+        _source("evt-first", "tool", first),
+        _source("evt-second", "tool", second),
+    )
+
+    rendered = apply_l1(sources, tool_preview_bytes=64)
+
+    if duplicate:
+        assert rendered.items[1].message["content"] == "[duplicate:evt-first]"
+        assert rendered.transformations == ("dedupe:evt-second",)
+    else:
+        assert rendered.items == sources
+        assert rendered.transformations == ()
+
+
 def test_l2_retains_protected_current_and_recent_and_structures_old_outcomes() -> None:
     sources = _strategy_sources()
     before = copy.deepcopy([item.model_dump(mode="json") for item in sources])
@@ -190,6 +232,26 @@ def test_l2_retains_protected_current_and_recent_and_structures_old_outcomes() -
     assert rendered.source_refs == tuple(item.ref for item in sources)
     assert len(rendered.source_refs) == len(set(rendered.source_refs))
     assert [item.model_dump(mode="json") for item in sources] == before
+
+
+def test_l2_layers_l1_preview_over_a_recent_unprotected_tool() -> None:
+    sources = (
+        _source("evt-old-user", "user", "older request"),
+        _source("evt-recent-tool", "tool", "数据🙂" * 300),
+    )
+
+    l1 = apply_l1(sources, tool_preview_bytes=64)
+    l2 = apply_l2(sources, recent_messages=1, tool_preview_bytes=64)
+
+    recent_l1 = l1.items[1].message["content"]
+    recent_l2 = l2.items[1].message["content"]
+    assert "[source:evt-recent-tool]" in recent_l2
+    assert len(recent_l2.encode("utf-8")) <= 64 + 96
+    assert len(recent_l2.encode("utf-8")) <= len(recent_l1.encode("utf-8"))
+    assert l2.transformations == (
+        "tool_preview:evt-recent-tool",
+        "outcome:evt-old-user",
+    )
 
 
 def test_render_level_dispatches_l0_l2_and_rejects_model_levels() -> None:
@@ -225,15 +287,161 @@ def test_render_level_dispatches_l0_l2_and_rejects_model_levels() -> None:
 
 
 def test_source_messages_validate_detached_json_and_unique_refs() -> None:
-    message = {"role": "user", "content": ["nested", {"value": 1}]}
-    source = SourceMessage(ref="evt-detached", message=message)
-    message["content"][1]["value"] = 2
-    assert source.message["content"][1]["value"] == 1
+    message = {
+        "role": "user",
+        "content": "nested",
+        "metadata": [{"value": 1}],
+    }
+    source = SourceMessage(
+        ref="evt-detached",
+        role="user",
+        message=message,
+        event_type="run.created",
+    )
+    message["metadata"][0]["value"] = 2
+    assert source.message["metadata"][0]["value"] == 1
 
     with pytest.raises(ValidationError):
-        SourceMessage(ref="evt-invalid", message={"role": "user", "bad": object()})
+        SourceMessage(
+            ref="evt-invalid",
+            role="user",
+            message={"role": "user", "content": "valid", "bad": object()},
+            event_type="run.created",
+        )
     with pytest.raises(ValueError, match="source message refs must be unique"):
         apply_l0((source, source))
+
+
+def _source_errors(**updates: Any) -> list[dict[str, Any]]:
+    values: dict[str, Any] = {
+        "ref": "evt-valid",
+        "role": "user",
+        "message": {"role": "user", "content": "valid"},
+        "event_type": "run.created",
+    }
+    values.update(updates)
+    if values["role"] is None:
+        del values["role"]
+    with pytest.raises(ValidationError) as raised:
+        SourceMessage(**values)
+    return raised.value.errors()
+
+
+def test_source_message_exposes_strict_bounded_runtime_interface() -> None:
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ],
+    }
+    source = SourceMessage(
+        ref="evt-valid",
+        role="assistant",
+        message=message,
+        event_type="model.call.completed",
+        protected=False,
+        current=True,
+    )
+    message["tool_calls"][0]["function"]["name"] = "mutated"
+    assert source.role == "assistant"
+    assert source.event_type == "model.call.completed"
+    assert source.message["tool_calls"][0]["function"]["name"] == "lookup"
+    assert source.model_dump(mode="json")["message"]["tool_calls"][0]["id"] == "call-1"
+
+
+def test_source_message_rejects_missing_unsupported_or_mismatched_roles() -> None:
+    missing = _source_errors(role=None)
+    unsupported = _source_errors(
+        role="invalid",
+        message={"role": "invalid", "content": "bad"},
+    )
+    mismatch = _source_errors(
+        role="user",
+        message={"role": "assistant", "content": "bad"},
+    )
+
+    assert any(error["loc"] == ("role",) for error in missing)
+    assert any(error["type"] == "literal_error" for error in unsupported)
+    assert "message role must match source role" in mismatch[0]["msg"]
+
+
+def test_source_message_rejects_invalid_provider_content_and_coerced_flags() -> None:
+    numeric_tool = _source_errors(
+        role="tool",
+        message={"role": "tool", "content": 7},
+        event_type="tool.call.completed",
+    )
+    coerced_protected = _source_errors(protected=1)
+    coerced_current = _source_errors(current=0)
+
+    assert "tool content must be a string" in numeric_tool[0]["msg"]
+    assert any(
+        error["loc"] == ("protected",) and error["type"] == "bool_type"
+        for error in coerced_protected
+    )
+    assert any(
+        error["loc"] == ("current",) and error["type"] == "bool_type"
+        for error in coerced_current
+    )
+
+
+def test_source_message_rejects_identity_and_json_resource_overflows() -> None:
+    long_ref = _source_errors(ref="r" * 513)
+    long_event_type = _source_errors(event_type="e" * 129)
+    oversized = _source_errors(
+        message={"role": "user", "content": "x" * (256 * 1024)}
+    )
+    too_many = _source_errors(
+        message={
+            "role": "assistant",
+            "content": "bounded",
+            "data": {str(index): 0 for index in range(20_001)},
+        },
+        role="assistant",
+    )
+
+    assert any(error["loc"] == ("ref",) for error in long_ref)
+    assert any(error["loc"] == ("event_type",) for error in long_event_type)
+    assert "serialized message exceeds 262144 bytes" in oversized[0]["msg"]
+    assert "message exceeds 20000 container entries" in too_many[0]["msg"]
+
+
+def test_source_message_normalizes_deep_cyclic_and_non_json_validation() -> None:
+    deep: list[Any] = []
+    cursor = deep
+    for _ in range(33):
+        child: list[Any] = []
+        cursor.append(child)
+        cursor = child
+    cyclic: dict[str, Any] = {}
+    cyclic["self"] = cyclic
+
+    deep_errors = _source_errors(
+        role="assistant",
+        message={"role": "assistant", "content": "bounded", "data": deep},
+    )
+    cyclic_errors = _source_errors(
+        role="assistant",
+        message={"role": "assistant", "content": "bounded", "data": cyclic},
+    )
+    key_errors = _source_errors(
+        role="assistant",
+        message={"role": "assistant", "content": "bounded", 1: "bad"},
+    )
+    number_errors = _source_errors(
+        role="assistant",
+        message={"role": "assistant", "content": "bounded", "score": float("inf")},
+    )
+
+    assert "message nesting exceeds 32" in deep_errors[0]["msg"]
+    assert "message contains a cycle" in cyclic_errors[0]["msg"]
+    assert "JSON object keys must be strings" in key_errors[0]["msg"]
+    assert "JSON numbers must be finite" in number_errors[0]["msg"]
 
 
 def test_checkpoint_refs_are_stable() -> None:
@@ -359,3 +567,181 @@ def test_extract_sources_correlates_checkpoint_and_protects_active_state() -> No
     current_messages[0]["content"] = "mutated"
     assert sources[0].message["content"] == "older request"
     assert sources[1].message["content"] == "current request"
+
+
+def _assistant_call(call_id: str) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ],
+    }
+
+
+def _tool_message(call_id: str, content: str) -> dict[str, Any]:
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": "lookup",
+        "content": content,
+    }
+
+
+def _tool_event(cursor: int, event_id: str, call_id: str, content: str) -> StoredEvent:
+    return _event(
+        cursor,
+        event_id,
+        "tool.call.completed",
+        run_id="run-current",
+        payload={
+            "call_id": call_id,
+            "tool_name": "lookup",
+            "status": "succeeded",
+            "content": content,
+            "value": {"content": content},
+            "error": None,
+        },
+    )
+
+
+def test_extract_sources_consumes_repeated_tool_call_ids_in_event_order() -> None:
+    messages = (
+        {"role": "user", "content": "current request"},
+        _assistant_call("call-reused"),
+        _tool_message("call-reused", "first"),
+        _assistant_call("call-reused"),
+        _tool_message("call-reused", "second"),
+    )
+    checkpoint = RunCheckpoint(
+        run_id="run-current",
+        session_id="ses-current",
+        checkpoint_version=5,
+        turn=2,
+        phase=RunCheckpointPhase.READY_FOR_MODEL,
+        messages=messages,
+    )
+    events = (
+        _event(
+            1,
+            "evt-user",
+            "run.created",
+            run_id="run-current",
+            payload={"user_input": "current request"},
+        ),
+        _event(
+            2,
+            "evt-model-1",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+        _tool_event(3, "evt-tool-1", "call-reused", "first"),
+        _event(
+            4,
+            "evt-model-2",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+        _tool_event(5, "evt-tool-2", "call-reused", "second"),
+    )
+
+    sources = extract_sources(events, checkpoint)
+
+    assert tuple(source.ref for source in sources) == (
+        "evt-user",
+        "evt-model-1",
+        "evt-tool-1",
+        "evt-model-2",
+        "evt-tool-2",
+    )
+    assert tuple(source.event_type for source in sources) == (
+        "run.created",
+        "model.call.completed",
+        "tool.call.completed",
+        "model.call.completed",
+        "tool.call.completed",
+    )
+
+
+def test_extract_sources_handles_interleaved_and_unmatched_tool_call_ids() -> None:
+    messages = (
+        {"role": "user", "content": "current request"},
+        _assistant_call("call-a"),
+        _tool_message("call-a", "a-first"),
+        _assistant_call("call-b"),
+        _tool_message("call-b", "b"),
+        _assistant_call("call-a"),
+        _tool_message("call-a", "a-second"),
+        _assistant_call("call-missing"),
+        _tool_message("call-missing", "synthetic"),
+    )
+    checkpoint = RunCheckpoint(
+        run_id="run-current",
+        session_id="ses-current",
+        checkpoint_version=9,
+        turn=4,
+        phase=RunCheckpointPhase.READY_FOR_MODEL,
+        messages=messages,
+    )
+    events = (
+        _event(
+            1,
+            "evt-user",
+            "run.created",
+            run_id="run-current",
+            payload={"user_input": "current request"},
+        ),
+        _event(
+            2,
+            "evt-model-1",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+        _tool_event(3, "evt-tool-a1", "call-a", "a-first"),
+        _event(
+            4,
+            "evt-model-2",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+        _tool_event(5, "evt-tool-b", "call-b", "b"),
+        _event(
+            6,
+            "evt-model-3",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+        _tool_event(7, "evt-tool-a2", "call-a", "a-second"),
+        _event(
+            8,
+            "evt-model-4",
+            "model.call.completed",
+            run_id="run-current",
+            payload={"finish_reason": "tool_calls"},
+        ),
+    )
+
+    sources = extract_sources(events, checkpoint)
+
+    assert tuple(source.ref for source in sources) == (
+        "evt-user",
+        "evt-model-1",
+        "evt-tool-a1",
+        "evt-model-2",
+        "evt-tool-b",
+        "evt-model-3",
+        "evt-tool-a2",
+        "evt-model-4",
+        "checkpoint:run-current:9:8",
+    )
+    assert len({source.ref for source in sources}) == len(sources)
+    assert sources[-1].event_type == "checkpoint.message"
