@@ -40,7 +40,12 @@ from agent_sdk.runtime.models import (
 from agent_sdk.runtime.recovery import RunRecoveryService
 from agent_sdk.runtime.reconciliation import RecoveryStateConflictError
 from agent_sdk.skills import SkillRegistry
-from agent_sdk.storage.base import CommitBatch, SnapshotWrite
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    SnapshotWrite,
+)
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.subagents import SubagentService, TaskEnvelope
@@ -762,6 +767,150 @@ async def test_r2_private_snapshot_recovery_validation_rejects_tampering(
             await reopened.list_external_operations(run_id)
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_r2_authenticated_event_allows_normalized_snapshot_precondition(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStore.open(tmp_path / "r2-precondition-valid.db")
+    spec = AgentSpec(name="r2-agent", revision="1", model="test/model")
+    try:
+        session_id, run_id = await _seed_r2_schema_v1_run(store, spec)
+        normalized = RunSnapshot.model_validate(
+            await store.get_snapshot("run", run_id)
+        )
+
+        await store.commit(
+            CommitBatch(
+                events=(),
+                preconditions=(
+                    SnapshotPrecondition(
+                        "run",
+                        run_id,
+                        version=1,
+                        session_id=session_id,
+                        data=normalized.model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "event_session",
+        "sequence",
+        "schema_version",
+        "payload",
+        "noncanonical_payload",
+        "old_hash",
+        "multiple_created",
+    ),
+)
+async def test_r2_normalized_snapshot_precondition_rejects_invalid_creation_event(
+    tmp_path: Path,
+    tamper: Literal[
+        "event_session",
+        "sequence",
+        "schema_version",
+        "payload",
+        "noncanonical_payload",
+        "old_hash",
+        "multiple_created",
+    ],
+) -> None:
+    store = await SQLiteStore.open(tmp_path / f"r2-precondition-{tamper}.db")
+    spec = AgentSpec(name="r2-agent", revision="1", model="test/model")
+    try:
+        session_id, run_id = await _seed_r2_schema_v1_run(store, spec)
+        normalized = RunSnapshot.model_validate(
+            await store.get_snapshot("run", run_id)
+        )
+        events = await store.read_events(after_cursor=0)
+        created = next(
+            stored.event
+            for stored in events
+            if stored.event.type == "run.created"
+        )
+        if tamper == "event_session":
+            await store._connection.execute(
+                "UPDATE events SET session_id = ? WHERE event_id = ?",
+                ("ses_forged", created.event_id),
+            )
+        elif tamper == "sequence":
+            await store._connection.execute(
+                "UPDATE events SET sequence = 2 WHERE event_id = ?",
+                (created.event_id,),
+            )
+        elif tamper == "schema_version":
+            await store._connection.execute(
+                "UPDATE events SET schema_version = 2 WHERE event_id = ?",
+                (created.event_id,),
+            )
+        elif tamper == "payload":
+            await store._connection.execute(
+                "UPDATE events SET payload_json = ? WHERE event_id = ?",
+                ('{"forged":"payload"}', created.event_id),
+            )
+        elif tamper == "noncanonical_payload":
+            await store._connection.execute(
+                "UPDATE events SET payload_json = payload_json || ' ' WHERE event_id = ?",
+                (created.event_id,),
+            )
+        elif tamper == "old_hash":
+            raw_payload = deepcopy(created.payload)
+            raw_payload["execution_descriptor"]["agent_hash"] = "a" * 64
+            await store._connection.execute(
+                "UPDATE events SET payload_json = ? WHERE event_id = ?",
+                (
+                    json.dumps(
+                        raw_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    created.event_id,
+                ),
+            )
+        else:
+            await store.commit(
+                CommitBatch(
+                    events=(
+                        EventEnvelope.new(
+                            schema_version=1,
+                            type="run.created",
+                            session_id=session_id,
+                            run_id=run_id,
+                            sequence=2,
+                            payload=created.payload,
+                        ),
+                    ),
+                )
+            )
+        await store._connection.commit()
+
+        with pytest.raises(SnapshotPreconditionError):
+            await store.commit(
+                CommitBatch(
+                    events=(),
+                    preconditions=(
+                        SnapshotPrecondition(
+                            "run",
+                            run_id,
+                            version=1,
+                            session_id=session_id,
+                            data=normalized.model_dump(mode="json"),
+                        ),
+                    ),
+                )
+            )
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

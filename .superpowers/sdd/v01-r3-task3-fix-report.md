@@ -124,3 +124,41 @@ Second-round TDD evidence:
   `25 passed`.
 - Ruff passed; strict mypy passed over all 92 source files.
 - Both working-tree and range `git diff --check` passed.
+
+## Final-review fix
+
+Final review `f34d2fc` found that the SQLite schema-v1 semantic precondition
+fallback checked only for one schema-v1 `run.created` event. A malformed event
+could therefore authorize normalized equality against a legacy private Run
+snapshot.
+
+The final fix keeps the fallback limited to legacy schema-v1 Runs and requires
+complete creation evidence:
+
+- The raw stored snapshot must be canonical JSON, validate as a complete
+  `RunSnapshot`, and match the precondition Run identity.
+- There must be exactly one `run.created` event for the Run.
+- The event Session must match the snapshot Session, its sequence must be 1,
+  and its schema version must be 1.
+- The raw event payload must be canonical JSON and must authenticate the
+  complete stored snapshot through `run_created_event_matches`.
+- The normalized expected snapshot must validate and equal the normalized
+  stored snapshot.
+- Schema-v2 preconditions retain the existing byte-exact behavior.
+
+Final-round TDD evidence:
+
+- Direct precondition negatives initially produced `4 failed, 2 passed`;
+  forged event Session, sequence, payload, and legacy descriptor hash were
+  incorrectly accepted.
+- After the fix, the genuine R2 positive plus event Session, sequence,
+  schema-version, forged payload, noncanonical payload, legacy descriptor
+  hash, and duplicate-creation negatives produced `8 passed`.
+- Complete prompt and execution-descriptor gate: `48 passed`.
+- Runtime descriptor, Task 3 prompt, observability, Context,
+  provider-recovery, and SQLite recovery/progress gate:
+  `521 passed, 1 skipped`.
+- Workflow recovery, child workflow, subprocess recovery, and release slices:
+  `25 passed`.
+- Ruff passed; strict mypy passed over all 92 source files.
+- Both working-tree and `f34d2fc` range `git diff --check` passed.

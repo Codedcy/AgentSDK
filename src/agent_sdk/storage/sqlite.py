@@ -22,7 +22,12 @@ from agent_sdk.runtime.leases import (
     LeaseLostError,
     canonical_lease_timestamp,
 )
-from agent_sdk.runtime.models import RunSnapshot, RunStatus, SessionSnapshot
+from agent_sdk.runtime.models import (
+    RunSnapshot,
+    RunStatus,
+    SessionSnapshot,
+    run_created_event_matches,
+)
 from agent_sdk.runtime.reconciliation import (
     ExternalOperation,
     ExternalOperationStatus,
@@ -1664,23 +1669,51 @@ class SQLiteStore:
     ) -> bool:
         if precondition.kind != "run" or precondition.data is None:
             return False
-        async with self._connection.execute(
-            """
-            SELECT schema_version FROM events
-            WHERE run_id = ? AND type = 'run.created'
-            """,
-            (precondition.entity_id,),
-        ) as cursor:
-            creation_versions = tuple(
-                cast(int, row[0]) for row in await cursor.fetchall()
-            )
-        if creation_versions != (1,):
-            return False
         try:
             stored_data = _strict_json_object(stored_json)
             if _canonical_json(stored_data) != stored_json:
                 return False
             stored = RunSnapshot.model_validate(stored_data)
+        except (TypeError, ValueError):
+            return False
+        if stored.run_id != precondition.entity_id:
+            return False
+        async with self._connection.execute(
+            """
+            SELECT session_id, sequence, schema_version, payload_json
+            FROM events
+            WHERE run_id = ? AND type = 'run.created'
+            """,
+            (precondition.entity_id,),
+        ) as cursor:
+            creation_rows = tuple(await cursor.fetchall())
+        if len(creation_rows) != 1:
+            return False
+        creation = creation_rows[0]
+        event_session_id = creation[0]
+        sequence = creation[1]
+        schema_version = creation[2]
+        payload_json = creation[3]
+        try:
+            if (
+                not isinstance(event_session_id, str)
+                or event_session_id != stored.session_id
+                or type(sequence) is not int
+                or sequence != 1
+                or type(schema_version) is not int
+                or schema_version != 1
+                or not isinstance(payload_json, str)
+            ):
+                return False
+            event_payload = _strict_json_object(payload_json)
+            if _canonical_json(event_payload) != payload_json:
+                return False
+            if not run_created_event_matches(
+                stored,
+                event_payload,
+                schema_version=1,
+            ):
+                return False
             expected = RunSnapshot.model_validate(precondition.data)
         except (TypeError, ValueError):
             return False
