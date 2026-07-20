@@ -67,8 +67,18 @@ async def test_context_facade_builds_retrieves_and_deletes_session_capsule() -> 
     assert isinstance(sdk.context, ContextAPI)
     session = await sdk.sessions.create(workspaces=[])
     agent = sdk.agents.define(AgentSpec(name="main", model="fake/main"))
-    run = await sdk.runs.start(session.session_id, agent, "retain this input")
-    await run.result()
+    first_run = await sdk.runs.start(
+        session.session_id,
+        agent,
+        "retain this historical input",
+    )
+    await first_run.result()
+    second_run = await sdk.runs.start(
+        session.session_id,
+        agent,
+        "keep this recent input exact",
+    )
+    await second_run.result()
 
     view = await sdk.context.build(
         session.session_id,
@@ -89,6 +99,12 @@ async def test_context_facade_builds_retrieves_and_deletes_session_capsule() -> 
     assert capsule.source_event_ids == tuple(
         item.event.event_id for item in sources
     )
+    assert len(sources) == 2
+    assert [item.event.type for item in sources] == [
+        "run.created",
+        "model.text.delta",
+    ]
+    assert sources[0].event.payload["user_input"] == "retain this historical input"
     assert all(isinstance(item, ObservedEvent) for item in sources)
 
     await sdk.sessions.close(session.session_id)

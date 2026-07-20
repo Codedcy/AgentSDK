@@ -174,8 +174,6 @@ async def test_forced_compaction_preserves_ledger_and_sources() -> None:
                             "source_event_ids": [
                                 "evt_user",
                                 "evt_assistant",
-                                "evt_tool",
-                                "evt_latest_user",
                             ],
                         }
                     }
@@ -213,8 +211,7 @@ async def test_forced_compaction_preserves_ledger_and_sources() -> None:
         session_id="ses_context",
     )
     assert isinstance(capsule, ContextCapsule)
-    assert set(capsule.source_event_ids) <= {event.event_id for event in sources}
-    assert {"evt_tool", "evt_latest_user"} <= set(capsule.source_event_ids)
+    assert capsule.source_event_ids == ("evt_user", "evt_assistant")
     after = await store.read_events(
         after_cursor=0,
         session_id="ses_context",
@@ -240,15 +237,14 @@ async def test_forced_compaction_preserves_ledger_and_sources() -> None:
     raw_messages = calls[0]["messages"]
     assert isinstance(raw_messages, list)
     source_document = json.loads(raw_messages[-1]["content"])
-    assert source_document["protected_event_ids"] == [
+    assert source_document["operation"] == "summarize"
+    assert source_document["retained_event_ids"] == [
         "evt_tool",
         "evt_latest_user",
     ]
     assert [item["event_id"] for item in source_document["sources"]] == [
         "evt_user",
         "evt_assistant",
-        "evt_tool",
-        "evt_latest_user",
     ]
 
 
@@ -681,7 +677,7 @@ def _planner(
 
 
 @pytest.mark.asyncio
-async def test_automatic_recommendation_does_not_claim_l1_or_l2_is_applied() -> None:
+async def test_automatic_l2_recommendation_applies_deterministic_l2() -> None:
     store = _RecordingStore(InMemoryStore())
     await _seed_projection(store)
     store.batches.clear()
@@ -690,12 +686,13 @@ async def test_automatic_recommendation_does_not_claim_l1_or_l2_is_applied() -> 
     async def acompletion(**_: object) -> object:
         nonlocal model_calls
         model_calls += 1
-        raise AssertionError("automatic recommendation must not compact in M01")
+        raise AssertionError("deterministic L2 must not call the model")
 
     view = await _planner(store, acompletion, token_count=80).build("ses_projection")
 
     assert view.recommended_level is CompactionLevel.L2
-    assert view.applied_level is CompactionLevel.L0
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is None
     assert view.capsule_id is None
     assert view.message_refs == (
         "evt_projection_user",
@@ -703,11 +700,21 @@ async def test_automatic_recommendation_does_not_claim_l1_or_l2_is_applied() -> 
         "evt_projection_tool",
         "evt_projection_latest",
     )
+    assert view.source_refs == view.message_refs
+    assert view.transformations == (
+        "outcome:evt_projection_user",
+        "outcome:evt_projection_assistant",
+    )
     assert model_calls == 0
     assert len(store.batches) == 1
     assert [event.type for event in store.batches[0].events] == [
         "context.view.created"
     ]
+    payload = store.batches[0].events[0].payload
+    assert payload["recommended_level"] == "L2"
+    assert payload["applied_level"] == "L2"
+    assert payload["source_refs"] == list(view.source_refs)
+    assert payload["transformations"] == list(view.transformations)
 
 
 @pytest.mark.asyncio
@@ -927,7 +934,8 @@ async def test_invalid_capsule_or_malformed_model_response_falls_back_safely(
         protected_event_ids={"evt_projection_tool"},
     )
 
-    assert view.applied_level is CompactionLevel.L0
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is CompactionLevel.L4
     assert view.capsule_id is None
     assert view.message_refs == (
         "evt_projection_user",
@@ -943,6 +951,8 @@ async def test_invalid_capsule_or_malformed_model_response_falls_back_safely(
     ]
     assert [snapshot.kind for snapshot in batch.snapshots] == ["context_view"]
     assert batch.events[0].payload["code"] == "context_compaction_failed"
+    assert batch.events[0].payload["applied_level"] == "L2"
+    assert batch.events[1].payload["fallback_from"] == "L4"
     serialized = json.dumps(
         [event.payload for event in batch.events],
         sort_keys=True,
@@ -1000,7 +1010,7 @@ async def test_success_is_one_atomic_commit_with_capsule_view_and_events() -> No
 
     async def acompletion(**_: object) -> dict[str, object]:
         return _structured_response(
-            ["evt_projection_tool", "evt_projection_latest"]
+            ["evt_projection_user", "evt_projection_assistant"]
         )
 
     view = await _planner(store, acompletion).build(
@@ -1020,6 +1030,11 @@ async def test_success_is_one_atomic_commit_with_capsule_view_and_events() -> No
         "context.view.created",
     ]
     assert all(event.run_id == view.view_id for event in batch.events)
+    capsule_snapshot = batch.snapshots[0].data["capsule"]
+    assert capsule_snapshot["source_event_ids"] == [
+        "evt_projection_user",
+        "evt_projection_assistant",
+    ]
 
 
 async def _assert_delete_wins_blocked_compaction(
