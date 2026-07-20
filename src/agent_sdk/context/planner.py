@@ -194,6 +194,21 @@ class ContextPlanner:
                 recommended=recommended,
                 requested=requested,
             )
+        estimated_tokens = self._estimate_compacted_tokens(
+            source,
+            retained,
+            result.capsule,
+        )
+        if estimated_tokens > budget.available_input_tokens:
+            fallback = self._render(CompactionLevel.L2, sources)
+            return await self._persist_fallback(
+                session_id=session_id,
+                rendered=fallback,
+                usage=result.usage,
+                budget=budget,
+                recommended=recommended,
+                requested=requested,
+            )
         return await self._persist_compacted(
             session_id=session_id,
             source=source,
@@ -204,6 +219,7 @@ class ContextPlanner:
             budget=budget,
             recommended=recommended,
             applied=requested,
+            estimated_tokens=estimated_tokens,
         )
 
     def _budget(self, source: tuple[ContextItem, ...]) -> ContextBudget:
@@ -371,6 +387,7 @@ class ContextPlanner:
         budget: ContextBudget,
         recommended: CompactionLevel,
         applied: CompactionLevel,
+        estimated_tokens: int,
     ) -> ContextView:
         view_id = new_id("view")
         capsule_id = new_id("cap")
@@ -389,11 +406,7 @@ class ContextPlanner:
             session_id=session_id,
             message_refs=message_refs,
             capsule_id=capsule_id,
-            estimated_tokens=self._estimate_compacted_tokens(
-                source,
-                retained,
-                capsule,
-            ),
+            estimated_tokens=estimated_tokens,
             recommended_level=recommended,
             applied_level=applied,
             budget=budget,

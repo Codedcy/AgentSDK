@@ -38,6 +38,12 @@ class ContextCompactor:
             summarized = tuple(
                 item for item in source if item.event_id not in retained
             )
+            summarized_refs = {item.event_id for item in summarized}
+            if not summarized_refs:
+                return CompactionResult(
+                    capsule=None,
+                    usage=UsageReported(None, None, None),
+                )
             return await self._complete(
                 document={
                     "schema": "ContextCapsule",
@@ -49,8 +55,8 @@ class ContextCompactor:
                     ],
                     "sources": self._bounded_sources(summarized),
                 },
-                allowed_refs={item.event_id for item in source},
-                required_refs={item.event_id for item in summarized},
+                allowed_refs=summarized_refs,
+                required_refs=summarized_refs,
                 instruction=(
                     "Summarize only the supplied closed older sources into a "
                     "ContextCapsule. Do not summarize retained messages. Cite "

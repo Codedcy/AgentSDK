@@ -92,6 +92,22 @@ async def test_l3_summarize_sends_only_closed_older_slice() -> None:
 
 
 @pytest.mark.asyncio
+async def test_l3_rejects_citation_of_retained_message() -> None:
+    sources = (
+        _item("evt_old", "old question", cursor=1),
+        _item("evt_recent", "recent question", cursor=2),
+    )
+    gateway = _StructuredGateway([_capsule("evt_old", "evt_recent")])
+    compactor = ContextCompactor(gateway, model="fake/compact")  # type: ignore[arg-type]
+
+    result = await compactor.summarize(sources, {"evt_recent"})
+
+    assert result.capsule is None
+    assert result.usage == UsageReported(11, 4, 15)
+    assert len(gateway.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_l4_rebase_supplies_prior_capsules_and_active_bounded_sources() -> None:
     prior = (
         _capsule("evt_prior_a", objective="prior A"),

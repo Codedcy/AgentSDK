@@ -127,6 +127,24 @@ def _planner(
     )
 
 
+def _planner_with_counts(
+    store: InMemoryStore,
+    acompletion: Any,
+    *counts: int,
+    recent_messages: int = 2,
+) -> ContextPlanner:
+    token_counts = iter(counts)
+    return ContextPlanner(
+        store,
+        LiteLLMGateway._for_test(acompletion),
+        model="fake/compact",
+        model_window=100,
+        recent_messages=recent_messages,
+        tool_preview_bytes=256,
+        _token_counter=lambda **_: next(token_counts),
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("token_count", "expected"),
@@ -224,6 +242,73 @@ async def test_l3_retains_recent_and_protected_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_l3_over_budget_output_falls_back_to_l2_with_usage() -> None:
+    store = InMemoryStore()
+    await _seed(store)
+
+    async def acompletion(**_: object) -> dict[str, object]:
+        return _response(
+            "evt_old_user",
+            "evt_old_answer",
+            "evt_old_tool",
+            objective="oversized summary",
+        )
+
+    view = await _planner_with_counts(
+        store,
+        acompletion,
+        90,
+        101,
+        60,
+    ).build("ses_task2", force_level="L3")
+
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is CompactionLevel.L3
+    assert view.capsule_id is None
+    assert view.estimated_tokens == 60
+    events = await store.read_events(after_cursor=0, session_id="ses_task2")
+    created = [item.event for item in events if item.event.type == "context.view.created"]
+    failed = [
+        item.event for item in events if item.event.type == "context.compaction.failed"
+    ]
+    completed = [
+        item.event for item in events if item.event.type == "context.compaction.completed"
+    ]
+    assert completed == []
+    assert created[-1].payload["compaction_usage"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "total_tokens": 17,
+    }
+    assert failed[-1].payload["usage"] == created[-1].payload["compaction_usage"]
+
+
+@pytest.mark.asyncio
+async def test_forced_l3_with_empty_closed_slice_skips_model_and_falls_back() -> None:
+    store = InMemoryStore()
+    await _seed(store)
+    model_calls = 0
+
+    async def acompletion(**_: object) -> object:
+        nonlocal model_calls
+        model_calls += 1
+        return _response("evt_latest_user")
+
+    view = await _planner_with_counts(
+        store,
+        acompletion,
+        90,
+        60,
+        recent_messages=5,
+    ).build("ses_task2", force_level="L3")
+
+    assert model_calls == 0
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is CompactionLevel.L3
+    assert view.capsule_id is None
+
+
+@pytest.mark.asyncio
 async def test_l4_rebases_prior_capsule_evidence() -> None:
     store = InMemoryStore()
     await _seed(store)
@@ -269,6 +354,63 @@ async def test_l4_rebases_prior_capsule_evidence() -> None:
     )
     assert {"evt_old_user", "evt_old_answer"} <= {
         item.event.event_id for item in recovered
+    }
+
+
+@pytest.mark.asyncio
+async def test_l4_over_budget_output_falls_back_to_l2_with_usage() -> None:
+    store = InMemoryStore()
+    await _seed(store)
+    call_count = 0
+
+    async def acompletion(**kwargs: object) -> dict[str, object]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return _response(
+                "evt_old_user",
+                "evt_old_answer",
+                "evt_old_tool",
+                objective="summary",
+            )
+        document = json.loads(kwargs["messages"][-1]["content"])
+        return _response(
+            document["capsule_ids"][0],
+            "evt_recent_answer",
+            "evt_latest_user",
+            objective="oversized rebase",
+        )
+
+    first = await _planner(store, acompletion, token_count=90).build(
+        "ses_task2",
+        force_level="L3",
+    )
+    assert first.capsule_id is not None
+    view = await _planner_with_counts(
+        store,
+        acompletion,
+        96,
+        101,
+        60,
+    ).build("ses_task2", force_level="L4")
+
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is CompactionLevel.L4
+    assert view.capsule_id is None
+    assert view.estimated_tokens == 60
+    events = await store.read_events(after_cursor=0, session_id="ses_task2")
+    completed = [
+        item.event for item in events if item.event.type == "context.compaction.completed"
+    ]
+    failed = [
+        item.event for item in events if item.event.type == "context.compaction.failed"
+    ]
+    assert len(completed) == 1
+    assert failed[-1].payload["requested_level"] == "L4"
+    assert failed[-1].payload["usage"] == {
+        "prompt_tokens": 12,
+        "completion_tokens": 5,
+        "total_tokens": 17,
     }
 
 
