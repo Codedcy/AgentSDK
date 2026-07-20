@@ -53,6 +53,29 @@ steps:
 """
 
 
+def _branch_child_yaml() -> str:
+    return """
+api_version: agent-sdk/v1
+kind: Workflow
+name: recover-branch-child
+inputs: {enabled: true}
+steps:
+  - id: choose
+    kind: condition
+    when: {path: inputs.enabled, op: eq, value: true}
+    then_steps:
+      - {id: selected, kind: agent, agent_revision: worker:1, input: selected}
+    else_steps:
+      - {id: skipped, kind: agent, agent_revision: worker:1, input: skipped}
+  - id: child
+    kind: agent
+    agent_revision: worker:1
+    input: child
+    run_as: child
+    success_criteria: [return child result]
+"""
+
+
 class _CancelAfterNthEventStore:
     def __init__(
         self,
@@ -239,5 +262,58 @@ steps:
         assert required.value.retryable is True
         assert calls == 2
         assert await reopened.recovery.pending_requests(child.run_id)
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_restart_preserves_selected_child_parent(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls
+        calls += 1
+        return _chunks("done")
+
+    database = tmp_path / "selected-child-parent.sqlite3"
+    sqlite = await SQLiteStore.open(database)
+    store = _CancelAfterNthEventStore(sqlite, "workflow.node.started", 2)
+    first = AgentSDK.for_test(store=store, acompletion=provider)
+    first.agents.define(
+        AgentSpec(name="worker", revision="1", model="fake/worker")
+    )
+    session = await first.sessions.create(workspaces=[])
+    handle = await first.workflows.start(session.session_id, _branch_child_yaml())
+
+    with pytest.raises(asyncio.CancelledError):
+        await handle.result()
+    assert calls == 1
+    workflow_run_id = handle.workflow_run_id
+    interrupted = await first.workflows.get(workflow_run_id)
+    parent = next(node for node in interrupted.nodes if node.node_id == "selected")
+    child = next(node for node in interrupted.nodes if node.node_id == "child")
+    assert parent.run_id is not None
+    assert child.run_id is not None
+    child_run_id = child.run_id
+    parent_run_id = parent.run_id
+    await first.close()
+    await sqlite.close()
+
+    reopened = AgentSDK.for_test(database_path=database, acompletion=provider)
+    reopened.agents.define(
+        AgentSpec(name="worker", revision="1", model="fake/worker")
+    )
+    try:
+        await reopened.recovery.scan()
+        recovered = await reopened.recovery.recover_workflow(workflow_run_id)
+        result = await recovered.result()
+
+        assert result.status is WorkflowRunStatus.COMPLETED
+        assert calls == 2
+        durable_child = await reopened.runs.get(child_run_id)
+        assert durable_child.parent_run_id == parent_run_id
+        assert durable_child.workflow_node_execution == 1
     finally:
         await reopened.close()

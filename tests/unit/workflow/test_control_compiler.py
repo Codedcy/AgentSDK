@@ -9,7 +9,12 @@ from pydantic import ValidationError
 
 from agent_sdk.runtime.execution import DurableWorkflowIR
 from agent_sdk.workflow.compiler import WorkflowCompiler
-from agent_sdk.workflow.models import AgentNode, WorkflowDefinition, WorkflowIR
+from agent_sdk.workflow.models import (
+    AgentNode,
+    WorkflowDefinition,
+    WorkflowIR,
+    WorkflowInstruction,
+)
 
 
 CONTROL_DATA: dict[str, object] = {
@@ -304,6 +309,71 @@ def test_loop_iteration_limit_is_statically_bounded() -> None:
         WorkflowCompiler(max_loop_iterations=2).compile(
             WorkflowDefinition.model_validate(CONTROL_DATA)
         )
+
+
+@pytest.mark.parametrize("coercive_value", (True, 1.0, "2"))
+def test_loop_iteration_limit_rejects_coercive_integers(
+    coercive_value: object,
+) -> None:
+    candidate = json.loads(json.dumps(CONTROL_DATA))
+    candidate["steps"][1]["max_iterations"] = coercive_value
+
+    with pytest.raises(ValidationError):
+        WorkflowDefinition.model_validate(candidate)
+
+
+@pytest.mark.parametrize("coercive_value", (True, 1.0, "2"))
+@pytest.mark.parametrize(
+    ("field", "instruction"),
+    (
+        (
+            "true_pc",
+            {
+                "id": "branch",
+                "op": "branch",
+                "expression": {"path": "inputs.ready", "op": "exists"},
+                "true_pc": 1,
+                "false_pc": 2,
+            },
+        ),
+        (
+            "false_pc",
+            {
+                "id": "branch",
+                "op": "branch",
+                "expression": {"path": "inputs.ready", "op": "exists"},
+                "true_pc": 1,
+                "false_pc": 2,
+            },
+        ),
+        (
+            "target_pc",
+            {"id": "jump", "op": "jump", "target_pc": 1},
+        ),
+        (
+            "max_iterations",
+            {
+                "id": "loop",
+                "op": "loop_check",
+                "expression": {"path": "outputs.done", "op": "exists"},
+                "true_pc": 3,
+                "false_pc": 1,
+                "loop_id": "loop",
+                "max_iterations": 2,
+            },
+        ),
+    ),
+)
+def test_instruction_control_numbers_reject_coercive_integers(
+    field: str,
+    instruction: dict[str, object],
+    coercive_value: object,
+) -> None:
+    candidate = dict(instruction)
+    candidate[field] = coercive_value
+
+    with pytest.raises(ValidationError):
+        WorkflowInstruction.model_validate(candidate)
 
 
 def test_unknown_operator_and_arbitrary_yaml_tags_are_rejected() -> None:

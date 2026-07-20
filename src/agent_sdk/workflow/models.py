@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictInt,
     ValidationInfo,
     field_serializer,
     field_validator,
@@ -92,7 +93,7 @@ class LoopStep(BaseModel):
     id: str = Field(min_length=1, max_length=128)
     kind: Literal["loop"] = "loop"
     until: WorkflowExpression
-    max_iterations: int = Field(ge=1)
+    max_iterations: StrictInt = Field(ge=1)
     body: tuple[WorkflowStep, ...] = Field(min_length=1)
 
 
@@ -166,11 +167,11 @@ class WorkflowInstruction(BaseModel):
     op: InstructionOp
     agent_node_id: str | None = None
     expression: WorkflowExpression | None = None
-    true_pc: int | None = None
-    false_pc: int | None = None
-    target_pc: int | None = None
+    true_pc: StrictInt | None = None
+    false_pc: StrictInt | None = None
+    target_pc: StrictInt | None = None
     loop_id: str | None = None
-    max_iterations: int | None = None
+    max_iterations: StrictInt | None = None
 
     @model_validator(mode="after")
     def _validate_operation_shape(self) -> Self:

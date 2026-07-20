@@ -601,11 +601,7 @@ class WorkflowExecutor:
             parent = await self._validated_child_parent(snapshot, index, node)
             self._validate_recovery_descriptor(snapshot)
             envelope = _task_envelope(node) if node.run_as == "child" else None
-            parent_run_id = (
-                _parent_run_id(snapshot, index)
-                if node.run_as == "child"
-                else None
-            )
+            parent_run_id = None if parent is None else parent.run_id
             user_input = (
                 render_task_envelope(envelope)
                 if envelope is not None
@@ -686,10 +682,9 @@ class WorkflowExecutor:
     ) -> RunSnapshot | None:
         if node.run_as != "child":
             return None
-        if index == 0:
-            raise _invalid_parent_run()
-        previous_node = snapshot.workflow.nodes[index - 1]
-        previous_projection = snapshot.nodes[index - 1]
+        parent_index = _parent_node_index(snapshot, index)
+        previous_node = snapshot.workflow.nodes[parent_index]
+        previous_projection = snapshot.nodes[parent_index]
         parent_run_id = previous_projection.run_id
         if (
             previous_projection.status is not WorkflowNodeStatus.COMPLETED
@@ -703,7 +698,7 @@ class WorkflowExecutor:
             or parent.status is not RunStatus.COMPLETED
             or not _related_run_matches(
                 snapshot,
-                index - 1,
+                parent_index,
                 previous_node,
                 parent,
                 expected_descriptor=expected_descriptor,
@@ -1529,13 +1524,8 @@ def _is_linear_program(workflow: WorkflowIR) -> bool:
 
 
 def _parent_run_id(snapshot: WorkflowRunSnapshot, index: int) -> str:
-    if index == 0:
-        raise AgentSDKError(
-            ErrorCode.INVALID_STATE,
-            "root workflow node cannot be a child",
-            retryable=False,
-        )
-    parent = snapshot.nodes[index - 1].run_id
+    parent_index = _parent_node_index(snapshot, index)
+    parent = snapshot.nodes[parent_index].run_id
     if parent is None:
         raise AgentSDKError(
             ErrorCode.INVALID_STATE,
@@ -1543,6 +1533,36 @@ def _parent_run_id(snapshot: WorkflowRunSnapshot, index: int) -> str:
             retryable=False,
         )
     return parent
+
+
+def _parent_node_index(snapshot: WorkflowRunSnapshot, index: int) -> int:
+    if index == 0:
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "root workflow node cannot be a child",
+            retryable=False,
+        )
+    if (
+        snapshot.workflow.schema_version == 1
+        or _is_linear_program(snapshot.workflow)
+    ):
+        return index - 1
+    control = snapshot.control
+    parent_node_id = None if control is None else control.last_output_node_id
+    if parent_node_id is None:
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "child workflow node has no parent run",
+            retryable=False,
+        )
+    for parent_index, candidate in enumerate(snapshot.workflow.nodes):
+        if candidate.id == parent_node_id:
+            return parent_index
+    raise AgentSDKError(
+        ErrorCode.INVALID_STATE,
+        "child workflow node has no parent run",
+        retryable=False,
+    )
 
 
 def _task_envelope(node: AgentNode) -> TaskEnvelope:
@@ -1590,13 +1610,10 @@ def _related_run_matches(
             and run.task_envelope is None
             and run.user_input == node.input
         )
-    if index == 0:
-        return False
-    expected_parent = workflow.nodes[index - 1].run_id
+    expected_parent = _parent_run_id(workflow, index)
     expected_envelope = _task_envelope(node)
     return (
-        expected_parent is not None
-        and run.parent_run_id == expected_parent
+        run.parent_run_id == expected_parent
         and run.task_envelope == expected_envelope
         and run.user_input == render_task_envelope(expected_envelope)
     )
