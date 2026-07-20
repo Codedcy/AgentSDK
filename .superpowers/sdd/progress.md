@@ -345,5 +345,9 @@ v0.1 R3 Task 2: complete (automatic L0-L4 recommendation/application; `allow_los
 v0.1 R3 Task 2 fallback contract: invalid, timeout, schema, reference, input-bound, or output-budget L3/L4 results use the exact deterministic L2 renderer without failing the main Run
 v0.1 R3 Task 2 final safety fix: `c3dc154`; final independent re-review: `3d8458e`, Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 2 fresh gates: Context 102 passed; Ruff clean; strict mypy clean; diff-check clean
-v0.1 next required action: R3 Task 3 Step 1, creating `tests/integration/prompts/test_runtime_prompt.py`
-v0.1 first Task 3 command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\prompts\test_runtime_prompt.py tests\unit\runtime\test_execution_descriptors.py -q`
+v0.1 R3 Task 3: complete (implementation `9fbcd16`; final approval `2bd48e3`; Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS)
+v0.1 R3 Task 3 delivered durable `AgentSpec`/`DurableAgentSpec` prompt and Context fields; public `SkillRegistry` exposure with one shared direct/Workflow/subagent preflight; ordered default/application/Skill prompt layers with persisted manifest; redacted public `run.created` schema v2; and authenticated genuine R2 schema-v1 recovery compatibility.
+v0.1 R3 Task 3 effective evidence: controller mainline 201 passed; implementer gate 521 passed, 1 skipped; Workflow/recovery/release gate 25 passed; Ruff clean; strict mypy clean across 92 source files.
+v0.1 current implementation status: R0-R2 completed; R3 in progress (Tasks 1-3 complete; Task 4 pending)
+v0.1 next required action: R3 Task 4 Step 1, creating `tests/integration/context/test_runtime_middleware.py` and `tests/integration/context/test_context_recovery.py`; first write RED tests for two model calls/Context View ordering and recovery fingerprints
+v0.1 first Task 4 command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\context\test_runtime_middleware.py tests\integration\context\test_context_recovery.py -q`

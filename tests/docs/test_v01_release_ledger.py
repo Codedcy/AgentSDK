@@ -78,12 +78,16 @@ R3_RESUME_COMMAND = (
 R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
 R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
 R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
-R3_TASK3_FIRST_TEST = "tests/integration/prompts/test_runtime_prompt.py"
-R3_TASK3_FIRST_COMMAND = (
+R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
+R3_TASK4_FIRST_TESTS = (
+    "tests/integration/context/test_runtime_middleware.py",
+    "tests/integration/context/test_context_recovery.py",
+)
+R3_TASK4_FIRST_COMMAND = (
     "$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; "
     r".\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin "
-    r"tests\integration\prompts\test_runtime_prompt.py "
-    r"tests\unit\runtime\test_execution_descriptors.py -q"
+    r"tests\integration\context\test_runtime_middleware.py "
+    r"tests\integration\context\test_context_recovery.py -q"
 )
 
 
@@ -137,15 +141,32 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "102 passed" in document
     assert "R3 Task 2 is complete" in document or "v0.1 R3 Task 2: complete" in document
     assert "Critical 0 / Important 0 / Minor 0" in document
-    assert "R3 Task 3 Step 1" in document
-    assert R3_TASK3_FIRST_TEST in document
-    assert R3_TASK3_FIRST_COMMAND in normalized_document
+    for commit in R3_TASK3_COMMITS:
+        assert commit in document
+    assert "R3 Task 3 is complete" in document or "v0.1 R3 Task 3: complete" in document
+    assert "AgentSpec" in document
+    assert "DurableAgentSpec" in document
+    assert "SkillRegistry" in document
+    assert "run.created" in document
+    assert "schema v2" in document or "schema-v2" in document
+    assert "schema-v1" in document
+    assert "Critical 0 / Important 0 / Minor 0" in document
+    assert "201 passed" in document
+    assert "521 passed, 1 skipped" in document
+    assert "25 passed" in document
+    assert "92 source files" in document
+    assert "R3 Task 4 Step 1" in document
+    for test_path in R3_TASK4_FIRST_TESTS:
+        assert test_path in document
+    assert R3_TASK4_FIRST_COMMAND in normalized_document
     assert "R3 Task 2 Step 1" not in document
     assert "tests/unit/context/test_compaction_levels.py" not in document
     assert "R3 Task 2 remains pending/unstarted" not in document
     assert "R3 remains pending" not in document
     assert "R3 implementation has not started" not in document
     assert "Tasks 4-5 have not started" not in document
+    assert "next required action: R3 Task 3 Step 1" not in document
+    assert "first Task 3 command:" not in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
@@ -193,7 +214,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
     assert (
         "v0.1 current implementation status: R0-R2 completed; "
-        "R3 in progress (Tasks 1-2 complete; Task 3 pending)"
+        "R3 in progress (Tasks 1-3 complete; Task 4 pending)"
     ) in progress
     _assert_release_checkpoint_and_r3_resume(ledger)
     _assert_release_checkpoint_and_r3_resume(progress)
