@@ -1,3 +1,5 @@
+import hashlib
+import json
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Literal, Self
@@ -264,3 +266,103 @@ class RunSnapshot(BaseModel):
         if update is not None:
             data.update(update)
         return type(self).model_validate(data)
+
+
+class RunCreatedEventPayload(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    run_id: str
+    session_id: str
+    agent_revision: str
+    status: Literal["created"] = "created"
+    version: Literal[1] = 1
+    parent_run_id: str | None = None
+    workflow_run_id: str | None = None
+    workflow_node_id: str | None = None
+    workflow_node_execution: int | None = None
+    execution_compatibility: Literal["legacy_unknown", "current"]
+    user_input: str
+    user_input_sha256: str
+    task_envelope_sha256: str | None = None
+    execution_descriptor_hash: str | None = None
+    agent_hash: str | None = None
+    tool_capability_hashes: tuple[str, ...] = ()
+
+    @classmethod
+    def from_snapshot(cls, snapshot: RunSnapshot) -> Self:
+        descriptor = snapshot.execution_descriptor
+        return cls(
+            run_id=snapshot.run_id,
+            session_id=snapshot.session_id,
+            agent_revision=snapshot.agent_revision,
+            parent_run_id=snapshot.parent_run_id,
+            workflow_run_id=snapshot.workflow_run_id,
+            workflow_node_id=snapshot.workflow_node_id,
+            workflow_node_execution=snapshot.workflow_node_execution,
+            execution_compatibility=snapshot.execution_compatibility,
+            user_input=snapshot.user_input,
+            user_input_sha256=_canonical_sha256(snapshot.user_input),
+            task_envelope_sha256=(
+                None
+                if snapshot.task_envelope is None
+                else _canonical_sha256(
+                    snapshot.task_envelope.model_dump(mode="json")
+                )
+            ),
+            execution_descriptor_hash=(
+                None if descriptor is None else descriptor.descriptor_hash
+            ),
+            agent_hash=None if descriptor is None else descriptor.agent_hash,
+            tool_capability_hashes=(
+                ()
+                if descriptor is None
+                else tuple(tool.capability_hash for tool in descriptor.tools)
+            ),
+        )
+
+
+def run_created_event_payload(snapshot: RunSnapshot) -> dict[str, Any]:
+    return RunCreatedEventPayload.from_snapshot(snapshot).model_dump(mode="json")
+
+
+def run_created_event_matches(
+    snapshot: RunSnapshot,
+    payload: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> bool:
+    try:
+        if schema_version == 1:
+            created = RunSnapshot(
+                run_id=snapshot.run_id,
+                session_id=snapshot.session_id,
+                agent_revision=snapshot.agent_revision,
+                status=RunStatus.CREATED,
+                user_input=snapshot.user_input,
+                parent_run_id=snapshot.parent_run_id,
+                workflow_run_id=snapshot.workflow_run_id,
+                workflow_node_id=snapshot.workflow_node_id,
+                workflow_node_execution=snapshot.workflow_node_execution,
+                task_envelope=snapshot.task_envelope,
+                execution_compatibility=snapshot.execution_compatibility,
+                execution_descriptor=snapshot.execution_descriptor,
+            )
+            return dict(payload) == created.model_dump(mode="json")
+        if schema_version == 2:
+            return (
+                RunCreatedEventPayload.model_validate(dict(payload))
+                == RunCreatedEventPayload.from_snapshot(snapshot)
+            )
+    except Exception:
+        return False
+    return False
+
+
+def _canonical_sha256(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

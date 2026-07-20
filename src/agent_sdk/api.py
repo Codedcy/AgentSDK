@@ -497,7 +497,6 @@ class RunAPI:
         lifecycle: _SDKLifecycle,
         tools: ToolRegistry,
         policy: PolicyEngine,
-        skills: SkillRegistry,
     ) -> None:
         self._store = store
         self._commands = commands
@@ -506,7 +505,6 @@ class RunAPI:
         self._lifecycle = lifecycle
         self._tools = tools
         self._policy = policy
-        self._skills = skills
         self._start_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[RunResult]] = {}
 
@@ -520,7 +518,6 @@ class RunAPI:
     ) -> RunHandle:
         try:
             async with self._lifecycle.admit():
-                self._activate_skills(agent)
                 messages = ({"role": "user", "content": user_input},)
                 config = self._policy.execution_config()
                 descriptor = ExecutionDescriptor.create(
@@ -554,17 +551,6 @@ class RunAPI:
                 return await self._await_start_coordinator(coordinator)
         finally:
             del idempotency_key
-
-    def _activate_skills(self, agent: AgentSpec) -> None:
-        for name in agent.skills:
-            try:
-                self._skills.activate(name)
-            except AgentSDKError:
-                raise AgentSDKError(
-                    ErrorCode.INVALID_STATE,
-                    "configured agent skill unavailable",
-                    retryable=False,
-                ) from None
 
     async def _coordinate_start(
         self,
@@ -1098,9 +1084,9 @@ class AgentSDK:
         self._lifecycle = _SDKLifecycle()
         self._startup_scan_lock = asyncio.Lock()
         self._startup_scan_task: asyncio.Task[None] | None = None
-        commands = RuntimeCommands(store)
         skills = SkillRegistry(skill_roots)
         skills.discover()
+        commands = RuntimeCommands(store, agent_preflight=skills.validate_agent)
         tools = ToolRegistry()
         if enable_builtin_tools:
             register_builtin_tools(
@@ -1144,7 +1130,6 @@ class AgentSDK:
             self._lifecycle,
             tools,
             policy,
-            skills,
         )
         self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)

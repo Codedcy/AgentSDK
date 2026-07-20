@@ -4,7 +4,11 @@ from enum import Enum
 from typing import Any, NoReturn
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import RunSnapshot
+from agent_sdk.runtime.models import (
+    RunCreatedEventPayload,
+    RunSnapshot,
+    run_created_event_matches,
+)
 from agent_sdk.storage.base import StateStore, StoredEvent
 from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 
@@ -203,26 +207,25 @@ class QueryService:
         ]
         descendants = {root.run_id}
         selected_ids: set[str] = set()
-        selected: list[tuple[StoredEvent, RunSnapshot]] = []
+        selected: list[tuple[StoredEvent, RunCreatedEventPayload | RunSnapshot]] = []
         pending = created
         while pending:
             progressed = False
             remaining: list[StoredEvent] = []
             for stored in pending:
-                initial = _run_snapshot(stored.event.payload)
+                initial = _run_creation(
+                    stored.event.payload,
+                    schema_version=stored.event.schema_version,
+                )
                 if isinstance(initial, _ReadFailure):
                     self._internal("failed to load execution tree")
                 if initial.run_id in descendants:
-                    if stored.event.schema_version != 1:
-                        self._internal("failed to load execution tree")
                     if initial.run_id in selected_ids:
                         self._internal("failed to load execution tree")
                     selected_ids.add(initial.run_id)
                     selected.append((stored, initial))
                     progressed = True
                 elif initial.parent_run_id in descendants:
-                    if stored.event.schema_version != 1:
-                        self._internal("failed to load execution tree")
                     if initial.session_id != root.session_id:
                         self._internal("failed to load execution tree")
                     descendants.add(initial.run_id)
@@ -249,7 +252,11 @@ class QueryService:
                 or current.parent_run_id != initial.parent_run_id
                 or stored.event.session_id != current.session_id
                 or stored.event.run_id != current.run_id
-                or not _same_creation_identity(initial, current)
+                or not run_created_event_matches(
+                    current,
+                    stored.event.payload,
+                    schema_version=stored.event.schema_version,
+                )
             ):
                 self._internal("failed to load execution tree")
             by_id[current.run_id] = ExecutionTreeNode(
@@ -408,20 +415,6 @@ def _parent_claim(payload: dict[str, Any]) -> str | None | _InvalidParent:
     return _InvalidParent.INVALID
 
 
-def _same_creation_identity(created: RunSnapshot, current: RunSnapshot) -> bool:
-    return (
-        created.run_id == current.run_id
-        and created.session_id == current.session_id
-        and created.agent_revision == current.agent_revision
-        and created.user_input == current.user_input
-        and created.parent_run_id == current.parent_run_id
-        and created.workflow_run_id == current.workflow_run_id
-        and created.workflow_node_id == current.workflow_node_id
-        and created.workflow_node_execution == current.workflow_node_execution
-        and created.task_envelope == current.task_envelope
-    )
-
-
 async def _stored_run(
     store: StateStore,
     run_id: str,
@@ -464,11 +457,19 @@ async def _events(
         return _ReadFailure.FAILED
 
 
-def _run_snapshot(data: dict[str, Any]) -> RunSnapshot | _ReadFailure:
+def _run_creation(
+    data: dict[str, Any],
+    *,
+    schema_version: int,
+) -> RunCreatedEventPayload | RunSnapshot | _ReadFailure:
     try:
-        return RunSnapshot.model_validate(data)
+        if schema_version == 1:
+            return RunSnapshot.model_validate(data)
+        if schema_version == 2:
+            return RunCreatedEventPayload.model_validate(data)
     except Exception:
-        return _ReadFailure.FAILED
+        pass
+    return _ReadFailure.FAILED
 
 
 def _observed_event(stored: StoredEvent) -> ObservedEvent | _ReadFailure:
@@ -519,7 +520,7 @@ def _tree_tail_status(
                     continue
                 if parent_run_id not in descendants:
                     continue
-                if event.schema_version != 1 or event.session_id != session_id:
+                if event.schema_version not in {1, 2} or event.session_id != session_id:
                     return _TreeTailStatus.INVALID
                 return _TreeTailStatus.CHANGED
             if (

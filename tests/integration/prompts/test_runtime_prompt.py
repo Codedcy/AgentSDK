@@ -7,16 +7,27 @@ from pathlib import Path
 
 import pytest
 
-from agent_sdk import AgentSDK, ContextRuntimeConfig, PromptManifestPersistence
+from agent_sdk import (
+    AgentNode,
+    AgentSDK,
+    ContextRuntimeConfig,
+    PromptManifestPersistence,
+    ToolSpec,
+    WorkflowIR,
+)
 from agent_sdk.context import CompactionLevel, ContextView
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.models.litellm_gateway import LiteLLMGateway
 from agent_sdk.prompts import PromptComposer
+from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.engine import RunEngine
 from agent_sdk.runtime.models import AgentSpec
 from agent_sdk.skills import SkillRegistry
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
+from agent_sdk.subagents import SubagentService, TaskEnvelope
 
 
 def _skill_root() -> Path:
@@ -25,6 +36,21 @@ def _skill_root() -> Path:
 
 async def _unused_provider(**_: object) -> AsyncIterator[dict[str, object]]:
     raise AssertionError("provider must not be called")
+
+
+async def _successful_provider(**_: object) -> AsyncIterator[dict[str, object]]:
+    async def chunks() -> AsyncIterator[dict[str, object]]:
+        yield {"choices": [{"delta": {"content": "done"}}]}
+        yield {
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+            },
+        }
+
+    return chunks()
 
 
 @pytest.mark.asyncio
@@ -199,6 +225,235 @@ async def test_sdk_discovers_skills_once_and_missing_skill_blocks_model_call(
         assert all(item.event.type != "run.created" for item in events)
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_run_events_never_expose_prompt_or_tool_sentinels(
+    tmp_path: Path,
+) -> None:
+    skill_marker = "SKILL-INSTRUCTIONS-PRIVATE-7D01"
+    application_marker = "APPLICATION-SYSTEM-PROMPT-PRIVATE-9A23"
+    model_params_marker = "MODEL-PARAMS-PRIVATE-2C44"
+    tool_marker = "TOOL-SCHEMA-PRIVATE-4B18"
+    skill_root = tmp_path / "skills"
+    skill_dir = skill_root / "private-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: private-skill\n"
+        "description: private test skill\n"
+        "---\n"
+        f"# Private\n\n{skill_marker}\n",
+        encoding="utf-8",
+    )
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=_successful_provider,
+        skill_roots=(skill_root,),
+        enable_builtin_tools=False,
+    )
+
+    async def private_tool(**_: object) -> dict[str, object]:
+        return {"ok": True}
+
+    sdk.tools.register(
+        ToolSpec(
+            name="private_tool",
+            description="private tool",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "secret": {"type": "string", "description": tool_marker}
+                },
+            },
+        ),
+        private_tool,
+    )
+    spec = AgentSpec(
+        name="private-agent",
+        model="test/model",
+        model_params={"application_secret": model_params_marker},
+        prompt_profile="coding",
+        system_prompt=application_marker,
+        skills=("private-skill",),
+    )
+    profile_texts = tuple(
+        message["content"]
+        for message in PromptComposer()
+        .compose(
+            profile="coding",
+            context_view=ContextView(
+                view_id="view_profile_sentinel",
+                session_id="ses_profile_sentinel",
+                message_refs=(),
+                capsule_id=None,
+                estimated_tokens=0,
+            ),
+            model=spec.model,
+        )
+        .messages
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        result = await (
+            await sdk.runs.start(session.session_id, spec, "ordinary user input")
+        ).result()
+        snapshot = await store.get_snapshot("run", result.run_id)
+        assert snapshot is not None
+        private_snapshot = json.dumps(snapshot, sort_keys=True)
+        assert application_marker in private_snapshot
+        assert model_params_marker in private_snapshot
+        assert tool_marker in private_snapshot
+
+        events = await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        public_events = json.dumps(
+            [item.event.model_dump(mode="json") for item in events],
+            sort_keys=True,
+        )
+        created = next(
+            item.event for item in events if item.event.type == "run.created"
+        )
+        assert created.schema_version == 2
+        assert "execution_descriptor" not in created.payload
+        for raw_text in (
+            application_marker,
+            model_params_marker,
+            skill_marker,
+            tool_marker,
+            *profile_texts,
+        ):
+            assert raw_text not in public_events
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_workflow_missing_skill_fails_before_node_run_or_provider_call(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def provider(**kwargs: object) -> AsyncIterator[dict[str, object]]:
+        calls.append(kwargs)
+        raise AssertionError("provider must not be called")
+
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        skill_roots=(skill_root,),
+    )
+    sdk.agents.define(
+        AgentSpec(
+            name="worker",
+            revision="1",
+            model="test/model",
+            skills=("missing-skill",),
+        )
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        workflow = WorkflowIR.create(
+            name="missing-skill",
+            nodes=(
+                AgentNode(
+                    id="work",
+                    agent_revision="worker:1",
+                    input="Do work.",
+                ),
+            ),
+            edges=(),
+        )
+        handle = await sdk.workflows.start(session.session_id, workflow)
+
+        with pytest.raises(AgentSDKError) as raised:
+            await handle.result()
+
+        assert raised.value.code is ErrorCode.INVALID_STATE
+        assert raised.value.message == "configured agent skill unavailable"
+        assert calls == []
+        events = await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        assert any(item.event.type == "workflow.started" for item in events)
+        assert all(item.event.type != "run.created" for item in events)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_missing_skill_fails_before_child_run_or_provider_call(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    async def provider(**kwargs: object) -> AsyncIterator[dict[str, object]]:
+        calls.append(kwargs)
+        raise AssertionError("provider must not be called")
+
+    skill_root = tmp_path / "skills"
+    skill_root.mkdir()
+    skills = SkillRegistry((skill_root,))
+    skills.discover()
+    store = InMemoryStore()
+    commands = RuntimeCommands(store, agent_preflight=skills.validate_agent)
+    engine = RunEngine(store, LiteLLMGateway._for_test(provider))
+    agents = AgentRegistry()
+    agents.define(
+        AgentSpec(
+            name="worker",
+            revision="1",
+            model="test/model",
+            skills=("missing-skill",),
+        )
+    )
+    service = SubagentService(store, commands, engine, agents)
+    session = await commands.create_session(workspaces=[])
+    parent = await commands.start_run(
+        session.session_id,
+        agent_revision="parent:1",
+        user_input="parent",
+    )
+
+    with pytest.raises(AgentSDKError) as raised:
+        await service.spawn(
+            session_id=session.session_id,
+            parent_run_id=parent.run_id,
+            workflow_run_id="wfr_missing_skill",
+            workflow_node_id="work",
+            agent_revision="worker:1",
+            task=TaskEnvelope(
+                objective="Do work.",
+                success_criteria=("Complete.",),
+            ),
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "configured agent skill unavailable"
+    assert calls == []
+    events = await store.read_events(
+        after_cursor=0,
+        session_id=session.session_id,
+    )
+    assert [
+        item.event
+        for item in events
+        if item.event.type == "run.created"
+    ] == [
+        next(
+            item.event
+            for item in events
+            if item.event.run_id == parent.run_id
+            and item.event.type == "run.created"
+        )
+    ]
 
 
 @pytest.mark.asyncio

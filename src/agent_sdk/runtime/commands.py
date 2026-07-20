@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
@@ -8,12 +8,13 @@ from agent_sdk.events.models import EventEnvelope
 from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.ids import new_id
 from agent_sdk.runtime.idempotency import _idempotency_public_error
-from agent_sdk.runtime.execution import ExecutionDescriptor
+from agent_sdk.runtime.execution import DurableAgentSpec, ExecutionDescriptor
 from agent_sdk.runtime.models import (
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
     SessionStatus,
+    run_created_event_payload,
 )
 from agent_sdk.runtime.session_lifecycle import (
     close_session_transition,
@@ -90,8 +91,14 @@ def validate_session_result(result: Mapping[str, Any]) -> SessionSnapshot:
 
 
 class RuntimeCommands:
-    def __init__(self, store: StateStore) -> None:
+    def __init__(
+        self,
+        store: StateStore,
+        *,
+        agent_preflight: Callable[[DurableAgentSpec], None] | None = None,
+    ) -> None:
         self._store = store
+        self._agent_preflight = agent_preflight
 
     async def create_session(
         self,
@@ -437,6 +444,8 @@ class RuntimeCommands:
                 "legacy run cannot use idempotency",
                 retryable=False,
             ) from None
+        if execution_descriptor is not None and self._agent_preflight is not None:
+            self._agent_preflight(execution_descriptor.agent)
         scope = f"session/{session_id}/run.start"
         invalid_key: AgentSDKError | None = None
         if idempotency_key is not None:
@@ -562,7 +571,8 @@ class RuntimeCommands:
                     session_id=session_id,
                     run_id=snapshot.run_id,
                     sequence=1,
-                    payload=run_data,
+                    payload=run_created_event_payload(snapshot),
+                    schema_version=2,
                 )
                 request = None
                 if idempotency_key is not None:

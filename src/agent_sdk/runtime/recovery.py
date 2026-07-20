@@ -51,6 +51,7 @@ from agent_sdk.runtime.models import (
     SessionStatus,
     TokenUsage,
     mutable_model_params,
+    run_created_event_matches,
 )
 from agent_sdk.runtime.provider_recovery import (
     ProviderRecoveryAdapter,
@@ -3062,7 +3063,14 @@ class RunRecoveryService:
             not isinstance(event.event_id, str)
             or not event.event_id.strip()
             or type(event.schema_version) is not int
-            or event.schema_version != 1
+            or (
+                event.type == "run.created"
+                and event.schema_version not in {1, 2}
+            )
+            or (
+                event.type != "run.created"
+                and event.schema_version != 1
+            )
             or not isinstance(event.type, str)
             or not event.type.strip()
             or event.session_id != run.session_id
@@ -3124,23 +3132,13 @@ class RunRecoveryService:
             )
         ):
             return False
-        created = RunSnapshot(
-            run_id=run.run_id,
-            session_id=run.session_id,
-            agent_revision=run.agent_revision,
-            status=RunStatus.CREATED,
-            user_input=run.user_input,
-            parent_run_id=run.parent_run_id,
-            workflow_run_id=run.workflow_run_id,
-            workflow_node_id=run.workflow_node_id,
-            workflow_node_execution=run.workflow_node_execution,
-            task_envelope=run.task_envelope,
-            execution_compatibility=run.execution_compatibility,
-            execution_descriptor=run.execution_descriptor,
-        )
         return (
             events[0].type == "run.created"
-            and events[0].payload == created.model_dump(mode="json")
+            and run_created_event_matches(
+                run,
+                events[0].payload,
+                schema_version=events[0].schema_version,
+            )
             and events[1].type == "run.started"
             and events[1].payload == {"status": RunStatus.RUNNING.value}
         )
@@ -4563,7 +4561,11 @@ class RunRecoveryService:
             and evidence.run_events[0].sequence == 1
             and evidence.run_events[0].session_id == run.session_id
             and evidence.run_events[0].run_id == run.run_id
-            and evidence.run_events[0].payload == run.model_dump(mode="json")
+            and run_created_event_matches(
+                run,
+                evidence.run_events[0].payload,
+                schema_version=evidence.run_events[0].schema_version,
+            )
         )
 
     def _effective_resolved_evidence(

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.runtime.execution import DurableAgentSpec
+from agent_sdk.runtime.models import AgentSpec
 from agent_sdk.skills.loader import load_skill
 from agent_sdk.skills.models import (
     ActivatedSkill,
@@ -116,6 +118,17 @@ class SkillRegistry:
             root=entry.skill_root,
             root_identity=entry.skill_root_identity,
         )
+
+    def validate_agent(self, agent: AgentSpec | DurableAgentSpec) -> None:
+        for name in agent.skills:
+            try:
+                self.activate(name)
+            except AgentSDKError:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "configured agent skill unavailable",
+                    retryable=False,
+                ) from None
 
     @classmethod
     def _verify_entry(cls, entry: _CatalogEntry) -> None:
