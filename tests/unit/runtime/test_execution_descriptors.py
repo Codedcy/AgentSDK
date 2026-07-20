@@ -22,6 +22,7 @@ from agent_sdk.runtime.models import (
     SessionSnapshot,
     SessionStatus,
     TokenUsage,
+    run_created_event_matches,
 )
 from agent_sdk.context import ContextRuntimeConfig
 from agent_sdk.tools.models import ToolSpec
@@ -252,6 +253,58 @@ def test_legacy_durable_agent_and_descriptor_load_prompt_defaults() -> None:
             for key, value in restored.model_dump(mode="json").items()
             if key != "descriptor_hash"
         }
+    )
+
+
+def test_schema_v1_run_creation_authenticates_genuine_legacy_descriptor_hashes() -> None:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    raw_descriptor = descriptor.model_dump(mode="json")
+    for field in ("prompt_profile", "system_prompt", "skills", "context"):
+        raw_descriptor["agent"].pop(field)
+    raw_descriptor["agent_hash"] = _canonical_hash(raw_descriptor["agent"])
+    raw_descriptor["descriptor_hash"] = _canonical_hash(
+        {
+            key: value
+            for key, value in raw_descriptor.items()
+            if key != "descriptor_hash"
+        }
+    )
+    raw_v1 = RunSnapshot(
+        run_id="run_r2",
+        session_id="ses_r2",
+        agent_revision="coder:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    ).model_dump(mode="json")
+    raw_v1["execution_descriptor"] = raw_descriptor
+    upgraded = RunSnapshot.model_validate(raw_v1)
+
+    assert run_created_event_matches(
+        upgraded,
+        raw_v1,
+        schema_version=1,
+    )
+
+    wrong_agent_hash = json.loads(json.dumps(raw_v1))
+    wrong_agent_hash["execution_descriptor"]["agent_hash"] = "a" * 64
+    assert not run_created_event_matches(
+        upgraded,
+        wrong_agent_hash,
+        schema_version=1,
+    )
+    wrong_descriptor_hash = json.loads(json.dumps(raw_v1))
+    wrong_descriptor_hash["execution_descriptor"]["descriptor_hash"] = "d" * 64
+    assert not run_created_event_matches(
+        upgraded,
+        wrong_descriptor_hash,
+        schema_version=1,
     )
 
 

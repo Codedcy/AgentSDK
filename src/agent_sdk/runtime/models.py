@@ -347,7 +347,8 @@ def run_created_event_matches(
                 execution_compatibility=snapshot.execution_compatibility,
                 execution_descriptor=snapshot.execution_descriptor,
             )
-            return dict(payload) == created.model_dump(mode="json")
+            historical = RunSnapshot.model_validate(dict(payload))
+            return historical == created
         if schema_version == 2:
             return (
                 RunCreatedEventPayload.model_validate(dict(payload))

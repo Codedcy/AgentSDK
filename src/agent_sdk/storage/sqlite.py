@@ -1637,6 +1637,15 @@ class SQLiteStore:
             if row is None:
                 raise SnapshotPreconditionError("snapshot precondition failed")
             version = cast(int, row[0])
+            data_matches = True
+            if (
+                precondition.data is not None
+                and cast(str, row[2]) != _canonical_json(precondition.data)
+            ):
+                data_matches = await self._legacy_v1_run_snapshot_matches(
+                    precondition,
+                    cast(str, row[2]),
+                )
             if (
                 precondition.version is not None
                 and version != precondition.version
@@ -1644,10 +1653,38 @@ class SQLiteStore:
                 precondition.session_id is not None
                 and cast(str, row[1]) != precondition.session_id
             ) or (
-                precondition.data is not None
-                and cast(str, row[2]) != _canonical_json(precondition.data)
+                precondition.data is not None and not data_matches
             ):
                 raise SnapshotPreconditionError("snapshot precondition failed")
+
+    async def _legacy_v1_run_snapshot_matches(
+        self,
+        precondition: SnapshotPrecondition,
+        stored_json: str,
+    ) -> bool:
+        if precondition.kind != "run" or precondition.data is None:
+            return False
+        async with self._connection.execute(
+            """
+            SELECT schema_version FROM events
+            WHERE run_id = ? AND type = 'run.created'
+            """,
+            (precondition.entity_id,),
+        ) as cursor:
+            creation_versions = tuple(
+                cast(int, row[0]) for row in await cursor.fetchall()
+            )
+        if creation_versions != (1,):
+            return False
+        try:
+            stored_data = _strict_json_object(stored_json)
+            if _canonical_json(stored_data) != stored_json:
+                return False
+            stored = RunSnapshot.model_validate(stored_data)
+            expected = RunSnapshot.model_validate(precondition.data)
+        except (TypeError, ValueError):
+            return False
+        return stored == expected
 
     async def _check_run_recovery_evidence_precondition(
         self,
@@ -2164,8 +2201,7 @@ class SQLiteStore:
                 run.run_id != run_id
                 or run.session_id != cast(str, run_row[0])
                 or run.version != cast(int, run_row[1])
-                or _canonical_json(run.model_dump(mode="json"))
-                != cast(str, run_row[2])
+                or _canonical_json(run_data) != cast(str, run_row[2])
             ):
                 raise RecoveryStateConflictError
             async with self._connection.execute(

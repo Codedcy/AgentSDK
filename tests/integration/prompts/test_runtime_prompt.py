@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, Literal
 
 import pytest
 
@@ -17,17 +19,32 @@ from agent_sdk import (
 )
 from agent_sdk.context import CompactionLevel, ContextView
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.models.litellm_gateway import LiteLLMGateway
+from agent_sdk.observability.queries import QueryService
+from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.prompts import PromptComposer
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.engine import RunEngine
-from agent_sdk.runtime.models import AgentSpec
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+)
+from agent_sdk.runtime.models import (
+    AgentSpec,
+    RunSnapshot,
+    RunStatus,
+    run_created_event_matches,
+)
+from agent_sdk.runtime.recovery import RunRecoveryService
+from agent_sdk.runtime.reconciliation import RecoveryStateConflictError
 from agent_sdk.skills import SkillRegistry
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.subagents import SubagentService, TaskEnvelope
+from agent_sdk.tools.registry import ToolRegistry
 
 
 def _skill_root() -> Path:
@@ -51,6 +68,132 @@ async def _successful_provider(**_: object) -> AsyncIterator[dict[str, object]]:
         }
 
     return chunks()
+
+
+def _canonical_hash(value: object) -> str:
+    return sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _r2_execution_descriptor(
+    spec: AgentSpec,
+    user_input: str,
+) -> dict[str, Any]:
+    current = ExecutionDescriptor.create(
+        agent=spec,
+        messages=({"role": "user", "content": user_input},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="allow"),
+    ).model_dump(mode="json")
+    for field in ("prompt_profile", "system_prompt", "skills", "context"):
+        current["agent"].pop(field)
+    current["agent_hash"] = _canonical_hash(current["agent"])
+    current["descriptor_hash"] = _canonical_hash(
+        {
+            key: value
+            for key, value in current.items()
+            if key != "descriptor_hash"
+        }
+    )
+    return current
+
+
+async def _seed_r2_schema_v1_run(
+    store: SQLiteStore,
+    spec: AgentSpec,
+    *,
+    tamper: Literal[
+        "agent_hash",
+        "descriptor_hash",
+        "identity",
+        "cross_session",
+    ]
+    | None = None,
+) -> tuple[str, str]:
+    session = await RuntimeCommands(store).create_session(workspaces=[])
+    run_id = f"run_r2_{tamper or 'valid'}"
+    user_input = "recover genuine R2 run"
+    current_descriptor = ExecutionDescriptor.create(
+        agent=spec,
+        messages=({"role": "user", "content": user_input},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="allow"),
+    )
+    current = RunSnapshot(
+        run_id=run_id,
+        session_id=session.session_id,
+        agent_revision=f"{spec.name}:{spec.revision}",
+        status=RunStatus.CREATED,
+        user_input=user_input,
+        execution_compatibility="current",
+        execution_descriptor=current_descriptor,
+    )
+    raw_snapshot = current.model_dump(mode="json")
+    raw_snapshot["execution_descriptor"] = _r2_execution_descriptor(
+        spec,
+        user_input,
+    )
+    event_payload = deepcopy(raw_snapshot)
+    event_session_id = session.session_id
+    if tamper == "agent_hash":
+        event_payload["execution_descriptor"]["agent_hash"] = "a" * 64
+    elif tamper == "descriptor_hash":
+        event_payload["execution_descriptor"]["descriptor_hash"] = "d" * 64
+    elif tamper == "identity":
+        event_payload["parent_run_id"] = "run_forged_parent"
+    elif tamper == "cross_session":
+        event_session_id = "ses_cross_session"
+
+    updated_session = session.model_copy(
+        update={
+            "active_run_ids": (run_id,),
+            "version": session.version + 1,
+        }
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="session.run.attached",
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=updated_session.version,
+                    payload={"run_id": run_id},
+                ),
+                EventEnvelope.new(
+                    schema_version=1,
+                    type="run.created",
+                    session_id=event_session_id,
+                    run_id=run_id,
+                    sequence=1,
+                    payload=event_payload,
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    "session",
+                    session.session_id,
+                    session.session_id,
+                    updated_session.version,
+                    updated_session.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    "run",
+                    run_id,
+                    session.session_id,
+                    1,
+                    raw_snapshot,
+                ),
+            ),
+        )
+    )
+    return session.session_id, run_id
 
 
 @pytest.mark.asyncio
@@ -454,6 +597,171 @@ async def test_subagent_missing_skill_fails_before_child_run_or_provider_call(
             and item.event.type == "run.created"
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_genuine_r2_schema_v1_run_recovers_and_builds_tree_after_sqlite_reopen(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "r2-v1.db"
+    spec = AgentSpec(name="r2-agent", revision="1", model="test/model")
+    store = await SQLiteStore.open(database_path)
+    try:
+        _, run_id = await _seed_r2_schema_v1_run(store, spec)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteStore.open(database_path)
+    agents = AgentRegistry()
+    agents.define(spec)
+    tools = ToolRegistry()
+    policy = PolicyEngine("allow")
+    engine = RunEngine(
+        reopened,
+        LiteLLMGateway._for_test(_successful_provider),
+        tools,
+        policy,
+    )
+    recovery = RunRecoveryService(
+        reopened,
+        engine,
+        agents,
+        tools,
+        policy,
+    )
+    try:
+        persisted = RunSnapshot.model_validate(
+            await reopened.get_snapshot("run", run_id)
+        )
+        assert persisted.execution_descriptor is not None
+        assert persisted.execution_descriptor.agent.prompt_profile == "general"
+        assert persisted.execution_descriptor.agent.system_prompt is None
+        assert persisted.execution_descriptor.agent.skills == ()
+        tree = await QueryService(reopened).execution_tree(run_id)
+        assert tuple(node.snapshot.run_id for node in tree.nodes) == (run_id,)
+
+        plan = await recovery.plan(run_id)
+        assert plan.request is not None
+        result = await recovery.execute(plan)
+
+        assert result.run_id == run_id
+        assert result.output_text == "done"
+        assert RunSnapshot.model_validate(
+            await reopened.get_snapshot("run", run_id)
+        ).status is RunStatus.COMPLETED
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ("agent_hash", "descriptor_hash", "identity", "cross_session"),
+)
+async def test_r2_schema_v1_authentication_rejects_tampered_event_after_reopen(
+    tmp_path: Path,
+    tamper: Literal[
+        "agent_hash",
+        "descriptor_hash",
+        "identity",
+        "cross_session",
+    ],
+) -> None:
+    database_path = tmp_path / f"r2-v1-{tamper}.db"
+    spec = AgentSpec(name="r2-agent", revision="1", model="test/model")
+    store = await SQLiteStore.open(database_path)
+    try:
+        session_id, run_id = await _seed_r2_schema_v1_run(
+            store,
+            spec,
+            tamper=tamper,
+        )
+    finally:
+        await store.close()
+
+    reopened = await SQLiteStore.open(database_path)
+    try:
+        snapshot = RunSnapshot.model_validate(
+            await reopened.get_snapshot("run", run_id)
+        )
+        events = await reopened.read_events(after_cursor=0)
+        created = next(
+            stored.event
+            for stored in events
+            if stored.event.type == "run.created"
+        )
+        assert created.schema_version == 1
+        payload_matches = run_created_event_matches(
+            snapshot,
+            created.payload,
+            schema_version=created.schema_version,
+        )
+        assert payload_matches is (tamper == "cross_session")
+        assert snapshot.session_id == session_id
+        with pytest.raises(AgentSDKError) as raised:
+            await QueryService(reopened).execution_tree(run_id)
+        assert raised.value.code is ErrorCode.INTERNAL
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tamper",
+    ("agent_hash", "descriptor_hash", "noncanonical_json"),
+)
+async def test_r2_private_snapshot_recovery_validation_rejects_tampering(
+    tmp_path: Path,
+    tamper: Literal["agent_hash", "descriptor_hash", "noncanonical_json"],
+) -> None:
+    database_path = tmp_path / f"r2-private-{tamper}.db"
+    spec = AgentSpec(name="r2-agent", revision="1", model="test/model")
+    store = await SQLiteStore.open(database_path)
+    try:
+        _, run_id = await _seed_r2_schema_v1_run(store, spec)
+        async with store._connection.execute(
+            """
+            SELECT data_json FROM snapshots
+            WHERE kind = 'run' AND entity_id = ?
+            """,
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        stored_json = str(row[0])
+        if tamper == "noncanonical_json":
+            replacement = stored_json + " "
+        else:
+            raw = json.loads(stored_json)
+            raw["execution_descriptor"][tamper] = tamper[0] * 64
+            replacement = json.dumps(
+                raw,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        await store._connection.execute(
+            """
+            UPDATE snapshots SET data_json = ?
+            WHERE kind = 'run' AND entity_id = ?
+            """,
+            (replacement, run_id),
+        )
+        await store._connection.commit()
+    finally:
+        await store.close()
+
+    if tamper != "noncanonical_json":
+        with pytest.raises(ValueError, match="incompatible current projections"):
+            await SQLiteStore.open(database_path)
+        return
+
+    reopened = await SQLiteStore.open(database_path)
+    try:
+        with pytest.raises(RecoveryStateConflictError):
+            await reopened.list_external_operations(run_id)
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

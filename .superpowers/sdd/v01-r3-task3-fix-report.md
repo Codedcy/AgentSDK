@@ -85,3 +85,42 @@ After the fixes:
 - Ruff over all source plus the changed Task 3 test: passed.
 - Strict mypy over all 92 source files: passed.
 
+## Re-review fix
+
+Re-review `fc72ae4` found that the schema-v1 compatibility branch compared an
+immutable raw R2 `run.created` payload with the upgraded current serialization.
+It also exposed two SQLite recovery reads that treated a safely upgraded raw
+R2 private Run snapshot as non-authoritative.
+
+The second-round fix is limited to schema-v1 compatibility:
+
+- The v1 matcher first validates the complete raw historical `RunSnapshot`.
+  Nested `ExecutionDescriptor` validation authenticates the original R2
+  `agent_hash` and `descriptor_hash`, applies the existing safe legacy prompt
+  defaults, and rejects malformed or extra fields.
+- It then compares the complete normalized created snapshot, including the
+  normalized execution descriptor, with the authoritative private snapshot.
+- Schema-v2 matching remains the existing exact `RunCreatedEventPayload`
+  derivation and equality check.
+- SQLite recovery validates the stored raw snapshot JSON as canonical and
+  validates it as a complete `RunSnapshot`; it no longer requires the upgraded
+  serialization to be byte-identical to immutable R2 JSON.
+- Exact Run preconditions may use normalized semantic equality only when the
+  Run has exactly one schema-v1 `run.created` event. Current schema-v2 Runs
+  retain byte-exact precondition matching.
+
+Second-round TDD evidence:
+
+- Genuine R2 matcher test: `1 failed` before the production change, then
+  `1 passed`.
+- SQLite close/reopen recovery, execution-tree, old-hash, identity,
+  cross-Session, and noncanonical-storage gate: `8 passed`.
+- Wrong original event and private-snapshot hashes fail closed.
+- Cross-Session event/snapshot pairs fail execution-tree authentication.
+- Runtime descriptor, Task 3 prompt, observability, Context,
+  provider-recovery, and SQLite recovery/progress gate:
+  `513 passed, 1 skipped`.
+- Workflow recovery, child workflow, subprocess recovery, and release slices:
+  `25 passed`.
+- Ruff passed; strict mypy passed over all 92 source files.
+- Both working-tree and range `git diff --check` passed.
