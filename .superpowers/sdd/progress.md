@@ -297,9 +297,9 @@ Success: no issues found in 84 source files
 v0.1 R2 Task 1: complete (commits e3494ae and 1fc9c72; final review Spec approved / Quality approved; fresh 82 focused and schema-v1 compiler tests passed; strict mypy and Ruff clean)
 v0.1 R2 Task 2: complete (commits 9b23e5a and cfdf43a; final review Spec approved / Quality approved; fresh 120 unit/descriptor and 253 Workflow integration tests passed; strict mypy and Ruff clean)
 v0.1 R2 Task 3: complete (commits e4624f7 and 36a7268; final review Spec approved / Quality approved; fresh 19 focused and 370 Workflow unit/integration tests passed; strict mypy and Ruff clean)
-v0.1 R2 Task 4: complete (commit 04d8ee2; final review Spec approved / Quality approved; fresh independent 380 Workflow unit/integration and v0.1 E2E tests passed; strict mypy and Ruff clean)
-v0.1 R2 checkpoint: complete (2026-07-17)
-v0.1 R2 checkpoint exact fresh evidence:
+v0.1 R2 Task 4: complete (commit 04d8ee2; final review Spec approved / Quality approved; historical independent 380 Workflow unit/integration and v0.1 E2E tests passed; strict mypy and Ruff clean)
+v0.1 R2 implementation checkpoint: `56d60a8` (2026-07-17)
+Historical R2 pre-final-hardening checkpoint evidence:
 ```text
 $ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
 ........................................................................ [ 18%]
@@ -315,6 +315,26 @@ All checks passed!
 
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
 Success: no issues found in 10 source files
+```
+v0.1 R2 final hardening: `852692f fix: bind child to executed workflow parent`; `309d63c fix: preserve child parent execution identity`
+v0.1 R2 final independent re-review: Critical 0 / Important 0 / Minor 0; Spec compliance PASS; Code quality PASS; Ready to proceed to R3: Yes
+Current canonical R2 final checkpoint evidence:
+```text
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
+$ .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
+403 passed in 43.03s
+
+$ .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\workflow\test_control_child_parent.py tests\integration\workflow\test_control_recovery.py tests\integration\workflow\test_control_state.py tests\unit\workflow\test_control_compiler.py -q
+47 passed in 7.31s
+
+$ .\.venv\Scripts\python.exe -m ruff check src\agent_sdk\workflow tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
+Success: no issues found in 10 source files
+
+$ git diff --check 56d60a8..309d63c
+clean
 ```
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md
 v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0.1-r3-auto-context.md`

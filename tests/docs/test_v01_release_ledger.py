@@ -40,7 +40,7 @@ R2_TASK_COMMITS = (
     "36a7268",
     "04d8ee2",
 )
-R2_CHECKPOINT = r"""$ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
+R2_HISTORICAL_CHECKPOINT = r"""$ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
 ........................................................................ [ 18%]
 ........................................................................ [ 37%]
 ........................................................................ [ 56%]
@@ -54,6 +54,22 @@ All checks passed!
 
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
 Success: no issues found in 10 source files"""
+R2_FINAL_COMMITS = ("852692f", "309d63c")
+R2_FINAL_CHECKPOINT = r"""$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
+$ .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
+403 passed in 43.03s
+
+$ .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\workflow\test_control_child_parent.py tests\integration\workflow\test_control_recovery.py tests\integration\workflow\test_control_state.py tests\unit\workflow\test_control_compiler.py -q
+47 passed in 7.31s
+
+$ .\.venv\Scripts\python.exe -m ruff check src\agent_sdk\workflow tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py
+All checks passed!
+
+$ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
+Success: no issues found in 10 source files
+
+$ git diff --check 56d60a8..309d63c
+clean"""
 R3_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
 R3_RESUME_COMMAND = (
     r"Get-Content docs\superpowers\plans"
@@ -78,9 +94,24 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
         assert commit in document
     for commit in R2_TASK_COMMITS:
         assert commit in document
-    assert R2_CHECKPOINT in normalized_document
+    assert "R2 implementation checkpoint: `56d60a8`" in document
+    for commit in R2_FINAL_COMMITS:
+        assert commit in document
+    historical_r2_marker = "Historical R2 pre-final-hardening checkpoint evidence:"
+    canonical_r2_marker = "Current canonical R2 final checkpoint evidence:"
+    assert document.count(historical_r2_marker) == 1
+    assert document.count(canonical_r2_marker) == 1
+    historical_r2_index = normalized_document.index(historical_r2_marker)
+    canonical_r2_index = normalized_document.index(canonical_r2_marker)
+    assert historical_r2_index < canonical_r2_index
+    assert R2_HISTORICAL_CHECKPOINT in normalized_document[
+        historical_r2_index:canonical_r2_index
+    ]
+    assert "380 passed in 44.02s" not in normalized_document[canonical_r2_index:]
+    assert R2_FINAL_CHECKPOINT in normalized_document
     assert "Critical 0 / Important 0 / Minor 0" in document
     assert "Ready to proceed to R2: Yes" in document
+    assert "Ready to proceed to R3: Yes" in document
     assert "R2 Task 4" in document
     assert "final review Spec approved / Quality approved" in document
     assert R3_PLAN in document
@@ -112,7 +143,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "final review approved" in ledger
     assert (
         "| R2 | completed | condition and bounded loop | "
-        "2026-07-17 checkpoint: 380 passed in 44.02s; Ruff/mypy clean |"
+        "2026-07-20 final checkpoint: 403 passed in 43.03s; Ruff/mypy clean |"
     ) in ledger
     for slice_id in ("R3", "R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
