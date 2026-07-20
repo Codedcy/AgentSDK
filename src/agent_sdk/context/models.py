@@ -89,6 +89,37 @@ def _bounded_json(
     raise ValueError("value must be JSON-compatible")
 
 
+def _valid_tool_calls(value: JsonValue) -> bool:
+    if not isinstance(value, tuple) or not value:
+        return False
+    for call in value:
+        if not isinstance(call, Mapping) or set(call) != {
+            "id",
+            "type",
+            "function",
+        }:
+            return False
+        call_id = call["id"]
+        function = call["function"]
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or call["type"] != "function"
+            or not isinstance(function, Mapping)
+            or set(function) != {"name", "arguments"}
+        ):
+            return False
+        name = function["name"]
+        arguments = function["arguments"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(arguments, str)
+        ):
+            return False
+    return True
+
+
 class _DetachedModel(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", validate_default=True)
 
@@ -169,12 +200,19 @@ class SourceMessage(_DetachedModel):
         strict=True,
     )
 
-    ref: StrictStr = Field(min_length=1, max_length=512)
+    ref: StrictStr = Field(min_length=1, max_length=64)
     role: Literal["system", "user", "assistant", "tool"]
     message: Mapping[str, JsonValue]
     event_type: StrictStr = Field(min_length=1, max_length=128)
     protected: StrictBool = False
     current: StrictBool = False
+
+    @field_validator("ref", mode="before")
+    @classmethod
+    def _validate_ref_bytes(cls, value: Any) -> Any:
+        if isinstance(value, str) and len(value.encode("utf-8")) > 64:
+            raise ValueError("ref must not exceed 64 UTF-8 bytes")
+        return value
 
     @field_validator("message", mode="before")
     @classmethod
@@ -225,14 +263,20 @@ class SourceMessage(_DetachedModel):
         if self.role in {"system", "user", "tool"}:
             if not isinstance(content, str):
                 raise ValueError(f"{self.role} content must be a string")
-        elif content is None:
+        else:
+            has_tool_calls = "tool_calls" in self.message
             tool_calls = self.message.get("tool_calls")
-            if not isinstance(tool_calls, tuple) or not tool_calls:
+            if has_tool_calls and not _valid_tool_calls(tool_calls):
+                raise ValueError(
+                    "tool_calls must be a nonempty sequence of exact "
+                    "function-call protocol objects"
+                )
+            if content is None and not has_tool_calls:
                 raise ValueError(
                     "assistant null content requires tool-call protocol data"
                 )
-        elif not isinstance(content, str):
-            raise ValueError("assistant content must be a string or null")
+            if content is not None and not isinstance(content, str):
+                raise ValueError("assistant content must be a string or null")
         return self
 
 

@@ -254,6 +254,44 @@ def test_l2_layers_l1_preview_over_a_recent_unprotected_tool() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "r" * 64,
+        ("界" * 21) + "r",
+    ],
+)
+def test_l1_and_l2_bound_complete_preview_for_maximum_byte_ref(ref: str) -> None:
+    sources = (
+        _source("evt-old-user", "user", "older request"),
+        _source(ref, "tool", "数据🙂" * 300),
+    )
+
+    rendered = (
+        apply_l1(sources, tool_preview_bytes=64),
+        apply_l2(sources, recent_messages=1, tool_preview_bytes=64),
+    )
+
+    assert len(ref.encode("utf-8")) == 64
+    for result in rendered:
+        preview = result.items[1].message["content"]
+        assert f"[source:{ref}]" in preview
+        assert len(preview.encode("utf-8")) <= 64 + 96
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "r" * 65,
+        ("界" * 21) + "rr",
+    ],
+)
+def test_source_message_rejects_ref_above_64_utf8_bytes(ref: str) -> None:
+    assert len(ref.encode("utf-8")) == 65
+    with pytest.raises(ValidationError, match="ref must not exceed 64 UTF-8 bytes"):
+        _source(ref, "tool", "result")
+
+
 def test_render_level_dispatches_l0_l2_and_rejects_model_levels() -> None:
     sources = _strategy_sources()
     assert render_level(
@@ -388,6 +426,90 @@ def test_source_message_rejects_invalid_provider_content_and_coerced_flags() -> 
         error["loc"] == ("current",) and error["type"] == "bool_type"
         for error in coerced_current
     )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        None,
+        "not-a-call",
+        {},
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup"},
+        },
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}", "extra": True},
+        },
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+            "extra": True,
+        },
+        {
+            "id": "call-1",
+            "type": "other",
+            "function": {"name": "lookup", "arguments": "{}"},
+        },
+        {
+            "id": "",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        },
+        {
+            "id": 1,
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        },
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "", "arguments": "{}"},
+        },
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": 1, "arguments": "{}"},
+        },
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": {}},
+        },
+    ],
+)
+def test_source_message_rejects_invalid_tool_call_protocol_entries(
+    entry: Any,
+) -> None:
+    with pytest.raises(ValidationError, match="tool_calls"):
+        SourceMessage(
+            ref="evt-invalid-call",
+            role="assistant",
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [entry],
+            },
+            event_type="model.call.completed",
+        )
+
+
+def test_source_message_validates_tool_calls_even_with_text_content() -> None:
+    with pytest.raises(ValidationError, match="tool_calls"):
+        SourceMessage(
+            ref="evt-empty-calls",
+            role="assistant",
+            message={
+                "role": "assistant",
+                "content": "text",
+                "tool_calls": [],
+            },
+            event_type="model.call.completed",
+        )
 
 
 def test_source_message_rejects_identity_and_json_resource_overflows() -> None:
