@@ -173,6 +173,268 @@ def test_stored_model_request_rejects_noncanonical_payloads(
         reconciliation.deserialize_model_request(payload)
 
 
+def _stored_request_payload(
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "model": "provider:model",
+        "messages": messages,
+        "tools": [] if tools is None else tools,
+        "params": {},
+        "purpose": "agent_loop",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            _stored_request_payload(messages=[]),
+            id="empty-messages",
+        ),
+        pytest.param(
+            _stored_request_payload(messages=[{}]),
+            id="empty-message",
+        ),
+        pytest.param(
+            _stored_request_payload(messages=[{"content": "missing role"}]),
+            id="missing-role",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "bogus", "content": "invalid"}]
+            ),
+            id="invalid-role",
+        ),
+        pytest.param(
+            _stored_request_payload(messages=[{"role": "user"}]),
+            id="missing-content",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "tool", "content": "result"}]
+            ),
+            id="tool-missing-call-id",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[
+                    {
+                        "role": "tool",
+                        "content": "result",
+                        "tool_call_id": "",
+                    }
+                ]
+            ),
+            id="tool-empty-call-id",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [],
+                    }
+                ]
+            ),
+            id="assistant-empty-tool-calls",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "custom",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            ),
+            id="assistant-tool-call-type",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            ),
+            id="assistant-tool-call-empty-id",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": 7,
+                                    "arguments": {},
+                                },
+                            }
+                        ],
+                    }
+                ]
+            ),
+            id="assistant-tool-call-function-fields",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": "run"}],
+                tools=[{}],
+            ),
+            id="empty-tool-schema",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": "run"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {},
+                        },
+                        "extra": True,
+                    }
+                ],
+            ),
+            id="tool-schema-extra",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": "run"}],
+                tools=[
+                    {
+                        "type": "custom",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": {},
+                        },
+                    }
+                ],
+            ),
+            id="tool-schema-type",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": "run"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "parameters": {},
+                        },
+                    }
+                ],
+            ),
+            id="tool-schema-empty-name",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": "run"}],
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "parameters": [],
+                        },
+                    }
+                ],
+            ),
+            id="tool-schema-parameters-not-object",
+        ),
+        pytest.param(
+            _stored_request_payload(
+                messages=[{"role": "user", "content": {"bad": object()}}],
+            ),
+            id="nested-non-json",
+        ),
+    ],
+)
+def test_stored_model_request_rejects_invalid_message_and_tool_shapes(
+    payload: dict[str, Any],
+) -> None:
+    with pytest.raises(AgentSDKError, match="stored model request is invalid"):
+        reconciliation.deserialize_model_request(payload)
+
+
+def test_stored_model_request_accepts_runtime_message_and_tool_shapes() -> None:
+    payload = _stored_request_payload(
+        messages=[
+            {"role": "system", "content": "general", "name": "profile"},
+            {"role": "user", "content": "run", "name": "operator"},
+            {
+                "role": "assistant",
+                "content": None,
+                "name": "agent",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"query":"context"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "lookup",
+                "content": "result",
+            },
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up context",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    )
+
+    request = reconciliation.deserialize_model_request(payload)
+
+    assert reconciliation.serialize_model_request(request) == payload
+
+
 def test_model_operation_accepts_legacy_records_and_rejects_prepared_mismatch() -> None:
     legacy = {
         "operation_id": "op_model",

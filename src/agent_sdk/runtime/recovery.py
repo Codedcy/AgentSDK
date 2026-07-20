@@ -15,6 +15,7 @@ from typing import Any, Literal
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JSONSchemaValidationError
 
+from agent_sdk.context.models import ContextView
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
@@ -22,6 +23,7 @@ from agent_sdk.models.litellm_gateway import ModelRequest, ToolCallCompleted
 from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.permissions.rules import PermissionRule
+from agent_sdk.prompts.models import PromptManifest
 from agent_sdk.runtime._recovery_observability import hashed_identity
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.engine import (
@@ -83,6 +85,7 @@ from agent_sdk.runtime.session_lifecycle import (
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
+    CommitBatch,
     CommitResult,
     EventPrecondition,
     ExternalOperationWrite,
@@ -90,6 +93,8 @@ from agent_sdk.storage.base import (
     RunCheckpointWrite,
     RunProgressBatch,
     RunRecoveryEvidencePrecondition,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
     SnapshotWrite,
     StateStore,
 )
@@ -262,6 +267,7 @@ class RunRecoveryService:
             return RecoveryPlan("detached", run_id)
         evidence = await self._load_evidence(run)
         checkpoint = evidence.checkpoint
+        await self._authenticate_prepared_references(evidence)
         try:
             request = await self._validated_request(evidence)
         except AgentSDKError:
@@ -4568,6 +4574,7 @@ class RunRecoveryService:
         self,
         evidence: _RecoveryEvidence,
     ) -> ModelRequest | None:
+        await self._authenticate_prepared_references(evidence)
         run = evidence.run
         descriptor = run.execution_descriptor
         if run.execution_compatibility != "current" or descriptor is None:
@@ -4601,6 +4608,80 @@ class RunRecoveryService:
             params=mutable_model_params(registered_agent.model_params),
         )
         return request
+
+    async def _authenticate_prepared_references(
+        self,
+        evidence: _RecoveryEvidence,
+    ) -> None:
+        for operation in evidence.operations:
+            if (
+                isinstance(operation, ModelCallOperation)
+                and operation.prepared_request is not None
+            ):
+                await self._authenticate_prepared_operation(
+                    operation,
+                    session_id=evidence.run.session_id,
+                    run_id=evidence.run.run_id,
+                )
+
+    async def _authenticate_prepared_operation(
+        self,
+        operation: ModelCallOperation,
+        *,
+        session_id: str,
+        run_id: str,
+    ) -> None:
+        context_view_id = operation.context_view_id
+        prompt_manifest_id = operation.prompt_manifest_id
+        if (
+            operation.session_id != session_id
+            or operation.run_id != run_id
+            or context_view_id is None
+            or prompt_manifest_id is None
+        ):
+            raise RecoveryStateConflictError
+        try:
+            raw_view = await self._store.get_snapshot(
+                "context_view",
+                context_view_id,
+            )
+            raw_manifest = await self._store.get_snapshot(
+                "prompt_manifest",
+                prompt_manifest_id,
+            )
+            view = ContextView.model_validate(raw_view)
+            manifest = PromptManifest.model_validate(raw_manifest)
+            if (
+                view.view_id != context_view_id
+                or view.session_id != session_id
+                or manifest.manifest_id != prompt_manifest_id
+                or manifest.context_view_id != context_view_id
+                or manifest.model != operation.provider_identity
+            ):
+                raise ValueError("prepared reference identity mismatch")
+            await self._store.commit(
+                CommitBatch(
+                    events=(),
+                    preconditions=(
+                        SnapshotPrecondition(
+                            "context_view",
+                            context_view_id,
+                            session_id=session_id,
+                            data=view.model_dump(mode="json"),
+                        ),
+                        SnapshotPrecondition(
+                            "prompt_manifest",
+                            prompt_manifest_id,
+                            session_id=session_id,
+                            data=manifest.model_dump(mode="json"),
+                        ),
+                    ),
+                )
+            )
+        except RecoveryStateConflictError:
+            raise
+        except (AgentSDKError, SnapshotPreconditionError, TypeError, ValueError):
+            raise RecoveryStateConflictError from None
 
     @staticmethod
     def _is_pristine_created(evidence: _RecoveryEvidence) -> bool:
@@ -6965,6 +7046,15 @@ class RunRecoveryService:
                 or operation.session_id != run.session_id
             ):
                 raise self._state_error() from None
+            if (
+                isinstance(operation, ModelCallOperation)
+                and operation.prepared_request is not None
+            ):
+                await self._authenticate_prepared_operation(
+                    operation,
+                    session_id=run.session_id,
+                    run_id=run.run_id,
+                )
         return tuple(
             ReconciliationRequest.model_validate_json(item.model_dump_json())
             for item in requests

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,13 +16,17 @@ from agent_sdk import (
     ProviderRecoveryDisposition,
     ProviderRecoveryRequest,
     ProviderRecoveryResult,
+    ToolRetryPolicy,
+    ToolSpec,
     TokenUsage,
 )
 from agent_sdk.runtime.engine import _model_request_fingerprint
 from agent_sdk.runtime import reconciliation
 from agent_sdk.runtime.reconciliation import ModelCallOperation
+from agent_sdk.storage.base import SnapshotWrite, StateStore
 from agent_sdk.storage.memory import InMemoryStore
-from agent_sdk.tools.models import thaw_json
+from agent_sdk.storage.sqlite import SQLiteStore
+from agent_sdk.tools.models import ToolContext, thaw_json
 
 
 @pytest.mark.asyncio
@@ -287,5 +293,401 @@ async def test_authoritative_recovery_receives_exact_stored_prepared_request() -
         assert sum(
             item.event.type == "model.call.started" for item in events
         ) == 1
+    finally:
+        await reopened.close()
+
+
+def _recovery_tool() -> ToolSpec:
+    return ToolSpec(
+        name="recovery_probe",
+        description="Must remain side-effect free during reference rejection.",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    )
+
+
+async def _tamper_prepared_reference(
+    store: InMemoryStore | SQLiteStore,
+    operation: ModelCallOperation,
+    corruption: str,
+) -> None:
+    assert operation.context_view_id is not None
+    assert operation.prompt_manifest_id is not None
+    target = (
+        ("context_view", operation.context_view_id)
+        if corruption.startswith("view_")
+        else ("prompt_manifest", operation.prompt_manifest_id)
+    )
+    if isinstance(store, InMemoryStore):
+        snapshot = store._snapshots[target]
+        if corruption.endswith("_missing"):
+            del store._snapshots[target]
+            return
+        data = dict(snapshot.data)
+        session_id = snapshot.session_id
+        if corruption.endswith("_owner"):
+            session_id = "ses_other"
+        elif corruption == "view_identity":
+            data["view_id"] = "view_other"
+        elif corruption == "manifest_identity":
+            data["manifest_id"] = "pmf_other"
+        elif corruption == "manifest_link":
+            data["context_view_id"] = "view_other"
+        else:
+            raise AssertionError(f"unknown corruption: {corruption}")
+        store._snapshots[target] = SnapshotWrite(
+            snapshot.kind,
+            snapshot.entity_id,
+            session_id,
+            snapshot.version,
+            data,
+        )
+        return
+
+    snapshot_data = (
+        await store.get_snapshot(*target)
+        if not (
+            corruption.endswith("_missing")
+            or corruption.endswith("_owner")
+        )
+        else None
+    )
+    async with store._lock:
+        if corruption.endswith("_missing"):
+            await store._connection.execute(
+                "DELETE FROM snapshots WHERE kind = ? AND entity_id = ?",
+                target,
+            )
+        elif corruption.endswith("_owner"):
+            await store._connection.execute(
+                """
+                UPDATE snapshots SET session_id = ?
+                WHERE kind = ? AND entity_id = ?
+                """,
+                ("ses_other", *target),
+            )
+        else:
+            assert snapshot_data is not None
+            if corruption == "view_identity":
+                snapshot_data["view_id"] = "view_other"
+            elif corruption == "manifest_identity":
+                snapshot_data["manifest_id"] = "pmf_other"
+            elif corruption == "manifest_link":
+                snapshot_data["context_view_id"] = "view_other"
+            else:
+                raise AssertionError(f"unknown corruption: {corruption}")
+            await store._connection.execute(
+                """
+                UPDATE snapshots SET data_json = ?
+                WHERE kind = ? AND entity_id = ?
+                """,
+                (
+                    json.dumps(
+                        snapshot_data,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    *target,
+                ),
+            )
+        await store._connection.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "view_missing",
+        "manifest_missing",
+        "view_owner",
+        "manifest_owner",
+        "view_identity",
+        "manifest_identity",
+        "manifest_link",
+    ],
+)
+async def test_recovery_rejects_unauthenticated_prepared_references(
+    backend: str,
+    corruption: str,
+    tmp_path: Path,
+) -> None:
+    store: InMemoryStore | SQLiteStore = (
+        InMemoryStore()
+        if backend == "memory"
+        else await SQLiteStore.open(
+            tmp_path / f"prepared-ref-{corruption}.sqlite3"
+        )
+    )
+    accepted = asyncio.Event()
+    tool_calls = 0
+
+    async def hanging_provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            accepted.set()
+            await asyncio.Event().wait()
+            yield {"choices": []}
+
+        return chunks()
+
+    async def tool_handler(_: ToolContext) -> None:
+        nonlocal tool_calls
+        tool_calls += 1
+
+    spec = AgentSpec(name="reference-auth", model="test/model")
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=hanging_provider,
+        enable_builtin_tools=False,
+    )
+    sdk.tools.register(_recovery_tool(), tool_handler)
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.runs.start(
+        session.session_id,
+        spec,
+        "Authenticate prepared references.",
+    )
+    await asyncio.wait_for(accepted.wait(), timeout=2)
+    operation = (await store.list_unresolved_external_operations(handle.run_id))[0]
+    assert isinstance(operation, ModelCallOperation)
+    assert handle._task is not None
+    handle._task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handle._task
+    await sdk.close()
+
+    await _tamper_prepared_reference(store, operation, corruption)
+    provider_calls = 0
+
+    async def must_not_call_provider(**_: Any) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("invalid references must fail before provider recovery")
+
+    reopened = AgentSDK.for_test(
+        store=store,
+        acompletion=must_not_call_provider,
+        enable_builtin_tools=False,
+    )
+    reopened.agents.define(spec)
+    reopened.tools.register(_recovery_tool(), tool_handler)
+    try:
+        with pytest.raises(AgentSDKError, match="recovery state conflict"):
+            await reopened.recovery.recover_run(handle.run_id)
+        assert provider_calls == 0
+        assert tool_calls == 0
+    finally:
+        await reopened.close()
+        if isinstance(store, SQLiteStore):
+            await store.close()
+
+
+class _SnapshotReadTrackingStore:
+    def __init__(self, delegate: StateStore) -> None:
+        self.delegate = delegate
+        self.reads: list[tuple[str, str]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def get_snapshot(
+        self,
+        kind: str,
+        entity_id: str,
+    ) -> dict[str, Any] | None:
+        self.reads.append((kind, entity_id))
+        return await self.delegate.get_snapshot(kind, entity_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tamper_old_view", [False, True])
+async def test_completed_model_recovery_authenticates_old_refs_and_adds_one_new_pair(
+    tamper_old_view: bool,
+) -> None:
+    durable = InMemoryStore()
+    store = _SnapshotReadTrackingStore(durable)
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def first_provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_recovery_probe",
+                                    "function": {
+                                        "name": "recovery_probe",
+                                        "arguments": "{}",
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    async def blocking_tool(_: ToolContext) -> None:
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            handler_cancelled.set()
+            raise
+
+    tool = _recovery_tool().model_copy(
+        update={"retry_policy": ToolRetryPolicy.SAFE_RETRY}
+    )
+    spec = AgentSpec(name="completed-ref-recovery", model="test/model")
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=first_provider,
+        permission_default="allow",
+        enable_builtin_tools=False,
+    )
+    sdk.tools.register(tool, blocking_tool)
+    session = await sdk.sessions.create(workspaces=[])
+    handle = await sdk.runs.start(
+        session.session_id,
+        spec,
+        "Complete the model, then recover the Tool.",
+    )
+    await asyncio.wait_for(handler_started.wait(), timeout=2)
+    operations = await durable.list_external_operations(handle.run_id)
+    old_model = next(
+        operation
+        for operation in operations
+        if isinstance(operation, ModelCallOperation)
+    )
+    assert old_model.status is reconciliation.ExternalOperationStatus.COMPLETED
+    assert old_model.context_view_id is not None
+    assert old_model.prompt_manifest_id is not None
+    assert handle._task is not None
+    handle._task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await handle._task
+    await asyncio.wait_for(handler_cancelled.wait(), timeout=2)
+    await sdk.close()
+
+    scanner = AgentSDK.for_test(
+        store=durable,
+        acompletion=first_provider,
+        enable_builtin_tools=False,
+    )
+    try:
+        await scanner.recovery.scan()
+    finally:
+        await scanner.close()
+
+    events_before = await durable.read_events(
+        after_cursor=0,
+        session_id=session.session_id,
+    )
+    old_pair_counts = {
+        event_type: sum(item.event.type == event_type for item in events_before)
+        for event_type in ("context.view.created", "prompt.manifest.created")
+    }
+    assert old_pair_counts == {
+        "context.view.created": 1,
+        "prompt.manifest.created": 1,
+    }
+    store.reads.clear()
+    if tamper_old_view:
+        del durable._snapshots[("context_view", old_model.context_view_id)]
+
+    provider_calls = 0
+    recovered_tool_calls = 0
+
+    async def final_provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal provider_calls
+        provider_calls += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {"content": "done"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    async def recovered_tool(_: ToolContext) -> None:
+        nonlocal recovered_tool_calls
+        recovered_tool_calls += 1
+
+    reopened = AgentSDK.for_test(
+        store=store,
+        acompletion=final_provider,
+        permission_default="allow",
+        enable_builtin_tools=False,
+    )
+    reopened.agents.define(spec)
+    reopened.tools.register(tool, recovered_tool)
+    try:
+        if tamper_old_view:
+            with pytest.raises(AgentSDKError, match="recovery state conflict"):
+                await reopened.recovery.recover_run(handle.run_id)
+            assert provider_calls == 0
+            assert recovered_tool_calls == 0
+            return
+        result = await (await reopened.recovery.recover_run(handle.run_id)).result()
+        assert result.output_text == "done"
+        assert provider_calls == 1
+        assert recovered_tool_calls == 1
+        assert (
+            "context_view",
+            old_model.context_view_id,
+        ) in store.reads
+        assert (
+            "prompt_manifest",
+            old_model.prompt_manifest_id,
+        ) in store.reads
+
+        recovered_operations = await durable.list_external_operations(handle.run_id)
+        recovered_models = tuple(
+            operation
+            for operation in recovered_operations
+            if isinstance(operation, ModelCallOperation)
+        )
+        assert len(recovered_models) == 2
+        assert recovered_models[0].operation_id == old_model.operation_id
+        assert recovered_models[0].context_view_id == old_model.context_view_id
+        assert (
+            recovered_models[0].prompt_manifest_id
+            == old_model.prompt_manifest_id
+        )
+        assert recovered_models[1].context_view_id != old_model.context_view_id
+        assert (
+            recovered_models[1].prompt_manifest_id
+            != old_model.prompt_manifest_id
+        )
+
+        events_after = await durable.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        assert {
+            event_type: sum(
+                item.event.type == event_type for item in events_after
+            )
+            for event_type in old_pair_counts
+        } == {
+            "context.view.created": 2,
+            "prompt.manifest.created": 2,
+        }
     finally:
         await reopened.close()

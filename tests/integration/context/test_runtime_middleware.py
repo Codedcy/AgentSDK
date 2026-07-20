@@ -6,8 +6,9 @@ from typing import Any
 
 import pytest
 
-from agent_sdk import AgentSDK, AgentSpec, ToolSpec
+from agent_sdk import AgentSDK, AgentSDKError, AgentSpec, ToolSpec
 from agent_sdk.runtime.reconciliation import ModelCallOperation
+from agent_sdk.storage.base import CommitBatch, CommitResult
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.tools.models import ToolContext
 
@@ -49,6 +50,30 @@ def _text_stream(text: str) -> AsyncIterator[dict[str, object]]:
         }
 
     return chunks()
+
+
+class _DeleteViewAfterManifestStore:
+    def __init__(self, delegate: InMemoryStore) -> None:
+        self.delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        result = await self.delegate.commit(batch)
+        manifest = next(
+            (
+                event
+                for event in batch.events
+                if event.type == "prompt.manifest.created"
+            ),
+            None,
+        )
+        if manifest is not None:
+            view_id = manifest.payload["context_view_id"]
+            assert isinstance(view_id, str)
+            del self.delegate._snapshots[("context_view", view_id)]
+        return result
 
 
 @pytest.mark.asyncio
@@ -164,5 +189,44 @@ async def test_context_is_prepared_before_each_new_model_call() -> None:
             views[1].event.payload["view_id"],
         )
         assert all(operation.prepared_request is not None for operation in model_operations)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_model_start_requires_prepared_snapshots_to_still_exist() -> None:
+    durable = InMemoryStore()
+    store = _DeleteViewAfterManifestStore(durable)
+    provider_calls = 0
+
+    async def provider(**_: Any) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _text_stream("must not run")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        enable_builtin_tools=False,
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handle = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="context-race", model="test/model"),
+            "Require durable references.",
+        )
+
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        assert provider_calls == 0
+        events = await durable.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        assert all(
+            event.event.type != "model.call.started" for event in events
+        )
+        assert await durable.list_external_operations(handle.run_id) == ()
     finally:
         await sdk.close()

@@ -283,6 +283,22 @@ class _RunEmitter:
                 self._new_event("step.started", {}),
                 self._new_event("model.call.started", started_payload, offset=1),
             )
+            prepared_preconditions: tuple[SnapshotPrecondition, ...] = ()
+            if prepared_request is not None:
+                assert context_view_id is not None
+                assert prompt_manifest_id is not None
+                prepared_preconditions = (
+                    SnapshotPrecondition(
+                        "context_view",
+                        context_view_id,
+                        session_id=self._run.session_id,
+                    ),
+                    SnapshotPrecondition(
+                        "prompt_manifest",
+                        prompt_manifest_id,
+                        session_id=self._run.session_id,
+                    ),
+                )
             await _commit_progress(
                 self._store,
                 RunProgressBatch(
@@ -292,6 +308,7 @@ class _RunEmitter:
                     preconditions=(
                         SnapshotPrecondition("session", self._run.session_id),
                         exact_run_precondition(self._run),
+                        *prepared_preconditions,
                     ),
                     operation=ExternalOperationWrite(None, operation),
                     checkpoint=RunCheckpointWrite(self._checkpoint, checkpoint),

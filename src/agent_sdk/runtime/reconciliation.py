@@ -130,12 +130,120 @@ def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return frozen
 
 
+def _validate_prepared_tool_call(value: Any) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "id",
+        "type",
+        "function",
+    }:
+        raise ValueError("prepared assistant Tool call shape is invalid")
+    function = value["function"]
+    if (
+        not isinstance(value["id"], str)
+        or not value["id"]
+        or value["type"] != "function"
+        or not isinstance(function, Mapping)
+        or set(function) != {"name", "arguments"}
+        or not isinstance(function["name"], str)
+        or not function["name"]
+        or not isinstance(function["arguments"], str)
+    ):
+        raise ValueError("prepared assistant Tool call fields are invalid")
+
+
+def _validate_prepared_message(value: Mapping[str, Any]) -> None:
+    role = value.get("role")
+    if role not in {"system", "user", "assistant", "tool"}:
+        raise ValueError("prepared message role is invalid")
+    allowed = {
+        "system": {"role", "content", "name"},
+        "user": {"role", "content", "name"},
+        "assistant": {"role", "content", "name", "tool_calls"},
+        "tool": {"role", "content", "name", "tool_call_id"},
+    }[role]
+    if not {"role", "content"} <= set(value) or not set(value) <= allowed:
+        raise ValueError("prepared message fields are invalid")
+    name = value.get("name")
+    if name is not None and (not isinstance(name, str) or not name):
+        raise ValueError("prepared message name is invalid")
+    content = value["content"]
+    if role in {"system", "user"}:
+        if not isinstance(content, str):
+            raise ValueError("prepared message content is invalid")
+        return
+    if role == "tool":
+        call_id = value.get("tool_call_id")
+        if (
+            not isinstance(content, str)
+            or not isinstance(call_id, str)
+            or not call_id
+        ):
+            raise ValueError("prepared Tool result fields are invalid")
+        return
+    if content is not None and not isinstance(content, str):
+        raise ValueError("prepared assistant content is invalid")
+    calls = value.get("tool_calls")
+    if calls is None:
+        if content is None:
+            raise ValueError("prepared assistant content is missing")
+        return
+    if not isinstance(calls, (list, tuple)) or not calls:
+        raise ValueError("prepared assistant Tool calls are invalid")
+    for call in calls:
+        _validate_prepared_tool_call(call)
+
+
+def _validate_prepared_tool(value: Mapping[str, Any]) -> None:
+    if set(value) != {"type", "function"} or value.get("type") != "function":
+        raise ValueError("prepared Tool schema shape is invalid")
+    function = value.get("function")
+    if not isinstance(function, Mapping):
+        raise ValueError("prepared Tool function is invalid")
+    allowed = {"name", "description", "parameters"}
+    if (
+        not {"name", "parameters"} <= set(function)
+        or not set(function) <= allowed
+    ):
+        raise ValueError("prepared Tool function fields are invalid")
+    name = function["name"]
+    description = function.get("description")
+    if (
+        not isinstance(name, str)
+        or not name
+        or (description is not None and not isinstance(description, str))
+        or not isinstance(function["parameters"], Mapping)
+    ):
+        raise ValueError("prepared Tool function values are invalid")
+
+
 class _ModelRequestPayload(_RecoveryModel):
     model: StrictStr = Field(min_length=1)
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[Mapping[str, Any], ...] = ()
     params: Mapping[str, Any] = Field(default_factory=dict)
     purpose: StrictStr | None = None
+
+    @field_validator("messages", mode="after")
+    @classmethod
+    def _validate_messages(
+        cls,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        if not value:
+            raise ValueError("prepared model request messages are empty")
+        for message in value:
+            _validate_prepared_message(message)
+        return value
+
+    @field_validator("tools", mode="after")
+    @classmethod
+    def _validate_tools(
+        cls,
+        value: tuple[Mapping[str, Any], ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        for tool in value:
+            _validate_prepared_tool(tool)
+        return value
 
     @field_validator("messages", "tools", mode="after")
     @classmethod
