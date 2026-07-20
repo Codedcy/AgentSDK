@@ -110,6 +110,8 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "380 passed in 44.02s" not in normalized_document[canonical_r2_index:]
     assert R2_FINAL_CHECKPOINT in normalized_document
     assert "Critical 0 / Important 0 / Minor 0" in document
+    assert "Spec compliance PASS" in document
+    assert "Code quality PASS" in document
     assert "Ready to proceed to R2: Yes" in document
     assert "Ready to proceed to R3: Yes" in document
     assert "R2 Task 4" in document
