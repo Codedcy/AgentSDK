@@ -243,7 +243,7 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: R0-R2 completed; R3 in progress (Task 1 deterministic L0-L2 complete; Task 2 pending/unstarted)
+v0.1 current implementation status: R0-R2 completed; R3 in progress (Tasks 1-2 complete; Task 3 pending)
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
@@ -341,6 +341,9 @@ v0.1 resume command: `Get-Content docs\superpowers\plans\2026-07-17-agent-sdk-v0
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
-v0.1 next required action: R3 Task 2 Step 1, creating `tests/unit/context/test_compaction_levels.py`
-v0.1 first RED command: `.\.venv\Scripts\python.exe -m pytest tests/unit/context/test_compaction_levels.py -q`
-v0.1 R3 Task 2 remains pending/unstarted
+v0.1 R3 Task 2: complete (automatic L0-L4 recommendation/application; `allow_lossy=False` caps L3/L4 at exact L2; distinct LiteLLM L3 summary and L4 rebase with purpose `context_compaction`; same-Session recursive evidence; atomic Context View/capsule/event persistence)
+v0.1 R3 Task 2 fallback contract: invalid, timeout, schema, reference, input-bound, or output-budget L3/L4 results use the exact deterministic L2 renderer without failing the main Run
+v0.1 R3 Task 2 final safety fix: `c3dc154`; final independent re-review: `3d8458e`, Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
+v0.1 R3 Task 2 fresh gates: Context 102 passed; Ruff clean; strict mypy clean; diff-check clean
+v0.1 next required action: R3 Task 3 Step 1, creating `tests/integration/prompts/test_runtime_prompt.py`
+v0.1 first Task 3 command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\prompts\test_runtime_prompt.py tests\unit\runtime\test_execution_descriptors.py -q`
