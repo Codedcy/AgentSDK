@@ -377,11 +377,21 @@ class ContextView(_DetachedModel):
     recommended_level: CompactionLevel = CompactionLevel.L0
     applied_level: CompactionLevel = CompactionLevel.L0
     budget: ContextBudget | None = None
+    source_refs: tuple[StrictStr, ...] = ()
+    transformations: tuple[StrictStr, ...] = ()
+    fallback_from: CompactionLevel | None = None
+    consumed_message_ids: tuple[StrictStr, ...] = ()
 
     @model_validator(mode="after")
     def _validate_unique_message_refs(self) -> ContextView:
         if len(set(self.message_refs)) != len(self.message_refs):
             raise ValueError("context message references must be unique")
+        if len(set(self.source_refs)) != len(self.source_refs):
+            raise ValueError("context source references must be unique")
+        if len(set(self.consumed_message_ids)) != len(
+            self.consumed_message_ids
+        ):
+            raise ValueError("consumed message ids must be unique")
         has_capsule = self.capsule_id is not None
         applied_capsule = self.applied_level in {
             CompactionLevel.L3,
@@ -391,6 +401,12 @@ class ContextView(_DetachedModel):
             raise ValueError(
                 "context capsule and applied level must describe the same state"
             )
+        if self.fallback_from is not None and (
+            self.fallback_from
+            not in {CompactionLevel.L3, CompactionLevel.L4}
+            or self.applied_level is not CompactionLevel.L2
+        ):
+            raise ValueError("context fallback must describe an L3/L4 to L2 path")
         return self
 
     @property

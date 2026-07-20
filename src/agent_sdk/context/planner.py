@@ -16,7 +16,11 @@ from agent_sdk.context.models import (
     ContextCapsule,
     ContextItem,
     ContextView,
+    SourceMessage,
 )
+from agent_sdk.context.rendering import render_level
+from agent_sdk.context.retrieval import ContextRetrieval
+from agent_sdk.context.strategies import StrategyResult
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.ids import new_id
@@ -29,6 +33,7 @@ from agent_sdk.storage.base import (
     StateStore,
     StoredEvent,
 )
+from agent_sdk.tools.models import thaw_json
 
 _Role = Literal["system", "user", "assistant", "tool"]
 _APPLICATION_ROLES = frozenset({"system", "user", "assistant", "tool"})
@@ -46,8 +51,22 @@ class ContextPlanner:
         tool_schema_tokens: int = 0,
         safety_reserve: int = 0,
         policy: CompactionPolicy | None = None,
+        recent_messages: int = 2,
+        tool_preview_bytes: int = 4_096,
         _token_counter: TokenCounter = default_token_counter,
     ) -> None:
+        if (
+            isinstance(recent_messages, bool)
+            or not isinstance(recent_messages, int)
+            or recent_messages < 0
+        ):
+            raise ValueError("recent_messages must be a non-negative integer")
+        if (
+            isinstance(tool_preview_bytes, bool)
+            or not isinstance(tool_preview_bytes, int)
+            or tool_preview_bytes < 0
+        ):
+            raise ValueError("tool_preview_bytes must be a non-negative integer")
         self._store = store
         self._model = model
         self._model_window = model_window
@@ -55,8 +74,11 @@ class ContextPlanner:
         self._tool_schema_tokens = tool_schema_tokens
         self._safety_reserve = safety_reserve
         self._policy = policy or CompactionPolicy()
+        self._recent_messages = recent_messages
+        self._tool_preview_bytes = tool_preview_bytes
         self._token_counter = _token_counter
         self._compactor = ContextCompactor(models, model=model)
+        self._retrieval = ContextRetrieval(store)
 
     async def build(
         self,
@@ -64,6 +86,7 @@ class ContextPlanner:
         *,
         force_level: CompactionLevel | str | None = None,
         protected_event_ids: Iterable[str] = (),
+        allow_lossy: bool = True,
     ) -> ContextView:
         session = await self._store.get_snapshot("session", session_id)
         if session is None:
@@ -106,46 +129,81 @@ class ContextPlanner:
                 retryable=False,
             )
         recommended = self._policy.recommend(budget.watermark_ratio)
-        requested = self._forced_level(force_level)
-        if requested in (CompactionLevel.L1, CompactionLevel.L2):
+        requested = self._requested_level(force_level, recommended)
+        if not isinstance(allow_lossy, bool):
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
-                "compaction level is not implemented",
+                "allow_lossy must be a boolean",
                 retryable=False,
             )
-        if requested in (CompactionLevel.L3, CompactionLevel.L4) and not source:
+        if not allow_lossy and requested in {
+            CompactionLevel.L3,
+            CompactionLevel.L4,
+        }:
+            requested = CompactionLevel.L2
+        if requested in {CompactionLevel.L3, CompactionLevel.L4} and not source:
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
                 "context sources are empty",
                 retryable=False,
             )
 
-        if requested in (CompactionLevel.L3, CompactionLevel.L4):
-            result = await self._compactor.compact(source, protected)
-            if result.capsule is not None:
-                return await self._persist_compacted(
-                    session_id=session_id,
-                    source=source,
-                    protected=protected,
-                    capsule=result.capsule,
-                    usage=result.usage,
-                    budget=budget,
-                    recommended=recommended,
-                    applied=requested,
-                )
+        sources = self._source_messages(source, protected)
+        if requested in {
+            CompactionLevel.L0,
+            CompactionLevel.L1,
+            CompactionLevel.L2,
+        }:
+            rendered = self._render(requested, sources)
+            return await self._persist_deterministic(
+                session_id=session_id,
+                rendered=rendered,
+                budget=budget,
+                recommended=recommended,
+                applied=requested,
+            )
+
+        retained = set(protected)
+        if self._recent_messages:
+            retained.update(
+                item.event_id for item in source[-self._recent_messages :]
+            )
+        if requested is CompactionLevel.L3:
+            result = await self._compactor.summarize(source, retained)
+            prior_refs: tuple[str, ...] = ()
+        else:
+            records = await self._retrieval.list_capsule_records(
+                session_id=session_id
+            )
+            capsule_ids = tuple(record[0] for record in records)
+            capsules = tuple(record[1] for record in records)
+            result = await self._compactor.rebase(
+                capsules,
+                source,
+                retained,
+                capsule_ids=capsule_ids,
+            )
+            prior_refs = capsule_ids
+        if result.capsule is None:
+            fallback = self._render(CompactionLevel.L2, sources)
             return await self._persist_fallback(
                 session_id=session_id,
-                source=source,
+                rendered=fallback,
                 usage=result.usage,
                 budget=budget,
                 recommended=recommended,
                 requested=requested,
             )
-        return await self._persist_l0(
+        return await self._persist_compacted(
             session_id=session_id,
             source=source,
+            retained=retained,
+            prior_refs=prior_refs,
+            capsule=result.capsule,
+            usage=result.usage,
             budget=budget,
             recommended=recommended,
+            applied=requested,
         )
 
     def _budget(self, source: tuple[ContextItem, ...]) -> ContextBudget:
@@ -168,23 +226,7 @@ class ContextPlanner:
             ) from error
         if baseline.available_input_tokens <= 0:
             return baseline
-        try:
-            projected = self._token_counter(
-                model=self._model,
-                messages=deepcopy(messages),
-            )
-            if (
-                isinstance(projected, bool)
-                or not isinstance(projected, int)
-                or projected < 0
-            ):
-                raise ValueError("token counter returned an invalid count")
-        except Exception as error:
-            raise AgentSDKError(
-                ErrorCode.INTERNAL,
-                "context token estimation failed",
-                retryable=False,
-            ) from error
+        projected = self._estimate_messages(messages)
         try:
             return ContextBudget.calculate(
                 model_window=self._model_window,
@@ -201,11 +243,12 @@ class ContextPlanner:
             ) from error
 
     @staticmethod
-    def _forced_level(
+    def _requested_level(
         force_level: CompactionLevel | str | None,
+        recommended: CompactionLevel,
     ) -> CompactionLevel:
         if force_level is None:
-            return CompactionLevel.L0
+            return recommended
         try:
             return CompactionLevel(force_level)
         except ValueError as error:
@@ -268,12 +311,61 @@ class ContextPlanner:
             return None
         return cast(_Role, role), content
 
+    @staticmethod
+    def _source_messages(
+        source: tuple[ContextItem, ...],
+        protected: set[str],
+    ) -> tuple[SourceMessage, ...]:
+        return tuple(
+            SourceMessage(
+                ref=item.event_id,
+                role=item.role,
+                message={"role": item.role, "content": item.content},
+                event_type=item.event_type,
+                protected=item.event_id in protected,
+            )
+            for item in source
+        )
+
+    def _render(
+        self,
+        level: CompactionLevel,
+        source: tuple[SourceMessage, ...],
+    ) -> StrategyResult:
+        return render_level(
+            level,
+            source,
+            recent_messages=self._recent_messages,
+            tool_preview_bytes=self._tool_preview_bytes,
+        )
+
+    async def _persist_deterministic(
+        self,
+        *,
+        session_id: str,
+        rendered: StrategyResult,
+        budget: ContextBudget,
+        recommended: CompactionLevel,
+        applied: CompactionLevel,
+    ) -> ContextView:
+        view = self._rendered_view(
+            session_id=session_id,
+            rendered=rendered,
+            budget=budget,
+            recommended=recommended,
+            applied=applied,
+            fallback_from=None,
+        )
+        await self._persist_view(view, usage=None)
+        return view
+
     async def _persist_compacted(
         self,
         *,
         session_id: str,
         source: tuple[ContextItem, ...],
-        protected: set[str],
+        retained: set[str],
+        prior_refs: tuple[str, ...],
         capsule: ContextCapsule,
         usage: UsageReported,
         budget: ContextBudget,
@@ -283,7 +375,14 @@ class ContextPlanner:
         view_id = new_id("view")
         capsule_id = new_id("cap")
         message_refs = tuple(
-            item.event_id for item in source if item.event_id in protected
+            item.event_id for item in source if item.event_id in retained
+        )
+        current_refs = tuple(item.event_id for item in source)
+        source_refs = tuple(dict.fromkeys((*prior_refs, *current_refs)))
+        transformed = tuple(
+            f"{applied.value.lower()}:{ref}"
+            for ref in source_refs
+            if ref not in message_refs
         )
         view = ContextView(
             view_id=view_id,
@@ -292,12 +391,14 @@ class ContextPlanner:
             capsule_id=capsule_id,
             estimated_tokens=self._estimate_compacted_tokens(
                 source,
-                protected,
+                retained,
                 capsule,
             ),
             recommended_level=recommended,
             applied_level=applied,
             budget=budget,
+            source_refs=source_refs,
+            transformations=transformed,
         )
         events = (
             self._event(
@@ -310,10 +411,14 @@ class ContextPlanner:
                     "level": applied.value,
                     "model": self._model,
                     "budget": budget.model_dump(mode="json"),
+                    "estimated_tokens": view.estimated_tokens,
+                    "message_refs": list(view.message_refs),
+                    "source_refs": list(view.source_refs),
+                    "transformations": list(view.transformations),
                     "usage": usage.to_payload(),
                 },
             ),
-            self._view_event(view, sequence=2),
+            self._view_event(view, sequence=2, usage=usage),
         )
         snapshots = (
             SnapshotWrite(
@@ -338,9 +443,7 @@ class ContextPlanner:
             CommitBatch(
                 events=events,
                 snapshots=snapshots,
-                preconditions=(
-                    SnapshotPrecondition("session", session_id),
-                ),
+                preconditions=(SnapshotPrecondition("session", session_id),),
             )
         )
         return view
@@ -349,13 +452,20 @@ class ContextPlanner:
         self,
         *,
         session_id: str,
-        source: tuple[ContextItem, ...],
+        rendered: StrategyResult,
         usage: UsageReported,
         budget: ContextBudget,
         recommended: CompactionLevel,
         requested: CompactionLevel,
     ) -> ContextView:
-        view = self._raw_view(session_id, source, budget, recommended)
+        view = self._rendered_view(
+            session_id=session_id,
+            rendered=rendered,
+            budget=budget,
+            recommended=recommended,
+            applied=CompactionLevel.L2,
+            fallback_from=requested,
+        )
         events = (
             self._event(
                 view,
@@ -364,12 +474,17 @@ class ContextPlanner:
                 payload={
                     "view_id": view.view_id,
                     "requested_level": requested.value,
+                    "applied_level": CompactionLevel.L2.value,
                     "code": "context_compaction_failed",
                     "budget": budget.model_dump(mode="json"),
+                    "estimated_tokens": view.estimated_tokens,
+                    "message_refs": list(view.message_refs),
+                    "source_refs": list(view.source_refs),
+                    "transformations": list(view.transformations),
                     "usage": usage.to_payload(),
                 },
             ),
-            self._view_event(view, sequence=2),
+            self._view_event(view, sequence=2, usage=usage),
         )
         await self._commit(
             CommitBatch(
@@ -383,45 +498,68 @@ class ContextPlanner:
                         view.model_dump(mode="json"),
                     ),
                 ),
-                preconditions=(
-                    SnapshotPrecondition("session", session_id),
-                ),
+                preconditions=(SnapshotPrecondition("session", session_id),),
             )
         )
         return view
 
-    async def _persist_l0(
+    def _rendered_view(
         self,
         *,
         session_id: str,
-        source: tuple[ContextItem, ...],
+        rendered: StrategyResult,
         budget: ContextBudget,
         recommended: CompactionLevel,
+        applied: CompactionLevel,
+        fallback_from: CompactionLevel | None,
     ) -> ContextView:
-        view = self._raw_view(session_id, source, budget, recommended)
+        messages = []
+        for item in rendered.items:
+            message = thaw_json(item.message)
+            assert isinstance(message, dict)
+            messages.append(message)
+        return ContextView(
+            view_id=new_id("view"),
+            session_id=session_id,
+            message_refs=tuple(item.ref for item in rendered.items),
+            capsule_id=None,
+            estimated_tokens=self._estimate_messages(messages),
+            recommended_level=recommended,
+            applied_level=applied,
+            budget=budget,
+            source_refs=rendered.source_refs,
+            transformations=rendered.transformations,
+            fallback_from=fallback_from,
+        )
+
+    async def _persist_view(
+        self,
+        view: ContextView,
+        *,
+        usage: UsageReported | None,
+    ) -> None:
         await self._commit(
             CommitBatch(
-                events=(self._view_event(view, sequence=1),),
+                events=(self._view_event(view, sequence=1, usage=usage),),
                 snapshots=(
                     SnapshotWrite(
                         "context_view",
                         view.view_id,
-                        session_id,
+                        view.session_id,
                         1,
                         view.model_dump(mode="json"),
                     ),
                 ),
                 preconditions=(
-                    SnapshotPrecondition("session", session_id),
+                    SnapshotPrecondition("session", view.session_id),
                 ),
             )
         )
-        return view
 
     def _estimate_compacted_tokens(
         self,
         source: tuple[ContextItem, ...],
-        protected: set[str],
+        retained: set[str],
         capsule: ContextCapsule,
     ) -> int:
         messages: list[dict[str, Any]] = [
@@ -439,8 +577,11 @@ class ContextPlanner:
         messages.extend(
             {"role": item.role, "content": item.content}
             for item in source
-            if item.event_id in protected
+            if item.event_id in retained
         )
+        return self._estimate_messages(messages)
+
+    def _estimate_messages(self, messages: list[dict[str, Any]]) -> int:
         try:
             count = self._token_counter(
                 model=self._model,
@@ -466,8 +607,7 @@ class ContextPlanner:
                 "context session no longer exists",
                 retryable=False,
             )
-        except Exception as error:
-            del error
+        except Exception:
             failure = AgentSDKError(
                 ErrorCode.INTERNAL,
                 "context persistence failed",
@@ -475,24 +615,6 @@ class ContextPlanner:
             )
         if failure is not None:
             raise failure
-
-    @staticmethod
-    def _raw_view(
-        session_id: str,
-        source: tuple[ContextItem, ...],
-        budget: ContextBudget,
-        recommended: CompactionLevel,
-    ) -> ContextView:
-        return ContextView(
-            view_id=new_id("view"),
-            session_id=session_id,
-            message_refs=tuple(item.event_id for item in source),
-            capsule_id=None,
-            estimated_tokens=budget.projected_source_tokens,
-            recommended_level=recommended,
-            applied_level=CompactionLevel.L0,
-            budget=budget,
-        )
 
     @staticmethod
     def _event(
@@ -511,7 +633,13 @@ class ContextPlanner:
         )
 
     @classmethod
-    def _view_event(cls, view: ContextView, *, sequence: int) -> EventEnvelope:
+    def _view_event(
+        cls,
+        view: ContextView,
+        *,
+        sequence: int,
+        usage: UsageReported | None,
+    ) -> EventEnvelope:
         return cls._event(
             view,
             sequence=sequence,
@@ -521,6 +649,22 @@ class ContextPlanner:
                 "capsule_id": view.capsule_id,
                 "recommended_level": view.recommended_level.value,
                 "applied_level": view.applied_level.value,
+                "fallback_from": (
+                    view.fallback_from.value
+                    if view.fallback_from is not None
+                    else None
+                ),
                 "estimated_tokens": view.estimated_tokens,
+                "budget": (
+                    view.budget.model_dump(mode="json")
+                    if view.budget is not None
+                    else None
+                ),
+                "message_refs": list(view.message_refs),
+                "source_refs": list(view.source_refs),
+                "transformations": list(view.transformations),
+                "compaction_usage": (
+                    usage.to_payload() if usage is not None else None
+                ),
             },
         )
