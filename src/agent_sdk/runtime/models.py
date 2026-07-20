@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from agent_sdk.context_runtime import ContextRuntimeConfig
 from agent_sdk.tools.models import ToolResult
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.runtime.execution import ExecutionDescriptor
@@ -65,6 +66,10 @@ class AgentSpec(BaseModel):
     model: str
     model_params: Mapping[str, Any] = Field(default_factory=dict)
     revision: str = "1"
+    prompt_profile: Literal["general", "coding"] = "general"
+    system_prompt: str | None = None
+    skills: tuple[str, ...] = ()
+    context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
 
     @field_validator("model_params", mode="after")
     @classmethod
@@ -76,6 +81,15 @@ class AgentSpec(BaseModel):
     @field_serializer("model_params")
     def _serialize_params(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return mutable_model_params(value)
+
+    @field_validator("skills")
+    @classmethod
+    def _validate_skills(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not name.strip() for name in value):
+            raise ValueError("skills must contain nonempty names")
+        if len(set(value)) != len(value):
+            raise ValueError("skills must be unique")
+        return value
 
     def model_copy(
         self,

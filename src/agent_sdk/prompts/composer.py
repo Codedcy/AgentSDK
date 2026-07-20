@@ -14,6 +14,8 @@ from agent_sdk.prompts.models import (
     PromptLayerManifest,
     PromptManifest,
 )
+from agent_sdk.ids import new_id
+from agent_sdk.skills.models import ActivatedSkill
 from agent_sdk.tools.models import freeze_json, thaw_json
 
 _PROFILE_ORDER = {
@@ -31,6 +33,7 @@ class PromptComposer:
         context_view: ContextView,
         model: str,
         application: str | None = None,
+        skills: Sequence[ActivatedSkill] = (),
         tools: Sequence[Mapping[str, Any]] = (),
     ) -> BuiltPrompt:
         profile_names = _PROFILE_ORDER.get(profile)
@@ -43,11 +46,27 @@ class PromptComposer:
         layers = [self._load_profile(name) for name in profile_names]
         if application:
             layers.append(self._layer("application", _PROFILE_VERSION, application))
+        skill_names = tuple(skill.metadata.name for skill in skills)
+        if len(set(skill_names)) != len(skill_names):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "duplicate prompt skill",
+                retryable=False,
+            )
+        layers.extend(
+            self._layer(
+                f"skill:{skill.metadata.name}",
+                skill.metadata.content_hash,
+                skill.instructions,
+            )
+            for skill in skills
+        )
         messages = tuple(
             {"role": "system", "content": layer.text} for layer in layers
         )
         text = "\n\n".join(layer.text for layer in layers)
         manifest = PromptManifest(
+            manifest_id=new_id("pmf"),
             layers=tuple(
                 PromptLayerManifest(
                     layer_id=layer.layer_id,

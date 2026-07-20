@@ -4,6 +4,7 @@ from agent_sdk.context.models import (
     ContextBudget,
     ContextCapsule,
     ContextItem,
+    ContextRuntimeConfig,
     ContextView,
     SourceMessage,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "ContextItem",
     "ContextPlanner",
     "ContextRetrieval",
+    "ContextRuntimeConfig",
     "ContextView",
     "SourceMessage",
     "StrategyResult",

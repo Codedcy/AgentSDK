@@ -49,6 +49,7 @@ class PromptLayerManifest(_PromptModel):
 
 
 class PromptManifest(_PromptModel):
+    manifest_id: StrictStr = Field(min_length=1)
     layers: tuple[PromptLayerManifest, ...]
     sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     context_view_id: StrictStr = Field(min_length=1)

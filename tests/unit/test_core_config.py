@@ -11,6 +11,7 @@ from agent_sdk.permissions import PermissionRule
 def test_core_contracts_are_stable() -> None:
     config = AgentSDKConfig(database_path=Path("state.db"))
     assert config.capture_level is CaptureLevel.PREVIEW
+    assert config.skill_roots == ()
     assert new_id("run").startswith("run_")
     with pytest.raises(Exception):
         AgentSDKConfig(database_path=Path("x.db"), unknown=True)
@@ -30,9 +31,11 @@ def test_permission_rules_round_trip_through_config_json(tmp_path: Path) -> None
                 command_prefix=("git", "status"),
             ),
         ),
+        skill_roots=(tmp_path / "skills",),
     )
 
     restored = AgentSDKConfig.model_validate_json(config.model_dump_json())
 
     assert restored == config
     assert restored.permission_rules[0].command_prefix == ("git", "status")
+    assert restored.skill_roots == (tmp_path / "skills",)

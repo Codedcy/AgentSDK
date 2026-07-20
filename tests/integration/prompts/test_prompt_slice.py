@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from agent_sdk.context import CompactionLevel, ContextView
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.prompts import PromptComposer
+from agent_sdk.skills import SkillRegistry
 
 
 def _view() -> ContextView:
@@ -79,6 +80,40 @@ def test_general_profile_is_first_and_application_is_last() -> None:
     )
     assert coding.messages[0] == general.messages[0]
     assert coding.messages[-1]["content"] == "Application layer."
+
+
+def test_skill_layers_preserve_order_and_reject_duplicate_names() -> None:
+    root = Path(__file__).parents[2] / "fixtures" / "skills"
+    registry = SkillRegistry((root,))
+    registry.discover()
+    demo = registry.activate("demo")
+    coding = registry.activate("coding-demo")
+    composer = PromptComposer()
+
+    built = composer.compose(
+        profile="general",
+        skills=(demo, coding),
+        context_view=_view(),
+        model="fake/model",
+    )
+
+    assert tuple(layer.layer_id for layer in built.manifest.layers[-2:]) == (
+        "skill:demo",
+        "skill:coding-demo",
+    )
+    assert tuple(layer.version for layer in built.manifest.layers[-2:]) == (
+        demo.metadata.content_hash,
+        coding.metadata.content_hash,
+    )
+    with pytest.raises(AgentSDKError) as raised:
+        composer.compose(
+            profile="general",
+            skills=(demo, demo),
+            context_view=_view(),
+            model="fake/model",
+        )
+    assert raised.value.code is ErrorCode.INVALID_STATE
+    assert raised.value.message == "duplicate prompt skill"
 
 
 def test_tool_fingerprint_uses_canonical_json_independent_of_key_order() -> None:

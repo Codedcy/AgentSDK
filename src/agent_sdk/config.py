@@ -20,5 +20,6 @@ class AgentSDKConfig(BaseModel):
     capture_level: CaptureLevel = CaptureLevel.PREVIEW
     permission_default: Literal["allow", "deny", "ask"] = "ask"
     permission_rules: tuple[PermissionRule, ...] = ()
+    skill_roots: tuple[Path, ...] = ()
     enable_builtin_tools: bool = True
     builtin_tool_output_bytes: int = Field(default=64 * 1024, ge=1024)

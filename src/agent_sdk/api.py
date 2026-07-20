@@ -70,6 +70,7 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpoint,
     _context_free_recovery_errors,
 )
+from agent_sdk.skills import SkillRegistry
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
@@ -496,6 +497,7 @@ class RunAPI:
         lifecycle: _SDKLifecycle,
         tools: ToolRegistry,
         policy: PolicyEngine,
+        skills: SkillRegistry,
     ) -> None:
         self._store = store
         self._commands = commands
@@ -504,6 +506,7 @@ class RunAPI:
         self._lifecycle = lifecycle
         self._tools = tools
         self._policy = policy
+        self._skills = skills
         self._start_lock = asyncio.Lock()
         self._tasks: dict[str, asyncio.Task[RunResult]] = {}
 
@@ -517,6 +520,7 @@ class RunAPI:
     ) -> RunHandle:
         try:
             async with self._lifecycle.admit():
+                self._activate_skills(agent)
                 messages = ({"role": "user", "content": user_input},)
                 config = self._policy.execution_config()
                 descriptor = ExecutionDescriptor.create(
@@ -550,6 +554,17 @@ class RunAPI:
                 return await self._await_start_coordinator(coordinator)
         finally:
             del idempotency_key
+
+    def _activate_skills(self, agent: AgentSpec) -> None:
+        for name in agent.skills:
+            try:
+                self._skills.activate(name)
+            except AgentSDKError:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "configured agent skill unavailable",
+                    retryable=False,
+                ) from None
 
     async def _coordinate_start(
         self,
@@ -1003,6 +1018,7 @@ class AgentSDK:
             LiteLLMGateway(),
             permission_default=config.permission_default,
             permission_rules=config.permission_rules,
+            skill_roots=config.skill_roots,
             enable_builtin_tools=config.enable_builtin_tools,
             builtin_tool_output_bytes=config.builtin_tool_output_bytes,
             permission_bridge=InProcessPermissionBridge(),
@@ -1019,6 +1035,7 @@ class AgentSDK:
         database_path: str | Path | None = None,
         permission_default: _PermissionDefault = "ask",
         permission_rules: tuple[PermissionRule, ...] = (),
+        skill_roots: tuple[str | Path, ...] = (),
         enable_builtin_tools: bool = True,
         builtin_tool_output_bytes: int = 64 * 1024,
         permission_bridge: InProcessPermissionBridge | None | object = (
@@ -1053,6 +1070,7 @@ class AgentSDK:
             LiteLLMGateway._for_test(acompletion),
             permission_default=permission_default,
             permission_rules=permission_rules,
+            skill_roots=tuple(Path(root) for root in skill_roots),
             enable_builtin_tools=enable_builtin_tools,
             builtin_tool_output_bytes=builtin_tool_output_bytes,
             permission_bridge=bridge,
@@ -1068,6 +1086,7 @@ class AgentSDK:
         *,
         permission_default: _PermissionDefault,
         permission_rules: tuple[PermissionRule, ...],
+        skill_roots: tuple[Path, ...],
         enable_builtin_tools: bool,
         builtin_tool_output_bytes: int,
         permission_bridge: InProcessPermissionBridge | None,
@@ -1080,6 +1099,8 @@ class AgentSDK:
         self._startup_scan_lock = asyncio.Lock()
         self._startup_scan_task: asyncio.Task[None] | None = None
         commands = RuntimeCommands(store)
+        skills = SkillRegistry(skill_roots)
+        skills.discover()
         tools = ToolRegistry()
         if enable_builtin_tools:
             register_builtin_tools(
@@ -1111,6 +1132,7 @@ class AgentSDK:
             track_workflow_task=self._track_task,
         )
         self.tools = tools
+        self.skills = skills
         self.agents = AgentAPI(agents)
         self.permissions = PermissionAPI(permission_bridge)
         self.sessions = SessionAPI(commands, self._lifecycle)
@@ -1122,6 +1144,7 @@ class AgentSDK:
             self._lifecycle,
             tools,
             policy,
+            skills,
         )
         self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)

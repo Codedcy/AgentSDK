@@ -22,6 +22,7 @@ from agent_sdk.context import (
     ContextItem,
     ContextPlanner,
     ContextRetrieval,
+    ContextRuntimeConfig,
     ContextView,
 )
 from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
@@ -53,7 +54,12 @@ from agent_sdk.observability import (
     RunTimeline,
     SubscriptionService,
 )
-from agent_sdk.prompts import BuiltPrompt, PromptComposer, PromptManifest
+from agent_sdk.prompts import (
+    BuiltPrompt,
+    PromptComposer,
+    PromptManifest,
+    PromptManifestPersistence,
+)
 from agent_sdk.runtime.handles import RunHandle
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
@@ -131,6 +137,7 @@ __all__ = [
     "ContextItem",
     "ContextPlanner",
     "ContextRetrieval",
+    "ContextRuntimeConfig",
     "ContextView",
     "ErrorCode",
     "EvaluationAPI",
@@ -162,6 +169,7 @@ __all__ = [
     "ObservedRun",
     "PromptComposer",
     "PromptManifest",
+    "PromptManifestPersistence",
     "BuiltPrompt",
     "RunAPI",
     "RunFailure",

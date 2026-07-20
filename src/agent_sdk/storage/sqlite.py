@@ -4422,6 +4422,7 @@ async def _validate_v1_events(
 async def _validate_current_projection_rows(connection: aiosqlite.Connection) -> None:
     from agent_sdk.context.models import ContextCapsule, ContextView
     from agent_sdk.evaluation.models import EvaluationResult
+    from agent_sdk.prompts.models import PromptManifest
     from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
     from agent_sdk.workflow.models import WorkflowNodeSnapshot, WorkflowRunSnapshot
 
@@ -4434,6 +4435,7 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
         nodes: dict[str, WorkflowNodeSnapshot] = {}
         capsules: dict[str, tuple[str, ContextCapsule]] = {}
         views: dict[str, ContextView] = {}
+        prompt_manifests: dict[str, tuple[str, PromptManifest]] = {}
         evaluations: dict[str, EvaluationResult] = {}
         for row in rows:
             if row.kind != "session":
@@ -4495,6 +4497,17 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
                 ):
                     raise ValueError("current context view identity is invalid")
                 views[view_value.view_id] = view_value
+            elif row.kind == "prompt_manifest":
+                manifest_value = PromptManifest.model_validate(data)
+                if (
+                    manifest_value.manifest_id != row.entity_id
+                    or row.version != 1
+                ):
+                    raise ValueError("current prompt manifest identity is invalid")
+                prompt_manifests[manifest_value.manifest_id] = (
+                    row.session_id,
+                    manifest_value,
+                )
             elif row.kind == "evaluation":
                 evaluation_value = EvaluationResult.model_validate(data)
                 if (
@@ -4519,6 +4532,10 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
                 capsule = capsules.get(view.capsule_id)
                 if capsule is None or capsule[0] != view.session_id:
                     raise ValueError("current context reference is invalid")
+        for session_id, manifest in prompt_manifests.values():
+            manifest_view = views.get(manifest.context_view_id)
+            if manifest_view is None or manifest_view.session_id != session_id:
+                raise ValueError("current prompt manifest context is invalid")
         for evaluation in evaluations.values():
             run = runs.get(evaluation.subject_run_id)
             if run is None or run.session_id != evaluation.session_id:

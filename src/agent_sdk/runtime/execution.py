@@ -9,6 +9,7 @@ from typing import Any, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
+from agent_sdk.context_runtime import ContextRuntimeConfig
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk._workflow_validation import validate_canonical_workflow_program
 
@@ -82,6 +83,10 @@ class DurableAgentSpec(_RevalidatedDescriptor):
     model: str
     model_params: Mapping[str, Any] = Field(default_factory=dict)
     revision: str = "1"
+    prompt_profile: Literal["general", "coding"] = "general"
+    system_prompt: str | None = None
+    skills: tuple[str, ...] = ()
+    context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
 
     @field_validator("model_params", mode="after")
     @classmethod
@@ -95,6 +100,15 @@ class DurableAgentSpec(_RevalidatedDescriptor):
         result = _thaw_json(value)
         assert isinstance(result, dict)
         return result
+
+    @field_validator("skills")
+    @classmethod
+    def _validate_skills(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not name.strip() for name in value):
+            raise ValueError("skills must contain nonempty names")
+        if len(set(value)) != len(value):
+            raise ValueError("skills must be unique")
+        return value
 
 
 class DurableAgentNode(_RevalidatedDescriptor):
@@ -365,6 +379,42 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
     tools: tuple[ToolCapabilityDescriptor, ...]
     policy: ExecutionPolicyDescriptor
     descriptor_hash: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_legacy_agent_fields(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        agent = value.get("agent")
+        if not isinstance(agent, Mapping):
+            return value
+        new_fields = {"prompt_profile", "system_prompt", "skills", "context"}
+        if new_fields <= set(agent):
+            return value
+        raw_agent = dict(agent)
+        if value.get("agent_hash") != _hash(raw_agent):
+            return value
+        raw_content = {
+            key: _thaw_json(item)
+            for key, item in value.items()
+            if key != "descriptor_hash"
+        }
+        if value.get("descriptor_hash") != _hash(raw_content):
+            return value
+        upgraded_agent = DurableAgentSpec.model_validate(raw_agent).model_dump(
+            mode="json"
+        )
+        upgraded = {key: _thaw_json(item) for key, item in value.items()}
+        upgraded["agent"] = upgraded_agent
+        upgraded["agent_hash"] = _hash(upgraded_agent)
+        upgraded["descriptor_hash"] = _hash(
+            {
+                key: item
+                for key, item in upgraded.items()
+                if key != "descriptor_hash"
+            }
+        )
+        return upgraded
 
     @field_validator("messages", mode="after")
     @classmethod

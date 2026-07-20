@@ -5,6 +5,7 @@ from agent_sdk.prompts.models import (
     PromptLayerManifest,
     PromptManifest,
 )
+from agent_sdk.prompts.persistence import PromptManifestPersistence
 
 __all__ = [
     "BuiltPrompt",
@@ -12,4 +13,5 @@ __all__ = [
     "PromptLayer",
     "PromptLayerManifest",
     "PromptManifest",
+    "PromptManifestPersistence",
 ]

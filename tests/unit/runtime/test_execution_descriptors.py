@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from agent_sdk.runtime.execution import (
+    DurableAgentSpec,
     DurableWorkflowIR,
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
@@ -22,6 +23,7 @@ from agent_sdk.runtime.models import (
     SessionStatus,
     TokenUsage,
 )
+from agent_sdk.context import ContextRuntimeConfig
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.models import (
     AgentNode,
@@ -172,6 +174,85 @@ def test_execution_descriptor_is_immutable_and_revalidates_hashes() -> None:
     )
     assert changed.agent_hash != descriptor.agent_hash
     assert changed.descriptor_hash != descriptor.descriptor_hash
+
+
+def test_agent_prompt_and_context_fields_are_defaulted_and_validated() -> None:
+    agent = AgentSpec(name="coder", model="openai/test")
+
+    assert agent.prompt_profile == "general"
+    assert agent.system_prompt is None
+    assert agent.skills == ()
+    assert agent.context == ContextRuntimeConfig()
+    with pytest.raises(ValidationError, match="skills"):
+        AgentSpec(name="coder", model="openai/test", skills=("",))
+    with pytest.raises(ValidationError, match="skills"):
+        AgentSpec(name="coder", model="openai/test", skills=("demo", "demo"))
+
+
+def test_execution_descriptor_hash_covers_prompt_skills_and_context() -> None:
+    def descriptor(agent: AgentSpec) -> ExecutionDescriptor:
+        return ExecutionDescriptor.create(
+            agent=agent,
+            messages=({"role": "user", "content": "hello"},),
+            tools=(),
+            policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+        )
+
+    base = descriptor(AgentSpec(name="coder", model="openai/test"))
+    changed = (
+        AgentSpec(name="coder", model="openai/test", prompt_profile="coding"),
+        AgentSpec(
+            name="coder",
+            model="openai/test",
+            system_prompt="Application constraint.",
+        ),
+        AgentSpec(name="coder", model="openai/test", skills=("coding-demo",)),
+        AgentSpec(
+            name="coder",
+            model="openai/test",
+            context=ContextRuntimeConfig(model_window=64_000),
+        ),
+    )
+
+    for agent in changed:
+        current = descriptor(agent)
+        assert current.agent_hash != base.agent_hash
+        assert current.descriptor_hash != base.descriptor_hash
+
+
+def test_legacy_durable_agent_and_descriptor_load_prompt_defaults() -> None:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    legacy = descriptor.model_dump(mode="json")
+    for field in ("prompt_profile", "system_prompt", "skills", "context"):
+        legacy["agent"].pop(field)
+    legacy["agent_hash"] = _canonical_hash(legacy["agent"])
+    legacy["descriptor_hash"] = _canonical_hash(
+        {key: value for key, value in legacy.items() if key != "descriptor_hash"}
+    )
+
+    restored_agent = DurableAgentSpec.model_validate(legacy["agent"])
+    restored = ExecutionDescriptor.model_validate(legacy)
+
+    assert restored_agent.prompt_profile == "general"
+    assert restored_agent.system_prompt is None
+    assert restored_agent.skills == ()
+    assert restored_agent.context == ContextRuntimeConfig()
+    assert restored.agent == restored_agent
+    assert restored.agent_hash == _canonical_hash(
+        restored.agent.model_dump(mode="json")
+    )
+    assert restored.descriptor_hash == _canonical_hash(
+        {
+            key: value
+            for key, value in restored.model_dump(mode="json").items()
+            if key != "descriptor_hash"
+        }
+    )
 
 
 def test_execution_descriptor_rejects_rehashed_noncanonical_agent() -> None:
