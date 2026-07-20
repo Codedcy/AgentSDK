@@ -76,8 +76,10 @@ R3_RESUME_COMMAND = (
     r"\2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
 )
 R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
-R3_FIRST_RED = (
-    rf".\.venv\Scripts\python.exe -m pytest {R3_FIRST_TEST} -q"
+R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
+R3_TASK2_FIRST_TEST = "tests/unit/context/test_compaction_levels.py"
+R3_TASK2_FIRST_RED = (
+    rf".\.venv\Scripts\python.exe -m pytest {R3_TASK2_FIRST_TEST} -q"
 )
 
 
@@ -118,11 +120,20 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "final review Spec approved / Quality approved" in document
     assert R3_PLAN in document
     assert R3_RESUME_COMMAND in document
-    assert "R3 Task 1 Step 1" in document
+    for commit in R3_TASK1_COMMITS:
+        assert commit in document
     assert R3_FIRST_TEST in document
-    assert R3_FIRST_RED in document
-    assert "R3 remains pending" in document
-    assert "R3 implementation has not started" in document
+    assert "R3 Task 1 deterministic L0-L2 is complete" in document
+    assert "R3 Task 1 final review: Critical 0 / Important 0 / Minor 0" in document
+    assert "Spec PASS; Quality PASS" in document
+    assert "42 deterministic strategy tests" in document
+    assert "48 context integration tests" in normalized_document
+    assert "R3 Task 2 Step 1" in document
+    assert R3_TASK2_FIRST_TEST in document
+    assert R3_TASK2_FIRST_RED in document
+    assert "R3 Task 2 remains pending/unstarted" in document
+    assert "R3 remains pending" not in document
+    assert "R3 implementation has not started" not in document
     assert "Tasks 4-5 have not started" not in document
 
 
@@ -147,8 +158,9 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
         "| R2 | completed | condition and bounded loop | "
         "2026-07-20 final checkpoint: 403 passed in 43.03s; Ruff/mypy clean |"
     ) in ledger
-    for slice_id in ("R3", "R4", "R5"):
+    for slice_id in ("R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
+    assert "| R3 | in_progress | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
     assert "74c1e3b" in ledger
@@ -170,7 +182,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
     assert (
         "v0.1 current implementation status: R0-R2 completed; "
-        "R3 pending and unstarted"
+        "R3 in progress (Task 1 deterministic L0-L2 complete; "
+        "Task 2 pending/unstarted)"
     ) in progress
     _assert_release_checkpoint_and_r3_resume(ledger)
     _assert_release_checkpoint_and_r3_resume(progress)
