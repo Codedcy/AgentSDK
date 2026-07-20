@@ -12,8 +12,12 @@ from pydantic import (
     StrictFloat,
     StrictInt,
     StrictStr,
+    field_serializer,
+    field_validator,
     model_validator,
 )
+
+from agent_sdk.tools.models import freeze_json, thaw_json
 
 
 class _DetachedModel(BaseModel):
@@ -85,6 +89,33 @@ class ContextItem(_DetachedModel):
     event_type: StrictStr = Field(min_length=1)
     role: Literal["system", "user", "assistant", "tool"]
     content: StrictStr
+
+
+class SourceMessage(_DetachedModel):
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        validate_default=True,
+        arbitrary_types_allowed=True,
+    )
+
+    ref: StrictStr = Field(min_length=1)
+    message: Mapping[str, Any]
+    protected: bool = False
+    current: bool = False
+
+    @field_validator("message", mode="after")
+    @classmethod
+    def _freeze_message(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
+        frozen = freeze_json(value)
+        assert isinstance(frozen, Mapping)
+        return frozen
+
+    @field_serializer("message")
+    def _serialize_message(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        thawed = thaw_json(value)
+        assert isinstance(thawed, dict)
+        return thawed
 
 
 class _BudgetInputs(_DetachedModel):
