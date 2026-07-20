@@ -72,6 +72,13 @@ class _RunLoadFailure(Enum):
     INVALID = "invalid"
 
 
+@dataclass(frozen=True)
+class _ParentExecutionIdentity:
+    node_index: int
+    run_id: str
+    node_execution: int | None
+
+
 class _IRValidationFailure(Enum):
     INVALID = "invalid"
 
@@ -682,29 +689,30 @@ class WorkflowExecutor:
     ) -> RunSnapshot | None:
         if node.run_as != "child":
             return None
-        parent_index = _parent_node_index(snapshot, index)
-        previous_node = snapshot.workflow.nodes[parent_index]
-        previous_projection = snapshot.nodes[parent_index]
-        parent_run_id = previous_projection.run_id
-        if (
-            previous_projection.status is not WorkflowNodeStatus.COMPLETED
-            or parent_run_id is None
-        ):
-            raise _invalid_parent_run()
-        parent = await _load_run(self._store, parent_run_id)
+        identity = _parent_execution_identity(snapshot, index)
+        previous_node = snapshot.workflow.nodes[identity.node_index]
+        previous_projection = snapshot.nodes[identity.node_index]
+        parent = await _load_run(self._store, identity.run_id)
         expected_descriptor = self._node_execution_descriptor(previous_node)
         if (
             not isinstance(parent, RunSnapshot)
             or parent.status is not RunStatus.COMPLETED
-            or not _related_run_matches(
+            or not _historical_parent_run_matches(
                 snapshot,
-                parent_index,
+                identity,
                 previous_node,
                 parent,
                 expected_descriptor=expected_descriptor,
             )
-            or parent.output_text != previous_projection.output_text
-            or parent.usage != previous_projection.usage
+        ):
+            raise _invalid_parent_run()
+        if (
+            previous_projection.run_id == identity.run_id
+            and (
+                previous_projection.status is not WorkflowNodeStatus.COMPLETED
+                or parent.output_text != previous_projection.output_text
+                or parent.usage != previous_projection.usage
+            )
         ):
             raise _invalid_parent_run()
         try:
@@ -1524,18 +1532,13 @@ def _is_linear_program(workflow: WorkflowIR) -> bool:
 
 
 def _parent_run_id(snapshot: WorkflowRunSnapshot, index: int) -> str:
-    parent_index = _parent_node_index(snapshot, index)
-    parent = snapshot.nodes[parent_index].run_id
-    if parent is None:
-        raise AgentSDKError(
-            ErrorCode.INVALID_STATE,
-            "child workflow node has no parent run",
-            retryable=False,
-        )
-    return parent
+    return _parent_execution_identity(snapshot, index).run_id
 
 
-def _parent_node_index(snapshot: WorkflowRunSnapshot, index: int) -> int:
+def _parent_execution_identity(
+    snapshot: WorkflowRunSnapshot,
+    index: int,
+) -> _ParentExecutionIdentity:
     if index == 0:
         raise AgentSDKError(
             ErrorCode.INVALID_STATE,
@@ -1546,18 +1549,51 @@ def _parent_node_index(snapshot: WorkflowRunSnapshot, index: int) -> int:
         snapshot.workflow.schema_version == 1
         or _is_linear_program(snapshot.workflow)
     ):
-        return index - 1
+        parent_index = index - 1
+        parent = snapshot.nodes[parent_index]
+        if parent.run_id is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "child workflow node has no parent run",
+                retryable=False,
+            )
+        return _ParentExecutionIdentity(
+            node_index=parent_index,
+            run_id=parent.run_id,
+            node_execution=(
+                parent.execution_count
+                if snapshot.workflow.schema_version == 2
+                else None
+            ),
+        )
     control = snapshot.control
-    parent_node_id = None if control is None else control.last_output_node_id
-    if parent_node_id is None:
+    if control is None or control.last_output_node_id is None:
         raise AgentSDKError(
             ErrorCode.INVALID_STATE,
             "child workflow node has no parent run",
             retryable=False,
         )
+    parent_node_id = control.last_output_node_id
     for parent_index, candidate in enumerate(snapshot.workflow.nodes):
         if candidate.id == parent_node_id:
-            return parent_index
+            projection = snapshot.nodes[parent_index]
+            parent_run_id = (
+                control.last_output_run_id
+                if control.last_output_run_id is not None
+                else projection.run_id
+            )
+            parent_execution = (
+                control.last_output_node_execution
+                if control.last_output_node_execution is not None
+                else projection.execution_count
+            )
+            if parent_run_id is None:
+                break
+            return _ParentExecutionIdentity(
+                node_index=parent_index,
+                run_id=parent_run_id,
+                node_execution=parent_execution,
+            )
     raise AgentSDKError(
         ErrorCode.INVALID_STATE,
         "child workflow node has no parent run",
@@ -1583,25 +1619,17 @@ def _related_run_matches(
     *,
     expected_descriptor: ExecutionDescriptor | None = None,
 ) -> bool:
-    if (
-        run.run_id != workflow.nodes[index].run_id
-        or run.session_id != workflow.session_id
-        or run.workflow_run_id != workflow.workflow_run_id
-        or run.workflow_node_id != node.id
-        or run.workflow_node_execution
-        != (
+    if not _workflow_execution_run_matches(
+        workflow,
+        node,
+        run,
+        expected_run_id=workflow.nodes[index].run_id,
+        expected_node_execution=(
             workflow.nodes[index].execution_count
             if workflow.workflow.schema_version == 2
             else None
-        )
-        or run.agent_revision != node.agent_revision
-        or (
-            expected_descriptor is not None
-            and (
-                run.execution_compatibility != "current"
-                or run.execution_descriptor != expected_descriptor
-            )
-        )
+        ),
+        expected_descriptor=expected_descriptor,
     ):
         return False
     if node.run_as == "parent":
@@ -1616,6 +1644,64 @@ def _related_run_matches(
         run.parent_run_id == expected_parent
         and run.task_envelope == expected_envelope
         and run.user_input == render_task_envelope(expected_envelope)
+    )
+
+
+def _historical_parent_run_matches(
+    workflow: WorkflowRunSnapshot,
+    identity: _ParentExecutionIdentity,
+    node: AgentNode,
+    run: RunSnapshot,
+    *,
+    expected_descriptor: ExecutionDescriptor,
+) -> bool:
+    if not _workflow_execution_run_matches(
+        workflow,
+        node,
+        run,
+        expected_run_id=identity.run_id,
+        expected_node_execution=identity.node_execution,
+        expected_descriptor=expected_descriptor,
+    ):
+        return False
+    if node.run_as == "parent":
+        return (
+            run.parent_run_id is None
+            and run.task_envelope is None
+            and run.user_input == node.input
+        )
+    expected_envelope = _task_envelope(node)
+    return (
+        run.parent_run_id is not None
+        and run.parent_run_id != run.run_id
+        and run.task_envelope == expected_envelope
+        and run.user_input == render_task_envelope(expected_envelope)
+    )
+
+
+def _workflow_execution_run_matches(
+    workflow: WorkflowRunSnapshot,
+    node: AgentNode,
+    run: RunSnapshot,
+    *,
+    expected_run_id: str | None,
+    expected_node_execution: int | None,
+    expected_descriptor: ExecutionDescriptor | None,
+) -> bool:
+    return not (
+        run.run_id != expected_run_id
+        or run.session_id != workflow.session_id
+        or run.workflow_run_id != workflow.workflow_run_id
+        or run.workflow_node_id != node.id
+        or run.workflow_node_execution != expected_node_execution
+        or run.agent_revision != node.agent_revision
+        or (
+            expected_descriptor is not None
+            and (
+                run.execution_compatibility != "current"
+                or run.execution_descriptor != expected_descriptor
+            )
+        )
     )
 
 

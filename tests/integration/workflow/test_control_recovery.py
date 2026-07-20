@@ -76,6 +76,27 @@ steps:
 """
 
 
+def _repeated_child_loop_yaml() -> str:
+    return """
+api_version: agent-sdk/v1
+kind: Workflow
+name: recover-repeated-child
+steps:
+  - {id: seed, kind: agent, agent_revision: worker:1, input: seed}
+  - id: repeat
+    kind: loop
+    until: {path: outputs.child.done, op: exists}
+    max_iterations: 2
+    body:
+      - id: child
+        kind: agent
+        agent_revision: worker:1
+        input: child
+        run_as: child
+        success_criteria: [return child result]
+"""
+
+
 class _CancelAfterNthEventStore:
     def __init__(
         self,
@@ -315,5 +336,76 @@ async def test_sqlite_restart_preserves_selected_child_parent(
         durable_child = await reopened.runs.get(child_run_id)
         assert durable_child.parent_run_id == parent_run_id
         assert durable_child.workflow_node_execution == 1
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_restart_preserves_previous_child_generation(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+    child_calls = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal calls, child_calls
+        calls += 1
+        if calls == 1:
+            return _chunks("seed")
+        child_calls += 1
+        return _chunks('{"done":true}' if child_calls == 2 else '{"progress":1}')
+
+    database = tmp_path / "repeated-child-generation.sqlite3"
+    sqlite = await SQLiteStore.open(database)
+    store = _CancelAfterNthEventStore(sqlite, "workflow.node.started", 3)
+    first = AgentSDK.for_test(store=store, acompletion=provider)
+    first.agents.define(
+        AgentSpec(name="worker", revision="1", model="fake/worker")
+    )
+    session = await first.sessions.create(workspaces=[])
+    handle = await first.workflows.start(
+        session.session_id,
+        _repeated_child_loop_yaml(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await handle.result()
+    assert calls == 2
+    workflow_run_id = handle.workflow_run_id
+    interrupted = await first.workflows.get(workflow_run_id)
+    assert interrupted.control is not None
+    child = next(node for node in interrupted.nodes if node.node_id == "child")
+    assert child.run_id is not None
+    generation_two_run_id = child.run_id
+    generation_one_run_id = interrupted.control.last_output_run_id
+    assert generation_one_run_id is not None
+    assert interrupted.control.last_output_node_id == "child"
+    assert interrupted.control.last_output_node_execution == 1
+    assert generation_one_run_id != generation_two_run_id
+    await first.close()
+    await sqlite.close()
+
+    reopened = AgentSDK.for_test(database_path=database, acompletion=provider)
+    reopened.agents.define(
+        AgentSpec(name="worker", revision="1", model="fake/worker")
+    )
+    try:
+        durable = await reopened.workflows.get(workflow_run_id)
+        assert durable.control is not None
+        assert durable.control.last_output_run_id == generation_one_run_id
+        assert durable.control.last_output_node_execution == 1
+
+        await reopened.recovery.scan()
+        result = await (
+            await reopened.recovery.recover_workflow(workflow_run_id)
+        ).result()
+
+        assert result.status is WorkflowRunStatus.COMPLETED
+        final_child = next(node for node in result.nodes if node.node_id == "child")
+        assert final_child.run_id == generation_two_run_id
+        generation_two = await reopened.runs.get(generation_two_run_id)
+        assert generation_two.parent_run_id == generation_one_run_id
+        assert generation_two.workflow_node_execution == 2
+        assert calls == 3
     finally:
         await reopened.close()

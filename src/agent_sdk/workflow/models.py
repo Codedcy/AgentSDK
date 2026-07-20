@@ -434,6 +434,17 @@ class WorkflowControlState(BaseModel):
         max_length=128,
         exclude_if=lambda value: value is None,
     )
+    last_output_run_id: str | None = Field(
+        default=None,
+        max_length=128,
+        exclude_if=lambda value: value is None,
+    )
+    last_output_node_execution: int | None = Field(
+        default=None,
+        ge=1,
+        strict=True,
+        exclude_if=lambda value: value is None,
+    )
 
     @field_validator("program_counter", "revision", mode="before")
     @classmethod
@@ -442,14 +453,24 @@ class WorkflowControlState(BaseModel):
             raise ValueError("workflow control counters must be integers")
         return value
 
-    @field_validator("last_output_node_id", mode="before")
+    @field_validator("last_output_node_id", "last_output_run_id", mode="before")
     @classmethod
-    def _validate_last_output_node_id(cls, value: Any) -> str | None:
+    def _validate_last_output_id(cls, value: Any) -> str | None:
         if value is None:
             return None
         if not isinstance(value, str) or not value:
-            raise ValueError("workflow last output node id must be a nonempty string")
+            raise ValueError("workflow last output id must be a nonempty string")
         return value
+
+    @model_validator(mode="after")
+    def _validate_last_output_execution_identity(self) -> Self:
+        has_run = self.last_output_run_id is not None
+        has_execution = self.last_output_node_execution is not None
+        if has_run != has_execution:
+            raise ValueError("workflow last output execution identity is incomplete")
+        if has_run and self.last_output_node_id is None:
+            raise ValueError("workflow last output execution has no node")
+        return self
 
     @field_validator(
         "selected_branches",
@@ -859,6 +880,23 @@ def _validate_control_state(
         and control.last_output_node_id not in control.outputs
     ):
         raise ValueError("workflow last output node id is not a recorded output")
+    if control.last_output_node_execution is not None:
+        last_output_node_id = cast(str, control.last_output_node_id)
+        last_output_run_id = cast(str, control.last_output_run_id)
+        last_output_node = node_by_id[last_output_node_id]
+        if (
+            control.node_execution_counts.get(last_output_node_id)
+            != control.last_output_node_execution
+        ):
+            raise ValueError(
+                "workflow last output execution is not the consumed generation"
+            )
+        if (
+            last_output_node.execution_count
+            == control.last_output_node_execution
+            and last_output_node.run_id != last_output_run_id
+        ):
+            raise ValueError("workflow last output run does not match its projection")
 
 
 def _sum_node_usage(nodes: tuple[WorkflowNodeSnapshot, ...]) -> TokenUsage:

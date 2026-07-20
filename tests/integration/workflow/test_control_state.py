@@ -174,6 +174,44 @@ def test_control_state_is_deeply_immutable_and_json_bounded() -> None:
             WorkflowControlState.model_validate(invalid)
 
 
+def test_last_output_execution_identity_is_optional_strict_and_bounded() -> None:
+    legacy = WorkflowControlState(
+        last_output_node_id="child",
+        outputs={"child": {"done": True}},
+    )
+    assert "last_output_run_id" not in legacy.model_dump(mode="json")
+    assert "last_output_node_execution" not in legacy.model_dump(mode="json")
+
+    exact = WorkflowControlState(
+        last_output_node_id="child",
+        last_output_run_id="run_child_generation_1",
+        last_output_node_execution=1,
+        outputs={"child": {"done": True}},
+    )
+    restored = WorkflowControlState.model_validate_json(exact.model_dump_json())
+    assert restored.last_output_run_id == "run_child_generation_1"
+    assert restored.last_output_node_execution == 1
+
+    for invalid in (
+        {"last_output_run_id": "run_only"},
+        {"last_output_node_execution": 1},
+        {
+            "last_output_run_id": "run_child",
+            "last_output_node_execution": True,
+        },
+        {
+            "last_output_run_id": "run_child",
+            "last_output_node_execution": 0,
+        },
+        {
+            "last_output_run_id": "r" * 129,
+            "last_output_node_execution": 1,
+        },
+    ):
+        with pytest.raises(ValidationError):
+            WorkflowControlState.model_validate(invalid)
+
+
 def test_schema_v1_preserves_none_control_and_prefix_version_rules() -> None:
     legacy = WorkflowCompiler().compile(
         WorkflowDefinition.model_validate(

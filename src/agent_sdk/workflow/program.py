@@ -91,6 +91,16 @@ def next_action(
                 if completed.execution_count > 0 or first_merge
                 else control.last_output_node_id
             ),
+            last_output_run_id=(
+                cast(str, completed.run_id)
+                if completed.execution_count > 0
+                else control.last_output_run_id
+            ),
+            last_output_node_execution=(
+                completed.execution_count
+                if completed.execution_count > 0
+                else control.last_output_node_execution
+            ),
         )
         payload: dict[str, JsonValue] = {
             "node_id": node_id,
@@ -257,6 +267,8 @@ def _updated_control(
     outputs: Mapping[str, JsonValue] | None = None,
     node_execution_counts: Mapping[str, int] | None = None,
     last_output_node_id: str | None = None,
+    last_output_run_id: str | None = None,
+    last_output_node_execution: int | None = None,
 ) -> WorkflowControlState:
     return WorkflowControlState.model_validate(
         {
@@ -282,6 +294,16 @@ def _updated_control(
                 current.last_output_node_id
                 if last_output_node_id is None
                 else last_output_node_id
+            ),
+            "last_output_run_id": (
+                current.last_output_run_id
+                if last_output_run_id is None
+                else last_output_run_id
+            ),
+            "last_output_node_execution": (
+                current.last_output_node_execution
+                if last_output_node_execution is None
+                else last_output_node_execution
             ),
         }
     )
