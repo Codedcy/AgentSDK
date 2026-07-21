@@ -5,12 +5,38 @@ from pathlib import Path
 import pytest
 
 from agent_sdk.runtime.commands import RuntimeCommands
-from agent_sdk.runtime.models import SessionSnapshot
+from agent_sdk.runtime.execution import ExecutionDescriptor, ExecutionPolicyDescriptor
+from agent_sdk.runtime.models import AgentSpec, RunSnapshot, RunStatus, SessionSnapshot
 from agent_sdk.storage.base import CommitBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.builtins.files import workspace_roots
+from agent_sdk.tools.builtins.workspace import resolve_workspace_path
 from agent_sdk.tools.errors import ToolAccessDenied
+
+
+def _current_run(
+    *,
+    run_id: str,
+    session_id: str,
+    workspace_scopes: tuple[str, ...] | None,
+) -> RunSnapshot:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="workspace", model="test/model"),
+        messages=({"role": "user", "content": "go"},),
+        tools=(),
+        workspace_scopes=workspace_scopes,
+        policy=ExecutionPolicyDescriptor.create(permission_default="allow"),
+    )
+    return RunSnapshot(
+        run_id=run_id,
+        session_id=session_id,
+        agent_revision="workspace:1",
+        status=RunStatus.CREATED,
+        user_input="go",
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    )
 
 
 @pytest.mark.asyncio
@@ -92,3 +118,106 @@ async def test_legacy_relative_session_root_fails_closed_for_builtins() -> None:
 
     with pytest.raises(ToolAccessDenied, match="session workspace is unavailable"):
         await workspace_roots(store, legacy.session_id)
+
+
+@pytest.mark.asyncio
+async def test_run_scoped_workspace_lookup_fails_closed_without_a_matching_run(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    root.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id="run_missing")
+
+    foreign = _current_run(
+        run_id="run_foreign",
+        session_id="ses_foreign",
+        workspace_scopes=(str(root.resolve()),),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    foreign.run_id,
+                    foreign.session_id,
+                    foreign.version,
+                    foreign.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id=foreign.run_id)
+
+
+@pytest.mark.asyncio
+async def test_legacy_run_workspace_scope_falls_back_to_session_roots(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    root.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+    run = _current_run(
+        run_id="run_legacy_scope",
+        session_id=session.session_id,
+        workspace_scopes=None,
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run.run_id,
+                    run.session_id,
+                    run.version,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+    assert await workspace_roots(store, session.session_id, run_id=run.run_id) == (
+        root.resolve(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_run_workspace_scope_does_not_inherit_session_roots(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    root.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+    run = _current_run(
+        run_id="run_empty_scope",
+        session_id=session.session_id,
+        workspace_scopes=(),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run.run_id,
+                    run.run_id,
+                    run.version,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+    roots = await workspace_roots(store, session.session_id, run_id=run.run_id)
+
+    assert roots == ()
+    with pytest.raises(ToolAccessDenied):
+        resolve_workspace_path(roots, "denied.txt", for_write=False)

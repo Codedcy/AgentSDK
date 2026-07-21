@@ -47,7 +47,7 @@ async def run_bash(
     if not argv or any(not isinstance(item, str) or "\0" in item for item in argv):
         raise ToolAccessDenied("invalid process arguments")
 
-    roots = await workspace_roots(store, context.session_id)
+    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
     canonical_cwd = _resolve_bash_cwd(roots, cwd)
 
     process = await asyncio.create_subprocess_exec(
@@ -105,7 +105,7 @@ async def bash_permission_arguments(
     cwd = arguments.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise ToolAccessDenied("invalid process cwd")
-    roots = await workspace_roots(store, context.session_id)
+    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
     canonical_cwd = _resolve_bash_cwd(roots, cwd)
     return {**arguments, "cwd": str(canonical_cwd)}
 

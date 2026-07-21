@@ -15,7 +15,7 @@ from agent_sdk.storage.base import CommitResult, RunProgressBatch
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools import ToolResultStatus
 from agent_sdk.tools.builtins import files as builtin_files
-from agent_sdk.tools.models import thaw_json
+from agent_sdk.tools.models import ToolContext, ToolSpec, thaw_json
 
 
 def _tool_stream(
@@ -117,6 +117,19 @@ async def test_sqlite_reopen_restores_the_same_pending_builtin_request(
         permission_default="ask",
     )
     reopened.agents.define(spec)
+    async def unrelated_tool(_: ToolContext) -> dict[str, bool]:
+        return {"ok": True}
+
+    reopened.tools.register(
+        ToolSpec(
+            name="registered_after_run_creation",
+            description="unrelated",
+            input_schema={"type": "object", "additionalProperties": False},
+            source="test",
+            effects=(),
+        ),
+        unrelated_tool,
+    )
     try:
         await reopened.recovery.scan()
         assert (await reopened.runs.get(handle.run_id)).status is RunStatus.INTERRUPTED

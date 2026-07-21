@@ -37,6 +37,11 @@ def resolve_workspace_path(
     raise ToolAccessDenied("path is outside configured workspace")
 
 
+def canonical_workspace_scope(value: str | Path) -> Path:
+    """Normalize a durable workspace scope with the same path rules as tools."""
+    return _resolve_with_existing_parent(_validated_path(value))
+
+
 def _validated_path(requested: str | Path) -> Path:
     try:
         raw = os.fspath(requested)
@@ -94,4 +99,4 @@ def _exists_or_link(path: Path) -> bool:
     return path.exists() or path.is_symlink() or path.is_junction()
 
 
-__all__ = ["resolve_workspace_path"]
+__all__ = ["canonical_workspace_scope", "resolve_workspace_path"]

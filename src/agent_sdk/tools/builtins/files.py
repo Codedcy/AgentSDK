@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from agent_sdk.runtime.models import SessionSnapshot
+from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
 from agent_sdk.storage.base import StateStore
 from agent_sdk.tools.builtins.workspace import resolve_workspace_path
 from agent_sdk.tools.errors import ToolAccessDenied
@@ -21,6 +21,8 @@ _DURABLE_PREVIEW_BYTES = 2048
 async def workspace_roots(
     store: StateStore,
     session_id: str,
+    *,
+    run_id: str | None = None,
 ) -> tuple[Path, ...]:
     try:
         data = await store.get_snapshot("session", session_id)
@@ -30,6 +32,19 @@ async def workspace_roots(
     except Exception as error:
         raise ToolAccessDenied("session workspace is unavailable") from error
     roots = tuple(Path(root) for root in session.workspaces)
+    if run_id is not None:
+        try:
+            run_data = await store.get_snapshot("run", run_id)
+            if run_data is None:
+                raise ValueError
+            run = RunSnapshot.model_validate(run_data)
+            if run.session_id != session_id:
+                raise ValueError
+            descriptor = run.execution_descriptor
+            if descriptor is not None and descriptor.workspace_scopes is not None:
+                roots = tuple(Path(root) for root in descriptor.workspace_scopes)
+        except Exception as error:
+            raise ToolAccessDenied("run workspace is unavailable") from error
     if any(not root.is_absolute() for root in roots):
         raise ToolAccessDenied("session workspace is unavailable")
     return roots
@@ -53,7 +68,7 @@ async def read_file(
     store: StateStore,
     output_limit: int,
 ) -> dict[str, object]:
-    roots = await workspace_roots(store, context.session_id)
+    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
     target = resolve_workspace_path(roots, path, for_write=False)
     limit = min(
         max_bytes if max_bytes is not None else output_limit,
@@ -76,7 +91,7 @@ async def file_permission_arguments(
     store: StateStore,
     for_write: bool,
 ) -> Mapping[str, Any]:
-    roots = await workspace_roots(store, context.session_id)
+    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
     requested = arguments.get("path")
     if not isinstance(requested, str):
         raise ToolAccessDenied("invalid workspace path")
@@ -98,7 +113,7 @@ async def write_file(
     output_limit: int,
 ) -> dict[str, object]:
     del output_limit
-    roots = await workspace_roots(store, context.session_id)
+    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
     target = resolve_workspace_path(roots, path, for_write=True)
     encoded = content.encode("utf-8")
     await asyncio.to_thread(_atomic_write, target, encoded, overwrite)

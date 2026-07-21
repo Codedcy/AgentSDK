@@ -77,7 +77,7 @@ from agent_sdk.tools.models import (
     ToolResultStatus,
     ToolRetryPolicy,
 )
-from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
+from agent_sdk.tools.registry import RegisteredTool, ToolCatalog, ToolRegistry
 
 _DELTA_FLUSH_SECONDS = 0.05
 _DELTA_FLUSH_BYTES = 4 * 1024
@@ -1125,11 +1125,13 @@ class RunEngine:
         *,
         sequence: int,
     ) -> RunResult:
+        catalog = self._validate_live_execution(run, request)
         return await self._execute_owned(
             run,
             request,
             lease,
             lambda: None,
+            catalog=catalog,
             checkpoint=checkpoint,
             sequence=sequence,
             recovery_session=session,
@@ -1149,11 +1151,13 @@ class RunEngine:
         *,
         sequence: int,
     ) -> RunResult:
+        catalog = self._validate_live_execution(run, request)
         return await self._execute_owned(
             run,
             request,
             lease,
             lambda: None,
+            catalog=catalog,
             checkpoint=checkpoint,
             sequence=sequence,
             recovery_session=session,
@@ -1173,11 +1177,13 @@ class RunEngine:
         *,
         sequence: int,
     ) -> RunResult:
+        catalog = self._validate_live_execution(run, request)
         return await self._execute_owned(
             run,
             request,
             lease,
             lambda: None,
+            catalog=catalog,
             checkpoint=checkpoint,
             sequence=sequence,
             recovery_session=session,
@@ -1234,7 +1240,7 @@ class RunEngine:
 
     async def _execute_private(self, run_id: str, request: ModelRequest) -> RunResult:
         created = await self._load_created_run(run_id)
-        self._validate_live_execution(created, request)
+        catalog = self._validate_live_execution(created, request)
         lease = await self._leases.acquire(run_id, new_id("coord"), now=self._clock())
         owner = asyncio.current_task()
         assert owner is not None
@@ -1257,6 +1263,7 @@ class RunEngine:
                     request,
                     lease,
                     lambda: heartbeat_error,
+                    catalog=catalog,
                 )
             except _RunProgressConflictError:
                 session = await self._store.get_snapshot("session", created.session_id)
@@ -1338,7 +1345,7 @@ class RunEngine:
                 "run is not safe to resume",
                 retryable=False,
             ) from None
-        self._validate_live_execution(interrupted, request)
+        catalog = self._validate_live_execution(interrupted, request)
         lease = await self._leases.acquire(run_id, new_id("coord"), now=self._clock())
         owner = asyncio.current_task()
         assert owner is not None
@@ -1360,6 +1367,7 @@ class RunEngine:
                 request,
                 lease,
                 lambda: heartbeat_error,
+                catalog=catalog,
                 checkpoint=checkpoint,
                 sequence=sequence + 1,
                 recovery_session=session,
@@ -1388,16 +1396,26 @@ class RunEngine:
         self,
         created: RunSnapshot,
         request: ModelRequest,
-    ) -> None:
+    ) -> ToolCatalog:
         descriptor = created.execution_descriptor
         if descriptor is None:
-            return
+            return self._tools.select(None)
         policy_config = self._policy.execution_config()
         live_policy = ExecutionPolicyDescriptor.create(
             permission_default=policy_config["permission_default"],
             permission_rules=policy_config["permission_rules"],
         )
-        live_tools = tuple(ToolCapabilityDescriptor.from_spec(spec) for spec in self._tools.list())
+        try:
+            catalog = self._tools.select(tool.spec.name for tool in descriptor.tools)
+        except AgentSDKError:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run execution descriptor mismatch",
+                retryable=False,
+            ) from None
+        live_tools = tuple(
+            ToolCapabilityDescriptor.from_spec(spec) for spec in catalog.list()
+        )
         request_messages = tuple(deepcopy(message) for message in request.messages)
         descriptor_messages = tuple(dict(message) for message in descriptor.messages)
         descriptor_params = descriptor.agent.model_dump(mode="json")["model_params"]
@@ -1406,7 +1424,7 @@ class RunEngine:
             or descriptor_messages != request_messages
             or descriptor_params != request.params
             or descriptor.tools != live_tools
-            or request.tools != self._tools.schemas()
+            or request.tools != catalog.schemas()
             or descriptor.policy != live_policy
         )
         if mismatched:
@@ -1415,6 +1433,7 @@ class RunEngine:
                 "run execution descriptor mismatch",
                 retryable=False,
             ) from None
+        return catalog
 
     async def _execute_owned(
         self,
@@ -1423,6 +1442,7 @@ class RunEngine:
         lease: Lease,
         lease_error: Callable[[], BaseException | None],
         *,
+        catalog: ToolCatalog,
         checkpoint: RunCheckpoint | None = None,
         sequence: int = 2,
         recovery_session: SessionSnapshot | None = None,
@@ -1467,7 +1487,7 @@ class RunEngine:
         tool_results = list(current_checkpoint.tool_results)
         messages = list(current_checkpoint.model_dump(mode="json")["messages"])
         executor = ToolExecutor(
-            self._tools,
+            catalog,
             self._policy,
             self._permission_bridge,
         )

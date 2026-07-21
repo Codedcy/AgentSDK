@@ -1,6 +1,7 @@
 import hashlib
 import json
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Self
 
@@ -17,8 +18,54 @@ from pydantic import (
 
 from agent_sdk.context_runtime import ContextRuntimeConfig
 from agent_sdk.tools.models import ToolResult
+from agent_sdk.tools.builtins.workspace import canonical_workspace_scope
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.runtime.execution import ExecutionDescriptor
+
+
+def intersect_names(
+    available: tuple[str, ...],
+    *allowlists: tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    """Return the canonical capability names allowed by every explicit scope."""
+    selected = set(available)
+    for allowlist in allowlists:
+        if allowlist is not None:
+            selected.intersection_update(allowlist)
+    return tuple(name for name in sorted(set(available)) if name in selected)
+
+
+def intersect_workspaces(
+    available: tuple[Path, ...],
+    *allowlists: tuple[str, ...] | None,
+) -> tuple[Path, ...]:
+    """Narrow workspace roots without allowing a later scope to expand them."""
+    selected = tuple(sorted({_canonical_workspace(root) for root in available}, key=str))
+    for allowlist in allowlists:
+        if allowlist is None:
+            continue
+        narrowed: set[Path] = set()
+        for raw_scope in allowlist:
+            candidate = _canonical_workspace(raw_scope)
+            for root in selected:
+                if _is_within(candidate, root):
+                    narrowed.add(candidate)
+                elif _is_within(root, candidate):
+                    narrowed.add(root)
+        selected = tuple(sorted(narrowed, key=str))
+    return selected
+
+
+def _canonical_workspace(value: str | Path) -> Path:
+    return canonical_workspace_scope(value)
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 class RunStatus(StrEnum):
@@ -72,6 +119,8 @@ class AgentSpec(BaseModel):
     system_prompt: str | None = None
     skills: tuple[str, ...] = ()
     context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
+    tool_allowlist: tuple[str, ...] | None = None
+    workspace_allowlist: tuple[str, ...] | None = None
 
     @field_validator("model_params", mode="after")
     @classmethod
@@ -91,6 +140,16 @@ class AgentSpec(BaseModel):
             raise ValueError("skills must contain nonempty names")
         if len(set(value)) != len(value):
             raise ValueError("skills must be unique")
+        return value
+
+    @field_validator("tool_allowlist", "workspace_allowlist")
+    @classmethod
+    def _validate_capability_allowlist(
+        cls,
+        value: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if value is not None and any(not item.strip() for item in value):
+            raise ValueError("capability allowlists must contain nonempty values")
         return value
 
     def model_copy(

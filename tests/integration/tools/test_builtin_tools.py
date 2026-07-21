@@ -54,7 +54,15 @@ async def _harness(
 ]:
     store = InMemoryStore()
     workspaces = () if workspace is None else (workspace,)
-    session = await RuntimeCommands(store).create_session(workspaces=workspaces)
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=workspaces)
+    run_id = "run-builtins"
+    await commands.start_run(
+        session.session_id,
+        run_id=run_id,
+        agent_revision="legacy:1",
+        user_input="builtin tool harness",
+    )
     registry = ToolRegistry()
     register_builtin_tools(
         registry=registry,
@@ -72,7 +80,7 @@ async def _harness(
     )
     return (
         executor,
-        ToolContext(run_id="run-builtins", session_id=session.session_id),
+        ToolContext(run_id=run_id, session_id=session.session_id),
         bridge,
     )
 
@@ -89,7 +97,15 @@ async def _multi_root_harness(
     InMemoryStore,
 ]:
     store = InMemoryStore()
-    session = await RuntimeCommands(store).create_session(workspaces=roots)
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=roots)
+    run_id = "run-bound-builtins"
+    await commands.start_run(
+        session.session_id,
+        run_id=run_id,
+        agent_revision="legacy:1",
+        user_input="builtin tool harness",
+    )
     registry = ToolRegistry()
     register_builtin_tools(
         registry=registry,
@@ -107,7 +123,7 @@ async def _multi_root_harness(
     )
     return (
         executor,
-        ToolContext(run_id="run-bound-builtins", session_id=session.session_id),
+        ToolContext(run_id=run_id, session_id=session.session_id),
         bridge,
         store,
     )

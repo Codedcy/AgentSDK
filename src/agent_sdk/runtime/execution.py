@@ -87,6 +87,8 @@ class DurableAgentSpec(_RevalidatedDescriptor):
     system_prompt: str | None = None
     skills: tuple[str, ...] = ()
     context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
+    tool_allowlist: tuple[str, ...] | None = None
+    workspace_allowlist: tuple[str, ...] | None = None
 
     @field_validator("model_params", mode="after")
     @classmethod
@@ -108,6 +110,16 @@ class DurableAgentSpec(_RevalidatedDescriptor):
             raise ValueError("skills must contain nonempty names")
         if len(set(value)) != len(value):
             raise ValueError("skills must be unique")
+        return value
+
+    @field_validator("tool_allowlist", "workspace_allowlist")
+    @classmethod
+    def _validate_capability_allowlist(
+        cls,
+        value: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if value is not None and any(not item.strip() for item in value):
+            raise ValueError("capability allowlists must contain nonempty values")
         return value
 
 
@@ -377,6 +389,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
     agent_hash: str
     messages: tuple[Mapping[str, Any], ...]
     tools: tuple[ToolCapabilityDescriptor, ...]
+    workspace_scopes: tuple[str, ...] | None = None
     policy: ExecutionPolicyDescriptor
     descriptor_hash: str
 
@@ -388,8 +401,15 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         agent = value.get("agent")
         if not isinstance(agent, Mapping):
             return value
-        new_fields = {"prompt_profile", "system_prompt", "skills", "context"}
-        if new_fields <= set(agent):
+        new_agent_fields = {
+            "prompt_profile",
+            "system_prompt",
+            "skills",
+            "context",
+            "tool_allowlist",
+            "workspace_allowlist",
+        }
+        if new_agent_fields <= set(agent) and "workspace_scopes" in value:
             return value
         raw_agent = dict(agent)
         if value.get("agent_hash") != _hash(raw_agent):
@@ -401,11 +421,10 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         }
         if value.get("descriptor_hash") != _hash(raw_content):
             return value
-        upgraded_agent = DurableAgentSpec.model_validate(raw_agent).model_dump(
-            mode="json"
-        )
+        upgraded_agent = DurableAgentSpec.model_validate(raw_agent).model_dump(mode="json")
         upgraded = {key: _thaw_json(item) for key, item in value.items()}
         upgraded["agent"] = upgraded_agent
+        upgraded.setdefault("workspace_scopes", None)
         upgraded["agent_hash"] = _hash(upgraded_agent)
         upgraded["descriptor_hash"] = _hash(
             {
@@ -436,6 +455,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         agent: object,
         messages: tuple[Mapping[str, Any], ...],
         tools: tuple[ToolCapabilityDescriptor, ...],
+        workspace_scopes: tuple[str, ...] | None = None,
         policy: ExecutionPolicyDescriptor,
     ) -> Self:
         agent_data = DurableAgentSpec.model_validate(_model_json(agent))
@@ -444,6 +464,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
             "agent_hash": _hash(agent_data.model_dump(mode="json")),
             "messages": messages,
             "tools": tools,
+            "workspace_scopes": workspace_scopes,
             "policy": policy,
         }
         content = {
@@ -451,6 +472,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
             "agent_hash": values["agent_hash"],
             "messages": list(messages),
             "tools": [tool.model_dump(mode="json") for tool in tools],
+            "workspace_scopes": workspace_scopes,
             "policy": policy.model_dump(mode="json"),
         }
         return cls(**values, descriptor_hash=_hash(content))
@@ -461,6 +483,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
             "agent_hash": self.agent_hash,
             "messages": [_thaw_json(message) for message in self.messages],
             "tools": [tool.model_dump(mode="json") for tool in self.tools],
+            "workspace_scopes": self.workspace_scopes,
             "policy": self.policy.model_dump(mode="json"),
         }
 

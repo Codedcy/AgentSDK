@@ -4589,8 +4589,12 @@ class RunRecoveryService:
             permission_default=policy_config["permission_default"],
             permission_rules=policy_config["permission_rules"],
         )
+        try:
+            catalog = self._tools.select(tool.spec.name for tool in descriptor.tools)
+        except AgentSDKError:
+            raise self._capability_error() from None
         live_tools = tuple(
-            ToolCapabilityDescriptor.from_spec(spec) for spec in self._tools.list()
+            ToolCapabilityDescriptor.from_spec(spec) for spec in catalog.list()
         )
         descriptor_data = descriptor.model_dump(mode="json")
         descriptor_messages = tuple(descriptor_data["messages"])
@@ -4598,6 +4602,7 @@ class RunRecoveryService:
             agent=registered_agent,
             messages=descriptor_messages,
             tools=live_tools,
+            workspace_scopes=descriptor.workspace_scopes,
             policy=live_policy,
         )
         if live_descriptor != descriptor:
@@ -4605,7 +4610,7 @@ class RunRecoveryService:
         request = ModelRequest(
             model=registered_agent.model,
             messages=descriptor_messages,
-            tools=self._tools.schemas(),
+            tools=catalog.schemas(),
             params=mutable_model_params(registered_agent.model_params),
         )
         return request

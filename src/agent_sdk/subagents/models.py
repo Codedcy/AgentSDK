@@ -12,8 +12,8 @@ class TaskEnvelope(BaseModel):
     success_criteria: tuple[str, ...] = ()
     instructions: tuple[str, ...] = ()
     evidence_refs: tuple[str, ...] = ()
-    allowed_tools: tuple[str, ...] = ()
-    workspace_scopes: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] | None = None
+    workspace_scopes: tuple[str, ...] | None = None
 
 
 class ChildUsage(BaseModel):

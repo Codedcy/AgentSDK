@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -33,6 +33,29 @@ class RegisteredTool:
     handler: ToolHandler
     permission_arguments: PermissionArgumentsResolver | None = None
     permission_argument_names: tuple[str, ...] = ()
+
+
+class ToolCatalog:
+    """An immutable, per-run view of registered tools."""
+
+    def __init__(self, registered: tuple[RegisteredTool, ...]) -> None:
+        self._registered = {item.spec.name: item for item in registered}
+
+    def get(self, name: str) -> RegisteredTool:
+        try:
+            return self._registered[name]
+        except KeyError as error:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "tool not found in run capability",
+                retryable=False,
+            ) from error
+
+    def list(self) -> tuple[ToolSpec, ...]:
+        return tuple(self._registered[name].spec for name in sorted(self._registered))
+
+    def schemas(self) -> tuple[dict[str, Any], ...]:
+        return _tool_schemas(self.list())
 
 
 class ToolRegistry:
@@ -112,11 +135,23 @@ class ToolRegistry:
                 retryable=False,
             ) from error
 
+    def select(self, names: Iterable[str] | None) -> ToolCatalog:
+        selected_names = (
+            tuple(sorted(self._registered))
+            if names is None
+            else tuple(sorted(set(names)))
+        )
+        return ToolCatalog(tuple(self.get(name) for name in selected_names))
+
     def list(self) -> tuple[ToolSpec, ...]:
         return tuple(self._registered[name].spec for name in sorted(self._registered))
 
     def schemas(self) -> tuple[dict[str, Any], ...]:
-        return tuple(
+        return _tool_schemas(self.list())
+
+
+def _tool_schemas(specs: tuple[ToolSpec, ...]) -> tuple[dict[str, Any], ...]:
+    return tuple(
             {
                 "type": "function",
                 "function": {
@@ -125,13 +160,14 @@ class ToolRegistry:
                     "parameters": thaw_json(spec.input_schema),
                 },
             }
-            for spec in self.list()
-        )
+            for spec in specs
+    )
 
 
 __all__ = [
     "PermissionArgumentsResolver",
     "RegisteredTool",
+    "ToolCatalog",
     "ToolHandler",
     "ToolRegistry",
     "ToolContext",

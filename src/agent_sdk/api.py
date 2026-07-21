@@ -53,6 +53,8 @@ from agent_sdk.runtime.models import (
     RunResult,
     RunSnapshot,
     SessionSnapshot,
+    intersect_names,
+    intersect_workspaces,
     mutable_model_params,
 )
 from agent_sdk.runtime.provider_recovery import (
@@ -521,13 +523,28 @@ class RunAPI:
             async with self._lifecycle.admit():
                 messages = ({"role": "user", "content": user_input},)
                 config = self._policy.execution_config()
+                session = await self._commands.get_session(session_id)
+                available_names = tuple(spec.name for spec in self._tools.list())
+                if agent.tool_allowlist is not None:
+                    self._tools.select(agent.tool_allowlist)
+                catalog = self._tools.select(
+                    intersect_names(available_names, agent.tool_allowlist)
+                )
+                workspace_scopes = tuple(
+                    str(scope)
+                    for scope in intersect_workspaces(
+                        tuple(Path(root) for root in session.workspaces),
+                        agent.workspace_allowlist,
+                    )
+                )
                 descriptor = ExecutionDescriptor.create(
                     agent=agent,
                     messages=messages,
                     tools=tuple(
                         ToolCapabilityDescriptor.from_spec(spec)
-                        for spec in self._tools.list()
+                        for spec in catalog.list()
                     ),
+                    workspace_scopes=workspace_scopes,
                     policy=ExecutionPolicyDescriptor.create(
                         permission_default=config["permission_default"],
                         permission_rules=config["permission_rules"],
@@ -536,7 +553,7 @@ class RunAPI:
                 request = ModelRequest(
                     model=agent.model,
                     messages=messages,
-                    tools=self._tools.schemas(),
+                    tools=catalog.schemas(),
                     params=mutable_model_params(agent.model_params),
                 )
                 coordinator = asyncio.create_task(

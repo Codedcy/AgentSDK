@@ -22,7 +22,7 @@ from agent_sdk.tools.models import (
     ToolResultStatus,
     thaw_json,
 )
-from agent_sdk.tools.registry import RegisteredTool, ToolRegistry
+from agent_sdk.tools.registry import RegisteredTool, ToolCatalog, ToolRegistry
 
 _Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
 _PermissionTransition = Callable[[PermissionRequest, PermissionDecision | None], Awaitable[None]]
@@ -34,7 +34,7 @@ _Preflight = Callable[[], Awaitable[None]]
 class ToolExecutor:
     def __init__(
         self,
-        registry: ToolRegistry,
+        registry: ToolRegistry | ToolCatalog,
         policy: PolicyEngine,
         bridge: InProcessPermissionBridge | None,
     ) -> None:
