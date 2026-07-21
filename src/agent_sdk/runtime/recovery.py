@@ -174,6 +174,8 @@ class _RecoveryEvidence:
     reconciliations: tuple[ReconciliationRequest, ...]
     run_events: tuple[EventEnvelope, ...]
     run_event_cursors: tuple[int, ...]
+    durable_run_events: tuple[EventEnvelope, ...]
+    durable_run_event_cursors: tuple[int, ...]
     session_lifecycle_events: tuple[EventEnvelope, ...]
     session_lifecycle_event_cursors: tuple[int, ...]
     run_event_ids_unique: bool
@@ -560,10 +562,10 @@ class RunRecoveryService:
             ),
             run_events=tuple(
                 (
-                    evidence.run_event_cursors[index],
+                    evidence.durable_run_event_cursors[index],
                     canonical_snapshot_data(event.model_dump(mode="json")),
                 )
-                for index, event in enumerate(evidence.run_events)
+                for index, event in enumerate(evidence.durable_run_events)
             ),
         )
 
@@ -3037,6 +3039,10 @@ class RunRecoveryService:
                 else normalized_run_events
             ),
             run_event_cursors=tuple(stored.cursor for stored in run_records),
+            durable_run_events=tuple(stored.event for stored in run_records),
+            durable_run_event_cursors=tuple(
+                stored.cursor for stored in run_records
+            ),
             session_lifecycle_events=tuple(
                 stored.event for stored in session_lifecycle_records
             ),

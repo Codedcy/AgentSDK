@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import agent_sdk.runtime.recovery as recovery_module
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.event_contracts import normalize_stage_events_for_recovery
+from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
 from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
     ModelCallOperation,
 )
+from agent_sdk.storage.base import canonical_snapshot_data
 
 
 def _event(
@@ -74,6 +77,54 @@ def test_v2_recovery_evidence_is_validated_and_normalized_to_v1() -> None:
         {},
         {"model": "provider/model"},
     ]
+
+
+def test_recovery_precondition_keeps_raw_v2_events_separate_from_validation_view(
+) -> None:
+    durable = (
+        _event(1, "step.started", {"step_id": "op_1"}, schema_version=2),
+        _event(
+            2,
+            "model.call.started",
+            {
+                "model": "provider/model",
+                "operation_id": "op_1",
+                "step_id": "op_1",
+            },
+            schema_version=2,
+        ),
+    )
+    normalized = normalize_stage_events_for_recovery(durable, (_operation(),))
+    assert normalized is not None
+    evidence = recovery_module._RecoveryEvidence(
+        run=RunSnapshot.model_construct(run_id="run_1"),
+        session=SessionSnapshot.model_construct(),
+        checkpoint=None,
+        operations=(),
+        pending=(),
+        reconciliations=(),
+        run_events=normalized,
+        run_event_cursors=(11, 12),
+        durable_run_events=durable,
+        durable_run_event_cursors=(11, 12),
+        session_lifecycle_events=(),
+        session_lifecycle_event_cursors=(),
+        run_event_ids_unique=True,
+    )
+
+    precondition = recovery_module.RunRecoveryService._recovery_evidence_precondition(
+        evidence
+    )
+
+    assert precondition.run_events == tuple(
+        (
+            cursor,
+            canonical_snapshot_data(event.model_dump(mode="json")),
+        )
+        for cursor, event in zip((11, 12), durable, strict=True)
+    )
+    assert tuple(event.schema_version for event in normalized) == (1, 1)
+    assert tuple(event.schema_version for event in durable) == (2, 2)
 
 
 def test_v2_recovery_reference_tampering_is_rejected() -> None:
