@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from agent_sdk.analytics import AnalyticsQueries, AnalyticsResult
 from agent_sdk.api import (
     AgentAPI,
@@ -139,6 +141,7 @@ from agent_sdk.workflow import (
 )
 
 __all__ = [
+    "__version__",
     "AgentSDK",
     "AgentAPI",
     "AgentSDKConfig",

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - 2026-07-21
+## 0.1.0 - 2026-07-22
 
 - Added SQLite Sessions, recoverable Runs, configurable/default prompts, automatic
   Context L0-L4, Skills, and durable Prompt Manifests.
@@ -17,5 +17,5 @@
   with result consumption, live/historical Trace, evaluation/attribution, safe
   reopen without replay, and history deletion without deleting workspace data.
 
-This entry describes the v0.1 contract; packaging/version finalization is handled
-by the release-candidate task.
+This entry describes the finalized v0.1 package contract. Tagging and external
+publication remain separate, explicitly requested release operations.

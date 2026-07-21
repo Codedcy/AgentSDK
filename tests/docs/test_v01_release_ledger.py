@@ -193,7 +193,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
         "2026-07-20 final checkpoint: 403 passed in 43.03s; Ruff/mypy clean |"
     ) in ledger
     assert "| R4 | completed with known pre-R4 recovery debt |" in ledger
-    assert "| R5 | in progress (Tasks 1-4 complete) |" in ledger
+    assert "| R5 | in progress (Task 5 complete; Task 6 pending) |" in ledger
     assert "| R3 | completed | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
@@ -214,8 +214,15 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
-    assert "v0.1 R5 Task 4: complete" in progress
-    assert "R5 Task 5 pending" in progress
+    assert "v0.1 R5 Task 5: complete" in progress
+    assert "R5 Task 6 pending" in progress
+    assert "2,953 passed, 6 skipped" in ledger
+    assert "80 passed" in ledger
+    assert "C0 / I0 / M0 APPROVE" in ledger
+    assert "Final 0.1.0 wheel SHA256:" in ledger
+    assert "2,953 passed, 6 skipped" in progress
+    assert "Final 0.1.0 wheel SHA256:" in progress
+    assert "v0.1 R5 Task 6: complete" not in progress
     assert R5_TASK1_TEST in ledger.replace("\\", "/")
     assert R5_TASK1_TEST in progress.replace("\\", "/")
     _assert_release_checkpoint_and_resume(ledger)
