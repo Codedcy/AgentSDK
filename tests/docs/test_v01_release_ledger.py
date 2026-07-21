@@ -75,18 +75,19 @@ R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
 R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
 R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
 R3_TASK4_COMMITS = ("2ea0464", "3a4b65f", "b98e93f")
-R4_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md"
 R4_TASK1_TEST = "tests/unit/runtime/test_capability_intersection.py"
-R4_FIRST_COMMAND = (
-    "$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; "
-    r".\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin "
-    r"tests\unit\runtime\test_capability_intersection.py -q"
-)
 R4_TASK2_MAILBOX_TEST = "tests/unit/subagents/test_mailbox.py"
 R3_TASK5_FRESH_RESULT = "221 passed, 1 skipped in 25.32s"
+R5_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r5-trace-release.md"
+R5_TASK1_TEST = "tests/unit/observability/test_stage_projection.py"
+R5_FIRST_COMMAND = (
+    "$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; "
+    r".\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin "
+    r"tests\unit\observability\test_stage_projection.py -q"
+)
 
 
-def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
+def _assert_release_checkpoint_and_resume(document: str) -> None:
     for commit in R1_COMMITS:
         assert commit in document
     normalized_document = "\n".join(
@@ -155,12 +156,10 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "Spec PASS; Quality PASS" in document
     assert R3_TASK5_FRESH_RESULT in document
     assert "13.65s" not in document
-    assert R4_PLAN in document
-    assert R4_TASK1_TEST in document
-    assert R4_FIRST_COMMAND in normalized_document
+    assert R5_PLAN in document
+    assert R5_TASK1_TEST in normalized_document.replace("\\", "/")
+    assert R5_FIRST_COMMAND in normalized_document
     assert "first expected RED" in document
-    assert "created by R4 Task 1" in document
-    assert R4_TASK2_MAILBOX_TEST not in document
     assert "R3 Task 2 Step 1" not in document
     assert "tests/unit/context/test_compaction_levels.py" not in document
     assert "R3 Task 2 remains pending/unstarted" not in document
@@ -170,7 +169,6 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "Tasks 4-5 have not started" not in document
     assert "R3 Task 4 Step 1" not in document
     assert "tests/integration/context/test_runtime_middleware.py" not in document
-    assert "tests/integration/context/test_context_recovery.py" not in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
@@ -194,8 +192,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
         "| R2 | completed | condition and bounded loop | "
         "2026-07-20 final checkpoint: 403 passed in 43.03s; Ruff/mypy clean |"
     ) in ledger
-    for slice_id in ("R4", "R5"):
-        assert f"| {slice_id} | pending |" in ledger
+    assert "| R4 | completed with known pre-R4 recovery debt |" in ledger
+    assert "| R5 | pending |" in ledger
     assert "| R3 | completed | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
@@ -216,9 +214,13 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
-    assert "v0.1 current implementation status: R0-R3 completed; R4 pending" in progress
-    _assert_release_checkpoint_and_r3_resume(ledger)
-    _assert_release_checkpoint_and_r3_resume(progress)
+    assert (
+        "v0.1 current implementation status: R0-R4 completed; R5 pending" in progress
+    )
+    assert R5_TASK1_TEST in ledger.replace("\\", "/")
+    assert R5_TASK1_TEST in progress.replace("\\", "/")
+    _assert_release_checkpoint_and_resume(ledger)
+    _assert_release_checkpoint_and_resume(progress)
 
 
 def test_active_roadmap_links_the_v01_plan_index() -> None:
