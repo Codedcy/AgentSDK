@@ -680,6 +680,7 @@ async def test_detached_nonterminal_replay_requires_recovery_without_execution(
             agent=AGENT,
             messages=({"role": "user", "content": "same input"},),
             tools=(),
+            workspace_scopes=(),
             policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
         )
         outcome = await commands.start_run(
@@ -699,7 +700,11 @@ async def test_detached_nonterminal_replay_requires_recovery_without_execution(
         provider_calls += 1
         raise AssertionError("detached replay must not call provider")
 
-    reopened = AgentSDK.for_test(database_path=database, acompletion=provider)
+    reopened = AgentSDK.for_test(
+        database_path=database,
+        acompletion=provider,
+        enable_builtin_tools=False,
+    )
     try:
         replay = await reopened.runs.start(
             session.session_id,
