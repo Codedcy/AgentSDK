@@ -343,6 +343,11 @@ v0.1 R4 Task 1 delivered persisted per-Run Tool/workspace capabilities, canonica
 v0.1 R4 Task 1 final gates: 184 passed, 5 skipped across capability/runtime/workspace/builtin/prompt slices; observability 67 passed; strict mypy clean across 93 source files; Ruff and diff-check clean.
 v0.1 current implementation status: R0-R3 and R4 Task 1 completed; R4 Task 2 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py -q`
+v0.1 R4 Task 2: complete (implementation `ae6aa89`; review hardening `1326fb8`; final independent review Spec approved / Quality approved; Critical 0 / Important 0 / Minor 0)
+v0.1 R4 Task 2 delivered a durable direct parent/child mailbox, recipient-local immutable sequences, bounded optimistic concurrency and idempotent replay, Memory/SQLite legacy-Run exact authentication, sender-attributed protected Context sources, and atomic L0-L4 Context View/cursor consumption.
+v0.1 R4 Task 2 final gates: 39 focused passed; 48 expanded subagent passed; Context 144 passed with one proven baseline recovery node deselected; Task 1 smoke 184 passed, 5 skipped; strict mypy clean across 94 source files; Ruff and diff-check clean.
+v0.1 current implementation status: R0-R3 and R4 Tasks 1-2 completed; R4 Task 3 pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\subagents\test_child_coordinator.py -q`
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
