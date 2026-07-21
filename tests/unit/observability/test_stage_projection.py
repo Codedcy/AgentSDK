@@ -355,6 +355,24 @@ def test_model_usage_is_ordering_and_bounded_stage_evidence() -> None:
     assert stage.duration_ms == 1000
 
 
+def test_model_usage_is_first_evidence_when_start_is_missing() -> None:
+    stage = project_stages(
+        (
+            _event(1, "model.usage.reported", {"operation_id": "op_1", "total_tokens": 3}),
+            _event(2, "model.call.completed", {"operation_id": "op_1"}, seconds=2),
+        )
+    )[0]
+
+    assert stage.first_cursor == 1
+    assert stage.last_cursor == 2
+    assert stage.evidence_event_ids == ("evt_1", "evt_2")
+    assert stage.evidence_cursors == (1, 2)
+    assert stage.started_at is None
+    assert stage.ended_at == BASE + timedelta(seconds=2)
+    assert stage.usage is not None
+    assert stage.usage.total_tokens == 3
+
+
 def test_tool_terminal_with_a_different_step_reference_is_rejected() -> None:
     with pytest.raises(AgentSDKError) as captured:
         project_stages(

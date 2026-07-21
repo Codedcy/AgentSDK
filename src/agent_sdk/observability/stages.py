@@ -201,14 +201,17 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 if pending_observed is None
                 else min(pending_observed.cursor, observed.cursor)
             )
-            evidence_event_ids: tuple[str, ...] = (event_id,)
-            evidence_cursors: tuple[int, ...] = (observed.cursor,)
+            start_evidence_event_ids: tuple[str, ...] = (event_id,)
+            start_evidence_cursors: tuple[int, ...] = (observed.cursor,)
             if pending_observed is not None and pending_observed.cursor < observed.cursor:
-                evidence_event_ids = (
+                start_evidence_event_ids = (
                     _bounded_identifier(pending_observed.event.event_id),
                     event_id,
                 )
-                evidence_cursors = (pending_observed.cursor, observed.cursor)
+                start_evidence_cursors = (
+                    pending_observed.cursor,
+                    observed.cursor,
+                )
             stages[lookup] = _MutableStage(
                 kind=rule.kind,
                 key=key,
@@ -218,8 +221,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 ended_at=None,
                 first_cursor=first_cursor,
                 last_cursor=observed.cursor,
-                evidence_event_ids=evidence_event_ids,
-                evidence_cursors=evidence_cursors,
+                evidence_event_ids=start_evidence_event_ids,
+                evidence_cursors=start_evidence_cursors,
                 usage=usage,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
             )
@@ -244,6 +247,28 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             continue
         terminal_usage = _usage(event.payload)
         if current is None:
+            pending_usage = (
+                pending_model_usage.get(key[0])
+                if rule.kind is TraceStageKind.MODEL
+                else None
+            )
+            pending_observed = None if pending_usage is None else pending_usage[1]
+            first_cursor = (
+                observed.cursor
+                if pending_observed is None
+                else min(pending_observed.cursor, observed.cursor)
+            )
+            terminal_evidence_event_ids: tuple[str, ...] = (event_id,)
+            terminal_evidence_cursors: tuple[int, ...] = (observed.cursor,)
+            if pending_observed is not None and pending_observed.cursor < observed.cursor:
+                terminal_evidence_event_ids = (
+                    _bounded_identifier(pending_observed.event.event_id),
+                    event_id,
+                )
+                terminal_evidence_cursors = (
+                    pending_observed.cursor,
+                    observed.cursor,
+                )
             stages[lookup] = _MutableStage(
                 kind=rule.kind,
                 key=key,
@@ -251,17 +276,13 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 run_id=run_id,
                 started_at=None,
                 ended_at=event.occurred_at,
-                first_cursor=observed.cursor,
+                first_cursor=first_cursor,
                 last_cursor=observed.cursor,
-                evidence_event_ids=(event_id,),
-                evidence_cursors=(observed.cursor,),
+                evidence_event_ids=terminal_evidence_event_ids,
+                evidence_cursors=terminal_evidence_cursors,
                 usage=(
                     terminal_usage
-                    or (
-                        pending_model_usage[key[0]][0]
-                        if key[0] in pending_model_usage
-                        else None
-                    )
+                    or (None if pending_usage is None else pending_usage[0])
                 ),
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
                 terminal=True,
@@ -573,13 +594,21 @@ def _identifier(observed: ObservedEvent, field: str) -> str:
     if value is None and field == "request_id":
         request = payload.get("request")
         value = request.get("request_id") if isinstance(request, Mapping) else request
+        if (
+            value is None
+            and observed.event.schema_version == 1
+            and observed.event.type in {"permission.requested", "permission.resolved"}
+            and _sha256_reference(payload.get("tool")) is not None
+        ):
+            value = _sha256_reference(request)
     if (
         value is None
         and field == "operation_id"
         and observed.event.schema_version == 1
         and observed.event.type == "tool.recovery.retry.started"
     ):
-        value = payload.get("operation")
+        operation = payload.get("operation")
+        value = _sha256_reference(operation) or operation
     if not isinstance(value, (str, int)) or isinstance(value, bool):
         raise _ProjectionFailure
     return _bounded_identifier(str(value))
@@ -589,6 +618,19 @@ def _bounded_identifier(value: str) -> str:
     if not value or len(value.encode("utf-8")) > 256:
         raise _ProjectionFailure
     return value
+
+
+def _sha256_reference(value: object) -> str | None:
+    if not isinstance(value, Mapping) or set(value) != {"sha256"}:
+        return None
+    digest = value.get("sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        return None
+    return digest
 
 
 def _event_run_id(

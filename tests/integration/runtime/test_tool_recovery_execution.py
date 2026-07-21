@@ -10,7 +10,13 @@ from typing import Any, cast
 
 import pytest
 
-from agent_sdk import AgentSDK, AgentSDKError, PermissionDecision
+from agent_sdk import (
+    AgentSDK,
+    AgentSDKError,
+    PermissionDecision,
+    TraceStageKind,
+    TraceStageStatus,
+)
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.models import AgentSpec, RunSnapshot, RunStatus
 from agent_sdk.runtime.reconciliation import (
@@ -1559,6 +1565,79 @@ async def test_permission_wait_cancellation_leaves_same_certified_operation_reco
         assert handler_calls == 1
         assert model_calls == [1]
     finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_recovery_permission_is_projected_in_public_timeline() -> None:
+    store = InMemoryStore()
+    run_id, spec, tool_spec, _ = await _seed_interrupted_tool_call(
+        store,
+        retry_policy=ToolRetryPolicy.IDEMPOTENT,
+        permission_default="ask",
+    )
+    model_calls: list[int] = []
+    handler_started = asyncio.Event()
+    release_handler = asyncio.Event()
+
+    async def handler(_: ToolContext, value: int) -> int:
+        handler_started.set()
+        await release_handler.wait()
+        return value
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=lambda **_: _final_completion(model_calls),
+        permission_default="ask",
+    )
+    sdk.agents.define(spec)
+    sdk.tools.register(tool_spec, handler)
+    try:
+        handle = await sdk.recovery.recover_run(run_id)
+        permission = await asyncio.wait_for(
+            sdk.permissions.next_request(run_id),
+            timeout=1,
+        )
+        await sdk.permissions.resolve(
+            permission.request_id,
+            PermissionDecision.allow_once(),
+        )
+        await asyncio.wait_for(handler_started.wait(), timeout=1)
+
+        timeline = await sdk.trace.timeline(run_id)
+
+        request_hash = hashlib.sha256(permission.request_id.encode("utf-8")).hexdigest()
+        projected = next(
+            stage
+            for stage in timeline.stages
+            if stage.kind is TraceStageKind.PERMISSION
+            and stage.entity_id == request_hash
+        )
+        assert projected.status is TraceStageStatus.COMPLETED
+        assert len(projected.evidence_event_ids) == 2
+        assert len(projected.evidence_cursors) == 2
+        recovery_events = [
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type in {"permission.requested", "permission.resolved"}
+            and stored.event.payload.get("request") == {"sha256": request_hash}
+        ]
+        assert [event.schema_version for event in recovery_events] == [1, 1]
+        assert recovery_events[0].payload == {
+            "request": {"sha256": request_hash},
+            "tool": {
+                "sha256": hashlib.sha256(tool_spec.name.encode("utf-8")).hexdigest()
+            },
+        }
+        assert recovery_events[1].payload == {
+            **recovery_events[0].payload,
+            "allowed": True,
+        }
+        release_handler.set()
+        await handle.result()
+    finally:
+        release_handler.set()
         await sdk.close()
 
 
