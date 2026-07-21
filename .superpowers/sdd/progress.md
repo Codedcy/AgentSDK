@@ -391,3 +391,8 @@ v0.1 R5 Task 2 delivered deterministic evidence-linked Run attribution, strict T
 v0.1 R5 Task 2 final controller gate: complete observability suite 106 passed; strict mypy clean across 9 Task 2 source files; Ruff and diff-check clean.
 v0.1 current implementation status: R0-R4 and R5 Tasks 1-2 completed; R5 Task 3 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\analytics\test_v01_analysis_contract.py tests\integration\analytics\test_analytics_queries.py -q`
+v0.1 R5 Task 3: complete (commits `27e9717`, `d4590b4`; final independent review Critical 0 / Important 0 / Minor 0; Spec approved / Quality approved).
+v0.1 R5 Task 3 locked existing success-rate and Tool-failure formulas, filters, missing/sample counts, fixed-high-water evidence pagination, Session deletion cleanup, and real interrupted unused-Tool attribution for Memory and SQLite without production changes.
+v0.1 R5 Task 3 final controller gate: Memory/SQLite contract 2 passed; expanded analytics/evaluation/attribution 56 passed; Ruff, strict mypy, and diff-check clean.
+v0.1 current implementation status: R0-R4 and R5 Tasks 1-3 completed; R5 Task 4 pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\e2e\test_v01_release.py tests\e2e\test_v01_reference_example.py tests\docs -q`
