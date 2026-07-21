@@ -123,7 +123,10 @@ def _optional_cost(value: object) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    converted = float(value)
+    try:
+        converted = float(value)
+    except (OverflowError, ValueError):
+        return None
     if not isfinite(converted) or converted < 0:
         return None
     return converted
@@ -131,13 +134,16 @@ def _optional_cost(value: object) -> float | None:
 
 def _response_cost(response: object, raw_usage: object) -> float | None:
     usage_cost = _value(raw_usage, "cost") if raw_usage is not None else None
-    if usage_cost is None and raw_usage is not None:
-        usage_cost = _value(raw_usage, "cost_usd")
+    usage_cost_usd = (
+        _value(raw_usage, "cost_usd") if raw_usage is not None else None
+    )
     hidden = _value(response, "_hidden_params")
     provider_cost = _value(hidden, "response_cost") if hidden is not None else None
-    if usage_cost is not None:
-        return _optional_cost(usage_cost)
-    return _optional_cost(provider_cost)
+    for candidate in (usage_cost, usage_cost_usd, provider_cost):
+        converted = _optional_cost(candidate)
+        if converted is not None:
+            return converted
+    return None
 
 
 class LiteLLMGateway:

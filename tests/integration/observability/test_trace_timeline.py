@@ -8,11 +8,20 @@ import pytest
 
 from agent_sdk import (
     AgentSDK,
+    AgentSDKError,
     AgentSpec,
+    ErrorCode,
+    TaskEnvelope,
     TraceStageKind,
     TraceStageStatus,
+    TraceService,
+    ToolContext,
+    ToolSpec,
     WorkflowDefinition,
 )
+from agent_sdk.events.models import EventEnvelope
+from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.storage.base import CommitBatch
 from agent_sdk.storage.memory import InMemoryStore
 
 
@@ -110,5 +119,239 @@ async def test_workflow_timeline_includes_node_runs_in_one_parent_tree() -> None
             TraceStageKind.WORKFLOW_NODE
         ].stage_id
         assert "private-workflow-input" not in timeline.model_dump_json()
+    finally:
+        await sdk.close()
+
+
+class _ChildAfterHighWaterStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_run_id: str | None = None
+        self.session_id: str | None = None
+        self.latest_calls = 0
+        self.child_run_id = "run_tail_child"
+
+    async def latest_cursor(self) -> int:
+        self.latest_calls += 1
+        if self.latest_calls == 2:
+            assert self.root_run_id is not None
+            assert self.session_id is not None
+            await RuntimeCommands(self).start_run(
+                self.session_id,
+                run_id=self.child_run_id,
+                agent_revision="child:1",
+                user_input="tail child",
+                parent_run_id=self.root_run_id,
+            )
+        return await super().latest_cursor()
+
+
+@pytest.mark.asyncio
+async def test_trace_retries_when_child_is_created_after_high_water() -> None:
+    store = _ChildAfterHighWaterStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        session.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    store.root_run_id = root.run_id
+    store.session_id = session.session_id
+
+    timeline = await TraceService(store).timeline(root.run_id)
+
+    assert store.latest_calls >= 3
+    assert any(
+        stage.kind is TraceStageKind.CHILD
+        and stage.entity_id == store.child_run_id
+        for stage in timeline.stages
+    )
+
+
+class _InvalidTailTransitionStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_id: str | None = None
+        self.session_id: str | None = None
+        self.latest_calls = 0
+
+    async def latest_cursor(self) -> int:
+        self.latest_calls += 1
+        if self.latest_calls == 2:
+            assert self.run_id is not None
+            assert self.session_id is not None
+            await self.commit(
+                CommitBatch(
+                    events=(
+                        EventEnvelope.new(
+                            type="run.started",
+                            schema_version=999,
+                            session_id=self.session_id,
+                            run_id=self.run_id,
+                            sequence=2,
+                            payload={"status": "running"},
+                        ),
+                    )
+                )
+            )
+        return await super().latest_cursor()
+
+
+@pytest.mark.asyncio
+async def test_trace_rejects_invalid_selected_transition_in_tail_window() -> None:
+    store = _InvalidTailTransitionStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=[])
+    root = await commands.start_run(
+        session.session_id,
+        agent_revision="root:1",
+        user_input="root",
+    )
+    store.run_id = root.run_id
+    store.session_id = session.session_id
+
+    with pytest.raises(AgentSDKError) as captured:
+        await TraceService(store).timeline(root.run_id)
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.message == "failed to load trace timeline"
+
+
+@pytest.mark.asyncio
+async def test_real_tool_stage_is_parented_to_its_step() -> None:
+    turn = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal turn
+        turn += 1
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            if turn == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_trace",
+                                        "function": {
+                                            "name": "lookup",
+                                            "arguments": '{"value":7}',
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            else:
+                yield {
+                    "choices": [
+                        {"delta": {"content": "done"}, "finish_reason": "stop"}
+                    ]
+                }
+
+        return chunks()
+
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        permission_default="allow",
+        enable_builtin_tools=False,
+    )
+    async def handler(_context: ToolContext, *, value: int) -> object:
+        return {"value": value}
+
+    sdk.tools.register(
+        ToolSpec(
+            name="lookup",
+            description="lookup",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+        handler,
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handle = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="tool-trace", model="fake/model"),
+            "use tool",
+        )
+        await handle.result()
+
+        timeline = await sdk.trace.timeline(handle.run_id)
+
+        tool = next(stage for stage in timeline.stages if stage.kind is TraceStageKind.TOOL)
+        step = next(stage for stage in timeline.stages if stage.kind is TraceStageKind.STEP)
+        assert tool.parent_stage_id == step.stage_id
+        events = [
+            item.event
+            for item in await store.read_events(after_cursor=0)
+            if item.event.run_id == handle.run_id
+            and item.event.type in {"tool.call.started", "tool.call.completed"}
+        ]
+        assert len(events) == 2
+        assert events[0].schema_version == 2
+        assert isinstance(events[0].payload["step_id"], str)
+        assert events[0].payload["step_id"]
+        assert events[1].schema_version == 1
+        assert set(events[1].payload) == {
+            "call_id",
+            "tool_name",
+            "status",
+            "content",
+            "value",
+            "error",
+        }
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_child_execution_projects_a_child_stage() -> None:
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=_provider,
+        enable_builtin_tools=False,
+    )
+    parent_agent = AgentSpec(name="parent", revision="1", model="fake/model")
+    sdk.agents.define(parent_agent)
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/model"))
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        parent = await sdk.runs.start(session.session_id, parent_agent, "parent")
+        await parent.result()
+        child = await sdk.children.spawn(
+            parent.run_id,
+            "worker:1",
+            TaskEnvelope(objective="child objective"),
+        )
+        completed = await sdk.children.wait(child.run_id, timeout_seconds=1)
+        assert completed.status == "completed"
+
+        timeline = await sdk.trace.timeline(parent.run_id)
+
+        child_stage = next(
+            stage
+            for stage in timeline.stages
+            if stage.kind is TraceStageKind.CHILD
+        )
+        parent_stage = next(
+            stage
+            for stage in timeline.stages
+            if stage.kind is TraceStageKind.RUN and stage.entity_id == parent.run_id
+        )
+        assert child_stage.entity_id == child.run_id
+        assert child_stage.status is TraceStageStatus.COMPLETED
+        assert child_stage.parent_stage_id == parent_stage.stage_id
     finally:
         await sdk.close()

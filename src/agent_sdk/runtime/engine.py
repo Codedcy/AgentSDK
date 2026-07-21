@@ -582,7 +582,11 @@ class _RunEmitter:
             )
             event = self._new_event(
                 "tool.call.started",
-                {"call_id": call.call_id, "tool_name": call.name},
+                {
+                    "call_id": call.call_id,
+                    "tool_name": call.name,
+                    "step_id": self._current_step_id,
+                },
             )
             await _commit_progress(
                 self._store,
@@ -643,18 +647,7 @@ class _RunEmitter:
             )
             event = self._new_event(
                 "tool.call.completed",
-                {
-                    **result.model_dump(mode="json"),
-                    "step_id": self._current_step_id,
-                },
-            )
-            event = event.model_copy(
-                update={
-                    "payload": {
-                        **event.payload,
-                        "result_event_id": event.event_id,
-                    }
-                }
+                result.model_dump(mode="json"),
             )
             await _commit_progress(
                 self._store,
@@ -766,7 +759,9 @@ class _RunEmitter:
             snapshot = self._run.model_copy(
                 update={"status": status, "version": self._run.version + 1}
             )
-            event = self._new_event(event_type, payload)
+            event = self._new_event(event_type, payload).model_copy(
+                update={"schema_version": 1}
+            )
             await _commit_progress(
                 self._store,
                 RunProgressBatch(

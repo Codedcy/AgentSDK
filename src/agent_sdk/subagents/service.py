@@ -494,7 +494,11 @@ class SubagentService:
             status="completed",
             output_text=result.output_text,
             evidence_refs=envelope.evidence_refs,
-            usage=ChildUsage.model_validate(result.usage.model_dump()),
+            usage=ChildUsage(
+                prompt_tokens=result.usage.prompt_tokens,
+                completion_tokens=result.usage.completion_tokens,
+                total_tokens=result.usage.total_tokens,
+            ),
         )
 
     def _task_finished(self, run_id: str, task: asyncio.Task[RunResult]) -> None:

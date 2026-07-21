@@ -389,6 +389,42 @@ async def test_gateway_structured_completion_accepts_supported_shapes_and_usage(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "invalid_cost",
+    [10**10_000, float("nan"), float("inf"), float("-inf"), -0.01, True],
+    ids=["huge", "nan", "inf", "negative_inf", "negative", "bool"],
+)
+async def test_invalid_usage_cost_uses_valid_hidden_fallback_without_failing(
+    invalid_cost: object,
+) -> None:
+    source = _capsule_data(["evt_1"])
+
+    async def acompletion(**_: object) -> dict[str, object]:
+        return {
+            "choices": [{"message": {"parsed": source}}],
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 5,
+                "total_tokens": 9,
+                "cost": invalid_cost,
+            },
+            "_hidden_params": {"response_cost": 0.75},
+        }
+
+    result = await LiteLLMGateway._for_test(acompletion).complete_structured(
+        ModelRequest(
+            model="fake/model",
+            messages=({"role": "user", "content": "compact"},),
+            purpose="compaction",
+        ),
+        ContextCapsule,
+    )
+
+    assert result.parsed == ContextCapsule.model_validate(source)
+    assert result.usage.cost_usd == 0.75
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "response",
     [
         {},

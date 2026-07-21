@@ -20,6 +20,7 @@ class StageEventRule:
     transition: Literal["start", "terminal", "point"]
     id_fields: tuple[str, ...]
     status: TraceStageStatus
+    schema_versions: frozenset[int] = frozenset({1})
 
 
 RULES: Mapping[str, StageEventRule] = {
@@ -65,6 +66,29 @@ RULES: Mapping[str, StageEventRule] = {
     "tool.recovery.retry.started": StageEventRule(TraceStageKind.RECOVERY, "point", ("operation_id",), TraceStageStatus.RUNNING),
     "reconciliation.requested": StageEventRule(TraceStageKind.RECOVERY, "start", ("request_id",), TraceStageStatus.WAITING),
     "reconciliation.resolved": StageEventRule(TraceStageKind.RECOVERY, "terminal", ("request_id",), TraceStageStatus.COMPLETED),
+}
+
+_V1_V2_EVENT_TYPES = frozenset(
+    {
+        "step.started",
+        "step.completed",
+        "step.failed",
+        "model.call.started",
+        "model.call.completed",
+        "model.call.failed",
+        "tool.call.started",
+        "tool.call.completed",
+        "permission.requested",
+        "permission.resolved",
+    }
+)
+RULES = {
+    event_type: (
+        replace(rule, schema_versions=frozenset({1, 2}))
+        if event_type in _V1_V2_EVENT_TYPES
+        else rule
+    )
+    for event_type, rule in RULES.items()
 }
 
 
@@ -118,23 +142,42 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
     if any(left.cursor >= right.cursor for left, right in zip(ordered, ordered[1:], strict=False)):
         raise _ProjectionFailure
     stages: dict[tuple[TraceStageKind, tuple[str, ...]], _MutableStage] = {}
-    pending_model_usage: dict[str, TokenUsage] = {}
+    pending_model_usage: dict[str, tuple[TokenUsage, ObservedEvent]] = {}
     run_parents = _run_parents(ordered)
     context_parents = _context_parents(ordered)
+    projection_events = _with_derived_child_events(ordered, run_parents)
 
-    for observed in ordered:
+    for observed in projection_events:
         event = observed.event
+        rule = RULES.get(event.type)
+        allowed_versions = (
+            frozenset({1, 2})
+            if event.type == "model.usage.reported"
+            else None if rule is None else rule.schema_versions
+        )
+        if allowed_versions is not None and event.schema_version not in allowed_versions:
+            raise _ProjectionFailure
         if event.type == "model.usage.reported":
             operation_id = _identifier(observed, "operation_id")
             usage = _usage(event.payload)
             if usage is None or operation_id in pending_model_usage:
                 raise _ProjectionFailure
-            pending_model_usage[operation_id] = usage
+            pending_model_usage[operation_id] = (usage, observed)
             stage_key = (TraceStageKind.MODEL, (operation_id,))
             if stage_key in stages:
-                stages[stage_key] = replace(stages[stage_key], usage=usage)
+                usage_stage = stages[stage_key]
+                if usage_stage.terminal:
+                    raise _ProjectionFailure
+                event_id = _bounded_identifier(event.event_id)
+                stages[stage_key] = replace(
+                    usage_stage,
+                    usage=usage,
+                    first_cursor=min(usage_stage.first_cursor, observed.cursor),
+                    last_cursor=max(usage_stage.last_cursor, observed.cursor),
+                    evidence_event_ids=(*usage_stage.evidence_event_ids, event_id),
+                    evidence_cursors=(*usage_stage.evidence_cursors, observed.cursor),
+                )
             continue
-        rule = RULES.get(event.type)
         if rule is None:
             continue
         key = tuple(_identifier(observed, field) for field in rule.id_fields)
@@ -146,7 +189,26 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
         if rule.transition == "start":
             if current is not None:
                 raise _ProjectionFailure
-            usage = pending_model_usage.get(key[0]) if rule.kind is TraceStageKind.MODEL else None
+            pending_usage = (
+                pending_model_usage.get(key[0])
+                if rule.kind is TraceStageKind.MODEL
+                else None
+            )
+            usage = None if pending_usage is None else pending_usage[0]
+            pending_observed = None if pending_usage is None else pending_usage[1]
+            first_cursor = (
+                observed.cursor
+                if pending_observed is None
+                else min(pending_observed.cursor, observed.cursor)
+            )
+            evidence_event_ids: tuple[str, ...] = (event_id,)
+            evidence_cursors: tuple[int, ...] = (observed.cursor,)
+            if pending_observed is not None and pending_observed.cursor < observed.cursor:
+                evidence_event_ids = (
+                    _bounded_identifier(pending_observed.event.event_id),
+                    event_id,
+                )
+                evidence_cursors = (pending_observed.cursor, observed.cursor)
             stages[lookup] = _MutableStage(
                 kind=rule.kind,
                 key=key,
@@ -154,10 +216,10 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 run_id=run_id,
                 started_at=event.occurred_at,
                 ended_at=None,
-                first_cursor=observed.cursor,
+                first_cursor=first_cursor,
                 last_cursor=observed.cursor,
-                evidence_event_ids=(event_id,),
-                evidence_cursors=(observed.cursor,),
+                evidence_event_ids=evidence_event_ids,
+                evidence_cursors=evidence_cursors,
                 usage=usage,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
             )
@@ -193,12 +255,33 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 last_cursor=observed.cursor,
                 evidence_event_ids=(event_id,),
                 evidence_cursors=(observed.cursor,),
-                usage=terminal_usage or pending_model_usage.get(key[0]),
+                usage=(
+                    terminal_usage
+                    or (
+                        pending_model_usage[key[0]][0]
+                        if key[0] in pending_model_usage
+                        else None
+                    )
+                ),
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
                 terminal=True,
             )
             continue
         if current.terminal:
+            raise _ProjectionFailure
+        terminal_parent = _parent_hint(
+            rule.kind,
+            observed,
+            run_parents,
+            context_parents,
+        )
+        if (
+            rule.kind is TraceStageKind.TOOL
+            and current.parent_hint is not None
+            and current.parent_hint[0] is TraceStageKind.STEP
+            and isinstance(observed.event.payload.get("step_id"), str)
+            and terminal_parent != current.parent_hint
+        ):
             raise _ProjectionFailure
         stages[lookup] = replace(
             current,
@@ -207,7 +290,15 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             last_cursor=observed.cursor,
             evidence_event_ids=(*current.evidence_event_ids, event_id),
             evidence_cursors=(*current.evidence_cursors, observed.cursor),
-            usage=terminal_usage or current.usage or pending_model_usage.get(key[0]),
+            usage=(
+                terminal_usage
+                or current.usage
+                or (
+                    pending_model_usage[key[0]][0]
+                    if key[0] in pending_model_usage
+                    else None
+                )
+            ),
             terminal=True,
         )
 
@@ -238,6 +329,58 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             )
         )
     return tuple(projected)
+
+
+def _with_derived_child_events(
+    events: list[ObservedEvent],
+    run_parents: Mapping[str, tuple[TraceStageKind, tuple[str, ...]]],
+) -> list[ObservedEvent]:
+    explicit_children = {
+        child_id
+        for observed in events
+        if observed.event.type.startswith("child.")
+        for child_id in (observed.event.payload.get("child_run_id"),)
+        if isinstance(child_id, str)
+    }
+    terminal_types = {
+        "run.completed": "child.completed",
+        "run.failed": "child.failed",
+        "run.interrupted": "child.interrupted",
+    }
+    expanded: list[ObservedEvent] = []
+    for observed in events:
+        expanded.append(observed)
+        event = observed.event
+        child_id = event.run_id
+        if not isinstance(child_id, str) or child_id in explicit_children:
+            continue
+        parent_hint = run_parents.get(child_id)
+        if parent_hint is None or parent_hint[0] is not TraceStageKind.RUN:
+            continue
+        parent_id = parent_hint[1][0]
+        derived_type: str | None = None
+        if event.type == "run.created":
+            derived_type = "child.created"
+        elif event.type in terminal_types:
+            derived_type = terminal_types[event.type]
+        if derived_type is None:
+            continue
+        expanded.append(
+            ObservedEvent(
+                cursor=observed.cursor,
+                event=event.model_copy(
+                    update={
+                        "type": derived_type,
+                        "schema_version": 1,
+                        "payload": {
+                            "child_run_id": child_id,
+                            "parent_run_id": parent_id,
+                        },
+                    }
+                ),
+            )
+        )
+    return expanded
 
 
 def _correlate_legacy_events(events: list[ObservedEvent]) -> list[ObservedEvent]:

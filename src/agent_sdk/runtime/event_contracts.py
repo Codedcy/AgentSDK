@@ -20,7 +20,7 @@ _V2_STAGE_EVENTS = frozenset(
         "model.usage.reported",
         "model.call.completed",
         "model.call.failed",
-        "tool.call.completed",
+        "tool.call.started",
         "permission.requested",
         "permission.resolved",
     }
@@ -152,6 +152,24 @@ def normalize_stage_events_for_recovery(
             if payload != expected:
                 return None
             legacy = {"error": error}
+        elif event.type == "tool.call.started":
+            call_id = payload.get("call_id")
+            tool_name = payload.get("tool_name")
+            if (
+                current_step is None
+                or current_call is None
+                or call_id != current_call
+                or not isinstance(tool_name, str)
+                or not tool_name
+                or payload
+                != {
+                    "call_id": current_call,
+                    "tool_name": tool_name,
+                    "step_id": current_step,
+                }
+            ):
+                return None
+            legacy = {"call_id": current_call, "tool_name": tool_name}
         elif event.type == "tool.call.completed":
             if current_step is None or payload.get("step_id") != current_step:
                 return None

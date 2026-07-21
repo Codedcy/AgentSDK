@@ -319,3 +319,59 @@ def test_v2_step_event_without_stable_id_is_rejected() -> None:
         project_stages((_event(1, "step.started", {}, schema_version=2),))
 
     assert captured.value.code is ErrorCode.INTERNAL
+
+
+def test_known_stage_event_with_unknown_schema_is_rejected() -> None:
+    with pytest.raises(AgentSDKError) as captured:
+        project_stages(
+            (
+                _event(
+                    1,
+                    "model.call.started",
+                    {"operation_id": "op_1"},
+                    schema_version=999,
+                ),
+            )
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.message == "failed to project trace stages"
+
+
+def test_model_usage_is_ordering_and_bounded_stage_evidence() -> None:
+    stage = project_stages(
+        (
+            _event(1, "model.usage.reported", {"operation_id": "op_1", "total_tokens": 3}),
+            _event(2, "model.call.started", {"operation_id": "op_1"}, seconds=1),
+            _event(3, "model.call.completed", {"operation_id": "op_1"}, seconds=2),
+        )
+    )[0]
+
+    assert stage.first_cursor == 1
+    assert stage.last_cursor == 3
+    assert stage.evidence_event_ids == ("evt_1", "evt_2", "evt_3")
+    assert stage.evidence_cursors == (1, 2, 3)
+    assert stage.started_at == BASE + timedelta(seconds=1)
+    assert stage.duration_ms == 1000
+
+
+def test_tool_terminal_with_a_different_step_reference_is_rejected() -> None:
+    with pytest.raises(AgentSDKError) as captured:
+        project_stages(
+            (
+                _event(
+                    1,
+                    "tool.call.started",
+                    {"call_id": "call_1", "step_id": "step_1"},
+                    schema_version=2,
+                ),
+                _event(
+                    2,
+                    "tool.call.completed",
+                    {"call_id": "call_1", "step_id": "step_2"},
+                    schema_version=2,
+                ),
+            )
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL

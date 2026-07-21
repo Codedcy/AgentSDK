@@ -109,3 +109,34 @@ def test_v2_terminal_can_follow_a_certified_legacy_v1_step() -> None:
     assert normalized is not None
     assert normalized[-1].schema_version == 1
     assert set(normalized[-1].payload) == {"error"}
+
+
+def test_hashed_recovery_permission_events_are_v1_only() -> None:
+    requested = _event(
+        1,
+        "permission.requested",
+        {"request": {"sha256": "request"}, "tool": {"sha256": "tool"}},
+        schema_version=1,
+    )
+    resolved = _event(
+        2,
+        "permission.resolved",
+        {
+            "request": {"sha256": "request"},
+            "tool": {"sha256": "tool"},
+            "allowed": True,
+        },
+        schema_version=1,
+    )
+
+    assert normalize_stage_events_for_recovery((requested, resolved), ()) == (
+        requested,
+        resolved,
+    )
+    assert (
+        normalize_stage_events_for_recovery(
+            (requested.model_copy(update={"schema_version": 2}),),
+            (),
+        )
+        is None
+    )

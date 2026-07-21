@@ -4,7 +4,7 @@ from enum import Enum
 from typing import NoReturn
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import RunSnapshot
+from agent_sdk.runtime.models import RunSnapshot, run_created_event_matches
 from agent_sdk.storage.base import StateStore, StoredEvent
 from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 from agent_sdk.workflow.models import WorkflowRunSnapshot
@@ -14,6 +14,27 @@ from .stages import project_stages
 
 _STABLE_READ_ATTEMPTS = 4
 _PAGE_SIZE = 100
+_RUN_SNAPSHOT_TRANSITIONS = frozenset(
+    {
+        "run.started",
+        "run.completed",
+        "run.failed",
+        "run.interrupted",
+        "run.recovery.started",
+        "permission.requested",
+        "permission.resolved",
+    }
+)
+_WORKFLOW_SNAPSHOT_TRANSITIONS = frozenset(
+    {
+        "workflow.started",
+        "workflow.node.started",
+        "workflow.node.completed",
+        "workflow.node.failed",
+        "workflow.completed",
+        "workflow.failed",
+    }
+)
 
 
 class _LoadFailure(Enum):
@@ -47,7 +68,12 @@ class TraceService:
                 )
             except Exception:
                 self._internal()
-            if not await self._stable(run, workflow, run_snapshots):
+            if not await self._stable(
+                run,
+                workflow,
+                run_snapshots,
+                cursor=cursor,
+            ):
                 continue
             return TraceTimeline(
                 root_id=root_id,
@@ -111,6 +137,20 @@ class TraceService:
                 ancestor = snapshot.parent_run_id
                 if ancestor not in run_ids:
                     raise ValueError
+            creation = [
+                item
+                for item in stored
+                if item.cursor <= cursor
+                and item.event.type == "run.created"
+                and item.event.run_id == run_id
+                and item.event.session_id == session_id
+            ]
+            if len(creation) != 1 or not run_created_event_matches(
+                snapshot,
+                dict(creation[0].event.payload),
+                schema_version=creation[0].event.schema_version,
+            ):
+                raise ValueError
             snapshots[run_id] = snapshot
 
         context_view_ids = {
@@ -147,6 +187,71 @@ class TraceService:
         run: RunSnapshot | None,
         workflow: WorkflowRunSnapshot | None,
         snapshots: dict[str, RunSnapshot],
+        *,
+        cursor: int,
+    ) -> bool:
+        if not await self._snapshots_match(run, workflow, snapshots):
+            return False
+        tail_cursor = await self._cursor()
+        tail = await self._read_through(tail_cursor, after_cursor=cursor)
+        run_ids = set(snapshots)
+        workflow_id = None if workflow is None else workflow.workflow_run_id
+        if run is not None:
+            session_id = run.session_id
+        else:
+            assert workflow is not None
+            session_id = workflow.session_id
+        for item in tail:
+            event = item.event
+            if event.type == "run.created":
+                if event.run_id in run_ids:
+                    self._internal()
+                parent_id = event.payload.get("parent_run_id")
+                bound_workflow = event.payload.get("workflow_run_id")
+                relevant = (
+                    isinstance(parent_id, str) and parent_id in run_ids
+                ) or (workflow_id is not None and bound_workflow == workflow_id)
+                if not relevant:
+                    continue
+                if (
+                    event.schema_version not in {1, 2, 3}
+                    or event.session_id != session_id
+                    or not isinstance(event.run_id, str)
+                ):
+                    self._internal()
+                return False
+            event_run_id = event.run_id
+            if (
+                isinstance(event_run_id, str)
+                and event_run_id in run_ids
+                and event.type in _RUN_SNAPSHOT_TRANSITIONS
+            ):
+                allowed_versions = (
+                    {1, 2}
+                    if event.type in {"permission.requested", "permission.resolved"}
+                    else {1}
+                )
+                if (
+                    event.schema_version not in allowed_versions
+                    or event.session_id != snapshots[event_run_id].session_id
+                ):
+                    self._internal()
+                return False
+            if (
+                workflow_id is not None
+                and event.run_id == workflow_id
+                and event.type in _WORKFLOW_SNAPSHOT_TRANSITIONS
+            ):
+                if event.schema_version != 1 or event.session_id != session_id:
+                    self._internal()
+                return False
+        return await self._snapshots_match(run, workflow, snapshots)
+
+    async def _snapshots_match(
+        self,
+        run: RunSnapshot | None,
+        workflow: WorkflowRunSnapshot | None,
+        snapshots: dict[str, RunSnapshot],
     ) -> bool:
         if run is not None and await self._run(run.run_id) != run:
             return False
@@ -177,9 +282,14 @@ class TraceService:
         except Exception:
             self._internal()
 
-    async def _read_through(self, up_to_cursor: int) -> list[StoredEvent]:
+    async def _read_through(
+        self,
+        up_to_cursor: int,
+        *,
+        after_cursor: int = 0,
+    ) -> list[StoredEvent]:
         events: list[StoredEvent] = []
-        current = 0
+        current = after_cursor
         while current < up_to_cursor:
             try:
                 page = validate_event_page(

@@ -1532,6 +1532,17 @@ async def test_permission_wait_cancellation_leaves_same_certified_operation_reco
         assert operation.status is ExternalOperationStatus.STARTED
         assert handler_calls == 0
         assert model_calls == []
+        recovery_permissions = [
+            stored.event
+            for stored in await store.read_events(after_cursor=0)
+            if stored.event.run_id == run_id
+            and stored.event.type in {"permission.requested", "permission.resolved"}
+            and isinstance(stored.event.payload.get("request"), dict)
+            and set(stored.event.payload["request"]) == {"sha256"}
+        ]
+        assert recovery_permissions
+        assert all(event.schema_version == 1 for event in recovery_permissions)
+        assert set(recovery_permissions[0].payload) == {"request", "tool"}
 
         await sdk.recovery.scan()
         retry = await sdk.recovery.recover_run(run_id)
