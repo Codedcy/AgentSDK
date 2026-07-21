@@ -300,7 +300,12 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 terminal=True,
             )
             continue
-        if current.terminal:
+        resumed_terminal = (
+            rule.kind in {TraceStageKind.RUN, TraceStageKind.CHILD}
+            and current.status is TraceStageStatus.INTERRUPTED
+            and status in {TraceStageStatus.COMPLETED, TraceStageStatus.FAILED}
+        )
+        if current.terminal and not resumed_terminal:
             raise _ProjectionFailure
         terminal_parent = _parent_hint(
             rule.kind,
@@ -431,6 +436,7 @@ def _correlate_legacy_events(events: list[ObservedEvent]) -> list[ObservedEvent]
 
     for observed in events:
         event = observed.event
+        run_id = event.run_id
         if event.schema_version != 1 or event.type not in {
             "step.started",
             *step_terminals,
@@ -438,9 +444,19 @@ def _correlate_legacy_events(events: list[ObservedEvent]) -> list[ObservedEvent]
             "model.usage.reported",
             *model_terminals,
         }:
+            if isinstance(run_id, str) and run_id:
+                identity = event.payload.get("step_id")
+                if event.type == "step.started" and isinstance(identity, str):
+                    active_steps[run_id] = identity
+                elif event.type in step_terminals:
+                    active_steps.pop(run_id, None)
+                identity = event.payload.get("operation_id")
+                if event.type == "model.call.started" and isinstance(identity, str):
+                    active_models[run_id] = identity
+                elif event.type in model_terminals:
+                    active_models.pop(run_id, None)
             correlated.append(observed)
             continue
-        run_id = event.run_id
         if not isinstance(run_id, str) or not run_id:
             correlated.append(observed)
             continue

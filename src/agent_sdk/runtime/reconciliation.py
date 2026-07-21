@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from hashlib import sha256
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import wraps
@@ -35,6 +37,102 @@ from agent_sdk.runtime.provider_recovery import (
     ProviderRecoveryResult,
 )
 from agent_sdk.tools.models import ToolResult, ToolResultStatus, freeze_json, thaw_json
+
+
+_TERMINATION_REASON_MAX_UTF8_BYTES = 256
+_TERMINATION_ACTOR_MAX_UTF8_BYTES = 1024
+_SENSITIVE_METADATA_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "credentials",
+        "password",
+        "secret",
+        "token",
+    }
+)
+_BEARER_SECRET = re.compile(
+    r"(?i)(\bauthorization\s*:\s*bearer)\s+[^\s,;]+"
+)
+_ASSIGNED_SECRET = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|password|credential|secret)"
+    r"\s*[:=]\s*[^\s,;]+"
+)
+
+
+def _contains_sensitive_metadata_key(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            normalized = key.lower().replace("-", "_") if isinstance(key, str) else ""
+            if normalized in _SENSITIVE_METADATA_KEYS:
+                return True
+            if _contains_sensitive_metadata_key(nested):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_contains_sensitive_metadata_key(item) for item in value)
+    return False
+
+
+def _redact_metadata_strings(value: Any) -> Any:
+    if isinstance(value, str):
+        value = _BEARER_SECRET.sub(r"\1 [REDACTED]", value)
+        return _ASSIGNED_SECRET.sub(r"\1=[REDACTED]", value)
+    if isinstance(value, dict):
+        return {key: _redact_metadata_strings(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_metadata_strings(item) for item in value]
+    return value
+
+
+def _sanitize_termination_resolution(
+    actor: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Return bounded, canonical metadata for an application abort decision."""
+    if not isinstance(actor, Mapping) or not actor or not isinstance(evidence, Mapping):
+        raise ValueError("termination resolution metadata is invalid")
+    if set(evidence) != {"reason"} or type(evidence.get("reason")) is not str:
+        raise ValueError("termination resolution reason is invalid")
+    reason = " ".join(cast(str, evidence["reason"]).split())
+    if not reason:
+        raise ValueError("termination resolution reason is empty")
+    reason = cast(str, _redact_metadata_strings(reason))
+    if len(reason.encode("utf-8")) > _TERMINATION_REASON_MAX_UTF8_BYTES:
+        raise ValueError("termination resolution reason is too large")
+    try:
+        canonical_actor = thaw_json(freeze_json(actor))
+        if not isinstance(canonical_actor, dict) or _contains_sensitive_metadata_key(canonical_actor):
+            raise ValueError("termination resolution actor is unsafe")
+        canonical_actor = _redact_metadata_strings(canonical_actor)
+        assert isinstance(canonical_actor, dict)
+        encoded_actor = json.dumps(
+            canonical_actor,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except Exception as error:
+        raise ValueError("termination resolution actor is invalid") from error
+    if len(encoded_actor) > _TERMINATION_ACTOR_MAX_UTF8_BYTES:
+        raise ValueError("termination resolution actor is too large")
+    return canonical_actor, {"reason": reason}
+
+
+def _is_sanitized_termination_resolution(
+    actor: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+) -> bool:
+    try:
+        expected_actor, expected_evidence = _sanitize_termination_resolution(
+            actor,
+            evidence,
+        )
+    except ValueError:
+        return False
+    return dict(actor) == expected_actor and dict(evidence) == expected_evidence
 
 
 class ExternalOperationKind(StrEnum):
@@ -1440,4 +1538,201 @@ def _valid_confirmed_model_terminalization_batch(batch: Any) -> bool:
         and session_write.session_id == session.session_id
         and session_write.version == expected_session.version
         and session_write.data == expected_session.model_dump(mode="json")
+    )
+
+
+@dataclass(frozen=True)
+class _TerminationProjection:
+    operation: ExternalOperation
+    checkpoint: RunCheckpoint
+    run: RunSnapshot
+    session: SessionSnapshot
+    session_event_type: str
+    failure: dict[str, Any]
+    event_types: tuple[str, ...]
+    event_payloads: tuple[dict[str, Any], ...]
+
+
+def _termination_projection(
+    *,
+    session: SessionSnapshot,
+    run: RunSnapshot,
+    checkpoint: RunCheckpoint,
+    operation: ExternalOperation,
+    request: ReconciliationRequest,
+    resolution: ReconciliationResolution,
+) -> _TerminationProjection:
+    reason = cast(str, resolution.evidence["reason"])
+    failure: dict[str, Any] = {
+        "code": "application_resolution_aborted",
+        "message": reason,
+        "retryable": False,
+    }
+    projected_operation = operation.model_copy(
+        update={
+            "status": ExternalOperationStatus.FAILED,
+            "outcome": {
+                "reconciliation": {
+                    "request_id": request.request_id,
+                    "action": ReconciliationAction.TERMINATE.value,
+                    "outcome_known": False,
+                }
+            },
+        }
+    )
+    terminal_checkpoint = checkpoint.model_copy(
+        update={
+            "checkpoint_version": checkpoint.checkpoint_version + 1,
+            "phase": RunCheckpointPhase.TERMINAL,
+            "operation_id": None,
+        }
+    )
+    failed_run = run.model_copy(
+        update={
+            "status": RunStatus.FAILED,
+            "version": run.version + 1,
+            "output_text": "".join(checkpoint.output_parts),
+            "usage": checkpoint.usage,
+            "tool_results": checkpoint.tool_results,
+            "error": RunFailure(**failure),
+        }
+    )
+    remaining = tuple(item for item in session.active_run_ids if item != run.run_id)
+    close_now = (
+        session.status is SessionStatus.CLOSING
+        and not remaining
+        and not session.active_workflow_run_ids
+    )
+    projected_session = session.model_copy(
+        update={
+            "active_run_ids": remaining,
+            "status": SessionStatus.CLOSED if close_now else session.status,
+            "version": session.version + 1,
+        }
+    )
+    resolution_payload = {
+        "request_id": request.request_id,
+        "operation_id": request.operation_id,
+        "action": resolution.action.value,
+        "actor": thaw_json(resolution.actor),
+        "evidence": thaw_json(resolution.evidence),
+    }
+    failure_payload = {"error": failure}
+    return _TerminationProjection(
+        operation=projected_operation,
+        checkpoint=terminal_checkpoint,
+        run=failed_run,
+        session=projected_session,
+        session_event_type=(
+            "session.closed" if close_now else "session.run.detached"
+        ),
+        failure=failure,
+        event_types=(
+            "reconciliation.resolved",
+            "step.failed",
+            "run.failed",
+        ),
+        event_payloads=(
+            resolution_payload,
+            failure_payload,
+            failure_payload,
+        ),
+    )
+
+
+def _valid_terminate_resolution_batch(batch: Any) -> bool:
+    operation_write, checkpoint_write, request_write = (
+        batch.operation,
+        batch.checkpoint,
+        batch.reconciliation,
+    )
+    if any(
+        write is None or write.expected is None
+        for write in (operation_write, checkpoint_write, request_write)
+    ) or (
+        len(batch.events),
+        len(batch.snapshots),
+        len(batch.preconditions),
+        len(batch.event_preconditions),
+        batch.checkpoint_precondition,
+        batch.operation_precondition,
+    ) != (4, 2, 2, 1, None, None):
+        return False
+    assert operation_write is not None and operation_write.expected is not None
+    assert checkpoint_write is not None and checkpoint_write.expected is not None
+    assert request_write is not None and request_write.expected is not None
+    operation, checkpoint, request = (
+        operation_write.expected,
+        checkpoint_write.expected,
+        request_write.expected,
+    )
+    resolved = request_write.updated
+    resolution = resolved.resolution
+    phase = (
+        RunCheckpointPhase.MODEL_IN_FLIGHT
+        if isinstance(operation, ModelCallOperation)
+        else RunCheckpointPhase.TOOL_IN_FLIGHT
+    )
+    reason = (
+        "model_call_unknown_outcome"
+        if isinstance(operation, ModelCallOperation)
+        else "tool_call_unknown_outcome"
+    )
+    preconditions = {item.kind: item for item in batch.preconditions}
+    try:
+        if resolution is None:
+            return False
+        session = SessionSnapshot.model_validate(preconditions["session"].data)
+        run = RunSnapshot.model_validate(preconditions["run"].data)
+        projection = _termination_projection(
+            session=session,
+            run=run,
+            checkpoint=checkpoint,
+            operation=operation,
+            request=request,
+            resolution=resolution,
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    requested = batch.event_preconditions[0]
+    run_events, session_event = batch.events[:-1], batch.events[-1]
+    run_write, session_write = batch.snapshots
+    return (
+        set(preconditions) == {"session", "run"}
+        and resolution.action is ReconciliationAction.TERMINATE
+        and _is_sanitized_termination_resolution(
+            resolution.actor, resolution.evidence
+        )
+        and request.status is ReconciliationStatus.PENDING
+        and resolved
+        == request.model_copy(
+            update={"status": ReconciliationStatus.RESOLVED, "resolution": resolution}
+        )
+        and run.status is RunStatus.WAITING_RECONCILIATION
+        and run.run_id in session.active_run_ids
+        and operation.status is ExternalOperationStatus.STARTED
+        and (operation.run_id, operation.session_id)
+        == (run.run_id, run.session_id)
+        and request.operation_id == checkpoint.operation_id == operation.operation_id
+        and request.reason == reason
+        and dict(request.details) == {"checkpoint_phase": phase.value}
+        and checkpoint.phase is phase
+        and checkpoint.turn == operation.turn
+        and operation_write.updated == projection.operation
+        and checkpoint_write.updated == projection.checkpoint
+        and run_write.data == projection.run.model_dump(mode="json")
+        and session_write.data == projection.session.model_dump(mode="json")
+        and tuple(event.type for event in run_events) == projection.event_types
+        and tuple(event.payload for event in run_events) == projection.event_payloads
+        and session_event.type == projection.session_event_type
+        and session_event.payload
+        == {"run_id": run.run_id, "status": projection.session.status.value}
+        and all(event.occurred_at == batch.now for event in batch.events)
+        and run_events[0].event_id == resolution.event_id
+        and requested.type == "reconciliation.requested"
+        and all(
+            event.sequence == requested.sequence + offset
+            for offset, event in enumerate(run_events, start=1)
+        )
+        and session_event.sequence == projection.session.version
     )

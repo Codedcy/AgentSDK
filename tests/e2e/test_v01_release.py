@@ -954,8 +954,10 @@ async def _accept_step_9_and_child_trace(
 
 async def _accept_step_12_unknown_inflight(
     tmp_path: Path,
+    *,
+    abort: bool,
 ) -> None:
-    database = tmp_path / "interrupted.sqlite3"
+    database = tmp_path / f"interrupted-{'abort' if abort else 'retry'}.sqlite3"
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -1031,13 +1033,39 @@ async def _accept_step_12_unknown_inflight(
         assert tool_calls == 0
         resolved = await sdk.recovery.resolve(
             request.request_id,
-            ReconciliationAction.RETRY,
+            (
+                ReconciliationAction.TERMINATE
+                if abort
+                else ReconciliationAction.RETRY
+            ),
             actor={"type": "operator", "id": "v01-acceptance"},
-            evidence={"acknowledge_duplicate_side_effect_risk": True},
+            evidence=(
+                {"reason": "v0.1 acceptance application abort"}
+                if abort
+                else {"acknowledge_duplicate_side_effect_risk": True}
+            ),
         )
         assert resolved.status.value == "resolved"
         assert provider_calls == 0
         assert tool_calls == 0
+        if abort:
+            failed = await sdk.runs.get(run_id)
+            assert failed.status is RunStatus.FAILED
+            assert failed.error is not None
+            assert failed.error.code == "application_resolution_aborted"
+            assert failed.error.message == "v0.1 acceptance application abort"
+            replay = await sdk.recovery.resolve(
+                request.request_id,
+                ReconciliationAction.TERMINATE,
+                actor={"type": "operator", "id": "v01-acceptance"},
+                evidence={"reason": "v0.1 acceptance application abort"},
+            )
+            assert replay == resolved
+            with pytest.raises(AgentSDKError, match="v0.1 acceptance application abort"):
+                await (await sdk.recovery.recover_run(run_id)).result()
+            assert provider_calls == 0
+            assert tool_calls == 0
+            return
         result = await (await sdk.recovery.recover_run(run_id)).result()
         assert result.output_text == "recovery complete"
         assert provider_calls == 1
@@ -1063,4 +1091,5 @@ async def test_v01_release_public_acceptance_thirteen_steps(
     await _accept_steps_3_4_and_6(tmp_path)
     await _accept_steps_7_8_and_12_safe_boundary(tmp_path)
     await _accept_step_9_and_child_trace(tmp_path)
-    await _accept_step_12_unknown_inflight(tmp_path)
+    await _accept_step_12_unknown_inflight(tmp_path, abort=False)
+    await _accept_step_12_unknown_inflight(tmp_path, abort=True)

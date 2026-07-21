@@ -157,9 +157,23 @@ After a process restart, call `sdk.recovery.recover_run`. An unknown in-flight
 operation stays interrupted. Inspect `sdk.recovery.pending_requests(run_id)` and
 use `sdk.recovery.resolve(request_id, action, actor=..., evidence=...)` for a safe
 retry (including explicit duplicate-side-effect acknowledgement) or an evidenced
-outcome. To abort in v0.1, keep the request pending and close the SDK without
-replay; `ReconciliationAction.TERMINATE` is reserved but not implemented. See the
-recovery guide before using this path.
+outcome. To abort without provider/Tool replay, make the terminal application
+decision explicit:
+
+```python
+await sdk.recovery.resolve(
+    request_id,
+    ReconciliationAction.TERMINATE,
+    actor={"type": "operator", "id": "user-123"},
+    evidence={"reason": "application chose not to retry"},
+)
+failed = await sdk.runs.get(run_id)
+assert failed.error.code == "application_resolution_aborted"
+```
+
+The reason is bounded and sanitized before persistence. Abort does not establish
+whether the unknown first attempt executed. See the recovery guide before using
+either retry or abort.
 
 Finally, close/delete history and then the SDK:
 

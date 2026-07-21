@@ -96,9 +96,21 @@ and `sdk.analytics`.
 On reopen, completed safe-boundary work is read rather than repeated. Unknown
 in-flight work remains interrupted until the application inspects
 `sdk.recovery.pending_requests(run_id)` and calls `sdk.recovery.resolve(...)` to
-retry with duplicate-effect acknowledgement or confirm an evidenced outcome. To
-abort in v0.1, leave the request pending and close the SDK; `TERMINATE` resolution
-is not implemented.
+retry with duplicate-effect acknowledgement, confirm an evidenced outcome, or
+terminally abort without replay:
+
+```python
+await sdk.recovery.resolve(
+    request.request_id,
+    ReconciliationAction.TERMINATE,
+    actor={"type": "operator", "id": "user-123"},
+    evidence={"reason": "application chose not to retry"},
+)
+```
+
+Abort atomically fails the Run with error code `application_resolution_aborted`.
+It does not call the provider or Tool and does not claim whether the interrupted
+external attempt executed.
 See the [quickstart](docs/guides/v01-quickstart.md),
 [recovery guide](docs/guides/v01-recovery.md), and
 [tracing and analysis guide](docs/guides/v01-tracing-and-analysis.md).

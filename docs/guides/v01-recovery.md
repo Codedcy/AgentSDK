@@ -61,14 +61,27 @@ Choose an action from evidence, not convenience:
   operation did not execute.
 - `RETRY` is the risk-accepting path. For external effects, acknowledge that a
   duplicate may occur; prefer idempotency keys and effect-specific verification.
-- `TERMINATE` is reserved but not supported by the v0.1 resolver. A safe abort in
-  v0.1 means leaving the request pending/interrupted and closing the SDK without
-  replay. Record the operator decision outside the SDK and resume only when valid
-  reconciliation evidence becomes available.
+- `TERMINATE` is the terminal abort path. It requires a bounded, non-empty
+  application reason, performs no provider/Tool replay, and atomically fails the
+  Run with `application_resolution_aborted`:
+
+  ```python
+  await sdk.recovery.resolve(
+      request.request_id,
+      ReconciliationAction.TERMINATE,
+      actor={"type": "operator", "id": "user-123"},
+      evidence={"reason": "application chose not to retry"},
+  )
+  ```
+
+  The resolution records that the application aborted recovery. It does not claim
+  that the unknown external attempt completed, failed, or never executed.
 
 Always store meaningful `actor` and bounded `evidence` fields. Re-read pending
 requests after conflicts: resolution is durable and compare-and-set protected.
-Do not run two SDK instances against the same recoverable work.
+Repeating the exact abort returns the same durable resolution; a different reason
+or action conflicts and never replays the operation. Do not run two SDK instances
+against the same recoverable work.
 
 ## Shutdown and deletion
 

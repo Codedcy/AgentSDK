@@ -27,6 +27,7 @@ from agent_sdk.runtime.reconciliation import (
     _valid_confirmed_model_resolution_batch,
     _valid_confirmed_model_terminalization_batch,
     _valid_confirmed_tool_resolution_batch,
+    _valid_terminate_resolution_batch,
 )
 from agent_sdk.storage.base import (
     canonical_snapshot_data,
@@ -273,11 +274,13 @@ class InMemoryStore:
                 _valid_confirmed_model_terminalization_batch(batch)
             )
             confirmed_tool_resolution = _valid_confirmed_tool_resolution_batch(batch)
+            terminate_resolution = _valid_terminate_resolution_batch(batch)
             resolution_batch = (
                 retry_resolution
                 or confirmed_model_resolution
                 or confirmed_terminalization
                 or confirmed_tool_resolution
+                or terminate_resolution
             )
             if (
                 reconciliation_write is not None
@@ -289,6 +292,14 @@ class InMemoryStore:
                     or confirmed_terminalization
                     or confirmed_tool_resolution
                 )
+            ):
+                raise RecoveryStateConflictError
+            if (
+                reconciliation_write is not None
+                and reconciliation_write.updated.resolution is not None
+                and reconciliation_write.updated.resolution.action
+                is ReconciliationAction.TERMINATE
+                and not terminate_resolution
             ):
                 raise RecoveryStateConflictError
             operation_json: str | None = None

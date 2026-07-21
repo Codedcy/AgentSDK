@@ -77,6 +77,9 @@ from agent_sdk.runtime.reconciliation import (
     RunCheckpoint,
     RunCheckpointPhase,
     ToolCallOperation,
+    _is_sanitized_termination_resolution,
+    _sanitize_termination_resolution,
+    _termination_projection,
     deserialize_model_request,
 )
 from agent_sdk.runtime.session_lifecycle import (
@@ -649,16 +652,24 @@ class RunRecoveryService:
                 "reconciliation decision is invalid",
                 retryable=False,
             ) from None
-        if action is ReconciliationAction.TERMINATE:
-            raise AgentSDKError(
-                ErrorCode.INVALID_STATE,
-                "reconciliation action is not supported",
-                retryable=False,
-            ) from None
-        expected_evidence: dict[str, object]
+        validated_actor: Mapping[str, Any] = actor
+        expected_evidence: Mapping[str, Any]
         provider_result: ProviderRecoveryResult | None = None
         tool_result: ToolResult | None = None
-        if action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
+        if action is ReconciliationAction.TERMINATE:
+            try:
+                sanitized_actor, sanitized_evidence = (
+                    _sanitize_termination_resolution(actor, evidence)
+                )
+            except Exception:
+                raise AgentSDKError(
+                    ErrorCode.INVALID_STATE,
+                    "reconciliation decision is invalid",
+                    retryable=False,
+                ) from None
+            validated_actor = sanitized_actor
+            expected_evidence = sanitized_evidence
+        elif action is ReconciliationAction.CONFIRM_NOT_EXECUTED:
             expected_evidence = {"disposition": "not_executed"}
         elif action is ReconciliationAction.RETRY:
             expected_evidence = {"acknowledge_duplicate_side_effect_risk": True}
@@ -702,10 +713,13 @@ class RunRecoveryService:
                 ) from None
             expected_evidence = dict(evidence)
         if (
-            not isinstance(actor, Mapping)
-            or not actor
+            not isinstance(validated_actor, Mapping)
+            or not validated_actor
             or not isinstance(evidence, Mapping)
-            or dict(evidence) != expected_evidence
+            or (
+                action is not ReconciliationAction.TERMINATE
+                and dict(evidence) != expected_evidence
+            )
         ):
             raise AgentSDKError(
                 ErrorCode.INVALID_STATE,
@@ -715,8 +729,8 @@ class RunRecoveryService:
         try:
             validated_metadata = ReconciliationResolution(
                 action=action,
-                actor=actor,
-                evidence=evidence,
+                actor=validated_actor,
+                evidence=expected_evidence,
                 decided_at=self._clock(),
                 event_id="evt_validation",
             )
@@ -982,6 +996,25 @@ class RunRecoveryService:
                     resolved.model_dump_json()
                 )
 
+            if action is ReconciliationAction.TERMINATE:
+                batch = self._terminated_resolution_batch(
+                    lease=lease,
+                    now=now,
+                    run=run,
+                    session=recovery_evidence.session,
+                    checkpoint=checkpoint,
+                    operation=operation,
+                    request=current,
+                    resolved=resolved,
+                    resolution=resolution,
+                    requested_cursor=requested[0][0],
+                    requested_event=requested[0][1],
+                )
+                await _commit_progress(self._store, batch)
+                return ReconciliationRequest.model_validate_json(
+                    resolved.model_dump_json()
+                )
+
             terminalized = operation.model_copy(
                 update={
                     "status": ExternalOperationStatus.FAILED,
@@ -1077,6 +1110,86 @@ class RunRecoveryService:
                 cancellation = await _settle_task(release)
                 if active_error is None and cancellation is not None:
                     raise cancellation from None
+
+    @staticmethod
+    def _terminated_resolution_batch(
+        *,
+        lease: Lease,
+        now: datetime,
+        run: RunSnapshot,
+        session: SessionSnapshot,
+        checkpoint: RunCheckpoint,
+        operation: ExternalOperation,
+        request: ReconciliationRequest,
+        resolved: ReconciliationRequest,
+        resolution: ReconciliationResolution,
+        requested_cursor: int,
+        requested_event: EventEnvelope,
+    ) -> RunProgressBatch:
+        projection = _termination_projection(
+            session=session,
+            run=run,
+            checkpoint=checkpoint,
+            operation=operation,
+            request=request,
+            resolution=resolution,
+        )
+        events = tuple(
+            EventEnvelope(
+                event_id=(resolution.event_id if offset == 1 else new_id("evt")),
+                type=event_type,
+                session_id=run.session_id,
+                run_id=run.run_id,
+                sequence=requested_event.sequence + offset,
+                payload=projection.event_payloads[offset - 1],
+                occurred_at=now,
+            )
+            for offset, event_type in enumerate(projection.event_types, start=1)
+        )
+        session_event = EventEnvelope(
+            event_id=new_id("evt"),
+            type=projection.session_event_type,
+            session_id=session.session_id,
+            run_id=None,
+            sequence=projection.session.version,
+            payload={
+                "run_id": run.run_id,
+                "status": projection.session.status.value,
+            },
+            occurred_at=now,
+        )
+        return RunProgressBatch(
+            lease=lease,
+            now=now,
+            events=(*events, session_event),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    projection.run.run_id,
+                    projection.run.session_id,
+                    projection.run.version,
+                    projection.run.model_dump(mode="json"),
+                ),
+                session_write(projection.session),
+            ),
+            preconditions=(
+                exact_session_precondition(session),
+                exact_run_precondition(run),
+            ),
+            event_preconditions=(
+                EventPrecondition(
+                    requested_event.event_id,
+                    requested_cursor,
+                    requested_event.session_id,
+                    requested_event.run_id,
+                    requested_event.type,
+                    requested_event.sequence,
+                ),
+            ),
+            operation=ExternalOperationWrite(operation, projection.operation),
+            checkpoint=RunCheckpointWrite(checkpoint, projection.checkpoint),
+            reconciliation=ReconciliationRequestWrite(request, resolved),
+        )
 
     @staticmethod
     def _confirmed_tool_resolution_batch(
@@ -1686,6 +1799,18 @@ class RunRecoveryService:
             if matching != (request,) or not (model_replay or tool_replay):
                 raise RecoveryStateConflictError
             return replay
+        if resolution is not None and resolution.action is ReconciliationAction.TERMINATE:
+            if (
+                matching != (request,)
+                or operation is None
+                or not self._is_exact_terminated_replay(
+                    recovery_evidence,
+                    request,
+                    operation,
+                )
+            ):
+                raise RecoveryStateConflictError
+            return replay
 
         effective = (
             None
@@ -1724,6 +1849,110 @@ class RunRecoveryService:
             ):
                 raise RecoveryStateConflictError
         return replay
+
+    def _is_exact_terminated_replay(
+        self,
+        evidence: _RecoveryEvidence,
+        request: ReconciliationRequest,
+        operation: ExternalOperation,
+    ) -> bool:
+        resolution = request.resolution
+        checkpoint = evidence.checkpoint
+        if (
+            resolution is None
+            or resolution.action is not ReconciliationAction.TERMINATE
+            or not _is_sanitized_termination_resolution(
+                resolution.actor,
+                resolution.evidence,
+            )
+            or checkpoint is None
+            or evidence.pending
+            or evidence.run.status is not RunStatus.FAILED
+            or evidence.run.error is None
+            or checkpoint.phase is not RunCheckpointPhase.TERMINAL
+            or checkpoint.operation_id is not None
+            or checkpoint.turn != operation.turn
+            or operation.status is not ExternalOperationStatus.FAILED
+            or request.operation_id != operation.operation_id
+            or not self._has_closed_reconciliation_markers(evidence)
+            or not self._is_valid_run_event_envelope(
+                evidence,
+                allow_recovery_closed=True,
+            )
+        ):
+            return False
+        reason = resolution.evidence.get("reason")
+        if not isinstance(reason, str):
+            return False
+        projection = _termination_projection(
+            session=evidence.session,
+            run=evidence.run.model_copy(
+                update={
+                    "status": RunStatus.WAITING_RECONCILIATION,
+                    "version": evidence.run.version - 1,
+                    "output_text": None,
+                    "usage": None,
+                    "tool_results": (),
+                    "error": None,
+                }
+            ),
+            checkpoint=checkpoint.model_copy(
+                update={
+                    "checkpoint_version": checkpoint.checkpoint_version - 1,
+                    "phase": (
+                        RunCheckpointPhase.MODEL_IN_FLIGHT
+                        if isinstance(operation, ModelCallOperation)
+                        else RunCheckpointPhase.TOOL_IN_FLIGHT
+                    ),
+                    "operation_id": operation.operation_id,
+                }
+            ),
+            operation=operation.model_copy(
+                update={
+                    "status": ExternalOperationStatus.STARTED,
+                    "outcome": None,
+                }
+            ),
+            request=request.model_copy(
+                update={
+                    "status": ReconciliationStatus.PENDING,
+                    "resolution": None,
+                }
+            ),
+            resolution=resolution,
+        )
+        resolution_indexes = tuple(
+            index
+            for index, event in enumerate(evidence.run_events)
+            if event.event_id == resolution.event_id
+            and event.type == "reconciliation.resolved"
+        )
+        if len(resolution_indexes) != 1:
+            return False
+        resolution_index = resolution_indexes[0]
+        terminal_events = evidence.run_events[
+            resolution_index : resolution_index + len(projection.event_types)
+        ]
+        return (
+            operation == projection.operation
+            and checkpoint == projection.checkpoint
+            and evidence.run == projection.run
+            and evidence.run.run_id not in evidence.session.active_run_ids
+            and resolution_index + len(projection.event_types)
+            == len(evidence.run_events)
+            and tuple(event.type for event in terminal_events)
+            == projection.event_types
+            and tuple(event.payload for event in terminal_events)
+            == projection.event_payloads
+            and self._is_exact_resolution_event_batch(
+                evidence,
+                first_run_index=resolution_index,
+                last_run_index=(
+                    resolution_index + len(projection.event_types) - 1
+                ),
+                terminal_session_transition=True,
+            )
+        )
 
     @staticmethod
     def _exact_resolution_replay(

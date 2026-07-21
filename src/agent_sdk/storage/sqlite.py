@@ -48,6 +48,7 @@ from agent_sdk.runtime.reconciliation import (
     _valid_confirmed_model_resolution_batch,
     _valid_confirmed_model_terminalization_batch,
     _valid_confirmed_tool_resolution_batch,
+    _valid_terminate_resolution_batch,
 )
 from agent_sdk.storage._sqlite_ddl import (
     _normalized_sql as _normalized_sql,
@@ -939,6 +940,7 @@ class SQLiteStore:
                     or _valid_confirmed_model_resolution_batch(batch)
                     or _valid_confirmed_model_terminalization_batch(batch)
                     or _valid_confirmed_tool_resolution_batch(batch)
+                    or _valid_terminate_resolution_batch(batch)
                 )
                 if resolution_batch:
                     await self._check_retry_resolution_requested_event(batch)
@@ -1024,6 +1026,7 @@ class SQLiteStore:
             or _valid_confirmed_model_resolution_batch(batch)
             or _valid_confirmed_model_terminalization_batch(batch)
             or _valid_confirmed_tool_resolution_batch(batch)
+            or _valid_terminate_resolution_batch(batch)
         )
         for event in batch.events:
             if event.session_id != run.session_id or event.run_id not in {
@@ -1100,6 +1103,7 @@ class SQLiteStore:
             _valid_confirmed_model_terminalization_batch(batch)
         )
         confirmed_tool_resolution = _valid_confirmed_tool_resolution_batch(batch)
+        terminate_resolution = _valid_terminate_resolution_batch(batch)
         if (
             batch.reconciliation is not None
             and batch.reconciliation.updated.resolution is not None
@@ -1110,6 +1114,14 @@ class SQLiteStore:
                 or confirmed_terminalization
                 or confirmed_tool_resolution
             )
+        ):
+            raise RecoveryStateConflictError
+        if (
+            batch.reconciliation is not None
+            and batch.reconciliation.updated.resolution is not None
+            and batch.reconciliation.updated.resolution.action
+            is ReconciliationAction.TERMINATE
+            and not terminate_resolution
         ):
             raise RecoveryStateConflictError
         if batch.operation is not None:

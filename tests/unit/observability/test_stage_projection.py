@@ -41,6 +41,26 @@ def _event(
     )
 
 
+def test_interrupted_run_and_child_can_reach_a_later_terminal_status() -> None:
+    stages = project_stages(
+        (
+            _event(1, "run.started", {"run_id": "run_1"}),
+            _event(2, "run.interrupted", {"run_id": "run_1"}),
+            _event(3, "run.failed", {"run_id": "run_1"}),
+            _event(4, "child.created", {"child_run_id": "run_child"}),
+            _event(5, "child.interrupted", {"child_run_id": "run_child"}),
+            _event(6, "child.failed", {"child_run_id": "run_child"}),
+        )
+    )
+
+    assert {
+        (stage.kind, stage.entity_id, stage.status) for stage in stages
+    } >= {
+        (TraceStageKind.RUN, "run_1", TraceStageStatus.FAILED),
+        (TraceStageKind.CHILD, "run_child", TraceStageStatus.FAILED),
+    }
+
+
 def test_projects_supported_events_by_stable_ids_in_first_evidence_order() -> None:
     events = (
         _event(1, "run.started", {"run_id": "run_1"}),

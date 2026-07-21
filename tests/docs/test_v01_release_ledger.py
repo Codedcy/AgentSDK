@@ -275,6 +275,13 @@ def test_v01_user_guides_state_public_flow_and_safety_boundaries() -> None:
     assert "0.1.0" in changelog
     assert "no exactly-once guarantee for external effects" in recovery
     assert "one SDK instance in one process" in recovery
+    for document in (readme, quickstart, recovery):
+        assert "ReconciliationAction.TERMINATE" in document
+        assert 'evidence={"reason":' in document
+        assert "application_resolution_aborted" in document
+        assert "reserved but not supported" not in document
+        assert "reserved but not implemented" not in document
+    assert "retry or abort" in changelog
     assert "deterministic correlation" in analysis
     assert "not causality" in analysis
     assert "aggregate Tool usefulness" in analysis

@@ -9,7 +9,8 @@
 - Added validated, explicitly started Workflows with conditions and bounded loops.
 - Added live subscriptions, normalized historical Trace, deterministic per-Run
   attribution, evaluation, success rate, and Tool failure metrics.
-- Added explicit interrupted-work reconciliation and Session deletion that keeps
+- Added explicit interrupted-work reconciliation with application-selected
+  retry or abort; abort terminally fails the Run without replay. Session deletion keeps
   application workspace files.
 
 This entry describes the v0.1 contract; packaging/version finalization is handled
