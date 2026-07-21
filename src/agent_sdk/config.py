@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_sdk.permissions.rules import PermissionRule
+from agent_sdk.subagents.models import ChildLimits
 
 
 class CaptureLevel(StrEnum):
@@ -23,3 +24,4 @@ class AgentSDKConfig(BaseModel):
     skill_roots: tuple[Path, ...] = ()
     enable_builtin_tools: bool = True
     builtin_tool_output_bytes: int = Field(default=64 * 1024, ge=1024)
+    child_limits: ChildLimits = Field(default_factory=ChildLimits)

@@ -21,6 +21,7 @@ from agent_sdk.tools.models import ToolResult
 from agent_sdk.tools.builtins.workspace import canonical_workspace_scope
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.runtime.execution import ExecutionDescriptor
+from agent_sdk.runtime.failures import RunFailure as RunFailure
 
 
 def intersect_names(
@@ -180,14 +181,6 @@ class RunResult(BaseModel):
     output_text: str
     usage: TokenUsage
     tool_results: tuple[ToolResult, ...] = ()
-
-
-class RunFailure(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    code: str
-    message: str
-    retryable: bool
 
 
 class SessionSnapshot(BaseModel):

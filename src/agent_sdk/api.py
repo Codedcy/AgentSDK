@@ -83,6 +83,15 @@ from agent_sdk.storage.base import (
 )
 from agent_sdk.storage.idempotency import IdempotencyRecord
 from agent_sdk.storage.sqlite import SQLiteStore
+from agent_sdk.subagents.coordinator import ChildCoordinator
+from agent_sdk.subagents.mailbox import MailboxService
+from agent_sdk.subagents.models import (
+    AgentMessage,
+    ChildLimits,
+    ChildProgress,
+    ChildWaitResult,
+    TaskEnvelope,
+)
 from agent_sdk.tools.registry import ToolRegistry
 from agent_sdk.tools.builtins.registration import register_builtin_tools
 from agent_sdk.workflow import (
@@ -673,6 +682,63 @@ class RunAPI:
         return snapshot
 
 
+class ChildAPI:
+    def __init__(
+        self,
+        coordinator: ChildCoordinator,
+        mailbox: MailboxService,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._coordinator = coordinator
+        self._mailbox = mailbox
+        self._lifecycle = lifecycle
+
+    async def spawn(
+        self,
+        parent_run_id: str,
+        agent_revision: str,
+        task: TaskEnvelope,
+    ) -> RunSnapshot:
+        async with self._lifecycle.admit():
+            return await self._coordinator.spawn(
+                parent_run_id,
+                agent_revision,
+                task,
+            )
+
+    async def send_message(
+        self,
+        sender_run_id: str,
+        target_run_id: str,
+        content: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> AgentMessage:
+        async with self._lifecycle.admit():
+            return await self._mailbox.send(
+                sender_run_id,
+                target_run_id,
+                content,
+                idempotency_key=idempotency_key,
+            )
+
+    async def wait(
+        self,
+        child_run_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> ChildWaitResult:
+        async with self._lifecycle.admit():
+            return await self._coordinator.wait(
+                child_run_id,
+                timeout_seconds=timeout_seconds,
+            )
+
+    async def list(self, parent_run_id: str) -> tuple[ChildProgress, ...]:
+        async with self._lifecycle.admit():
+            return await self._coordinator.list(parent_run_id)
+
+
 class RecoveryAPI:
     def __init__(
         self,
@@ -1025,6 +1091,7 @@ class AgentSDK:
             skill_roots=config.skill_roots,
             enable_builtin_tools=config.enable_builtin_tools,
             builtin_tool_output_bytes=config.builtin_tool_output_bytes,
+            child_limits=config.child_limits,
             permission_bridge=InProcessPermissionBridge(),
             owned_close=store.close,
             provider_recovery_timeout_seconds=30.0,
@@ -1042,6 +1109,7 @@ class AgentSDK:
         skill_roots: tuple[str | Path, ...] = (),
         enable_builtin_tools: bool = True,
         builtin_tool_output_bytes: int = 64 * 1024,
+        child_limits: ChildLimits | None = None,
         permission_bridge: InProcessPermissionBridge | None | object = (
             _DEFAULT_PERMISSION_BRIDGE
         ),
@@ -1077,6 +1145,7 @@ class AgentSDK:
             skill_roots=tuple(Path(root) for root in skill_roots),
             enable_builtin_tools=enable_builtin_tools,
             builtin_tool_output_bytes=builtin_tool_output_bytes,
+            child_limits=child_limits or ChildLimits(),
             permission_bridge=bridge,
             owned_close=owned_close,
             provider_recovery_timeout_seconds=provider_recovery_timeout_seconds,
@@ -1093,6 +1162,7 @@ class AgentSDK:
         skill_roots: tuple[Path, ...],
         enable_builtin_tools: bool,
         builtin_tool_output_bytes: int,
+        child_limits: ChildLimits,
         permission_bridge: InProcessPermissionBridge | None,
         owned_close: Callable[[], Awaitable[None]] | None,
         provider_recovery_timeout_seconds: float,
@@ -1125,6 +1195,16 @@ class AgentSDK:
         )
         agents = AgentRegistry()
         recovery_scanner = RecoveryScanner(store)
+        children = ChildCoordinator(
+            store,
+            commands,
+            engine,
+            agents,
+            tools=tools,
+            policy=policy,
+            limits=child_limits,
+            track_task=self._track_task,
+        )
         workflows = WorkflowExecutor(
             store,
             commands,
@@ -1135,6 +1215,7 @@ class AgentSDK:
             policy=policy,
             track_run_task=self._track_task,
             track_workflow_task=self._track_task,
+            child_coordinator=children,
         )
         self.tools = tools
         self.skills = skills
@@ -1149,6 +1230,11 @@ class AgentSDK:
             self._lifecycle,
             tools,
             policy,
+        )
+        self.children = ChildAPI(
+            children,
+            MailboxService(store),
+            self._lifecycle,
         )
         self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)
@@ -1173,6 +1259,7 @@ class AgentSDK:
             provider_recovery_timeout_seconds,
             workflows,
         )
+        children.set_recover_run(self.recovery._recover_run_handle)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

@@ -39,7 +39,8 @@ from agent_sdk.storage.base import (
 )
 from agent_sdk.storage.idempotency import IdempotencyError
 from agent_sdk.subagents.models import TaskEnvelope
-from agent_sdk.subagents.service import SubagentService, render_task_envelope
+from agent_sdk.subagents.coordinator import ChildCoordinator
+from agent_sdk.subagents.service import render_task_envelope
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.handles import WorkflowHandle
 from agent_sdk.workflow.models import (
@@ -96,6 +97,7 @@ class WorkflowExecutor:
         policy: PolicyEngine | None = None,
         track_run_task: Callable[[asyncio.Task[RunResult]], None] | None = None,
         track_workflow_task: Callable[[asyncio.Task[WorkflowResult]], None] | None = None,
+        child_coordinator: ChildCoordinator | None = None,
     ) -> None:
         self._store = store
         self._commands = commands
@@ -105,7 +107,7 @@ class WorkflowExecutor:
         self._tool_schemas = tool_schemas or (lambda: ())
         self._tool_specs = tool_specs or (lambda: ())
         self._policy = policy or PolicyEngine()
-        self._subagents = SubagentService(
+        self._children = child_coordinator or ChildCoordinator(
             store,
             commands,
             engine,
@@ -474,6 +476,11 @@ class WorkflowExecutor:
                 run_id,
                 expected_descriptor,
             )
+            expected_descriptor = self._selected_execution_descriptor(
+                node,
+                run,
+                expected_descriptor,
+            )
             if not _related_run_matches(
                 snapshot,
                 index,
@@ -488,9 +495,11 @@ class WorkflowExecutor:
                 ) from None
 
             if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
-                handle = await recover_run(run_id)
                 try:
-                    await handle.result()
+                    if node.run_as == "child":
+                        await self._children.await_result(run_id)
+                    else:
+                        await (await recover_run(run_id)).result()
                 except AgentSDKError as error:
                     run = await self._load_selected_run(run_id)
                     if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
@@ -586,6 +595,23 @@ class WorkflowExecutor:
         )
         return self._execution_descriptor(agent, message)
 
+    @staticmethod
+    def _selected_execution_descriptor(
+        node: AgentNode,
+        run: RunSnapshot,
+        default: ExecutionDescriptor,
+    ) -> ExecutionDescriptor:
+        if node.run_as != "child":
+            return default
+        descriptor = run.execution_descriptor
+        if descriptor is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "child run execution descriptor is missing",
+                retryable=False,
+            )
+        return descriptor
+
     async def _ensure_selected_run(
         self,
         snapshot: WorkflowRunSnapshot,
@@ -616,41 +642,58 @@ class WorkflowExecutor:
             )
             creation_error: tuple[ErrorCode, str, bool] | None = None
             try:
-                await self._commands.start_run(
-                    snapshot.session_id,
-                    run_id=run_id,
-                    agent_revision=node.agent_revision,
-                    user_input=user_input,
-                    parent_run_id=parent_run_id,
-                    workflow_run_id=snapshot.workflow_run_id,
-                    workflow_node_id=node.id,
-                    workflow_node_execution=(
-                        snapshot.nodes[index].execution_count
-                        if snapshot.workflow.schema_version == 2
-                        else None
-                    ),
-                    task_envelope=envelope,
-                    execution_descriptor=execution_descriptor,
-                    idempotency_key=(
-                        (
-                            "workflow-node:"
-                            f"{snapshot.workflow_run_id}:{node.id}:"
-                            f"{snapshot.nodes[index].execution_count}"
+                if envelope is not None:
+                    assert parent_run_id is not None
+                    await self._children.spawn(
+                        parent_run_id=parent_run_id,
+                        agent_revision=node.agent_revision,
+                        task=envelope,
+                        session_id=snapshot.session_id,
+                        run_id=run_id,
+                        workflow_run_id=snapshot.workflow_run_id,
+                        workflow_node_id=node.id,
+                        workflow_node_execution=(
+                            snapshot.nodes[index].execution_count
                             if snapshot.workflow.schema_version == 2
-                            else (
+                            else None
+                        ),
+                    )
+                else:
+                    await self._commands.start_run(
+                        snapshot.session_id,
+                        run_id=run_id,
+                        agent_revision=node.agent_revision,
+                        user_input=user_input,
+                        parent_run_id=parent_run_id,
+                        workflow_run_id=snapshot.workflow_run_id,
+                        workflow_node_id=node.id,
+                        workflow_node_execution=(
+                            snapshot.nodes[index].execution_count
+                            if snapshot.workflow.schema_version == 2
+                            else None
+                        ),
+                        task_envelope=envelope,
+                        execution_descriptor=execution_descriptor,
+                        idempotency_key=(
+                            (
                                 "workflow-node:"
-                                f"{snapshot.workflow_run_id}:{node.id}"
+                                f"{snapshot.workflow_run_id}:{node.id}:"
+                                f"{snapshot.nodes[index].execution_count}"
+                                if snapshot.workflow.schema_version == 2
+                                else (
+                                    "workflow-node:"
+                                    f"{snapshot.workflow_run_id}:{node.id}"
+                                )
                             )
-                        )
-                        if use_idempotency
-                        else None
-                    ),
-                    related_preconditions=(
-                        ()
-                        if parent is None
-                        else (_exact_run_precondition(parent),)
-                    ),
-                )
+                            if use_idempotency
+                            else None
+                        ),
+                        related_preconditions=(
+                            ()
+                            if parent is None
+                            else (_exact_run_precondition(parent),)
+                        ),
+                    )
             except AgentSDKError as error:
                 creation_error = (error.code, error.message, error.retryable)
             except Exception:
@@ -693,18 +736,20 @@ class WorkflowExecutor:
         previous_node = snapshot.workflow.nodes[identity.node_index]
         previous_projection = snapshot.nodes[identity.node_index]
         parent = await _load_run(self._store, identity.run_id)
-        expected_descriptor = self._node_execution_descriptor(previous_node)
-        if (
-            not isinstance(parent, RunSnapshot)
-            or parent.status is not RunStatus.COMPLETED
-            or not _historical_parent_run_matches(
+        if not isinstance(parent, RunSnapshot) or parent.status is not RunStatus.COMPLETED:
+            raise _invalid_parent_run()
+        expected_descriptor = self._selected_execution_descriptor(
+            previous_node,
+            parent,
+            self._node_execution_descriptor(previous_node),
+        )
+        if not _historical_parent_run_matches(
                 snapshot,
                 identity,
                 previous_node,
                 parent,
                 expected_descriptor=expected_descriptor,
-            )
-        ):
+            ):
             raise _invalid_parent_run()
         if (
             previous_projection.run_id == identity.run_id
@@ -1086,6 +1131,7 @@ class WorkflowExecutor:
             run_id,
             descriptor,
         )
+        descriptor = self._selected_execution_descriptor(node, run, descriptor)
         if not _related_run_matches(
             snapshot,
             index,
@@ -1099,9 +1145,11 @@ class WorkflowExecutor:
                 retryable=False,
             )
         if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
-            handle = await recover_run(run_id)
             try:
-                await handle.result()
+                if node.run_as == "child":
+                    await self._children.await_result(run_id)
+                else:
+                    await (await recover_run(run_id)).result()
             except AgentSDKError as error:
                 run = await self._load_selected_run(run_id)
                 if run.status not in {RunStatus.COMPLETED, RunStatus.FAILED}:
@@ -1299,7 +1347,7 @@ class WorkflowExecutor:
             parent_run_id = _parent_run_id(snapshot, index)
             task_envelope = _task_envelope(node)
             outcome = await _spawn_child(
-                self._subagents,
+                self._children,
                 session_id=snapshot.session_id,
                 run_id=run_id,
                 parent_run_id=parent_run_id,
@@ -1357,6 +1405,7 @@ class WorkflowExecutor:
                 descriptor,
                 use_idempotency=False,
             )
+            descriptor = self._selected_execution_descriptor(node, run, descriptor)
         except AgentSDKError as failure:
             return _RunFailure(failure.code, failure.message)
         except Exception:
@@ -1372,6 +1421,18 @@ class WorkflowExecutor:
                 ErrorCode.INVALID_STATE,
                 "related run does not match workflow node",
             )
+        if node.run_as == "child":
+            try:
+                child = await self._children.await_result(run_id)
+                return RunResult(
+                    run_id=child.run_id,
+                    output_text=child.output_text,
+                    usage=TokenUsage.model_validate(child.usage.model_dump()),
+                )
+            except AgentSDKError as failure:
+                return _RunFailure(failure.code, failure.message)
+            except Exception:
+                return _RunFailure(ErrorCode.INTERNAL, "child execution failed")
         return await self._recover_normal_run(run_id)
 
     async def _recover_normal_run(
@@ -1505,7 +1566,7 @@ async def _create_run(
 
 
 async def _spawn_child(
-    service: SubagentService,
+    service: ChildCoordinator,
     **values: Any,
 ) -> Any:
     try:

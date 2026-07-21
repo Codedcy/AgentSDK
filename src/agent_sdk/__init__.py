@@ -3,6 +3,7 @@ from agent_sdk.api import (
     AgentAPI,
     AgentSDK,
     AnalyticsAPI,
+    ChildAPI,
     ContextAPI,
     EvaluationAPI,
     EventAPI,
@@ -91,7 +92,17 @@ from agent_sdk.runtime.reconciliation import (
     ReconciliationService,
 )
 from agent_sdk.skills import ActivatedSkill, SkillMetadata, SkillRegistry
-from agent_sdk.subagents import ChildResult, ChildUsage, SubagentService, TaskEnvelope
+from agent_sdk.subagents import (
+    AgentMessage,
+    ChildCoordinator,
+    ChildLimits,
+    ChildProgress,
+    ChildResult,
+    ChildUsage,
+    ChildWaitResult,
+    SubagentService,
+    TaskEnvelope,
+)
 from agent_sdk.tools import (
     ToolContext,
     ToolRegistry,
@@ -127,8 +138,14 @@ __all__ = [
     "AnalyticsQueries",
     "AnalyticsResult",
     "CaptureLevel",
+    "ChildAPI",
+    "ChildCoordinator",
+    "ChildLimits",
+    "ChildProgress",
     "ChildResult",
     "ChildUsage",
+    "ChildWaitResult",
+    "AgentMessage",
     "CompactionLevel",
     "CompactionPolicy",
     "ContextAPI",
