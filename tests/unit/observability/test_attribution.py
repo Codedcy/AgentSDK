@@ -440,6 +440,26 @@ def test_interrupted_unknown_external_operation_is_visible_as_fixed_hint() -> No
     assert "interrupted_external_work" in {hint.code for hint in summary.hints}
 
 
+def test_interrupted_in_flight_tool_is_supporting_without_unused_result() -> None:
+    events = (
+        _event(1, "run.started", {"run_id": "run_root"}),
+        _event(
+            2,
+            "tool.call.started",
+            {"call_id": "external-tool", "tool_name": "lookup"},
+        ),
+        _event(3, "run.interrupted", {"run_id": "run_root", "status": "interrupted"}),
+    )
+
+    summary = _summary(events, RunStatus.INTERRUPTED)
+    tool = _contributor(summary.contributors, "external-tool")
+
+    assert tool.status == "running"
+    assert tool.disposition == "supporting"
+    assert "unused_tool_output" not in {hint.code for hint in summary.hints}
+    assert "interrupted_external_work" in {hint.code for hint in summary.hints}
+
+
 def test_explicit_evaluation_pass_fail_and_unknown_are_preserved() -> None:
     events = [
         _event(1, "run.started", {"run_id": "run_root"}),

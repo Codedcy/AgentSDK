@@ -30,6 +30,15 @@ _FAILING_STATUSES = frozenset(
         TraceStageStatus.INTERRUPTED,
     }
 )
+_TERMINAL_STATUSES = frozenset(
+    {
+        TraceStageStatus.COMPLETED,
+        TraceStageStatus.FAILED,
+        TraceStageStatus.DENIED,
+        TraceStageStatus.TIMED_OUT,
+        TraceStageStatus.INTERRUPTED,
+    }
+)
 _TOOL_FAILURE_STATUSES = frozenset({"denied", "failed", "invalid_arguments", "timed_out"})
 _HINT_SUMMARIES: Mapping[ImprovementHintCode, str] = {
     "repeated_tool_failure": "The same Tool failed more than once.",
@@ -622,6 +631,8 @@ def _terminal_event(
     stage: TraceStage,
     event_by_cursor: Mapping[int, ObservedEvent],
 ) -> ObservedEvent | None:
+    if stage.status not in _TERMINAL_STATUSES:
+        return None
     return event_by_cursor.get(stage.last_cursor)
 
 
