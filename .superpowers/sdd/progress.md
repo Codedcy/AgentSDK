@@ -395,17 +395,20 @@ v0.1 R5 Task 3: complete (commits `27e9717`, `d4590b4`; final independent review
 v0.1 R5 Task 3 locked existing success-rate and Tool-failure formulas, filters, missing/sample counts, fixed-high-water evidence pagination, Session deletion cleanup, and real interrupted unused-Tool attribution for Memory and SQLite without production changes.
 v0.1 R5 Task 3 final controller gate: Memory/SQLite contract 2 passed; expanded analytics/evaluation/attribution 56 passed; Ruff, strict mypy, and diff-check clean.
 v0.1 current implementation status: R0-R4 and R5 Tasks 1-3 completed; R5 Task 4 pending.
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\e2e\test_v01_release.py tests\e2e\test_v01_reference_example.py tests\docs -q`
-v0.1 R5 Task 5: complete (version finalization working tree; release commit `release: finalize agent sdk 0.1.0`; R5 Task 6 pending and not completed).
+v0.1 R5 Task 5: complete (release commit `1476554`, `release: finalize agent sdk 0.1.0`).
 v0.1 R5 Task 5 pre-version final gate: Python 3.13 2,953 passed, 6 skipped, 0 failed in 529.64s; whole-repository Ruff passed; exact strict mypy passed across 107 source files; official CPython 3.12.10 exact critical gate 80 passed, 0 skipped in 93.36s; clean dev-wheel install and expanded reference smoke passed with source leakage false.
-v0.1 R5 Task 5 whole-review disposition: all four blockers closed; final narrow review at `d59f28f` reported C0 / I0 / M0 APPROVE.
+v0.1 R5 Task 5 whole-review disposition: all four blockers closed; final narrow review at `d59f28f` reported C0 / I0 / M0 APPROVE; metadata review at release commit `1476554` reported C0 / I0 / M1 APPROVE.
 v0.1 R5 Task 5 version contract: `pyproject.toml`, public `agent_sdk.__version__`, and `agent_sdk.__all__` expose `0.1.0`; CHANGELOG date is 2026-07-22.
 v0.1 R5 Task 5 Final 0.1.0 wheel SHA256: `6D5E223373D306EEAFAED73F45E8D1B59C2ABD7492A4351BDBB8BCAF44B6536C` (305,654 bytes); final sdist SHA256: `056AF875C8810B8DFFA7CF390E8888A1B1438A6413BB4FA9C4F46E2D62DD5615` (11,022,476 bytes).
 v0.1 R5 Task 5 fresh official CPython 3.12.10 final-wheel gate: installed outside the repository with `PYTHONPATH` cleared; metadata/public version `0.1.0`; `py.typed` and general/coding prompts present; source leakage false; expanded reference smoke passed with L0-L4, condition `then`, loop iterations 2, message count 2, Child result consumed, Trace stages 32, safe reopen, Session deletion, and workspace preservation.
-v0.1 R5 Task 5 boundaries: no tag, publish, merge, or push. R5 Task 6 pending.
+v0.1 R5 Task 5 metadata-review Minor: stale Task 5 pending/resume state in this ledger; Minor resolved by Task 6 status cleanup.
+v0.1 R5 Task 5 boundaries: no tag, publish, merge, or push.
 v0.1 R5 Task 4: complete (implementation `85d4ba2`; review hardening `7b1e241`; final independent review Critical 0 / Important 0 / Minor 0; Spec approved / Quality approved).
 v0.1 R5 Task 4 delivered `examples/v01_reference.py`, a no-network subprocess smoke whose JSON is derived from real public Run/Workflow/Child/Context/Trace/Evaluation/Attribution results, expanded release Trace/analysis evidence, and README/CHANGELOG/quickstart/recovery/tracing-analysis documentation.
 v0.1 R5 Task 4 boundaries: normal reference mode constructs `AgentSDK(AgentSDKConfig(database_path=...))` and relies on application-environment LiteLLM credentials; recovery explicitly has no exactly-once guarantee for external effects and is limited to one SDK instance in one process; attribution is deterministic correlation, not causality; aggregate Tool usefulness and multidimensional failure analysis remain deferred.
 v0.1 R5 Task 4 final controller gate: release/subprocess/docs 6 passed; no-network smoke returned one real JSON line; Ruff, strict mypy for the reference and changed fixture, and diff-check clean.
-v0.1 current implementation status: R0-R4 and R5 Tasks 1-4 completed; R5 Task 5 pending. Task 4 does not change version, tag, or publish.
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\e2e\test_v01_release.py tests\e2e\test_v01_reference_example.py tests\docs -q`
+v0.1 R5 Task 6: complete (documentation-only final checkpoint; no runtime scope added).
+v0.1 final checkpoint: complete on 2026-07-22; R0-R5 completed; release commit `1476554`; package version `0.1.0`.
+v0.1 Task 6 executable-marker audit: no pytest skip/xfail/TODO/TBD release phase; Workflow node identifier `skipped` is conditional-branch domain language, not a skipped test or acceptance phase.
+v0.2 first recommended task: Aggregate Trace analysis across repeated Agent executions, including success rate, failure reasons and stages, result attribution, Tool failure rate and useless-result identification. This explicit user requirement was intentionally deferred from v0.1.
+v0.2 retained hardening backlog after the first task: workspace authorization TOCTOU, Tool handler cancellation containment, bounded/indexed Context scans, and the remaining compatibility/performance work. No v0.2 implementation was added by this checkpoint.
