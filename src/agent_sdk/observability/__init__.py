@@ -6,9 +6,15 @@ from .models import (
     ObservedEvent,
     ObservedRun,
     RunTimeline,
+    TraceStage,
+    TraceStageKind,
+    TraceStageStatus,
+    TraceTimeline,
 )
 from .queries import QueryService
+from .stages import RULES, StageEventRule, project_stages
 from .subscriptions import SubscriptionService
+from .trace import TraceService
 
 __all__ = [
     "EventFilter",
@@ -20,4 +26,12 @@ __all__ = [
     "QueryService",
     "RunTimeline",
     "SubscriptionService",
+    "RULES",
+    "StageEventRule",
+    "TraceService",
+    "TraceStage",
+    "TraceStageKind",
+    "TraceStageStatus",
+    "TraceTimeline",
+    "project_stages",
 ]

@@ -34,6 +34,7 @@ from agent_sdk.runtime.engine import (
     _tool_base_recovery_metadata,
     _tool_request_fingerprint,
 )
+from agent_sdk.runtime.event_contracts import normalize_stage_events_for_recovery
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
@@ -3019,6 +3020,10 @@ class RunRecoveryService:
         events_match_session = all(
             stored.event.session_id == run.session_id for stored in events
         )
+        normalized_run_events = normalize_stage_events_for_recovery(
+            tuple(stored.event for stored in run_records),
+            operations,
+        )
         return _RecoveryEvidence(
             run=run,
             session=session,
@@ -3026,7 +3031,11 @@ class RunRecoveryService:
             operations=operations,
             pending=pending,
             reconciliations=reconciliations,
-            run_events=tuple(stored.event for stored in run_records),
+            run_events=(
+                tuple(stored.event for stored in run_records)
+                if normalized_run_events is None
+                else normalized_run_events
+            ),
             run_event_cursors=tuple(stored.cursor for stored in run_records),
             session_lifecycle_events=tuple(
                 stored.event for stored in session_lifecycle_records
@@ -3035,7 +3044,9 @@ class RunRecoveryService:
                 stored.cursor for stored in session_lifecycle_records
             ),
             run_event_ids_unique=(
-                events_match_session and len(event_ids) == len(set(event_ids))
+                events_match_session
+                and normalized_run_events is not None
+                and len(event_ids) == len(set(event_ids))
             ),
         )
 
@@ -7581,7 +7592,13 @@ class RunRecoveryService:
             ):
                 raise RecoveryStateConflictError
             sequence = await self._store.latest_run_event_sequence(run.run_id)
-            if sequence is None:
+            step_ids = {
+                operation.operation_id
+                for operation in evidence.operations
+                if isinstance(operation, ModelCallOperation)
+                and operation.turn == checkpoint.turn
+            }
+            if sequence is None or len(step_ids) != 1:
                 raise RecoveryStateConflictError
             return await self._engine.resume_pending_permission(
                 run,
@@ -7592,6 +7609,7 @@ class RunRecoveryService:
                 certified.request,
                 base_request,
                 lease,
+                step_id=step_ids.pop(),
                 sequence=sequence + 1,
             )
         except asyncio.CancelledError:
@@ -7740,7 +7758,13 @@ class RunRecoveryService:
                     linked.operation_id,
                 )
             sequence = await self._store.latest_run_event_sequence(run.run_id)
-            if sequence is None:
+            step_ids = {
+                operation.operation_id
+                for operation in evidence.operations
+                if isinstance(operation, ModelCallOperation)
+                and operation.turn == checkpoint.turn
+            }
+            if sequence is None or len(step_ids) != 1:
                 raise RecoveryStateConflictError
             try:
                 return await self._engine.resume_recovered_tool(
@@ -7752,6 +7776,7 @@ class RunRecoveryService:
                     certified.registered,
                     base_request,
                     lease,
+                    step_id=step_ids.pop(),
                     sequence=sequence + 1,
                 )
             except RecoveryStateConflictError:

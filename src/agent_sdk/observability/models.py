@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
+from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
@@ -81,3 +83,60 @@ class ExecutionTree(BaseModel):
     root_run_id: str
     nodes: tuple[ExecutionTreeNode, ...]
     as_of_cursor: int = Field(ge=0)
+
+
+class TraceStageKind(StrEnum):
+    RUN = "run"
+    STEP = "step"
+    CONTEXT = "context"
+    MODEL = "model"
+    TOOL = "tool"
+    PERMISSION = "permission"
+    WORKFLOW = "workflow"
+    WORKFLOW_NODE = "workflow_node"
+    CHILD = "child"
+    MESSAGE = "message"
+    EVALUATION = "evaluation"
+    RECOVERY = "recovery"
+
+
+class TraceStageStatus(StrEnum):
+    RUNNING = "running"
+    WAITING = "waiting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    DENIED = "denied"
+    TIMED_OUT = "timed_out"
+    INTERRUPTED = "interrupted"
+
+
+class TraceStage(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stage_id: str = Field(min_length=1, max_length=128)
+    kind: TraceStageKind
+    status: TraceStageStatus
+    entity_id: str = Field(min_length=1, max_length=256)
+    run_id: str | None = Field(default=None, max_length=256)
+    parent_stage_id: str | None = Field(default=None, max_length=128)
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    duration_ms: int | None = Field(default=None, ge=0)
+    first_cursor: int = Field(ge=1)
+    last_cursor: int = Field(ge=1)
+    usage: "TokenUsage | None" = None
+    evidence_event_ids: tuple[str, ...] = ()
+    evidence_cursors: tuple[int, ...] = ()
+
+
+class TraceTimeline(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    root_id: str = Field(min_length=1, max_length=256)
+    stages: tuple[TraceStage, ...]
+    as_of_cursor: int = Field(ge=0)
+
+
+from agent_sdk.runtime.models import TokenUsage  # noqa: E402
+
+TraceStage.model_rebuild()

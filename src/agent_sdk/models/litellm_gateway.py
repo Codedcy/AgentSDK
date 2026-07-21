@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
 from typing import Any, Generic, TypeAlias, TypeVar
 
 import litellm
@@ -34,16 +35,25 @@ class UsageReported:
     prompt_tokens: int | None
     completion_tokens: int | None
     total_tokens: int | None
+    cost_usd: float | None = None
 
-    def to_payload(self) -> dict[str, int | None]:
-        return {
+    def to_payload(self) -> dict[str, int | float | None]:
+        payload: dict[str, int | float | None] = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
         }
+        if self.cost_usd is not None:
+            payload["cost_usd"] = self.cost_usd
+        return payload
 
     def to_usage(self) -> TokenUsage:
-        return TokenUsage(**self.to_payload())
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.total_tokens,
+            cost_usd=self.cost_usd,
+        )
 
 
 _StructuredModel = TypeVar("_StructuredModel", bound=BaseModel)
@@ -106,6 +116,28 @@ def _optional_int(value: object) -> int | None:
     if value < 0:
         raise ValueError("usage token count must be non-negative")
     return value
+
+
+def _optional_cost(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    converted = float(value)
+    if not isfinite(converted) or converted < 0:
+        return None
+    return converted
+
+
+def _response_cost(response: object, raw_usage: object) -> float | None:
+    usage_cost = _value(raw_usage, "cost") if raw_usage is not None else None
+    if usage_cost is None and raw_usage is not None:
+        usage_cost = _value(raw_usage, "cost_usd")
+    hidden = _value(response, "_hidden_params")
+    provider_cost = _value(hidden, "response_cost") if hidden is not None else None
+    if usage_cost is not None:
+        return _optional_cost(usage_cost)
+    return _optional_cost(provider_cost)
 
 
 class LiteLLMGateway:
@@ -195,6 +227,7 @@ class LiteLLMGateway:
                     if raw_usage is not None
                     else None
                 ),
+                cost_usd=_response_cost(response, raw_usage),
             )
         except Exception:
             return _StructuredFailure.RESPONSE
@@ -248,6 +281,7 @@ class LiteLLMGateway:
                     prompt_tokens=_optional_int(_value(raw_usage, "prompt_tokens")),
                     completion_tokens=_optional_int(_value(raw_usage, "completion_tokens")),
                     total_tokens=_optional_int(_value(raw_usage, "total_tokens")),
+                    cost_usd=_response_cost(chunk, raw_usage),
                 )
 
         for index in sorted(tool_calls):

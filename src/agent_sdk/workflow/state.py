@@ -131,6 +131,7 @@ class WorkflowState:
             run_id=workflow_run_id,
             sequence=1,
             payload={
+                "workflow_run_id": workflow_run_id,
                 "definition_hash": workflow.definition_hash,
                 "name": workflow.name,
             },
@@ -315,6 +316,7 @@ class WorkflowState:
             }
         )
         payload: dict[str, object] = {
+            "workflow_run_id": snapshot.workflow_run_id,
             "node_id": node.node_id,
             "run_id": run_id,
         }
@@ -401,6 +403,7 @@ class WorkflowState:
             }
         )
         payload: dict[str, object] = {
+            "workflow_run_id": snapshot.workflow_run_id,
             "node_id": node.node_id,
             "run_id": node.run_id,
             "output_text": result.output_text,
@@ -442,7 +445,12 @@ class WorkflowState:
             index,
             node,
             "workflow.node.failed",
-            {"node_id": node.node_id, "run_id": node.run_id, "error": failure.model_dump()},
+            {
+                "workflow_run_id": snapshot.workflow_run_id,
+                "node_id": node.node_id,
+                "run_id": node.run_id,
+                "error": failure.model_dump(),
+            },
             related_preconditions=related_preconditions,
             recovery_evidence_precondition=recovery_evidence_precondition,
         )
@@ -472,6 +480,7 @@ class WorkflowState:
             completed,
             "workflow.completed",
             {
+                "workflow_run_id": snapshot.workflow_run_id,
                 "output_text": selected_output,
                 "usage": usage.model_dump(mode="json"),
             },
@@ -494,7 +503,10 @@ class WorkflowState:
             snapshot,
             failed,
             "workflow.failed",
-            {"error": failure.model_dump(mode="json")},
+            {
+                "workflow_run_id": snapshot.workflow_run_id,
+                "error": failure.model_dump(mode="json"),
+            },
         )
         return failed
 

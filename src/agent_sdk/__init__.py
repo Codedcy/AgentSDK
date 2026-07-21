@@ -12,6 +12,7 @@ from agent_sdk.api import (
     RecoveryAPI,
     RunAPI,
     SessionAPI,
+    TraceAPI,
     WorkflowAPI,
 )
 from agent_sdk.config import AgentSDKConfig, CaptureLevel
@@ -54,6 +55,11 @@ from agent_sdk.observability import (
     QueryService,
     RunTimeline,
     SubscriptionService,
+    TraceService,
+    TraceStage,
+    TraceStageKind,
+    TraceStageStatus,
+    TraceTimeline,
 )
 from agent_sdk.prompts import (
     BuiltPrompt,
@@ -213,6 +219,12 @@ __all__ = [
     "SubagentService",
     "SubscriptionService",
     "TaskEnvelope",
+    "TraceAPI",
+    "TraceService",
+    "TraceStage",
+    "TraceStageKind",
+    "TraceStageStatus",
+    "TraceTimeline",
     "StreamableHTTPMCPTransport",
     "TokenUsage",
     "ToolContext",

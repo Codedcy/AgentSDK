@@ -172,6 +172,12 @@ class TokenUsage(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cost_usd: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class RunResult(BaseModel):

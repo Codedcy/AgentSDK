@@ -31,6 +31,7 @@ from agent_sdk.runtime.execution import (
     ExecutionPolicyDescriptor,
     ToolCapabilityDescriptor,
 )
+from agent_sdk.runtime.event_contracts import stage_event_schema_version
 from agent_sdk.runtime.models import (
     RunFailure,
     RunResult,
@@ -120,6 +121,7 @@ class _RunEmitter:
         checkpoint: RunCheckpoint | None = None,
         sequence: int = 2,
         provider_recovery: ProviderRecoveryRegistry | None = None,
+        recovered_step_id: str | None = None,
     ) -> None:
         self._store = store
         self._run = run
@@ -134,6 +136,13 @@ class _RunEmitter:
         self._delta_bytes = 0
         self._timer: asyncio.Task[None] | None = None
         self._timer_error: BaseException | None = None
+        self._current_step_id: str | None = (
+            recovered_step_id
+            if recovered_step_id is not None
+            else checkpoint.operation_id
+            if checkpoint is not None and checkpoint.phase is RunCheckpointPhase.MODEL_IN_FLIGHT
+            else None
+        )
 
     @property
     def current_snapshot(self) -> RunSnapshot:
@@ -268,7 +277,11 @@ class _RunEmitter:
                     "operation_id": operation.operation_id,
                 }
             )
-            started_payload: dict[str, Any] = {"model": request.model}
+            started_payload: dict[str, Any] = {
+                "model": request.model,
+                "operation_id": operation.operation_id,
+                "step_id": operation.operation_id,
+            }
             if prepared_request is not None:
                 assert context_view_id is not None
                 assert prompt_manifest_id is not None
@@ -280,7 +293,7 @@ class _RunEmitter:
                     }
                 )
             events = (
-                self._new_event("step.started", {}),
+                self._new_event("step.started", {"step_id": operation.operation_id}),
                 self._new_event("model.call.started", started_payload, offset=1),
             )
             prepared_preconditions: tuple[SnapshotPrecondition, ...] = ()
@@ -316,6 +329,7 @@ class _RunEmitter:
             )
             self._checkpoint = checkpoint
             self._sequence += len(events)
+            self._current_step_id = operation.operation_id
             return operation
 
     async def complete_model(
@@ -327,7 +341,7 @@ class _RunEmitter:
         calls: list[ToolCallCompleted],
         operation_usage: TokenUsage,
         usage: TokenUsage,
-        usage_payload: dict[str, int | None] | None,
+        usage_payload: dict[str, int | float | None] | None,
         output_parts: list[str],
     ) -> None:
         async with self._lock:
@@ -381,8 +395,22 @@ class _RunEmitter:
             )
             event_specs: list[tuple[str, dict[str, Any]]] = []
             if usage_payload is not None:
-                event_specs.append(("model.usage.reported", usage_payload))
-            event_specs.append(("model.call.completed", {"finish_reason": finish_reason}))
+                event_specs.append(
+                    (
+                        "model.usage.reported",
+                        {"operation_id": operation.operation_id, **usage_payload},
+                    )
+                )
+            terminal_payload: dict[str, Any] = {
+                "operation_id": operation.operation_id,
+                "step_id": operation.operation_id,
+                "finish_reason": finish_reason,
+            }
+            if operation.context_view_id is not None:
+                terminal_payload["context_view_id"] = operation.context_view_id
+            if operation.prompt_manifest_id is not None:
+                terminal_payload["prompt_manifest_id"] = operation.prompt_manifest_id
+            event_specs.append(("model.call.completed", terminal_payload))
             events = tuple(
                 self._new_event(event_type, payload, offset=index)
                 for index, (event_type, payload) in enumerate(event_specs)
@@ -416,7 +444,15 @@ class _RunEmitter:
         async with self._lock:
             self._ensure_lease_current()
             assert self._checkpoint is not None
-            payload = {"error": failure.to_dict()}
+            payload: dict[str, Any] = {
+                "operation_id": operation.operation_id,
+                "step_id": operation.operation_id,
+                "error": failure.to_dict(),
+            }
+            if operation.context_view_id is not None:
+                payload["context_view_id"] = operation.context_view_id
+            if operation.prompt_manifest_id is not None:
+                payload["prompt_manifest_id"] = operation.prompt_manifest_id
             failed_operation = operation.model_copy(
                 update={
                     "status": ExternalOperationStatus.FAILED,
@@ -605,7 +641,21 @@ class _RunEmitter:
                     "tool_results": (*self._checkpoint.tool_results, result),
                 }
             )
-            event = self._new_event("tool.call.completed", result.model_dump(mode="json"))
+            event = self._new_event(
+                "tool.call.completed",
+                {
+                    **result.model_dump(mode="json"),
+                    "step_id": self._current_step_id,
+                },
+            )
+            event = event.model_copy(
+                update={
+                    "payload": {
+                        **event.payload,
+                        "result_event_id": event.event_id,
+                    }
+                }
+            )
             await _commit_progress(
                 self._store,
                 RunProgressBatch(
@@ -633,7 +683,12 @@ class _RunEmitter:
         async with self._lock:
             self._ensure_lease_current()
             self._raise_timer_error()
-            await self._emit_locked(event_type, payload or {}, snapshot=snapshot)
+            selected = dict(payload or {})
+            if event_type.startswith("step.") and self._current_step_id is not None:
+                selected.setdefault("step_id", self._current_step_id)
+            await self._emit_locked(event_type, selected, snapshot=snapshot)
+            if event_type in {"step.completed", "step.failed", "step.timed_out"}:
+                self._current_step_id = None
 
     async def transition(
         self,
@@ -901,6 +956,7 @@ class _RunEmitter:
         offset: int = 0,
     ) -> EventEnvelope:
         return EventEnvelope.new(
+            schema_version=stage_event_schema_version(event_type),
             type=event_type,
             session_id=self._run.session_id,
             run_id=self._run.run_id,
@@ -1149,6 +1205,7 @@ class RunEngine:
         request: ModelRequest,
         lease: Lease,
         *,
+        step_id: str,
         sequence: int,
     ) -> RunResult:
         catalog = self._validate_live_execution(run, request)
@@ -1162,6 +1219,7 @@ class RunEngine:
             sequence=sequence,
             recovery_session=session,
             recovered_tool=(operation, call, registered),
+            recovered_step_id=step_id,
         )
 
     async def resume_pending_permission(
@@ -1175,6 +1233,7 @@ class RunEngine:
         request: ModelRequest,
         lease: Lease,
         *,
+        step_id: str,
         sequence: int,
     ) -> RunResult:
         catalog = self._validate_live_execution(run, request)
@@ -1188,6 +1247,7 @@ class RunEngine:
             sequence=sequence,
             recovery_session=session,
             recovered_permission=(call, registered, permission_request),
+            recovered_step_id=step_id,
         )
 
     async def fail_recovered_model(
@@ -1459,6 +1519,7 @@ class RunEngine:
             PermissionRequest,
         ]
         | None = None,
+        recovered_step_id: str | None = None,
     ) -> RunResult:
         run_id = created.run_id
         emitter = _RunEmitter(
@@ -1470,6 +1531,7 @@ class RunEngine:
             checkpoint=checkpoint,
             sequence=sequence,
             provider_recovery=self._provider_recovery,
+            recovered_step_id=recovered_step_id,
         )
         if checkpoint is None:
             initial_messages = request.messages
@@ -1568,7 +1630,7 @@ class RunEngine:
                 step_usage = TokenUsage()
                 calls: list[ToolCallCompleted] = []
                 model_completed: ModelCompleted | None = None
-                usage_payload: dict[str, int | None] | None = None
+                usage_payload: dict[str, int | float | None] | None = None
                 if recovered_model is not None:
                     operation, recovered_result = recovered_model
                     recovered_model = None
@@ -1819,6 +1881,7 @@ class RunEngine:
                     RunStatus.WAITING_PERMISSION,
                     permission,
                     decision,
+                    call_id=call.call_id,
                 )
 
         try:
@@ -1837,6 +1900,7 @@ class RunEngine:
                         RunStatus.RUNNING,
                         permission,
                         decision,
+                        call_id=call.call_id,
                     )
                 ),
                 on_before_handler=before_handler,
@@ -2056,9 +2120,13 @@ class RunEngine:
         status: RunStatus,
         request: PermissionRequest,
         decision: PermissionDecision | None,
+        *,
+        call_id: str,
     ) -> None:
         payload: dict[str, Any] = {
             "request": request.model_dump(mode="json"),
+            "request_id": request.request_id,
+            "call_id": call_id,
         }
         if decision is not None:
             payload["decision"] = decision.model_dump(mode="json")
@@ -2218,6 +2286,13 @@ def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
         prompt_tokens=add(left.prompt_tokens, right.prompt_tokens),
         completion_tokens=add(left.completion_tokens, right.completion_tokens),
         total_tokens=add(left.total_tokens, right.total_tokens),
+        cost_usd=(
+            right.cost_usd
+            if left.cost_usd is None
+            else left.cost_usd
+            if right.cost_usd is None
+            else left.cost_usd + right.cost_usd
+        ),
     )
 
 

@@ -37,6 +37,8 @@ from agent_sdk.observability import (
     QueryService,
     RunTimeline,
     SubscriptionService,
+    TraceService,
+    TraceTimeline,
 )
 from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.execution import (
@@ -1002,6 +1004,30 @@ class EventAPI:
         return self._subscriptions.subscribe(filters=filters, cursor=cursor)
 
 
+class TraceAPI:
+    def __init__(
+        self,
+        traces: TraceService,
+        subscriptions: SubscriptionService,
+        lifecycle: _SDKLifecycle,
+    ) -> None:
+        self._traces = traces
+        self._subscriptions = subscriptions
+        self._lifecycle = lifecycle
+
+    async def timeline(self, root_id: str) -> TraceTimeline:
+        async with self._lifecycle.admit():
+            return await self._traces.timeline(root_id)
+
+    def subscribe(
+        self,
+        *,
+        filters: EventFilter | None = None,
+        cursor: int = 0,
+    ) -> AsyncIterator[ObservedEvent]:
+        return self._subscriptions.subscribe(filters=filters, cursor=cursor)
+
+
 class EvaluationAPI:
     def __init__(
         self,
@@ -1247,9 +1273,12 @@ class AgentSDK:
         self.context = ContextAPI(store, models, self._lifecycle)
         self.workflows = WorkflowAPI(workflows, WorkflowCompiler(), self._lifecycle)
         self.queries = QueryAPI(QueryService(store), self._lifecycle)
-        self.events = EventAPI(
-            SubscriptionService(store, close_signal=self._lifecycle.close_signal)
+        subscriptions = SubscriptionService(
+            store,
+            close_signal=self._lifecycle.close_signal,
         )
+        self.events = EventAPI(subscriptions)
+        self.trace = TraceAPI(TraceService(store), subscriptions, self._lifecycle)
         self.evaluations = EvaluationAPI(EvaluationEngine(store), self._lifecycle)
         self.analytics = AnalyticsAPI(AnalyticsQueries(store), self._lifecycle)
         self._recovery_scanner = recovery_scanner
