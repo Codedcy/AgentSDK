@@ -12,15 +12,29 @@ def resolve_workspace_path(
     requested: str | Path,
     *,
     for_write: bool,
+    containment_roots: Sequence[Path] | None = None,
 ) -> Path:
     """Resolve a path while keeping it inside one configured workspace root."""
     if not roots:
         raise ToolAccessDenied("session has no workspace")
 
     candidate = _validated_path(requested)
+    try:
+        canonical_containment = (
+            ()
+            if containment_roots is None
+            else tuple(Path(root).resolve(strict=True) for root in containment_roots)
+        )
+    except (OSError, RuntimeError) as error:
+        raise ToolAccessDenied("path is outside configured workspace") from error
     for root in roots:
         try:
             canonical_root = Path(root).resolve(strict=True)
+            if canonical_containment and not any(
+                canonical_root.is_relative_to(ancestor)
+                for ancestor in canonical_containment
+            ):
+                continue
             raw = candidate if candidate.is_absolute() else canonical_root / candidate
             canonical = (
                 _resolve_with_existing_parent(raw)
@@ -29,7 +43,10 @@ def resolve_workspace_path(
             )
         except (OSError, RuntimeError):
             continue
-        if canonical.is_relative_to(canonical_root):
+        if canonical.is_relative_to(canonical_root) and (
+            not canonical_containment
+            or any(canonical.is_relative_to(ancestor) for ancestor in canonical_containment)
+        ):
             return canonical
 
     if not for_write and not candidate.is_absolute():

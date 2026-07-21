@@ -392,3 +392,84 @@ async def test_run_workspace_scope_rejects_a_symlink_redirected_outside(
 
     with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
         await workspace_roots(store, session.session_id, run_id=run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_run_workspace_scope_rejects_relative_descriptor_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    root.mkdir()
+    monkeypatch.chdir(root)
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+    run = _current_run(
+        run_id="run_relative_scope",
+        session_id=session.session_id,
+        workspace_scopes=("child",),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run.run_id,
+                    run.session_id,
+                    run.version,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id=run.run_id)
+
+
+@pytest.mark.asyncio
+async def test_final_workspace_resolution_rechecks_scope_after_redirect(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    child = root / "child"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    child.mkdir()
+    outside.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+    run = _current_run(
+        run_id="run_redirect_between_checks",
+        session_id=session.session_id,
+        workspace_scopes=(str(child),),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run.run_id,
+                    run.session_id,
+                    run.version,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    scopes = await workspace_roots(store, session.session_id, run_id=run.run_id)
+    child.rmdir()
+    try:
+        child.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ToolAccessDenied, match="outside configured workspace"):
+        resolve_workspace_path(
+            scopes,
+            "secret.txt",
+            for_write=True,
+            containment_roots=(root,),
+        )

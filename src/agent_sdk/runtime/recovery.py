@@ -3067,7 +3067,7 @@ class RunRecoveryService:
             or type(event.schema_version) is not int
             or (
                 event.type == "run.created"
-                and event.schema_version not in {1, 2}
+                and event.schema_version not in {1, 2, 3}
             )
             or (
                 event.type != "run.created"

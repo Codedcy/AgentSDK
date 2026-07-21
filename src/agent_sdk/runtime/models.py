@@ -408,11 +408,13 @@ def run_created_event_matches(
             )
             historical = RunSnapshot.model_validate(dict(payload))
             return historical == created
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             historical_event = RunCreatedEventPayload.model_validate(dict(payload))
             current = RunCreatedEventPayload.from_snapshot(snapshot)
             if historical_event == current:
                 return True
+            if schema_version == 3:
+                return False
             legacy = _pre_r4_run_created_event_payload(snapshot)
             return legacy is not None and historical_event == legacy
     except Exception:

@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +27,18 @@ from agent_sdk.tools.models import ToolContext
 _DURABLE_PREVIEW_BYTES = 2048
 
 
-async def workspace_roots(
+@dataclass(frozen=True)
+class WorkspaceBoundaries:
+    capability_roots: tuple[Path, ...]
+    session_roots: tuple[Path, ...]
+
+
+async def workspace_boundaries(
     store: StateStore,
     session_id: str,
     *,
     run_id: str | None = None,
-) -> tuple[Path, ...]:
+) -> WorkspaceBoundaries:
     try:
         session_data = await store.get_snapshot("session", session_id)
         if session_data is None:
@@ -73,6 +80,11 @@ async def workspace_roots(
             )
             descriptor = run.execution_descriptor
             if descriptor is not None and descriptor.workspace_scopes is not None:
+                if any(
+                    not Path(scope).is_absolute()
+                    for scope in descriptor.workspace_scopes
+                ):
+                    raise ValueError
                 scopes = tuple(
                     canonical_workspace_scope(scope)
                     for scope in descriptor.workspace_scopes
@@ -82,12 +94,22 @@ async def workspace_roots(
                     for scope in scopes
                 ):
                     raise ValueError
-                return scopes
+                return WorkspaceBoundaries(scopes, session_roots)
         except SnapshotPreconditionError as error:
             raise ToolAccessDenied("run workspace is unavailable") from error
         except Exception as error:
             raise ToolAccessDenied("run workspace is unavailable") from error
-    return session_roots
+    return WorkspaceBoundaries(session_roots, session_roots)
+
+
+async def workspace_roots(
+    store: StateStore,
+    session_id: str,
+    *,
+    run_id: str | None = None,
+) -> tuple[Path, ...]:
+    boundaries = await workspace_boundaries(store, session_id, run_id=run_id)
+    return boundaries.capability_roots
 
 
 def _is_within(candidate: Path, root: Path) -> bool:
@@ -116,8 +138,17 @@ async def read_file(
     store: StateStore,
     output_limit: int,
 ) -> dict[str, object]:
-    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
-    target = resolve_workspace_path(roots, path, for_write=False)
+    boundaries = await workspace_boundaries(
+        store,
+        context.session_id,
+        run_id=context.run_id,
+    )
+    target = resolve_workspace_path(
+        boundaries.capability_roots,
+        path,
+        for_write=False,
+        containment_roots=boundaries.session_roots,
+    )
     limit = min(
         max_bytes if max_bytes is not None else output_limit,
         output_limit,
@@ -125,7 +156,7 @@ async def read_file(
     )
     preview, truncated = await asyncio.to_thread(_read_prefix, target, limit)
     return {
-        "path": relative_display_path(target, roots),
+        "path": relative_display_path(target, boundaries.capability_roots),
         "content": preview.decode("utf-8", errors="replace"),
         "truncated": truncated,
         "bytes_read": len(preview),
@@ -139,14 +170,19 @@ async def file_permission_arguments(
     store: StateStore,
     for_write: bool,
 ) -> Mapping[str, Any]:
-    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
+    boundaries = await workspace_boundaries(
+        store,
+        context.session_id,
+        run_id=context.run_id,
+    )
     requested = arguments.get("path")
     if not isinstance(requested, str):
         raise ToolAccessDenied("invalid workspace path")
     target = resolve_workspace_path(
-        roots,
+        boundaries.capability_roots,
         requested,
         for_write=for_write,
+        containment_roots=boundaries.session_roots,
     )
     return {**arguments, "path": str(target)}
 
@@ -161,12 +197,21 @@ async def write_file(
     output_limit: int,
 ) -> dict[str, object]:
     del output_limit
-    roots = await workspace_roots(store, context.session_id, run_id=context.run_id)
-    target = resolve_workspace_path(roots, path, for_write=True)
+    boundaries = await workspace_boundaries(
+        store,
+        context.session_id,
+        run_id=context.run_id,
+    )
+    target = resolve_workspace_path(
+        boundaries.capability_roots,
+        path,
+        for_write=True,
+        containment_roots=boundaries.session_roots,
+    )
     encoded = content.encode("utf-8")
     await asyncio.to_thread(_atomic_write, target, encoded, overwrite)
     return {
-        "path": relative_display_path(target, roots),
+        "path": relative_display_path(target, boundaries.capability_roots),
         "bytes_written": len(encoded),
     }
 
@@ -216,6 +261,8 @@ __all__ = [
     "read_file",
     "file_permission_arguments",
     "relative_display_path",
+    "WorkspaceBoundaries",
+    "workspace_boundaries",
     "workspace_roots",
     "write_file",
 ]

@@ -469,7 +469,7 @@ async def test_public_run_events_never_expose_prompt_or_tool_sentinels(
         created = next(
             item.event for item in events if item.event.type == "run.created"
         )
-        assert created.schema_version == 2
+        assert created.schema_version == 3
         assert "execution_descriptor" not in created.payload
         for raw_text in (
             application_marker,

@@ -15,6 +15,7 @@ from agent_sdk.runtime.execution import (
     WorkflowAgentDescriptor,
     WorkflowExecutionDescriptor,
 )
+from agent_sdk.runtime.commands import RuntimeCommands
 from agent_sdk.runtime.models import (
     AgentSpec,
     RunCreatedEventPayload,
@@ -26,6 +27,7 @@ from agent_sdk.runtime.models import (
     run_created_event_matches,
 )
 from agent_sdk.context import ContextRuntimeConfig
+from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.workflow.models import (
     AgentNode,
@@ -355,6 +357,74 @@ def test_schema_v2_event_authenticates_a_genuine_pre_r4_descriptor_projection() 
 
     payload["agent_hash"] = "a" * 64
     assert not run_created_event_matches(upgraded, payload, schema_version=2)
+
+
+def test_schema_v3_rejects_an_alternate_pre_r4_hash_projection() -> None:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        workspace_scopes=None,
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    snapshot = RunSnapshot(
+        run_id="run_r4_v3",
+        session_id="ses_r4_v3",
+        agent_revision="coder:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    )
+    legacy_descriptor = descriptor.model_dump(mode="json")
+    for field in ("tool_allowlist", "workspace_allowlist"):
+        legacy_descriptor["agent"].pop(field)
+    legacy_descriptor.pop("workspace_scopes")
+    legacy_descriptor["agent_hash"] = _canonical_hash(legacy_descriptor["agent"])
+    legacy_descriptor["descriptor_hash"] = _canonical_hash(
+        {
+            key: value
+            for key, value in legacy_descriptor.items()
+            if key != "descriptor_hash"
+        }
+    )
+    alternate = RunCreatedEventPayload.from_snapshot(snapshot).model_copy(
+        update={
+            "agent_hash": legacy_descriptor["agent_hash"],
+            "execution_descriptor_hash": legacy_descriptor["descriptor_hash"],
+        }
+    ).model_dump(mode="json")
+
+    assert run_created_event_matches(snapshot, alternate, schema_version=2)
+    assert not run_created_event_matches(snapshot, alternate, schema_version=3)
+
+
+@pytest.mark.asyncio
+async def test_new_current_run_created_event_uses_schema_v3() -> None:
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    session = await commands.create_session(workspaces=())
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        workspace_scopes=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    run = await commands.start_run(
+        session.session_id,
+        agent_revision="coder:1",
+        user_input="hello",
+        execution_descriptor=descriptor,
+    )
+    events = tuple(
+        stored
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == run.value.run_id
+    )
+
+    assert events[0].event.type == "run.created"
+    assert events[0].event.schema_version == 3
 
 
 def test_execution_descriptor_rejects_rehashed_noncanonical_agent() -> None:

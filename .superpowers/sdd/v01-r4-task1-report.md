@@ -168,3 +168,47 @@ git diff --check
 
 Result: `159 passed, 4 skipped in 6.40s`; strict mypy (93 source files),
 Ruff, and diff-check passed.
+
+## Second review hardening (schema-v3 provenance / I2 final resolution)
+
+Reviewer conclusion: the schema-v2 compatibility branch could also authenticate
+a newly emitted all-`None` descriptor when supplied with the old projection.
+Additionally, descriptor scopes had to reject relative paths before any
+current-working-directory normalization, and a scope required a second Session
+ancestor check at each tool/permission resolution after a filesystem redirect.
+
+### RED
+
+The new schema-v3 event assertion initially observed that `RuntimeCommands`
+still emitted schema v2. A relative descriptor scope was also accepted. The
+final-redirect regression is skipped only when Windows cannot create a test
+symlink.
+
+### GREEN
+
+- New primary `run.created` events use schema v3. Schema v3 accepts only the
+  current R4 payload projection; schema v2 retains its narrow R3-only fallback,
+  and schema v1 remains unchanged.
+- Recovery validates schema v3 events while still accepting historical v1/v2
+  events. The existing builtin recovery coverage passes with new v3 events.
+- Scope strings are required to be absolute before canonicalization. File read,
+  write, permission, and bash paths share `WorkspaceBoundaries`, so every final
+  resolution requires membership in both the descriptor capability root and the
+  original canonical Session root.
+
+Final second-review gate:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests/unit/runtime/test_capability_intersection.py tests/integration/runtime/test_run_tool_catalog.py tests/unit/runtime/test_execution_descriptors.py tests/unit/runtime/test_session_workspace_roots.py tests/integration/runtime/test_builtin_tool_recovery.py tests/integration/runtime/test_live_run_progress.py tests/integration/subagents/test_child_run_slice.py tests/integration/workflow/test_workflow_child_slice.py tests/integration/tools/test_builtin_tools.py tests/unit/tools/test_workspace_paths.py tests/integration/prompts/test_runtime_prompt.py -q
+.\.venv\Scripts\python.exe -m mypy --strict src/agent_sdk
+.\.venv\Scripts\python.exe -m ruff check [changed sources and tests]
+git diff --check
+```
+
+Result: `184 passed, 5 skipped in 10.21s`; strict mypy (93 source files),
+Ruff, and diff-check passed.
+
+Baseline check for the separate recovery API suite: the five checkpoint-message
+failures reproduce unchanged in a clean `5466757` worktree. Each expects a
+provider request without the existing ContextMiddleware system prompt; no
+prompt/recovery-composition change is included in this hardening.

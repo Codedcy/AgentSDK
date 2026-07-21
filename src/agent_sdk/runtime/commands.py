@@ -572,7 +572,7 @@ class RuntimeCommands:
                     run_id=snapshot.run_id,
                     sequence=1,
                     payload=run_created_event_payload(snapshot),
-                    schema_version=2,
+                    schema_version=3,
                 )
                 request = None
                 if idempotency_key is not None:
