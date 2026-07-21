@@ -19,6 +19,21 @@ parameters such as `max_tokens` and response token-count fields remain valid.
 python -m pip install agent-sdk
 ```
 
+Run the installed deterministic reference without provider credentials:
+
+```powershell
+python examples/v01_reference.py --smoke --database .agent-sdk/state.db --workspace .
+```
+
+It performs no network I/O and emits one result-derived JSON line covering
+automatic L0-L4 Context, Workflow condition plus two bounded-loop iterations,
+Agent-driven Child spawn and two-way message/list/wait/result consumption, live
+and historical Trace, evaluation and deterministic attribution, safe SQLite
+reopen with no replay, and Session deletion while a workspace marker survives.
+Omit `--smoke` and pass `--model` to use normal LiteLLM environment credentials.
+The reference fully allows its control Tools to remain non-interactive; use the
+authorization policy below for an application boundary.
+
 ```python
 from pathlib import Path
 from agent_sdk import AgentSDK, AgentSDKConfig, AgentSpec

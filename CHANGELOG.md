@@ -12,6 +12,10 @@
 - Added explicit interrupted-work reconciliation with application-selected
   retry or abort; abort terminally fails the Run without replay. Session deletion keeps
   application workspace files.
+- Expanded the installed reference so deterministic `--smoke` proves automatic
+  L0-L4, condition and two-iteration loop control, two-way Child communication
+  with result consumption, live/historical Trace, evaluation/attribution, safe
+  reopen without replay, and history deletion without deleting workspace data.
 
 This entry describes the v0.1 contract; packaging/version finalization is handled
 by the release-candidate task.

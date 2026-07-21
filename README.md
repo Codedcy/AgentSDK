@@ -11,10 +11,22 @@ python -m pip install agent-sdk
 python examples/v01_reference.py --smoke --database .agent-sdk/state.db --workspace .
 ```
 
+The deterministic `--smoke` flow makes no network calls and prints one JSON
+line derived from public SDK results. It demonstrates automatic L0-L4 Context,
+a selected Workflow condition and two bounded-loop iterations, Agent-driven
+Child spawn plus two-way messages/list/wait/result consumption, live and
+historical Trace, evaluation and attribution, completed-boundary SQLite reopen
+without replay, and Session deletion that preserves an application-owned
+workspace marker.
+
 For a real provider, set the LiteLLM credentials in the application environment,
 omit `--smoke`, and select a LiteLLM model name with `--model`.
 Raw credential fields are rejected in durable `AgentSpec.model_params`; see the
 quickstart for the exact v0.1 key policy.
+
+The reference uses `permission_default="allow"` so its Child-control sequence is
+non-interactive. Applications should replace that demo setting with explicit
+allow/ask/deny rules before admitting untrusted work.
 
 ```python
 from pathlib import Path
