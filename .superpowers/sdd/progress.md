@@ -348,6 +348,11 @@ v0.1 R4 Task 2 delivered a durable direct parent/child mailbox, recipient-local 
 v0.1 R4 Task 2 final gates: 39 focused passed; 48 expanded subagent passed; Context 144 passed with one proven baseline recovery node deselected; Task 1 smoke 184 passed, 5 skipped; strict mypy clean across 94 source files; Ruff and diff-check clean.
 v0.1 current implementation status: R0-R3 and R4 Tasks 1-2 completed; R4 Task 3 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\subagents\test_child_coordinator.py -q`
+v0.1 R4 Task 3: complete (implementation `b90c8f7`; review hardening `3e71c9a`; final independent review Spec approved / Quality approved; Critical 0 / Important 0 / Minor 0)
+v0.1 R4 Task 3 delivered shared API/Workflow Child coordination, durable depth/per-parent/per-Session limits, process-local queued concurrency, authoritative ancestor capability intersection with atomic raw preconditions, public `sdk.children` spawn/send/wait/list, SQLite-reopen progress, and bounded non-cancelling recovery waits.
+v0.1 R4 Task 3 final gates: 42 focused passed; 353 broad subagent/Workflow passed; Task 1/2 smoke 79 passed; strict mypy clean across 96 source files; Ruff and diff-check clean.
+v0.1 current implementation status: R0-R3 and R4 Tasks 1-3 completed; R4 Task 4 pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\subagents\test_child_tools.py -q`
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
