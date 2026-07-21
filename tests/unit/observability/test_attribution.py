@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 import agent_sdk.observability.attribution as attribution_module
+from agent_sdk import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.observability import (
     AttributionContributor,
@@ -84,6 +85,7 @@ def _summary(
 ) -> object:
     timeline = TraceTimeline(
         root_id="run_root",
+        root_kind="run",
         stages=project_stages(events),
         as_of_cursor=max(event.cursor for event in events),
     )
@@ -218,6 +220,7 @@ def test_failed_run_uses_first_terminal_denial_before_root_failure() -> None:
     )
     timeline = TraceTimeline(
         root_id="run_root",
+        root_kind="run",
         stages=project_stages(events),
         as_of_cursor=6,
     )
@@ -743,6 +746,8 @@ def test_trace_and_attribution_models_share_evidence_element_bounds() -> None:
         kind=TraceStageKind.MODEL,
         status=TraceStageStatus.COMPLETED,
         entity_id="model-1",
+        run_id="run_root",
+        session_id="ses_1",
         first_cursor=1,
         last_cursor=1,
         evidence_event_ids=(legal,),
@@ -775,6 +780,8 @@ def test_trace_and_attribution_models_share_evidence_element_bounds() -> None:
             kind=TraceStageKind.MODEL,
             status=TraceStageStatus.COMPLETED,
             entity_id="model-1",
+            run_id="run_root",
+            session_id="ses_1",
             first_cursor=1,
             last_cursor=1,
             evidence_event_ids=("e" * 257,),
@@ -809,7 +816,7 @@ def test_historical_stage_with_oversized_event_id_remains_projectable_without_ev
     assert stage.evidence_cursors == ()
 
 
-def test_oversized_tool_completion_id_still_uses_internal_terminal_fact() -> None:
+def test_oversized_context_reference_fails_closed() -> None:
     oversized = "e" * 257
     completion = _event(
         3,
@@ -846,16 +853,11 @@ def test_oversized_tool_completion_id_still_uses_internal_terminal_fact() -> Non
         _event(7, "run.completed", {"run_id": "run_root"}),
     )
 
-    summary = _summary(events, RunStatus.COMPLETED)
-    tool = _contributor(summary.contributors, "call-1")
+    with pytest.raises(AgentSDKError) as captured:
+        _summary(events, RunStatus.COMPLETED)
 
-    assert tool.disposition == "consumed"
-    assert oversized not in tool.evidence_ids
-    assert "unused_tool_output" not in {hint.code for hint in summary.hints}
-    assert all(
-        oversized not in hint.evidence_ids
-        for hint in summary.hints
-    )
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.message == "failed to project trace stages"
 
 
 def test_interruption_projection_indexes_running_external_stages_once() -> None:
@@ -874,6 +876,7 @@ def test_interruption_projection_indexes_running_external_stages_once() -> None:
                 status=TraceStageStatus.RUNNING,
                 entity_id="model-one",
                 run_id="run_root",
+                session_id="ses_1",
                 first_cursor=1,
                 last_cursor=1,
                 evidence_event_ids=("evt_1",),
@@ -885,6 +888,7 @@ def test_interruption_projection_indexes_running_external_stages_once() -> None:
                 status=TraceStageStatus.RUNNING,
                 entity_id="tool-two",
                 run_id="run_child",
+                session_id="ses_1",
                 first_cursor=2,
                 last_cursor=2,
                 evidence_event_ids=("evt_2",),

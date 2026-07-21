@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -60,6 +61,7 @@ async def test_public_trace_timeline_projects_run_at_one_high_water() -> None:
         timeline = await sdk.trace.timeline(handle.run_id)
 
         assert timeline.root_id == handle.run_id
+        assert timeline.root_kind == "run"
         assert timeline.as_of_cursor > 0
         assert [stage.kind for stage in timeline.stages] == [
             TraceStageKind.RUN,
@@ -111,7 +113,12 @@ async def test_workflow_timeline_includes_node_runs_in_one_parent_tree() -> None
 
         timeline = await sdk.trace.timeline(handle.workflow_run_id)
 
+        assert timeline.root_kind == "workflow"
         by_kind = {stage.kind: stage for stage in timeline.stages}
+        assert all(stage.session_id == session.session_id for stage in timeline.stages)
+        assert all(stage.run_id for stage in timeline.stages)
+        assert by_kind[TraceStageKind.WORKFLOW].run_id == handle.workflow_run_id
+        assert by_kind[TraceStageKind.WORKFLOW_NODE].run_id == handle.workflow_run_id
         assert by_kind[TraceStageKind.WORKFLOW_NODE].parent_stage_id == by_kind[
             TraceStageKind.WORKFLOW
         ].stage_id
@@ -355,3 +362,46 @@ async def test_public_child_execution_projects_a_child_stage() -> None:
         assert child_stage.parent_stage_id == parent_stage.stage_id
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_trace_shape_survives_sqlite_reopen(tmp_path: Path) -> None:
+    database = tmp_path / "trace.sqlite3"
+    first = AgentSDK.for_test(database_path=database, acompletion=_provider)
+    try:
+        session = await first.sessions.create(workspaces=[])
+        handle = await first.runs.start(
+            session.session_id,
+            AgentSpec(name="agent", model="fake/model"),
+            "private-input",
+        )
+        await handle.result()
+        run_id = handle.run_id
+        session_id = session.session_id
+        before = await first.trace.timeline(run_id)
+    finally:
+        await first.close()
+
+    calls = 0
+
+    async def must_not_call(**_: Any) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("historical trace reopen must not call the provider")
+
+    reopened = AgentSDK.for_test(database_path=database, acompletion=must_not_call)
+    try:
+        after = await reopened.trace.timeline(run_id)
+        assert calls == 0
+        assert after == before
+        assert after.root_kind == "run"
+        assert all(stage.session_id == session_id for stage in after.stages)
+        assert all(stage.run_id == run_id for stage in after.stages)
+        model = next(stage for stage in after.stages if stage.kind is TraceStageKind.MODEL)
+        run = next(stage for stage in after.stages if stage.kind is TraceStageKind.RUN)
+        assert model.input_refs
+        assert model.output_refs
+        assert model.cost_usd == 0.125
+        assert run.cost_usd == 0.125
+    finally:
+        await reopened.close()

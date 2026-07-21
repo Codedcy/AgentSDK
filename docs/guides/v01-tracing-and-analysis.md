@@ -21,6 +21,15 @@ and recovery. Payloads contain identifiers, hashes, bounded previews, usage/cost
 sanitized error facts, and evidence references—not credentials or unbounded raw
 provider values.
 
+`TraceTimeline.root_kind` distinguishes a Run root from a Workflow root. Every
+stage carries its durable `session_id` and a non-empty `run_id`: Agent-owned stages
+use the authenticated owning Run id, while Workflow and Workflow-node control
+stages use the Workflow Run id as the stable v0.1 convention. `input_refs` and
+`output_refs` contain only bounded, event-type-whitelisted public identifiers in
+stable order. `error_code` and `retryable` contain structured or fixed SDK failure
+facts only; raw error messages, Tool output, arguments, and provider responses are
+never copied into the normalized stage.
+
 ## Evaluation and cross-Run metrics
 
 `await sdk.evaluations.evaluate(run_id, evaluator)` stores an evidence-linked

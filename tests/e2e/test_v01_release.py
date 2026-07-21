@@ -268,6 +268,9 @@ async def _accept_steps_1_2_5_10_11_13(
             ).hexdigest()
         trace = await sdk.trace.timeline(run_id)
         assert trace.root_id == run_id
+        assert trace.root_kind == "run"
+        assert all(stage.session_id == session.session_id for stage in trace.stages)
+        assert all(stage.run_id for stage in trace.stages)
         assert any(stage.kind is TraceStageKind.PERMISSION for stage in trace.stages)
         evaluation = await sdk.evaluations.evaluate(
             run_id,
@@ -930,6 +933,9 @@ async def _accept_step_9_and_child_trace(
         assert child_types[0] == "run.created"
         assert child_types[-1] == "run.completed"
         trace = await sdk.trace.timeline(parent_run_id)
+        assert trace.root_kind == "run"
+        assert all(stage.session_id == session.session_id for stage in trace.stages)
+        assert all(stage.run_id for stage in trace.stages)
         assert {stage.kind for stage in trace.stages} >= {
             TraceStageKind.RUN,
             TraceStageKind.CONTEXT,

@@ -413,3 +413,158 @@ def test_tool_terminal_with_a_different_step_reference_is_rejected() -> None:
         )
 
     assert captured.value.code is ErrorCode.INTERNAL
+
+
+def test_public_stage_shape_projects_identity_refs_cost_and_sanitized_failure() -> None:
+    stages = project_stages(
+        (
+            _event(1, "run.started", {"run_id": "run_1"}),
+            _event(
+                2,
+                "model.call.started",
+                {
+                    "operation_id": "op_1",
+                    "context_view_id": "view_1",
+                    "prompt_manifest_id": "manifest_1",
+                },
+            ),
+            _event(
+                3,
+                "context.view.created",
+                {
+                    "view_id": "view_1",
+                    "capsule_id": "capsule_1",
+                    "source_refs": ["evt_1", "evt_1"],
+                },
+                run_id="view_1",
+            ),
+            _event(
+                4,
+                "model.usage.reported",
+                {
+                    "operation_id": "op_1",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5,
+                    "cost_usd": 0.25,
+                },
+            ),
+            _event(
+                5,
+                "model.call.failed",
+                {
+                    "operation_id": "op_1",
+                    "context_view_id": "view_1",
+                    "prompt_manifest_id": "manifest_1",
+                    "error": {
+                        "code": "invalid_state",
+                        "message": "provider secret must not leak",
+                        "retryable": True,
+                    },
+                },
+            ),
+            _event(
+                6,
+                "run.failed",
+                {
+                    "run_id": "run_1",
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 3,
+                        "total_tokens": 5,
+                        "cost_usd": 0.25,
+                    },
+                    "error": {
+                        "code": "invalid_state",
+                        "message": "run secret must not leak",
+                        "retryable": True,
+                    },
+                },
+            ),
+        )
+    )
+
+    by_kind = {stage.kind: stage for stage in stages}
+    model = by_kind[TraceStageKind.MODEL]
+    context = by_kind[TraceStageKind.CONTEXT]
+    run = by_kind[TraceStageKind.RUN]
+
+    assert all(stage.session_id == "ses_1" for stage in stages)
+    assert all(stage.run_id == "run_1" for stage in stages)
+    assert model.input_refs == ("view_1", "manifest_1")
+    assert model.output_refs == ("evt_5",)
+    assert context.input_refs == ("evt_1",)
+    assert context.output_refs == ("view_1", "capsule_1")
+    assert model.cost_usd == 0.25
+    assert run.cost_usd == 0.25
+    assert model.error_code == "invalid_state"
+    assert model.retryable is True
+    assert run.error_code == "invalid_state"
+    assert run.retryable is True
+    serialized = "".join(stage.model_dump_json() for stage in stages)
+    assert "provider secret" not in serialized
+    assert "run secret" not in serialized
+
+
+def test_tool_refs_and_fixed_failure_code_do_not_expose_raw_error() -> None:
+    stage = next(
+        stage
+        for stage in project_stages(
+            (
+                _event(1, "run.started", {"run_id": "run_1"}),
+                _event(2, "step.started", {"step_id": "step_1"}),
+                _event(
+                    3,
+                    "tool.call.started",
+                    {"call_id": "call_1", "tool_name": "lookup", "step_id": "step_1"},
+                    schema_version=2,
+                ),
+                _event(
+                    4,
+                    "tool.call.completed",
+                    {
+                        "call_id": "call_1",
+                        "tool_name": "lookup",
+                        "status": "failed",
+                        "content": "private tool output",
+                        "value": {"credential": "private"},
+                        "error": "raw handler failure",
+                    },
+                ),
+            )
+        )
+        if stage.kind is TraceStageKind.TOOL
+    )
+
+    assert stage.input_refs == ("step_1",)
+    assert stage.output_refs == ("evt_4",)
+    assert stage.error_code == "tool_failed"
+    assert stage.retryable is None
+    serialized = stage.model_dump_json()
+    assert "raw handler failure" not in serialized
+    assert "private tool output" not in serialized
+    assert "credential" not in serialized
+
+
+def test_malformed_public_reference_fails_closed() -> None:
+    with pytest.raises(AgentSDKError) as captured:
+        project_stages(
+            (
+                _event(1, "run.started", {"run_id": "run_1"}),
+                _event(
+                    2,
+                    "model.call.started",
+                    {"operation_id": "op_1", "context_view_id": "view_1"},
+                    schema_version=2,
+                ),
+                _event(
+                    3,
+                    "context.view.created",
+                    {"view_id": "view_1", "source_refs": ["r" * 257]},
+                    run_id="view_1",
+                ),
+            )
+        )
+
+    assert captured.value.code is ErrorCode.INTERNAL
+    assert captured.value.message == "failed to project trace stages"

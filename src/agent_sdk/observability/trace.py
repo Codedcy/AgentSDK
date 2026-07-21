@@ -122,6 +122,7 @@ class TraceService:
                 root_run=run,
                 timeline=TraceTimeline(
                     root_id=root_id,
+                    root_kind="run" if run is not None else "workflow",
                     stages=project_stages(events),
                     as_of_cursor=cursor,
                 ),

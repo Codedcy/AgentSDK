@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
@@ -13,6 +13,8 @@ from agent_sdk.runtime.models import TokenUsage
 
 from .models import (
     ObservedEvent,
+    PUBLIC_REF_MAX_BYTES,
+    PUBLIC_REF_MAX_ITEMS,
     TraceStage,
     TraceStageKind,
     TraceStageStatus,
@@ -99,18 +101,137 @@ RULES = {
 
 
 @dataclass(frozen=True)
+class StageReferenceRule:
+    input_fields: tuple[str, ...] = ()
+    input_sequence_fields: tuple[str, ...] = ()
+    output_fields: tuple[str, ...] = ()
+    output_event: bool = False
+
+
+REFERENCE_RULES: Mapping[str, StageReferenceRule] = {
+    "run.completed": StageReferenceRule(output_event=True),
+    "run.failed": StageReferenceRule(output_event=True),
+    "run.interrupted": StageReferenceRule(output_event=True),
+    "model.call.started": StageReferenceRule(
+        input_fields=("context_view_id", "prompt_manifest_id"),
+    ),
+    "model.call.completed": StageReferenceRule(
+        input_fields=("context_view_id", "prompt_manifest_id"),
+        output_event=True,
+    ),
+    "model.call.failed": StageReferenceRule(
+        input_fields=("context_view_id", "prompt_manifest_id"),
+        output_event=True,
+    ),
+    "model.call.timed_out": StageReferenceRule(
+        input_fields=("context_view_id", "prompt_manifest_id"),
+        output_event=True,
+    ),
+    "tool.call.started": StageReferenceRule(input_fields=("step_id",)),
+    "tool.call.completed": StageReferenceRule(
+        input_fields=("step_id",),
+        output_event=True,
+    ),
+    "tool.call.failed": StageReferenceRule(
+        input_fields=("step_id",),
+        output_event=True,
+    ),
+    "tool.call.denied": StageReferenceRule(
+        input_fields=("step_id",),
+        output_event=True,
+    ),
+    "tool.call.timed_out": StageReferenceRule(
+        input_fields=("step_id",),
+        output_event=True,
+    ),
+    "permission.requested": StageReferenceRule(
+        input_fields=("call_id",),
+        output_fields=("request_id",),
+    ),
+    "permission.resolved": StageReferenceRule(
+        input_fields=("call_id", "request_id"),
+        output_event=True,
+    ),
+    "permission.denied": StageReferenceRule(
+        input_fields=("call_id", "request_id"),
+        output_event=True,
+    ),
+    "permission.timed_out": StageReferenceRule(
+        input_fields=("call_id", "request_id"),
+        output_event=True,
+    ),
+    "context.view.created": StageReferenceRule(
+        input_sequence_fields=(
+            "source_refs",
+            "message_refs",
+            "consumed_message_ids",
+        ),
+        output_fields=("view_id", "capsule_id"),
+    ),
+    "workflow.completed": StageReferenceRule(output_event=True),
+    "workflow.failed": StageReferenceRule(output_event=True),
+    "workflow.node.started": StageReferenceRule(input_fields=("instruction_id",)),
+    "workflow.node.completed": StageReferenceRule(
+        input_fields=("instruction_id",),
+        output_fields=("run_id",),
+        output_event=True,
+    ),
+    "workflow.node.failed": StageReferenceRule(
+        input_fields=("instruction_id",),
+        output_fields=("run_id",),
+        output_event=True,
+    ),
+    "workflow.node.timed_out": StageReferenceRule(
+        input_fields=("instruction_id",),
+        output_fields=("run_id",),
+        output_event=True,
+    ),
+    "child.created": StageReferenceRule(
+        input_fields=("parent_run_id",),
+        output_fields=("child_run_id",),
+    ),
+    "child.completed": StageReferenceRule(output_event=True),
+    "child.failed": StageReferenceRule(output_event=True),
+    "child.timed_out": StageReferenceRule(output_event=True),
+    "child.interrupted": StageReferenceRule(output_event=True),
+    "agent.message.sent": StageReferenceRule(
+        input_fields=("sender_run_id", "recipient_run_id"),
+        output_fields=("message_id",),
+    ),
+    "evaluation.completed": StageReferenceRule(
+        input_fields=("subject_run_id",),
+        output_fields=("evaluation_id",),
+    ),
+    "run.recovery.started": StageReferenceRule(input_fields=("run_id",)),
+    "model.recovery.query.started": StageReferenceRule(input_fields=("operation_id",)),
+    "model.recovery.resend.started": StageReferenceRule(input_fields=("operation_id",)),
+    "tool.recovery.retry.started": StageReferenceRule(input_fields=("operation_id",)),
+    "reconciliation.requested": StageReferenceRule(output_fields=("request_id",)),
+    "reconciliation.resolved": StageReferenceRule(
+        input_fields=("request_id",),
+        output_event=True,
+    ),
+}
+
+
+@dataclass(frozen=True)
 class _MutableStage:
     kind: TraceStageKind
     key: tuple[str, ...]
     status: TraceStageStatus
-    run_id: str | None
+    run_id: str
+    session_id: str
     started_at: datetime | None
     ended_at: datetime | None
     first_cursor: int
     last_cursor: int
     evidence_event_ids: tuple[str, ...]
     evidence_cursors: tuple[int, ...]
+    input_refs: tuple[str, ...] = ()
+    output_refs: tuple[str, ...] = ()
     usage: TokenUsage | None = None
+    error_code: str | None = None
+    retryable: bool | None = None
     parent_hint: tuple[TraceStageKind, tuple[str, ...]] | None = None
     terminal: bool = False
 
@@ -172,7 +293,11 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             stage_key = (TraceStageKind.MODEL, (operation_id,))
             if stage_key in stages:
                 usage_stage = stages[stage_key]
-                if usage_stage.terminal:
+                if (
+                    usage_stage.terminal
+                    or usage_stage.session_id != _bounded_identifier(event.session_id)
+                    or usage_stage.run_id != _event_run_id(observed, context_parents)
+                ):
                     raise _ProjectionFailure
                 evidence_ids, evidence_cursors = _evidence(observed)
                 stages[stage_key] = replace(
@@ -192,6 +317,9 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
         status = _effective_status(rule.status, event.payload)
         evidence_ids, evidence_cursors = _evidence(observed)
         run_id = _event_run_id(observed, context_parents)
+        session_id = _bounded_identifier(event.session_id)
+        input_refs, output_refs = _public_refs(observed)
+        error_code, retryable = _failure_fact(rule.kind, status, event.payload)
         if rule.transition == "start":
             if current is not None:
                 raise _ProjectionFailure
@@ -226,13 +354,18 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 key=key,
                 status=status,
                 run_id=run_id,
+                session_id=session_id,
                 started_at=event.occurred_at,
                 ended_at=None,
                 first_cursor=first_cursor,
                 last_cursor=observed.cursor,
                 evidence_event_ids=start_evidence_event_ids,
                 evidence_cursors=start_evidence_cursors,
+                input_refs=input_refs,
+                output_refs=output_refs,
                 usage=usage,
+                error_code=error_code,
+                retryable=retryable,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
             )
             continue
@@ -244,12 +377,17 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 key=key,
                 status=status,
                 run_id=run_id,
+                session_id=session_id,
                 started_at=event.occurred_at,
                 ended_at=event.occurred_at,
                 first_cursor=observed.cursor,
                 last_cursor=observed.cursor,
                 evidence_event_ids=evidence_ids,
                 evidence_cursors=evidence_cursors,
+                input_refs=input_refs,
+                output_refs=output_refs,
+                error_code=error_code,
+                retryable=retryable,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
                 terminal=True,
             )
@@ -286,20 +424,27 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 key=key,
                 status=status,
                 run_id=run_id,
+                session_id=session_id,
                 started_at=None,
                 ended_at=event.occurred_at,
                 first_cursor=first_cursor,
                 last_cursor=observed.cursor,
                 evidence_event_ids=terminal_evidence_event_ids,
                 evidence_cursors=terminal_evidence_cursors,
+                input_refs=input_refs,
+                output_refs=output_refs,
                 usage=(
                     terminal_usage
                     or (None if pending_usage is None else pending_usage[0])
                 ),
+                error_code=error_code,
+                retryable=retryable,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
                 terminal=True,
             )
             continue
+        if current.run_id != run_id or current.session_id != session_id:
+            raise _ProjectionFailure
         resumed_terminal = (
             rule.kind in {TraceStageKind.RUN, TraceStageKind.CHILD}
             and current.status is TraceStageStatus.INTERRUPTED
@@ -328,6 +473,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             last_cursor=observed.cursor,
             evidence_event_ids=(*current.evidence_event_ids, *evidence_ids),
             evidence_cursors=(*current.evidence_cursors, *evidence_cursors),
+            input_refs=_merge_refs(current.input_refs, input_refs),
+            output_refs=_merge_refs(current.output_refs, output_refs),
             usage=(
                 terminal_usage
                 or current.usage
@@ -337,6 +484,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                     else None
                 )
             ),
+            error_code=error_code,
+            retryable=retryable,
             terminal=True,
         )
 
@@ -355,13 +504,19 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 status=stage.status,
                 entity_id=stage.key[-1],
                 run_id=stage.run_id,
+                session_id=stage.session_id,
                 parent_stage_id=parent_id,
                 started_at=stage.started_at,
                 ended_at=stage.ended_at,
                 duration_ms=duration_ms,
                 first_cursor=stage.first_cursor,
                 last_cursor=stage.last_cursor,
+                input_refs=stage.input_refs,
+                output_refs=stage.output_refs,
                 usage=stage.usage,
+                cost_usd=(None if stage.usage is None else stage.usage.cost_usd),
+                error_code=stage.error_code,
+                retryable=stage.retryable,
                 evidence_event_ids=stage.evidence_event_ids,
                 evidence_cursors=stage.evidence_cursors,
             )
@@ -639,7 +794,12 @@ def _identifier(observed: ObservedEvent, field: str) -> str:
         value = _sha256_reference(operation) or operation
     if not isinstance(value, (str, int)) or isinstance(value, bool):
         raise _ProjectionFailure
-    return _bounded_identifier(str(value))
+    bounded = _bounded_identifier(str(value))
+    if field == "workflow_run_id" and observed.event.type.startswith("workflow."):
+        event_run_id = observed.event.run_id
+        if not isinstance(event_run_id, str) or _bounded_identifier(event_run_id) != bounded:
+            raise _ProjectionFailure
+    return bounded
 
 
 def _bounded_identifier(value: str) -> str:
@@ -670,16 +830,146 @@ def _sha256_reference(value: object) -> str | None:
 def _event_run_id(
     observed: ObservedEvent,
     context_parents: Mapping[str, tuple[str, str]] | None = None,
-) -> str | None:
+) -> str:
     if observed.event.type == "context.view.created" and context_parents is not None:
         view_id = observed.event.payload.get("view_id")
         parent = context_parents.get(view_id) if isinstance(view_id, str) else None
         if parent is not None:
             return parent[0]
+        raise _ProjectionFailure
+    if observed.event.type.startswith("workflow."):
+        return _identifier(observed, "workflow_run_id")
+    if observed.event.type.startswith("child."):
+        return _identifier(observed, "child_run_id")
+    if observed.event.type == "agent.message.sent":
+        return _identifier(observed, "sender_run_id")
+    if observed.event.type == "evaluation.completed":
+        return _identifier(observed, "subject_run_id")
     value = observed.event.run_id
-    if value is None or observed.event.type.startswith("workflow.") or observed.event.type == "evaluation.completed":
-        return None
+    if value is None:
+        raise _ProjectionFailure
     return _bounded_identifier(value)
+
+
+def _public_refs(observed: ObservedEvent) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    rule = REFERENCE_RULES.get(observed.event.type)
+    if rule is None:
+        return (), ()
+    payload = observed.event.payload
+    inputs = [_optional_public_ref(observed, field) for field in rule.input_fields]
+    outputs = [_optional_public_ref(observed, field) for field in rule.output_fields]
+    for field in rule.input_sequence_fields:
+        value = payload.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, (list, tuple)) or len(value) > PUBLIC_REF_MAX_ITEMS:
+            raise _ProjectionFailure
+        inputs.extend(_bounded_public_ref(item) for item in value)
+    if rule.output_event and is_public_evidence_id(observed.event.event_id):
+        outputs.append(observed.event.event_id)
+    return (
+        _deduplicate_refs(item for item in inputs if item is not None),
+        _deduplicate_refs(item for item in outputs if item is not None),
+    )
+
+
+def _optional_public_ref(observed: ObservedEvent, field: str) -> str | None:
+    value: object = observed.event.payload.get(field)
+    if value is None and field == "run_id":
+        value = observed.event.run_id
+    if value is None:
+        return None
+    return _bounded_public_ref(value)
+
+
+def _bounded_public_ref(value: object) -> str:
+    if not isinstance(value, str):
+        raise _ProjectionFailure
+    if not value or len(value.encode("utf-8")) > PUBLIC_REF_MAX_BYTES:
+        raise _ProjectionFailure
+    return value
+
+
+def _deduplicate_refs(values: Iterable[str]) -> tuple[str, ...]:
+    selected: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        selected.append(value)
+        if len(selected) > PUBLIC_REF_MAX_ITEMS:
+            raise _ProjectionFailure
+    return tuple(selected)
+
+
+def _merge_refs(left: tuple[str, ...], right: tuple[str, ...]) -> tuple[str, ...]:
+    return _deduplicate_refs((*left, *right))
+
+
+def _failure_fact(
+    kind: TraceStageKind,
+    status: TraceStageStatus,
+    payload: Mapping[str, object],
+) -> tuple[str | None, bool | None]:
+    if status not in {
+        TraceStageStatus.FAILED,
+        TraceStageStatus.DENIED,
+        TraceStageStatus.TIMED_OUT,
+        TraceStageStatus.INTERRUPTED,
+    }:
+        return None, None
+    structured: Mapping[str, object] | None = None
+    for field in ("error", "failure"):
+        candidate = payload.get(field)
+        if isinstance(candidate, Mapping):
+            structured = candidate
+            break
+    code: str | None = None
+    retryable: bool | None = None
+    if structured is not None:
+        raw_code = structured.get("code")
+        if raw_code is not None:
+            code = _sanitized_error_code(raw_code)
+        raw_retryable = structured.get("retryable")
+        if raw_retryable is not None:
+            if not isinstance(raw_retryable, bool):
+                raise _ProjectionFailure
+            retryable = raw_retryable
+    if code is None:
+        raw_code = payload.get("code")
+        if raw_code is not None:
+            code = _sanitized_error_code(raw_code)
+    if code is None:
+        raw_status = payload.get("status")
+        if raw_status == "invalid_arguments":
+            code = "invalid_arguments"
+        elif status is TraceStageStatus.DENIED:
+            code = "permission_denied"
+        elif status is TraceStageStatus.TIMED_OUT:
+            code = f"{kind.value}_timed_out"
+        elif status is TraceStageStatus.INTERRUPTED:
+            code = f"{kind.value}_interrupted"
+        else:
+            code = f"{kind.value}_failed"
+    return code, retryable
+
+
+def _sanitized_error_code(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 128
+        or any(
+            not (
+                character.isascii()
+                and (character.isalnum() or character in "._:-")
+            )
+            for character in value
+        )
+    ):
+        raise _ProjectionFailure
+    return value
 
 
 def _usage(payload: Mapping[str, object]) -> TokenUsage | None:

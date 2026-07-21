@@ -13,6 +13,8 @@ from agent_sdk.runtime.models import RunSnapshot
 
 
 EVIDENCE_ID_MAX_BYTES = 256
+PUBLIC_REF_MAX_BYTES = 256
+PUBLIC_REF_MAX_ITEMS = 64
 
 
 def is_public_evidence_id(value: str) -> bool:
@@ -26,6 +28,15 @@ def _evidence_id(value: str) -> str:
 
 
 EvidenceId = Annotated[str, AfterValidator(_evidence_id)]
+
+
+def _public_ref(value: str) -> str:
+    if not value or len(value.encode("utf-8")) > PUBLIC_REF_MAX_BYTES:
+        raise ValueError("public reference exceeds the public bound")
+    return value
+
+
+PublicRef = Annotated[str, AfterValidator(_public_ref)]
 
 
 def _freeze(value: Any) -> Any:
@@ -133,14 +144,20 @@ class TraceStage(BaseModel):
     kind: TraceStageKind
     status: TraceStageStatus
     entity_id: str = Field(min_length=1, max_length=256)
-    run_id: str | None = Field(default=None, max_length=256)
+    run_id: str = Field(min_length=1, max_length=256)
+    session_id: str = Field(min_length=1, max_length=256)
     parent_stage_id: str | None = Field(default=None, max_length=128)
     started_at: datetime | None = None
     ended_at: datetime | None = None
     duration_ms: int | None = Field(default=None, ge=0)
     first_cursor: int = Field(ge=1)
     last_cursor: int = Field(ge=1)
+    input_refs: tuple[PublicRef, ...] = Field(default=(), max_length=PUBLIC_REF_MAX_ITEMS)
+    output_refs: tuple[PublicRef, ...] = Field(default=(), max_length=PUBLIC_REF_MAX_ITEMS)
     usage: "TokenUsage | None" = None
+    cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    error_code: str | None = Field(default=None, min_length=1, max_length=128)
+    retryable: bool | None = None
     evidence_event_ids: tuple[EvidenceId, ...] = ()
     evidence_cursors: tuple[int, ...] = ()
 
@@ -149,6 +166,7 @@ class TraceTimeline(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     root_id: str = Field(min_length=1, max_length=256)
+    root_kind: Literal["run", "workflow"]
     stages: tuple[TraceStage, ...]
     as_of_cursor: int = Field(ge=0)
 
