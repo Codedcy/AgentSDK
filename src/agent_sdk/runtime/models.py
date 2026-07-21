@@ -22,6 +22,7 @@ from agent_sdk.tools.builtins.workspace import canonical_workspace_scope
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.runtime.execution import ExecutionDescriptor
 from agent_sdk.runtime.failures import RunFailure as RunFailure
+from agent_sdk.runtime.model_params import validate_model_params_for_durability
 
 
 def intersect_names(
@@ -122,6 +123,12 @@ class AgentSpec(BaseModel):
     context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
     tool_allowlist: tuple[str, ...] | None = None
     workspace_allowlist: tuple[str, ...] | None = None
+
+    @field_validator("model_params", mode="before")
+    @classmethod
+    def _reject_credentials(cls, value: Any) -> Any:
+        validate_model_params_for_durability(value)
+        return value
 
     @field_validator("model_params", mode="after")
     @classmethod

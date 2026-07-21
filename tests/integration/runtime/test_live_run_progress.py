@@ -1068,7 +1068,7 @@ async def test_provider_failure_is_atomic_and_public_traceback_is_secret_free() 
         agent=AgentSpec(
             name="agent",
             model="fake/model",
-            model_params={"api_secret": secret_param},
+            model_params={"provider_marker": secret_param},
         ),
         messages=messages,
         tools=(),
@@ -1094,7 +1094,7 @@ async def test_provider_failure_is_atomic_and_public_traceback_is_secret_free() 
             ModelRequest(
                 model="fake/model",
                 messages=messages,
-                params={"api_secret": secret_param},
+                params={"provider_marker": secret_param},
             ),
         )
 

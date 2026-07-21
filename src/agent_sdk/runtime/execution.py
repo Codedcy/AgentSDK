@@ -10,6 +10,7 @@ from typing import Any, Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from agent_sdk.context_runtime import ContextRuntimeConfig
+from agent_sdk.runtime.model_params import validate_model_params_for_durability
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk._workflow_validation import validate_canonical_workflow_program
 
@@ -89,6 +90,12 @@ class DurableAgentSpec(_RevalidatedDescriptor):
     context: ContextRuntimeConfig = Field(default_factory=ContextRuntimeConfig)
     tool_allowlist: tuple[str, ...] | None = None
     workspace_allowlist: tuple[str, ...] | None = None
+
+    @field_validator("model_params", mode="before")
+    @classmethod
+    def _reject_credentials(cls, value: Any) -> Any:
+        validate_model_params_for_durability(value)
+        return value
 
     @field_validator("model_params", mode="after")
     @classmethod
@@ -458,6 +465,7 @@ class ExecutionDescriptor(_RevalidatedDescriptor):
         workspace_scopes: tuple[str, ...] | None = None,
         policy: ExecutionPolicyDescriptor,
     ) -> Self:
+        validate_model_params_for_durability(getattr(agent, "model_params", None))
         agent_data = DurableAgentSpec.model_validate(_model_json(agent))
         values: dict[str, Any] = {
             "agent": agent_data,

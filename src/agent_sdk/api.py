@@ -61,6 +61,7 @@ from agent_sdk.runtime.models import (
     intersect_workspaces,
     mutable_model_params,
 )
+from agent_sdk.runtime.model_params import validate_model_params_for_durability
 from agent_sdk.runtime.provider_recovery import (
     ProviderRecoveryAdapter,
     ProviderRecoveryRegistry,
@@ -533,6 +534,7 @@ class RunAPI:
         *,
         idempotency_key: str | None = None,
     ) -> RunHandle:
+        validate_model_params_for_durability(agent.model_params)
         try:
             validate_idempotency_key(
                 f"session/{session_id}/run.start",

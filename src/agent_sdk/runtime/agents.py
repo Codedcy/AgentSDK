@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
+from agent_sdk.runtime.model_params import validate_model_params_for_durability
 from agent_sdk.runtime.models import AgentSpec
 
 
@@ -9,6 +10,7 @@ class AgentRegistry:
         self._agents: dict[str, AgentSpec] = {}
 
     def define(self, spec: AgentSpec) -> AgentSpec:
+        validate_model_params_for_durability(spec.model_params)
         key = self.key(spec)
         if key in self._agents:
             raise AgentSDKError(

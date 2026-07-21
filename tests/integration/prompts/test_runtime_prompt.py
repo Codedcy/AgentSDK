@@ -425,7 +425,7 @@ async def test_public_run_events_never_expose_prompt_or_tool_sentinels(
     spec = AgentSpec(
         name="private-agent",
         model="test/model",
-        model_params={"application_secret": model_params_marker},
+        model_params={"application_marker": model_params_marker},
         prompt_profile="coding",
         system_prompt=application_marker,
         skills=("private-skill",),

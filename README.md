@@ -13,6 +13,8 @@ python examples/v01_reference.py --smoke --database .agent-sdk/state.db --worksp
 
 For a real provider, set the LiteLLM credentials in the application environment,
 omit `--smoke`, and select a LiteLLM model name with `--model`.
+Raw credential fields are rejected in durable `AgentSpec.model_params`; see the
+quickstart for the exact v0.1 key policy.
 
 ```python
 from pathlib import Path
