@@ -20,8 +20,9 @@ from agent_sdk import (
     ReconciliationAction,
     SessionStatus,
 )
-from agent_sdk.runtime.models import RunStatus
+from agent_sdk.models.litellm_gateway import ModelRequest
 from agent_sdk.runtime.leases import LeaseManager
+from agent_sdk.runtime.models import RunStatus
 from agent_sdk.runtime.reconciliation import (
     ExternalOperationStatus,
     ModelCallOperation,
@@ -30,6 +31,9 @@ from agent_sdk.runtime.reconciliation import (
     ReconciliationStatus,
     RecoveryStateConflictError,
     _canonical_record_json,
+    deserialize_model_request,
+    model_request_fingerprint,
+    serialize_model_request,
 )
 from agent_sdk.storage.base import CommitBatch, RunProgressBatch, SnapshotWrite
 from agent_sdk.storage.memory import InMemoryStore
@@ -1105,6 +1109,31 @@ async def _replace_external_operation_record(store: Any, operation: Any) -> None
     await store._connection.commit()
 
 
+def _forge_model_operation_request(
+    operation: ModelCallOperation,
+    *,
+    marker: str,
+) -> ModelCallOperation:
+    assert operation.prepared_request is not None
+    request = deserialize_model_request(operation.prepared_request)
+    forged_request = ModelRequest(
+        model=request.model,
+        messages=(
+            *request.messages,
+            {"role": "user", "content": marker},
+        ),
+        tools=request.tools,
+        params=request.params,
+        purpose=request.purpose,
+    )
+    payload = operation.model_dump(mode="python")
+    payload.update(
+        prepared_request=serialize_model_request(forged_request),
+        request_fingerprint=model_request_fingerprint(forged_request),
+    )
+    return ModelCallOperation.model_validate(payload)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
 @pytest.mark.parametrize("entrypoint", ("replay", "recovery"))
@@ -1236,7 +1265,13 @@ async def test_confirmed_tool_ready_model_replay_requires_exact_checkpoint_relat
                     else isinstance(operation, ToolCallOperation)
                 )
             )
-            if corruption.endswith("fingerprint"):
+            if corruption == "model_fingerprint":
+                assert isinstance(target, ModelCallOperation)
+                corrupted_operation = _forge_model_operation_request(
+                    target,
+                    marker="forged model request",
+                )
+            elif corruption == "tool_fingerprint":
                 corrupted_operation = target.model_copy(
                     update={"request_fingerprint": "sha256:forged"}
                 )
@@ -2336,8 +2371,9 @@ async def _corrupt_confirmed_tool_current_ready_tool_state(
         for item in operations
         if isinstance(item, ModelCallOperation) and item.turn == 1
     )
-    corrupted = operation.model_copy(
-        update={"request_fingerprint": "sha256:corrupt-current-model"}
+    corrupted = _forge_model_operation_request(
+        operation,
+        marker="corrupt current model request",
     )
     serialized = _canonical_record_json(corrupted)
     if isinstance(store, InMemoryStore):
@@ -5679,8 +5715,10 @@ async def test_recovery_rejects_lockstep_corrupt_resolved_history_before_externa
             )
         else:
             assert corruption == "operation_fingerprint"
-            corrupted_operation = operation.model_copy(
-                update={"request_fingerprint": "sha256:wrong-attempt-fingerprint"}
+            assert isinstance(operation, ModelCallOperation)
+            corrupted_operation = _forge_model_operation_request(
+                operation,
+                marker="wrong attempt model request",
             )
         if isinstance(store, InMemoryStore):
             store._reconciliation_requests[corrupted.request_id] = (
