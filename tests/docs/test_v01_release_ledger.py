@@ -193,7 +193,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
         "2026-07-20 final checkpoint: 403 passed in 43.03s; Ruff/mypy clean |"
     ) in ledger
     assert "| R4 | completed with known pre-R4 recovery debt |" in ledger
-    assert "| R5 | pending |" in ledger
+    assert "| R5 | in progress (Tasks 1-4 complete) |" in ledger
     assert "| R3 | completed | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
@@ -214,9 +214,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
-    assert (
-        "v0.1 current implementation status: R0-R4 completed; R5 pending" in progress
-    )
+    assert "v0.1 R5 Task 4: complete" in progress
+    assert "R5 Task 5 pending" in progress
     assert R5_TASK1_TEST in ledger.replace("\\", "/")
     assert R5_TASK1_TEST in progress.replace("\\", "/")
     _assert_release_checkpoint_and_resume(ledger)
@@ -244,3 +243,39 @@ def test_r3_plan_hands_r4_to_capability_intersection_before_mailbox() -> None:
     assert R4_TASK2_MAILBOX_TEST in plan
     assert plan.index(R4_TASK1_TEST) < plan.index(R4_TASK2_MAILBOX_TEST)
     assert "uv run pytest tests/unit/subagents/test_mailbox.py -q" not in plan
+
+
+def test_v01_user_guides_state_public_flow_and_safety_boundaries() -> None:
+    root = Path(__file__).parents[2]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    quickstart = (root / "docs/guides/v01-quickstart.md").read_text(
+        encoding="utf-8"
+    )
+    recovery = (root / "docs/guides/v01-recovery.md").read_text(encoding="utf-8")
+    analysis = (root / "docs/guides/v01-tracing-and-analysis.md").read_text(
+        encoding="utf-8"
+    )
+
+    for document in (readme, quickstart):
+        assert "AgentSDKConfig" in document
+        assert "system_prompt" in document
+        assert "sdk.tools.register" in document
+        assert "PermissionDecision.allow_once" in document
+        assert "PermissionDecision.deny" in document
+        assert "MCPServerConfig" in document
+        assert "Skill" in document
+        assert "sdk.workflows.compile" in document
+        assert "sdk.workflows.start" in document
+        assert "spawn_agent" in document
+        assert "sdk.trace.subscribe" in document
+        assert "sdk.trace.attribution" in document
+        assert "sdk.recovery.resolve" in document
+
+    assert "0.1.0" in changelog
+    assert "no exactly-once guarantee for external effects" in recovery
+    assert "one SDK instance in one process" in recovery
+    assert "deterministic correlation" in analysis
+    assert "not causality" in analysis
+    assert "aggregate Tool usefulness" in analysis
+    assert "multidimensional failure analysis" in analysis

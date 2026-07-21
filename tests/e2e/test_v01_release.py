@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,15 +16,22 @@ from agent_sdk import (
     ContextPlanner,
     ContextRuntimeConfig,
     ErrorCode,
+    EvaluationVerdict,
+    EventFilter,
+    ExactOutputEvaluator,
+    MCPManager,
+    MCPServerConfig,
     PermissionDecision,
-    PromptManifest,
+    PromptComposer,
+    ReconciliationAction,
     RunStatus,
+    StdioMCPTransport,
+    TraceStageKind,
+    ToolContext,
     ToolResultStatus,
+    ToolSpec,
     WorkflowRunStatus,
 )
-from agent_sdk.tools.models import thaw_json
-from agent_sdk.storage.base import CommitBatch, CommitResult, StateStore
-from agent_sdk.storage.memory import InMemoryStore
 
 if TYPE_CHECKING:
     from tests.fixtures.v01_runtime import V01Harness
@@ -81,34 +89,64 @@ def _v01_tool_stream(
     return chunks()
 
 
-class _CancelAfterSecondLoopIteration:
-    def __init__(self, delegate: StateStore) -> None:
-        self.delegate = delegate
-        self.iterations = 0
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.delegate, name)
-
-    async def commit(self, batch: CommitBatch) -> CommitResult:
-        result = await self.delegate.commit(batch)
-        self.iterations += sum(
-            event.type == "workflow.loop.iteration"
-            for event in batch.events
-        )
-        if self.iterations == 2:
-            self.iterations += 1
-            raise asyncio.CancelledError
-        return result
+async def _collect_until_run_completed(
+    sdk: AgentSDK,
+    session_id: str,
+    observed_types: list[str],
+) -> None:
+    async for item in sdk.trace.subscribe(
+        filters=EventFilter(session_id=session_id),
+        cursor=0,
+    ):
+        observed_types.append(item.event.type)
+        if item.event.type == "run.completed":
+            return
 
 
-@pytest.mark.asyncio
-async def test_v01_release_baseline_reopens_and_deletes_history(
+async def _accept_steps_1_2_5_10_11_13(
     v01_harness: V01Harness,
 ) -> None:
     workspace_file = v01_harness.workspace / "keep.txt"
     workspace_file.write_text("application-owned", encoding="utf-8")
 
     sdk: AgentSDK = v01_harness.open()
+    async def app_echo(_: ToolContext, *, text: str) -> dict[str, str]:
+        return {"text": text}
+
+    sdk.tools.register(
+        ToolSpec(
+            name="app_echo",
+            description="Echo application text",
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+            effects=("application.read",),
+        ),
+        app_echo,
+    )
+    manager = MCPManager(sdk.tools)
+    await asyncio.wait_for(
+        manager.connect(
+            MCPServerConfig(
+                name="demo",
+                transport=StdioMCPTransport(
+                    command=sys.executable,
+                    args=(
+                        str(
+                            Path(__file__).parents[1]
+                            / "fixtures"
+                            / "mcp_server.py"
+                        ),
+                    ),
+                    cwd=v01_harness.workspace,
+                ),
+            )
+        ),
+        timeout=10,
+    )
     session = await sdk.sessions.create(
         workspaces=(v01_harness.workspace,),
         idempotency_key="v01-session",
@@ -117,7 +155,12 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
         AgentSpec(
             name="release-agent",
             model="test/model",
+            system_prompt="Application release policy.",
         )
+    )
+    live_event_types: list[str] = []
+    live_monitor = asyncio.create_task(
+        _collect_until_run_completed(sdk, session.session_id, live_event_types)
     )
     handle = await sdk.runs.start(
         session.session_id,
@@ -139,26 +182,32 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
         timeout=2,
     )
     terminal = await asyncio.wait_for(handle.result(), timeout=5)
+    await asyncio.wait_for(live_monitor, timeout=5)
+    await asyncio.wait_for(manager.close(), timeout=5)
     assert terminal.output_text == "baseline complete"
     assert [result.tool_name for result in terminal.tool_results] == [
+        "app_echo",
         "write",
         "read",
         "bash",
         "write",
+        "mcp.demo.echo",
     ]
     assert [result.status for result in terminal.tool_results] == [
         ToolResultStatus.SUCCEEDED,
         ToolResultStatus.SUCCEEDED,
         ToolResultStatus.SUCCEEDED,
+        ToolResultStatus.SUCCEEDED,
         ToolResultStatus.DENIED,
+        ToolResultStatus.SUCCEEDED,
     ]
     assert (v01_harness.workspace / "generated.txt").read_text(
         encoding="utf-8"
     ) == "created by builtin write"
-    assert thaw_json(terminal.tool_results[1].value)["content"] == "application-owned"
+    assert terminal.tool_results[2].value["content"] == "application-owned"
     assert (
         "builtin bash complete"
-        in thaw_json(terminal.tool_results[2].value)["stdout"]
+        in terminal.tool_results[3].value["stdout"]
     )
     assert v01_harness.outside_file.read_text(
         encoding="utf-8"
@@ -168,8 +217,33 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     event_types = [item.event.type for item in timeline.events]
     assert event_types.count("permission.requested") == 1
     assert event_types.count("permission.resolved") == 1
-    assert event_types.count("tool.call.completed") == 4
-    assert event_types.count("tool.call.started") == 3
+    assert event_types.count("tool.call.completed") == 6
+    assert event_types.count("tool.call.started") == 5
+    assert "run.completed" in live_event_types
+    trace = await sdk.trace.timeline(handle.run_id)
+    assert trace.root_id == handle.run_id
+    assert any(stage.kind is TraceStageKind.PERMISSION for stage in trace.stages)
+    evaluation = await sdk.evaluations.evaluate(
+        handle.run_id,
+        ExactOutputEvaluator(expected="baseline complete"),
+    )
+    assert evaluation.verdict is EvaluationVerdict.PASS
+    success_rate = await sdk.analytics.success_rate(evaluator_id="exact_output")
+    assert success_rate.value == 1.0
+    assert success_rate.sample_count == 1
+    tool_failure_rate = await sdk.analytics.tool_failure_rate()
+    assert tool_failure_rate.value == pytest.approx(1 / 6)
+    assert tool_failure_rate.sample_count == 6
+    attribution = await sdk.trace.attribution(handle.run_id)
+    assert attribution.method == "deterministic_event_evidence_v1"
+    assert attribution.terminal_status is RunStatus.COMPLETED
+    assert attribution.failure is None
+    assert {contributor.kind for contributor in attribution.contributors} >= {
+        "context",
+        "evaluation",
+        "model",
+        "tool",
+    }
     await asyncio.wait_for(sdk.close(), timeout=5)
 
     provider_calls = 0
@@ -195,8 +269,9 @@ async def test_v01_release_baseline_reopens_and_deletes_history(
     assert provider_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_v01_generated_workflow_is_explicit_and_restart_safe() -> None:
+async def _accept_steps_7_8_and_12_safe_boundary(
+    tmp_path: Path,
+) -> None:
     calls: list[str] = []
     review_calls = 0
 
@@ -249,9 +324,8 @@ steps:
       - {id: review, kind: agent, agent_revision: workflow:1, input: review}
   - {id: finish, kind: agent, agent_revision: workflow:1, input: finish}
     """
-    store = InMemoryStore()
     sdk = AgentSDK.for_test(
-        store=_CancelAfterSecondLoopIteration(store),
+        database_path=tmp_path / "workflow.sqlite3",
         acompletion=provider,
     )
     sdk.agents.define(AgentSpec(name="workflow", revision="1", model="test/workflow"))
@@ -272,36 +346,41 @@ steps:
         sdk.workflows.start(session.session_id, compiled),
         timeout=5,
     )
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(handle.result(), timeout=10)
+    result = await asyncio.wait_for(handle.result(), timeout=10)
     workflow_run_id = handle.workflow_run_id
-    assert calls == ["selected", "review"]
-    await asyncio.wait_for(sdk.close(), timeout=5)
-
-    reopened = AgentSDK.for_test(store=store, acompletion=provider)
-    reopened.agents.define(
-        AgentSpec(name="workflow", revision="1", model="test/workflow")
-    )
-    recovered = await asyncio.wait_for(
-        reopened.recovery.recover_workflow(workflow_run_id),
-        timeout=5,
-    )
-    result = await asyncio.wait_for(recovered.result(), timeout=10)
     assert result.status is WorkflowRunStatus.COMPLETED
     assert calls == ["selected", "review", "review", "finish"]
     async def collect_events() -> list[str]:
-        return [item.event.type async for item in recovered.events()]
+        return [item.event.type async for item in handle.events()]
 
     event_types = await asyncio.wait_for(collect_events(), timeout=5)
     assert "workflow.condition.selected" in event_types
     assert event_types.count("workflow.loop.iteration") == 2
     assert event_types[-1] == "workflow.completed"
+    await asyncio.wait_for(sdk.close(), timeout=5)
+    reopen_calls = 0
+
+    async def must_not_call(**_: object) -> object:
+        nonlocal reopen_calls
+        reopen_calls += 1
+        raise AssertionError("safe-boundary reopen must not call LiteLLM")
+
+    reopened = AgentSDK.for_test(
+        database_path=tmp_path / "workflow.sqlite3",
+        acompletion=must_not_call,
+    )
+    observed = await asyncio.wait_for(
+        reopened.workflows.get(workflow_run_id),
+        timeout=5,
+    )
+    assert observed.status is WorkflowRunStatus.COMPLETED
     await asyncio.wait_for(reopened.close(), timeout=5)
+    assert reopen_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_v01_runtime_automatically_compacts_l0_through_l4(
+async def _accept_steps_3_4_and_6(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     stage_tokens = {
         "stage-l0": 10,
@@ -395,10 +474,9 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
             },
         }
 
-    store = InMemoryStore()
     skill_root = Path(__file__).parents[1] / "fixtures" / "skills"
     sdk = AgentSDK.for_test(
-        store=store,
+        database_path=tmp_path / "context.sqlite3",
         acompletion=provider,
         skill_roots=(skill_root,),
         enable_builtin_tools=False,
@@ -424,10 +502,12 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
             assert result.output_text == "completed"
             run_ids.append(handle.run_id)
 
-        events = await store.read_events(
+        event_page = await sdk.queries.query_events(
+            EventFilter(session_id=session.session_id),
             after_cursor=0,
-            session_id=session.session_id,
+            limit=1_000,
         )
+        events = event_page.events
         views = [
             item.event
             for item in events
@@ -450,9 +530,7 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
         )
         assert any(item.event.event_id == original.event_id for item in events)
         final_view_id = str(views[-1].payload["view_id"])
-        final_view = await store.get_snapshot("context_view", final_view_id)
-        assert final_view is not None
-        capsule_id = final_view["capsule_id"]
+        capsule_id = views[-1].payload["capsule_id"]
         assert isinstance(capsule_id, str)
         recovered_sources = await sdk.context.read_sources(
             capsule_id,
@@ -469,11 +547,25 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
             and item.event.run_id == run_ids[-1]
         )
         manifest_id = str(last_started.payload["prompt_manifest_id"])
-        raw_manifest = await store.get_snapshot("prompt_manifest", manifest_id)
-        assert raw_manifest is not None
-        manifest = PromptManifest.model_validate(raw_manifest)
-        assert manifest.context_view_id == final_view_id
-        assert manifest.layer_names == (
+        assert manifest_id.startswith("pmf_")
+        assert last_started.payload["context_view_id"] == final_view_id
+        manifest_view = await sdk.context.build(
+            session.session_id,
+            model="test/context",
+            model_window=100,
+            force_level="L2",
+        )
+        activated = sdk.skills.activate("demo")
+        prompt = PromptComposer().compose(
+            profile="general",
+            context_view=manifest_view,
+            model="test/context",
+            application="Application runtime policy.",
+            skills=(activated,),
+        )
+        assert "Follow this demo skill." in activated.instructions
+        assert prompt.manifest.context_view_id == manifest_view.view_id
+        assert prompt.manifest.layer_names == (
             "profile:general",
             "application",
             "skill:demo",
@@ -482,8 +574,7 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
         await sdk.close()
 
 
-@pytest.mark.asyncio
-async def test_v01_parent_controls_child_and_consumes_mailbox_context(
+async def _accept_step_9_and_child_trace(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -653,9 +744,8 @@ async def test_v01_parent_controls_child_and_consumes_mailbox_context(
             "parent used verified child finding from evt-2"
         )
 
-    store = InMemoryStore()
     sdk = AgentSDK.for_test(
-        store=store,
+        database_path=tmp_path / "child.sqlite3",
         acompletion=provider,
         permission_default="allow",
     )
@@ -725,10 +815,12 @@ async def test_v01_parent_controls_child_and_consumes_mailbox_context(
         ]
         assert all(node.snapshot.status is RunStatus.COMPLETED for node in tree.nodes)
 
-        events = await store.read_events(
+        event_page = await sdk.queries.query_events(
+            EventFilter(session_id=session.session_id),
             after_cursor=0,
-            session_id=session.session_id,
+            limit=1_000,
         )
+        events = event_page.events
         messages_sent = [
             stored.event
             for stored in events
@@ -802,7 +894,139 @@ async def test_v01_parent_controls_child_and_consumes_mailbox_context(
         assert parent_types[-1] == "run.completed"
         assert child_types[0] == "run.created"
         assert child_types[-1] == "run.completed"
+        trace = await sdk.trace.timeline(parent_run_id)
+        assert {stage.kind for stage in trace.stages} >= {
+            TraceStageKind.RUN,
+            TraceStageKind.CONTEXT,
+            TraceStageKind.MODEL,
+            TraceStageKind.TOOL,
+            TraceStageKind.CHILD,
+            TraceStageKind.MESSAGE,
+        }
+        attribution = await sdk.trace.attribution(parent_run_id)
+        assert attribution.method == "deterministic_event_evidence_v1"
+        assert {contributor.kind for contributor in attribution.contributors} >= {
+            "child",
+            "context",
+            "model",
+            "tool",
+        }
     finally:
         allow_child_message.set()
         allow_child_complete.set()
         await sdk.close()
+
+
+async def _accept_step_12_unknown_inflight(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "interrupted.sqlite3"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "tests.fixtures.v01_runtime",
+        "--seed-interrupted-tool",
+        str(database),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    try:
+        line = await asyncio.wait_for(process.stdout.readline(), timeout=10)
+        assert line, (await process.stderr.read()).decode("utf-8", errors="replace")
+        seeded = json.loads(line)
+        assert seeded["status"] == "tool_in_flight"
+    finally:
+        if process.returncode is None:
+            process.kill()
+        await asyncio.wait_for(process.wait(), timeout=5)
+
+    provider_calls = 0
+    tool_calls = 0
+
+    async def recovery_provider(**_: object) -> object:
+        nonlocal provider_calls
+        provider_calls += 1
+        return _v01_text_stream("recovery complete")
+
+    async def recovered_effect(*_: object, **kwargs: object) -> object:
+        nonlocal tool_calls
+        tool_calls += 1
+        return {"value": kwargs["value"]}
+
+    sdk = AgentSDK.for_test(
+        database_path=database,
+        acompletion=recovery_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(AgentSpec(name="recovery", revision="1", model="test/recovery"))
+    sdk.tools.register(
+        ToolSpec(
+            name="external_effect",
+            description="Block until the fixture process is terminated",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+            version="1",
+            source="application",
+            effects=("external.write",),
+        ),
+        recovered_effect,
+    )
+    try:
+        run_id = str(seeded["run_id"])
+        deadline = asyncio.get_running_loop().time() + 45
+        while True:
+            await asyncio.wait_for(sdk.recovery.scan(), timeout=10)
+            interrupted = await sdk.runs.get(run_id)
+            if interrupted.status is RunStatus.INTERRUPTED:
+                break
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.25)
+        assert interrupted.status is RunStatus.INTERRUPTED
+        waiting = await sdk.recovery.recover_run(run_id)
+        with pytest.raises(AgentSDKError, match="recovery required"):
+            await asyncio.wait_for(waiting.result(), timeout=5)
+        request = (await sdk.recovery.pending_requests(run_id))[0]
+        assert provider_calls == 0
+        assert tool_calls == 0
+        resolved = await sdk.recovery.resolve(
+            request.request_id,
+            ReconciliationAction.RETRY,
+            actor={"type": "operator", "id": "v01-acceptance"},
+            evidence={"acknowledge_duplicate_side_effect_risk": True},
+        )
+        assert resolved.status.value == "resolved"
+        assert provider_calls == 0
+        assert tool_calls == 0
+        result = await (await sdk.recovery.recover_run(run_id)).result()
+        assert result.output_text == "recovery complete"
+        assert provider_calls == 1
+        assert tool_calls == 1
+    finally:
+        await asyncio.wait_for(sdk.close(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_v01_release_public_acceptance_thirteen_steps(
+    v01_harness: V01Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Prove the installed/public v0.1 contract as one ordered acceptance.
+
+    1 SQLite workspace Session; 2 configurable prompt; 3 automatic Context;
+    4 L0-L4 ledger; 5 application/built-in/MCP authorization; 6 Skill/manifest;
+    7 condition/bounded-loop candidate; 8 validate/confirm/start; 9 agent-driven
+    Child controls; 10 live/historical Trace; 11 evaluation/analytics/attribution;
+    12 safe reopen plus interrupted explicit recovery; 13 delete history, keep files.
+    """
+    await _accept_steps_1_2_5_10_11_13(v01_harness)
+    await _accept_steps_3_4_and_6(monkeypatch, tmp_path)
+    await _accept_steps_7_8_and_12_safe_boundary(tmp_path)
+    await _accept_step_9_and_child_trace(tmp_path)
+    await _accept_step_12_unknown_inflight(tmp_path)

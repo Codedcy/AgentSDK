@@ -396,3 +396,8 @@ v0.1 R5 Task 3 locked existing success-rate and Tool-failure formulas, filters, 
 v0.1 R5 Task 3 final controller gate: Memory/SQLite contract 2 passed; expanded analytics/evaluation/attribution 56 passed; Ruff, strict mypy, and diff-check clean.
 v0.1 current implementation status: R0-R4 and R5 Tasks 1-3 completed; R5 Task 4 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\e2e\test_v01_release.py tests\e2e\test_v01_reference_example.py tests\docs -q`
+v0.1 R5 Task 4: complete (implementation working tree; review/commit pending).
+v0.1 R5 Task 4 delivered `examples/v01_reference.py`, a no-network subprocess smoke whose JSON is derived from real public Run/Workflow/Child/Context/Trace/Evaluation/Attribution results, expanded release Trace/analysis evidence, and README/CHANGELOG/quickstart/recovery/tracing-analysis documentation.
+v0.1 R5 Task 4 boundaries: normal reference mode constructs `AgentSDK(AgentSDKConfig(database_path=...))` and relies on application-environment LiteLLM credentials; recovery explicitly has no exactly-once guarantee for external effects and is limited to one SDK instance in one process; attribution is deterministic correlation, not causality; aggregate Tool usefulness and multidimensional failure analysis remain deferred.
+v0.1 current implementation status: R0-R4 and R5 Tasks 1-4 completed; R5 Task 5 pending. Task 4 does not change version, tag, or publish.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\e2e\test_v01_release.py tests\e2e\test_v01_reference_example.py tests\docs -q`
