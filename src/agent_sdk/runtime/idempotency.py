@@ -4,7 +4,22 @@ from agent_sdk.storage.idempotency import (
     IdempotencyError,
     IdempotencyReplayMissError,
     IdempotencyValidationError,
+    IdempotencyReplay,
+    validate_replay,
 )
+
+
+def validate_idempotency_key(scope: str, key: str | None) -> None:
+    if key is None:
+        return
+    public_error: AgentSDKError | None = None
+    try:
+        validate_replay(IdempotencyReplay(scope, key, "0" * 64))
+    except IdempotencyError as error:
+        public_error = _idempotency_public_error(error)
+    if public_error is not None:
+        key = None
+        raise public_error from None
 
 
 def _idempotency_public_error(error: IdempotencyError) -> AgentSDKError:

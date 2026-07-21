@@ -7,7 +7,10 @@ from typing import Any, Generic, Literal, TypeVar
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.errors import AgentSDKError, ErrorCode, SessionBusyError
 from agent_sdk.ids import new_id
-from agent_sdk.runtime.idempotency import _idempotency_public_error
+from agent_sdk.runtime.idempotency import (
+    _idempotency_public_error,
+    validate_idempotency_key,
+)
 from agent_sdk.runtime.execution import DurableAgentSpec, ExecutionDescriptor
 from agent_sdk.runtime.models import (
     RunSnapshot,
@@ -39,7 +42,6 @@ from agent_sdk.storage.idempotency import (
     IdempotencyReplayMissError,
     IdempotencyWrite,
     fingerprint_command,
-    validate_replay,
 )
 from agent_sdk.subagents.models import TaskEnvelope
 
@@ -447,17 +449,7 @@ class RuntimeCommands:
         if execution_descriptor is not None and self._agent_preflight is not None:
             self._agent_preflight(execution_descriptor.agent)
         scope = f"session/{session_id}/run.start"
-        invalid_key: AgentSDKError | None = None
-        if idempotency_key is not None:
-            try:
-                validate_replay(
-                    IdempotencyReplay(scope, idempotency_key, "0" * 64)
-                )
-            except IdempotencyError as error:
-                invalid_key = _idempotency_public_error(error)
-        if invalid_key is not None:
-            idempotency_key = None
-            raise invalid_key from None
+        validate_idempotency_key(scope, idempotency_key)
 
         selected_run_id = run_id or new_id("run")
         compatibility: Literal["legacy_unknown", "current"] = (

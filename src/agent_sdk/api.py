@@ -42,6 +42,7 @@ from agent_sdk.observability import (
     TraceTimeline,
 )
 from agent_sdk.runtime.commands import RuntimeCommands
+from agent_sdk.runtime.idempotency import validate_idempotency_key
 from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
@@ -533,6 +534,10 @@ class RunAPI:
         idempotency_key: str | None = None,
     ) -> RunHandle:
         try:
+            validate_idempotency_key(
+                f"session/{session_id}/run.start",
+                idempotency_key,
+            )
             async with self._lifecycle.admit():
                 messages = ({"role": "user", "content": user_input},)
                 config = self._policy.execution_config()
