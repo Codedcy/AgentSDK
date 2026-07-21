@@ -70,24 +70,17 @@ Success: no issues found in 10 source files
 
 $ git diff --check 56d60a8..309d63c
 clean"""
-R3_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
-R3_RESUME_COMMAND = (
-    r"Get-Content docs\superpowers\plans"
-    r"\2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
-)
 R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
 R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
 R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
 R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
-R3_TASK4_FIRST_TESTS = (
-    "tests/integration/context/test_runtime_middleware.py",
-    "tests/integration/context/test_context_recovery.py",
-)
-R3_TASK4_FIRST_COMMAND = (
+R3_TASK4_COMMITS = ("2ea0464", "3a4b65f", "b98e93f")
+R4_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md"
+R4_FIRST_TEST = "tests/unit/subagents/test_mailbox.py"
+R4_FIRST_COMMAND = (
     "$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; "
     r".\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin "
-    r"tests\integration\context\test_runtime_middleware.py "
-    r"tests\integration\context\test_context_recovery.py -q"
+    r"tests\unit\subagents\test_mailbox.py -q"
 )
 
 
@@ -126,8 +119,6 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "Ready to proceed to R3: Yes" in document
     assert "R2 Task 4" in document
     assert "final review Spec approved / Quality approved" in document
-    assert R3_PLAN in document
-    assert R3_RESUME_COMMAND in document
     for commit in R3_TASK1_COMMITS:
         assert commit in document
     assert R3_FIRST_TEST in document
@@ -155,18 +146,26 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "521 passed, 1 skipped" in document
     assert "25 passed" in document
     assert "92 source files" in document
-    assert "R3 Task 4 Step 1" in document
-    for test_path in R3_TASK4_FIRST_TESTS:
-        assert test_path in document
-    assert R3_TASK4_FIRST_COMMAND in normalized_document
+    for commit in R3_TASK4_COMMITS:
+        assert commit in document
+    assert "R3 Task 4 is complete" in document or "v0.1 R3 Task 4: complete" in document
+    assert "Task 4 final approval: Critical 0 / Important 0 / Minor 0" in document
+    assert "Spec PASS; Quality PASS" in document
+    assert R4_PLAN in document
+    assert R4_FIRST_TEST in document
+    assert R4_FIRST_COMMAND in normalized_document
+    assert "first expected RED" in document
+    assert "created by R4 Task 1" in document
     assert "R3 Task 2 Step 1" not in document
     assert "tests/unit/context/test_compaction_levels.py" not in document
     assert "R3 Task 2 remains pending/unstarted" not in document
     assert "R3 remains pending" not in document
+    assert "R3 is in progress" not in document
     assert "R3 implementation has not started" not in document
     assert "Tasks 4-5 have not started" not in document
-    assert "next required action: R3 Task 3 Step 1" not in document
-    assert "first Task 3 command:" not in document
+    assert "R3 Task 4 Step 1" not in document
+    assert "tests/integration/context/test_runtime_middleware.py" not in document
+    assert "tests/integration/context/test_context_recovery.py" not in document
 
 
 def test_v01_release_ledger_names_every_required_slice() -> None:
@@ -192,7 +191,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     ) in ledger
     for slice_id in ("R4", "R5"):
         assert f"| {slice_id} | pending |" in ledger
-    assert "| R3 | in_progress | automatic L0-L4 | " in ledger
+    assert "| R3 | completed | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
     assert "74c1e3b" in ledger
@@ -212,10 +211,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R1 checkpoint: complete" in progress
     assert "v0.1 R1 initial checkpoint historical evidence:" in progress
     assert "v0.1 R1 final checkpoint exact fresh evidence:" in progress
-    assert (
-        "v0.1 current implementation status: R0-R2 completed; "
-        "R3 in progress (Tasks 1-3 complete; Task 4 pending)"
-    ) in progress
+    assert "v0.1 current implementation status: R0-R3 completed; R4 pending" in progress
     _assert_release_checkpoint_and_r3_resume(ledger)
     _assert_release_checkpoint_and_r3_resume(progress)
 
