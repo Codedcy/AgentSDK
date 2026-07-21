@@ -20,14 +20,23 @@ complete. It records no production-code change and does not start R4.
 ## Ledger facts
 
 - R3 is complete and R4 is pending.
-- The R3 checkpoint evidence recorded from the approved Task 4 re-review is
-  221 passed, 1 skipped in 13.65s; Ruff clean; strict mypy clean across 93
+- The Task 5 fresh R3 checkpoint evidence is 221 passed, 1 skipped in 25.32s;
+  Ruff clean; strict mypy clean across 93
   source files.
 - The next plan is
   `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md`.
-- The resume command targets `tests/unit/subagents/test_mailbox.py`. R4 Task 1
-  creates that file, so its first execution is intentionally expected to be
-  RED; its absence is not an R3 checkpoint failure.
+- The resume command targets `tests/unit/runtime/test_capability_intersection.py`.
+  R4 Task 1 creates that file, so its first execution is intentionally expected
+  to be RED; its absence is not an R3 checkpoint failure. The mailbox test is
+  introduced by R4 Task 2.
+
+## Checkpoint correction
+
+The independent Task 5 review found that the original handoff skipped R4 Task
+1 by naming the later mailbox test, and that it attributed an unsupported
+duration to the Task 4 approval. The durable ledgers and their
+executable contract now use the Task 1 capability-intersection test and the
+actual Task 5 checkpoint result of 25.32s.
 
 ## Fresh Task 5 verification
 

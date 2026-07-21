@@ -76,12 +76,14 @@ R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
 R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
 R3_TASK4_COMMITS = ("2ea0464", "3a4b65f", "b98e93f")
 R4_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md"
-R4_FIRST_TEST = "tests/unit/subagents/test_mailbox.py"
+R4_TASK1_TEST = "tests/unit/runtime/test_capability_intersection.py"
 R4_FIRST_COMMAND = (
     "$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; "
     r".\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin "
-    r"tests\unit\subagents\test_mailbox.py -q"
+    r"tests\unit\runtime\test_capability_intersection.py -q"
 )
+R4_TASK2_MAILBOX_TEST = "tests/unit/subagents/test_mailbox.py"
+R3_TASK5_FRESH_RESULT = "221 passed, 1 skipped in 25.32s"
 
 
 def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
@@ -151,11 +153,14 @@ def _assert_release_checkpoint_and_r3_resume(document: str) -> None:
     assert "R3 Task 4 is complete" in document or "v0.1 R3 Task 4: complete" in document
     assert "Task 4 final approval: Critical 0 / Important 0 / Minor 0" in document
     assert "Spec PASS; Quality PASS" in document
+    assert R3_TASK5_FRESH_RESULT in document
+    assert "13.65s" not in document
     assert R4_PLAN in document
-    assert R4_FIRST_TEST in document
+    assert R4_TASK1_TEST in document
     assert R4_FIRST_COMMAND in normalized_document
     assert "first expected RED" in document
     assert "created by R4 Task 1" in document
+    assert R4_TASK2_MAILBOX_TEST not in document
     assert "R3 Task 2 Step 1" not in document
     assert "tests/unit/context/test_compaction_levels.py" not in document
     assert "R3 Task 2 remains pending/unstarted" not in document

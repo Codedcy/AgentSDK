@@ -337,7 +337,7 @@ $ git diff --check 56d60a8..309d63c
 clean
 ```
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py -q`
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py -q`
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
@@ -352,8 +352,8 @@ v0.1 R3 Task 4: complete (implementation `2ea0464`; recovery-evidence fix `3a4b6
 v0.1 R3 Task 4 final approval: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 4 delivered ContextMiddleware preparation before each new model call, durable exact prepared requests, authenticated Context View/Prompt Manifest bindings, strict provider request validation, and no-side-effect failure for corrupted recovery evidence.
 v0.1 R3 checkpoint: complete (2026-07-20; Tasks 1-4 approved)
-v0.1 R3 checkpoint fresh evidence: 221 passed, 1 skipped in 13.65s across unit/context, integration/context, integration/prompts, reconciliation models, and v0.1 E2E; Ruff clean; strict mypy clean across 93 source files.
+v0.1 R3 checkpoint fresh evidence: 221 passed, 1 skipped in 25.32s across unit/context, integration/context, integration/prompts, reconciliation models, and v0.1 E2E; Ruff clean; strict mypy clean across 93 source files.
 v0.1 current implementation status: R0-R3 completed; R4 pending
 v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md
-v0.1 `tests/unit/subagents/test_mailbox.py` is created by R4 Task 1; it does not exist yet and the resume command is the first expected RED, not a current code failure.
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py -q`
+v0.1 `tests/unit/runtime/test_capability_intersection.py` is created by R4 Task 1; it does not exist yet and the resume command is the first expected RED, not a current code failure.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py -q`
