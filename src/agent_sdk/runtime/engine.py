@@ -490,8 +490,19 @@ class _RunEmitter:
             )
             run_events = (
                 self._new_event("model.call.failed", payload),
-                self._new_event("step.failed", payload, offset=1),
-                self._new_event("run.failed", payload, offset=2),
+                self._new_event(
+                    "step.failed",
+                    {
+                        "step_id": operation.operation_id,
+                        "error": failure.to_dict(),
+                    },
+                    offset=1,
+                ),
+                self._new_event(
+                    "run.failed",
+                    {"error": failure.to_dict()},
+                    offset=2,
+                ),
             )
             for attempt in range(_MAX_SESSION_COMMIT_ATTEMPTS):
                 session = await load_session(self._store, self._run.session_id)

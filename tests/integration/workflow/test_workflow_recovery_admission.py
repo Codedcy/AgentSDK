@@ -2994,6 +2994,22 @@ async def test_recover_selected_failed_run_projects_sanitized_failure() -> None:
     with pytest.raises(AgentSDKError):
         await (await sdk.recovery.recover_run(created.run_id)).result()
     assert (await sdk.runs.get(created.run_id)).status is RunStatus.FAILED
+    failed_step = next(
+        stored.event
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == created.run_id
+        and stored.event.type == "step.failed"
+    )
+    assert failed_step.schema_version == 2
+    assert set(failed_step.payload) == {"step_id", "error"}
+    failed_run = next(
+        stored.event
+        for stored in await store.read_events(after_cursor=0)
+        if stored.event.run_id == created.run_id
+        and stored.event.type == "run.failed"
+    )
+    assert failed_run.schema_version == 1
+    assert set(failed_run.payload) == {"error"}
     try:
         handle = await sdk.recovery.recover_workflow(workflow.workflow_run_id)
         with pytest.raises(AgentSDKError) as failed:
