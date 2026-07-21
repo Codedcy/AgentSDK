@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from importlib import resources
 import json
 from pathlib import Path
 import sqlite3
@@ -21,6 +22,13 @@ from agent_sdk import (
     ToolContext,
     ToolSpec,
     WorkflowDefinition,
+)
+
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
 )
 
 
@@ -102,8 +110,14 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
     async def script(**params: Any) -> object:
         model = str(params["model"])
         provider_calls[model] += 1
+        messages = params["messages"]
+        assert isinstance(messages, list)
         if params["stream"] is False:
-            source_document = json.loads(params["messages"][1]["content"])
+            assert [message["role"] for message in messages] == [
+                "system",
+                "user",
+            ]
+            source_document = json.loads(messages[1]["content"])
             source_ids = [
                 item["event_id"] for item in source_document["sources"]
             ]
@@ -129,6 +143,23 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
                     "total_tokens": 3,
                 },
             }
+        assert messages[0] == {
+            "role": "system",
+            "content": _GENERAL_SYSTEM_PROMPT,
+        }
+        if model == "fake/worker" and provider_calls[model] == 1:
+            assert messages[1:] == [
+                {"role": "user", "content": "seed context history"}
+            ]
+        elif model == "fake/worker":
+            assert messages[1:] == [
+                {"role": "user", "content": "seed context history"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "complete workflow"},
+            ]
+        else:
+            assert model == "fake/main"
+            assert messages[-1] == {"role": "user", "content": "main"}
         if model == "fake/main":
             provider_started.set()
             await release_provider.wait()
@@ -146,6 +177,12 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
             workspaces=[workspace],
             idempotency_key="create-session",
         )
+        seed = await first.runs.start(
+            session.session_id,
+            worker,
+            "seed context history",
+        )
+        assert (await seed.result()).output_text == "done"
         workflow_handle = await first.workflows.start(
             session.session_id,
             WORKFLOW,
@@ -179,7 +216,7 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
         assert {result.output_text for result in results} == {"done"}
         assert provider_calls == {
             "fake/main": 1,
-            "fake/worker": 1,
+            "fake/worker": 2,
             "fake/context": 1,
         }
         assert tool_calls == 0
@@ -342,10 +379,32 @@ async def test_session_run_lifecycle_replays_after_sqlite_reopen(
                 "SELECT COUNT(*) FROM events WHERE session_id = ?",
                 (session.session_id,),
             ).fetchone()[0] > 0
-            assert connection.execute(
-                "SELECT COUNT(*) FROM idempotency_records WHERE session_id = ?",
-                (session.session_id,),
-            ).fetchone()[0] == 3
+            idempotency_records = set(
+                connection.execute(
+                    "SELECT scope, key FROM idempotency_records "
+                    "WHERE session_id = ?",
+                    (session.session_id,),
+                )
+            )
+            assert {
+                ("session.create", "create-session"),
+                (
+                    f"session/{session.session_id}/run.start",
+                    "start-main",
+                ),
+                (
+                    f"session/{session.session_id}/workflow.start",
+                    "start-workflow",
+                ),
+            } <= idempotency_records
+            assert sum(
+                scope.endswith("/mailbox.bootstrap") and key == "v1"
+                for scope, key in idempotency_records
+            ) == 3
+            assert sum(
+                scope.endswith("/mailbox_cursor.bootstrap") and key == "v1"
+                for scope, key in idempotency_records
+            ) == 3
 
         assert reopen_calls == 0
         await reopened.sessions.delete(session.session_id)
