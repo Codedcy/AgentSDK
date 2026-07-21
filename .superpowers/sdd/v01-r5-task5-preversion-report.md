@@ -4,16 +4,20 @@ Date: 2026-07-22
 
 Baseline: `c8b4110`
 
-Verified HEAD: `b422985`
+Pre-review verified HEAD: `b422985`
+
+Post-review tested code HEAD: `8a63e7b`
 
 Package version: `0.1.0.dev0` (unchanged)
 
 ## Result
 
-Task 5 Steps 1-3 pass at the pre-version stop point. Python 3.13 full tests,
-whole-repository Ruff, strict package mypy, the Python 3.12 critical set, dev
-sdist/wheel build, clean Python 3.12 wheel import, and installed-wheel reference
-smoke all pass. No version bump, tag, or publication was performed.
+Task 5 Steps 1-3 pass at the final post-review pre-version stop point. Python
+3.13 full tests, whole-repository Ruff, strict package mypy, the Python 3.12
+critical set, dev sdist/wheel build, clean Python 3.12 wheel import, and
+installed-wheel reference smoke all pass after the four approved whole-v0.1
+review blocker groups were fixed. No version bump, tag, or publication was
+performed.
 
 ## Initial Python 3.13 Evidence
 
@@ -194,8 +198,98 @@ Installed-wheel reference smoke output:
 {"attribution_method":"deterministic_event_evidence_v1","child_status":"completed","context_levels":["L0","L1","L2","L3","L4"],"evaluation_verdict":"pass","run_status":"completed","trace_stage_count":1,"workflow_status":"completed"}
 ```
 
-## Stop Point
+## Post-Review Final Rerun
 
-Steps 1-3 are complete. The mandatory whole-v0.1 review and any resulting
-written-contract blockers must be handled before changing package metadata to
-`0.1.0`. The version remains `0.1.0.dev0`; no tag or publication was created.
+The four approved whole-v0.1 review blocker groups were closed before this
+rerun: immutable/frozen mapping trust, terminal recovery abort safety, complete
+trace fields and failed-run usage aggregation, and the installed v0.1 reference
+loop. Their implementation commits precede tested code HEAD `8a63e7b`.
+
+The first post-review Python 3.13 full run exposed four stale storage-test
+fixture failures:
+
+- 2,949 passed, 4 failed, 6 skipped in 535.95 seconds;
+- both memory and SQLite variants of atomic reconciliation resolution and exact
+  expired-lease replay rejected the fixture with `RecoveryStateConflictError`;
+- root cause: the generic storage CAS fixture still represented `TERMINATE` as
+  a resolution event plus run snapshot, while terminal abort now correctly
+  requires the complete operation/checkpoint/session/run/failure projection;
+- disposition: `8a63e7b test: update reconciliation progress fixture` changed
+  only the generic test fixture to semantic `RETRY` evidence. Production abort
+  validation was not relaxed. The four failed nodes then passed, followed by
+  all 72 tests in the storage reconciliation progress file.
+
+### Final Python 3.13 gate
+
+- Full pytest: 2,953 passed, 6 skipped, 0 failed, 0 errors in 529.64 seconds
+  (0:08:49).
+- JUnit: `.superpowers/sdd/v01-r5-task5-post-review-py313-full.xml`.
+- Ruff: `python -m ruff check .` -> `All checks passed!`.
+- Exact strict mypy: `python -m mypy --strict` -> 107 source files, no issues.
+
+Exact skipped nodes and reasons from the final JUnit:
+
+1. `tests/integration/prompts/test_prompt_slice.py::test_wheel_and_sdist_include_both_markdown_profiles`
+   - `uv executable is unavailable`.
+   - Covered by the successful real build, archive inspection, fresh-wheel
+     install, and installed reference smoke below.
+2. `tests/unit/runtime/test_session_workspace_roots.py::test_run_workspace_scope_rejects_a_symlink_redirected_outside`
+   - `symlink creation is unavailable: [WinError 1314] 客户端没有所需的特权。`
+3. `tests/unit/runtime/test_session_workspace_roots.py::test_final_workspace_resolution_rechecks_scope_after_redirect`
+   - `symlink creation is unavailable: [WinError 1314] 客户端没有所需的特权。`
+4. `tests/unit/tools/test_workspace_paths.py::test_resolve_workspace_path_rejects_existing_symlink_escape`
+   - `platform refused symlink creation: [WinError 1314] 客户端没有所需的特权。`
+5. `tests/unit/tools/test_workspace_paths.py::test_posix_trailing_dot_and_space_names_remain_valid[trailing.]`
+   - `POSIX filename semantics only`.
+6. `tests/unit/tools/test_workspace_paths.py::test_posix_trailing_dot_and_space_names_remain_valid[trailing ]`
+   - `POSIX filename semantics only`.
+
+### Final dev artifacts
+
+Fresh output directory:
+`.superpowers/sdd/dist-post-review-8a63e7b/`.
+
+- `agent_sdk-0.1.0.dev0-py3-none-any.whl`
+  - size: 305,668 bytes;
+  - SHA256: `7140CAA1492F331C0795645CA7651CF20F5B2E7E16090014F8A5107583A0C7A5`.
+- `agent_sdk-0.1.0.dev0.tar.gz`
+  - size: 5,368,022 bytes;
+  - SHA256: `F4BCA84C4D61496CF13F7B5363229D1D548BF9123301000B73ED5C0DE888D18F`.
+
+Wheel metadata remains `agent-sdk 0.1.0.dev0` with
+`Requires-Python: >=3.12,<3.14`. Both archives contain `py.typed` and the
+packaged `general` and `coding` `system.md` profiles.
+
+### Final official Python 3.12 gate
+
+The exact five critical files listed above ran under official CPython 3.12.10:
+
+- 80 passed, 0 skipped, 0 failed in 93.36 seconds (0:01:33);
+- JUnit: `.superpowers/sdd/v01-r5-task5-post-review-py312-critical.xml`.
+
+### Final fresh installed-wheel gate
+
+A newly created CPython 3.12.10 venv
+`fresh-wheel-8a63e7b` installed only the freshly built wheel and its declared
+runtime dependencies. `PYTHONPATH` was cleared and the smoke ran outside the
+repository:
+
+- imported module:
+  `C:\Users\10176\AppData\Local\Temp\agent-sdk-python312-gate\fresh-wheel-8a63e7b\Lib\site-packages\agent_sdk\__init__.py`;
+- installed version: `0.1.0.dev0`;
+- source directory on `sys.path`: false;
+- module loaded from source: false;
+- installed `py.typed`, general prompt, and coding prompt: present.
+
+Installed-wheel extended reference smoke output:
+
+```json
+{"attribution_method":"deterministic_event_evidence_v1","child_result_consumed":true,"child_status":"completed","condition_selection":"then","context_levels":["L0","L1","L2","L3","L4"],"evaluation_verdict":"pass","live_subscription_observed":true,"loop_iterations":2,"message_count":2,"run_status":"completed","safe_reopen_no_replay":true,"session_deleted":true,"trace_stage_count":32,"workflow_status":"completed","workspace_preserved":true}
+```
+
+## Final Stop Point
+
+R5 Task 5 Steps 1-3 and the approved whole-review blocker rerun are complete.
+The tested code is ready for the separate `0.1.0` metadata-release step. The
+package version intentionally remains `0.1.0.dev0`; no tag or publication was
+created.
