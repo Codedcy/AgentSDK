@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
@@ -22,7 +23,7 @@ from agent_sdk.context.models import (
 )
 from agent_sdk.context.rendering import render_level
 from agent_sdk.context.retrieval import ContextRetrieval
-from agent_sdk.context.sources import extract_sources
+from agent_sdk.context.sources import extract_sources, mailbox_sources
 from agent_sdk.context.strategies import StrategyResult
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.events.models import EventEnvelope
@@ -37,10 +38,17 @@ from agent_sdk.storage.base import (
     StateStore,
     StoredEvent,
 )
+from agent_sdk.subagents.mailbox import MailboxRead, MailboxService
+from agent_sdk.subagents.models import MailboxCursorSnapshot, MailboxSnapshot
 from agent_sdk.tools.models import thaw_json
 
 _Role = Literal["system", "user", "assistant", "tool"]
 _APPLICATION_ROLES = frozenset({"system", "user", "assistant", "tool"})
+_MAX_MAILBOX_COMMIT_ATTEMPTS = 8
+
+
+class _MailboxStateChanged(Exception):
+    pass
 
 
 @dataclass(frozen=True)
@@ -89,8 +97,36 @@ class ContextPlanner:
         self._token_counter = _token_counter
         self._compactor = ContextCompactor(models, model=model)
         self._retrieval = ContextRetrieval(store)
+        self._mailbox = MailboxService(store)
 
     async def prepare(
+        self,
+        *,
+        session_id: str,
+        run_id: str,
+        checkpoint: RunCheckpoint,
+        config: ContextRuntimeConfig,
+    ) -> PlannedContext:
+        for attempt in range(_MAX_MAILBOX_COMMIT_ATTEMPTS):
+            try:
+                return await self._prepare_once(
+                    session_id=session_id,
+                    run_id=run_id,
+                    checkpoint=checkpoint,
+                    config=config,
+                )
+            except _MailboxStateChanged:
+                if attempt + 1 < _MAX_MAILBOX_COMMIT_ATTEMPTS:
+                    await asyncio.sleep(0)
+                    continue
+                break
+        raise AgentSDKError(
+            ErrorCode.CONFLICT,
+            "context mailbox changed concurrently",
+            retryable=True,
+        )
+
+    async def _prepare_once(
         self,
         *,
         session_id: str,
@@ -111,12 +147,16 @@ class ContextPlanner:
                 "session not found",
                 retryable=False,
             )
+        mailbox = await self._mailbox.read(run_id, session_id=session_id)
         try:
             stored_events = await self._store.read_events(
                 after_cursor=0,
                 session_id=session_id,
             )
-            sources = extract_sources(stored_events, checkpoint)
+            sources = (
+                *extract_sources(stored_events, checkpoint),
+                *mailbox_sources(mailbox.messages),
+            )
         except AgentSDKError:
             raise
         except Exception as error:
@@ -163,6 +203,7 @@ class ContextPlanner:
                 budget=budget,
                 recommended=recommended,
                 applied=requested,
+                mailbox=mailbox,
             )
             messages = self._strategy_messages(rendered)
             await self._record_over_budget_if_needed(view)
@@ -202,6 +243,7 @@ class ContextPlanner:
                     recommended=recommended,
                     applied=requested,
                     estimated_tokens=estimated_tokens,
+                    mailbox=mailbox,
                 )
                 return PlannedContext(
                     view=view,
@@ -225,6 +267,7 @@ class ContextPlanner:
             budget=budget,
             recommended=recommended,
             requested=requested,
+            mailbox=mailbox,
         )
         messages = self._strategy_messages(fallback)
         await self._record_over_budget_if_needed(view)
@@ -313,6 +356,7 @@ class ContextPlanner:
         budget: ContextBudget,
         recommended: CompactionLevel,
         applied: CompactionLevel,
+        mailbox: MailboxRead,
     ) -> ContextView:
         view = self._rendered_view(
             session_id=session_id,
@@ -321,8 +365,11 @@ class ContextPlanner:
             recommended=recommended,
             applied=applied,
             fallback_from=None,
+            consumed_message_ids=tuple(
+                message.message_id for message in mailbox.messages
+            ),
         )
-        await self._persist_view(view, usage=None)
+        await self._persist_view(view, usage=None, mailbox=mailbox)
         return view
 
     async def _record_over_budget_if_needed(self, view: ContextView) -> None:
@@ -676,6 +723,7 @@ class ContextPlanner:
         recommended: CompactionLevel,
         applied: CompactionLevel,
         estimated_tokens: int,
+        mailbox: MailboxRead | None = None,
     ) -> ContextView:
         view_id = new_id("view")
         capsule_id = new_id("cap")
@@ -700,6 +748,7 @@ class ContextPlanner:
             budget=budget,
             source_refs=source_refs,
             transformations=transformed,
+            consumed_message_ids=self._consumed_message_ids(mailbox),
         )
         events = (
             self._event(
@@ -721,6 +770,9 @@ class ContextPlanner:
             ),
             self._view_event(view, sequence=2, usage=usage),
         )
+        mailbox_snapshots, mailbox_preconditions = self._mailbox_commit_parts(
+            mailbox
+        )
         snapshots = (
             SnapshotWrite(
                 "context_capsule",
@@ -739,13 +791,18 @@ class ContextPlanner:
                 1,
                 view.model_dump(mode="json"),
             ),
+            *mailbox_snapshots,
         )
         await self._commit(
             CommitBatch(
                 events=events,
                 snapshots=snapshots,
-                preconditions=(SnapshotPrecondition("session", session_id),),
-            )
+                preconditions=(
+                    SnapshotPrecondition("session", session_id),
+                    *mailbox_preconditions,
+                ),
+            ),
+            mailbox=mailbox,
         )
         return view
 
@@ -758,6 +815,7 @@ class ContextPlanner:
         budget: ContextBudget,
         recommended: CompactionLevel,
         requested: CompactionLevel,
+        mailbox: MailboxRead | None = None,
     ) -> ContextView:
         view = self._rendered_view(
             session_id=session_id,
@@ -766,6 +824,7 @@ class ContextPlanner:
             recommended=recommended,
             applied=CompactionLevel.L2,
             fallback_from=requested,
+            consumed_message_ids=self._consumed_message_ids(mailbox),
         )
         events = (
             self._event(
@@ -787,6 +846,9 @@ class ContextPlanner:
             ),
             self._view_event(view, sequence=2, usage=usage),
         )
+        mailbox_snapshots, mailbox_preconditions = self._mailbox_commit_parts(
+            mailbox
+        )
         await self._commit(
             CommitBatch(
                 events=events,
@@ -798,9 +860,14 @@ class ContextPlanner:
                         1,
                         view.model_dump(mode="json"),
                     ),
+                    *mailbox_snapshots,
                 ),
-                preconditions=(SnapshotPrecondition("session", session_id),),
-            )
+                preconditions=(
+                    SnapshotPrecondition("session", session_id),
+                    *mailbox_preconditions,
+                ),
+            ),
+            mailbox=mailbox,
         )
         return view
 
@@ -813,6 +880,7 @@ class ContextPlanner:
         recommended: CompactionLevel,
         applied: CompactionLevel,
         fallback_from: CompactionLevel | None,
+        consumed_message_ids: tuple[str, ...] = (),
     ) -> ContextView:
         messages = []
         for item in rendered.items:
@@ -831,6 +899,7 @@ class ContextPlanner:
             source_refs=rendered.source_refs,
             transformations=rendered.transformations,
             fallback_from=fallback_from,
+            consumed_message_ids=consumed_message_ids,
         )
 
     async def _persist_view(
@@ -838,7 +907,11 @@ class ContextPlanner:
         view: ContextView,
         *,
         usage: UsageReported | None,
+        mailbox: MailboxRead | None = None,
     ) -> None:
+        mailbox_snapshots, mailbox_preconditions = self._mailbox_commit_parts(
+            mailbox
+        )
         await self._commit(
             CommitBatch(
                 events=(self._view_event(view, sequence=1, usage=usage),),
@@ -850,11 +923,14 @@ class ContextPlanner:
                         1,
                         view.model_dump(mode="json"),
                     ),
+                    *mailbox_snapshots,
                 ),
                 preconditions=(
                     SnapshotPrecondition("session", view.session_id),
+                    *mailbox_preconditions,
                 ),
-            )
+            ),
+            mailbox=mailbox,
         )
 
     def _estimate_compacted_tokens(
@@ -898,16 +974,101 @@ class ContextPlanner:
             ) from error
         return count
 
-    async def _commit(self, batch: CommitBatch) -> None:
+    @staticmethod
+    def _consumed_message_ids(
+        mailbox: MailboxRead | None,
+    ) -> tuple[str, ...]:
+        if mailbox is None:
+            return ()
+        return tuple(message.message_id for message in mailbox.messages)
+
+    @staticmethod
+    def _mailbox_commit_parts(
+        mailbox: MailboxRead | None,
+    ) -> tuple[tuple[SnapshotWrite, ...], tuple[SnapshotPrecondition, ...]]:
+        if mailbox is None:
+            return (), ()
+        advanced = mailbox.advanced_cursor()
+        if advanced is None:
+            return (), ()
+        current_mailbox = mailbox.mailbox
+        current_cursor = mailbox.cursor
+        return (
+            (
+                SnapshotWrite(
+                    "mailbox_cursor",
+                    advanced.recipient_run_id,
+                    advanced.session_id,
+                    advanced.version,
+                    advanced.model_dump(mode="json"),
+                ),
+            ),
+            (
+                SnapshotPrecondition(
+                    "mailbox",
+                    current_mailbox.recipient_run_id,
+                    current_mailbox.version,
+                    current_mailbox.session_id,
+                    current_mailbox.model_dump(mode="json"),
+                ),
+                SnapshotPrecondition(
+                    "mailbox_cursor",
+                    current_cursor.recipient_run_id,
+                    current_cursor.version,
+                    current_cursor.session_id,
+                    current_cursor.model_dump(mode="json"),
+                ),
+            ),
+        )
+
+    async def _commit(
+        self,
+        batch: CommitBatch,
+        *,
+        mailbox: MailboxRead | None = None,
+    ) -> None:
         failure: AgentSDKError | None = None
         try:
             await self._store.commit(batch)
         except SnapshotPreconditionError:
-            failure = AgentSDKError(
-                ErrorCode.NOT_FOUND,
-                "context session no longer exists",
-                retryable=False,
+            session_id = (
+                mailbox.mailbox.session_id
+                if mailbox is not None
+                else next(
+                    (
+                        item.entity_id
+                        for item in batch.preconditions
+                        if item.kind == "session"
+                    ),
+                    "",
+                )
             )
+            try:
+                session = await self._store.get_snapshot("session", session_id)
+                if session is None:
+                    failure = AgentSDKError(
+                        ErrorCode.NOT_FOUND,
+                        "context session no longer exists",
+                        retryable=False,
+                    )
+                elif mailbox is not None and await self._mailbox_state_changed(
+                    mailbox
+                ):
+                    raise _MailboxStateChanged
+                else:
+                    failure = AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "context persistence failed",
+                        retryable=False,
+                    )
+            except _MailboxStateChanged:
+                raise
+            except Exception:
+                failure = AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "context persistence failed",
+                    retryable=False,
+                )
         except Exception:
             failure = AgentSDKError(
                 ErrorCode.INTERNAL,
@@ -916,6 +1077,21 @@ class ContextPlanner:
             )
         if failure is not None:
             raise failure
+
+    async def _mailbox_state_changed(self, expected: MailboxRead) -> bool:
+        mailbox_data = await self._store.get_snapshot(
+            "mailbox",
+            expected.mailbox.recipient_run_id,
+        )
+        cursor_data = await self._store.get_snapshot(
+            "mailbox_cursor",
+            expected.cursor.recipient_run_id,
+        )
+        if mailbox_data is None or cursor_data is None:
+            raise ValueError("mailbox state is missing")
+        mailbox = MailboxSnapshot.model_validate(mailbox_data)
+        cursor = MailboxCursorSnapshot.model_validate(cursor_data)
+        return mailbox != expected.mailbox or cursor != expected.cursor
 
     @staticmethod
     def _event(

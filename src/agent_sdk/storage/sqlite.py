@@ -4493,6 +4493,7 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
     from agent_sdk.evaluation.models import EvaluationResult
     from agent_sdk.prompts.models import PromptManifest
     from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
+    from agent_sdk.subagents.models import MailboxCursorSnapshot, MailboxSnapshot
     from agent_sdk.workflow.models import WorkflowNodeSnapshot, WorkflowRunSnapshot
 
     try:
@@ -4506,6 +4507,8 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
         views: dict[str, ContextView] = {}
         prompt_manifests: dict[str, tuple[str, PromptManifest]] = {}
         evaluations: dict[str, EvaluationResult] = {}
+        mailboxes: dict[str, MailboxSnapshot] = {}
+        mailbox_cursors: dict[str, MailboxCursorSnapshot] = {}
         for row in rows:
             if row.kind != "session":
                 continue
@@ -4586,6 +4589,24 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
                 ):
                     raise ValueError("current evaluation identity is invalid")
                 evaluations[evaluation_value.evaluation_id] = evaluation_value
+            elif row.kind == "mailbox":
+                mailbox_value = MailboxSnapshot.model_validate(data)
+                if (
+                    mailbox_value.recipient_run_id != row.entity_id
+                    or mailbox_value.session_id != row.session_id
+                    or mailbox_value.version != row.version
+                ):
+                    raise ValueError("current mailbox identity is invalid")
+                mailboxes[mailbox_value.recipient_run_id] = mailbox_value
+            elif row.kind == "mailbox_cursor":
+                cursor_value = MailboxCursorSnapshot.model_validate(data)
+                if (
+                    cursor_value.recipient_run_id != row.entity_id
+                    or cursor_value.session_id != row.session_id
+                    or cursor_value.version != row.version
+                ):
+                    raise ValueError("current mailbox cursor identity is invalid")
+                mailbox_cursors[cursor_value.recipient_run_id] = cursor_value
             else:
                 raise ValueError("current snapshot kind is invalid")
         for workflow in workflows.values():
@@ -4609,6 +4630,26 @@ async def _validate_current_projection_rows(connection: aiosqlite.Connection) ->
             run = runs.get(evaluation.subject_run_id)
             if run is None or run.session_id != evaluation.session_id:
                 raise ValueError("current evaluation subject is invalid")
+        for mailbox in mailboxes.values():
+            recipient = runs.get(mailbox.recipient_run_id)
+            if recipient is None or recipient.session_id != mailbox.session_id:
+                raise ValueError("current mailbox recipient is invalid")
+        for mailbox_cursor in mailbox_cursors.values():
+            recipient = runs.get(mailbox_cursor.recipient_run_id)
+            owned_mailbox = mailboxes.get(mailbox_cursor.recipient_run_id)
+            if (
+                recipient is None
+                or recipient.session_id != mailbox_cursor.session_id
+                or owned_mailbox is None
+                or owned_mailbox.session_id != mailbox_cursor.session_id
+                or mailbox_cursor.last_consumed_sequence
+                > (
+                    owned_mailbox.messages[-1].sequence
+                    if owned_mailbox.messages
+                    else 0
+                )
+            ):
+                raise ValueError("current mailbox cursor owner is invalid")
         async with connection.execute(
             """
             SELECT scope, key, request_fingerprint, session_id, result_json

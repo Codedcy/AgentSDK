@@ -7,8 +7,31 @@ from typing import Any, Literal, cast
 from agent_sdk.context.models import SourceMessage
 from agent_sdk.runtime.reconciliation import RunCheckpoint
 from agent_sdk.storage.base import StoredEvent
+from agent_sdk.subagents.models import AgentMessage
 
 type _Role = Literal["system", "user", "assistant", "tool"]
+
+
+def mailbox_sources(
+    messages: Iterable[AgentMessage],
+) -> tuple[SourceMessage, ...]:
+    return tuple(
+        SourceMessage(
+            ref=message.message_id,
+            role="user",
+            message={
+                "role": "user",
+                "content": (
+                    f"Agent message from {message.sender_run_id}:\n"
+                    f"{message.content}"
+                ),
+            },
+            event_type="agent.message.sent",
+            protected=True,
+            current=True,
+        )
+        for message in messages
+    )
 
 
 def checkpoint_ref(run_id: str, checkpoint_version: int, index: int) -> str:
