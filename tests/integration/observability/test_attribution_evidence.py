@@ -13,10 +13,35 @@ from agent_sdk import (
     AttributionSummary,
     ToolContext,
     ToolSpec,
+    WorkflowEdge,
     WorkflowIR,
 )
 from agent_sdk.observability import TraceStageKind
 from agent_sdk.storage.memory import InMemoryStore
+
+
+class _MismatchedWorkflowBindingStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.workflow_id: str | None = None
+        self.node_id: str | None = None
+        self.wrong_run_id: str | None = None
+
+    async def get_snapshot(self, kind: str, entity_id: str) -> dict[str, Any] | None:
+        data = await super().get_snapshot(kind, entity_id)
+        if (
+            data is None
+            or kind != "workflow"
+            or entity_id != self.workflow_id
+            or self.node_id is None
+            or self.wrong_run_id is None
+        ):
+            return data
+        nodes = data["nodes"]
+        assert isinstance(nodes, list)
+        node = next(item for item in nodes if item["node_id"] == self.node_id)
+        node["run_id"] = self.wrong_run_id
+        return data
 
 
 @pytest.mark.asyncio
@@ -180,6 +205,95 @@ async def test_run_attribution_includes_its_real_workflow_node_evidence() -> Non
         )
         assert workflow_contributor.status == "completed"
         assert workflow_contributor.evidence_ids
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_run_attribution_excludes_real_sibling_workflow_node_evidence() -> None:
+    async def provider(**params: Any) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {"content": str(params["messages"][-1]["content"])},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+        return chunks()
+
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        enable_builtin_tools=False,
+    )
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/model"))
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        workflow = WorkflowIR.create(
+            name="two-node-attribution",
+            nodes=(
+                AgentNode(id="first", agent_revision="worker:1", input="first"),
+                AgentNode(id="second", agent_revision="worker:1", input="second"),
+            ),
+            edges=(WorkflowEdge(source="first", target="second"),),
+        )
+        handle = await sdk.workflows.start(session.session_id, workflow)
+        result = await handle.result()
+        first_run_id = next(node.run_id for node in result.nodes if node.node_id == "first")
+        assert first_run_id is not None
+
+        summary = await sdk.trace.attribution(first_run_id)
+
+        workflow_entities = {
+            item.entity_id for item in summary.contributors if item.kind == "workflow"
+        }
+        assert "first" in workflow_entities
+        assert "second" not in workflow_entities
+        assert handle.workflow_run_id in workflow_entities
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_run_attribution_authenticates_workflow_node_run_binding() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {"choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}]}
+
+        return chunks()
+
+    store = _MismatchedWorkflowBindingStore()
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        enable_builtin_tools=False,
+    )
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/model"))
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        workflow = WorkflowIR.create(
+            name="binding-attribution",
+            nodes=(
+                AgentNode(id="first", agent_revision="worker:1", input="first"),
+                AgentNode(id="second", agent_revision="worker:1", input="second"),
+            ),
+            edges=(WorkflowEdge(source="first", target="second"),),
+        )
+        handle = await sdk.workflows.start(session.session_id, workflow)
+        result = await handle.result()
+        first_run_id = next(node.run_id for node in result.nodes if node.node_id == "first")
+        second_run_id = next(node.run_id for node in result.nodes if node.node_id == "second")
+        assert first_run_id is not None
+        assert second_run_id is not None
+        store.workflow_id = handle.workflow_run_id
+        store.node_id = "first"
+        store.wrong_run_id = second_run_id
+
+        with pytest.raises(AgentSDKError, match="failed to load trace timeline"):
+            await sdk.trace.attribution(first_run_id)
     finally:
         await sdk.close()
 

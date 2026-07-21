@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+import agent_sdk.observability.attribution as attribution_module
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.observability import (
     AttributionContributor,
@@ -786,3 +787,105 @@ def test_historical_stage_with_oversized_event_id_remains_projectable_without_ev
     assert stage.entity_id == "call-1"
     assert stage.evidence_event_ids == ()
     assert stage.evidence_cursors == ()
+
+
+def test_oversized_tool_completion_id_still_uses_internal_terminal_fact() -> None:
+    oversized = "e" * 257
+    completion = _event(
+        3,
+        "tool.call.completed",
+        {
+            "call_id": "call-1",
+            "tool_name": "lookup",
+            "status": "succeeded",
+            "content": "{}",
+            "value": {},
+            "error": None,
+        },
+    )
+    completion = completion.model_copy(
+        update={"event": completion.event.model_copy(update={"event_id": oversized})}
+    )
+    events = (
+        _event(1, "run.started", {"run_id": "run_root"}),
+        _event(2, "tool.call.started", {"call_id": "call-1", "tool_name": "lookup"}),
+        completion,
+        _context(4, "view-1", source_refs=(oversized,)),
+        _event(
+            5,
+            "model.call.started",
+            {"operation_id": "model-1", "context_view_id": "view-1"},
+            schema_version=2,
+        ),
+        _event(
+            6,
+            "model.call.completed",
+            {"operation_id": "model-1", "finish_reason": "stop"},
+            schema_version=2,
+        ),
+        _event(7, "run.completed", {"run_id": "run_root"}),
+    )
+
+    summary = _summary(events, RunStatus.COMPLETED)
+    tool = _contributor(summary.contributors, "call-1")
+
+    assert tool.disposition == "consumed"
+    assert oversized not in tool.evidence_ids
+    assert "unused_tool_output" not in {hint.code for hint in summary.hints}
+    assert all(
+        oversized not in hint.evidence_ids
+        for hint in summary.hints
+    )
+
+
+def test_interruption_projection_indexes_running_external_stages_once() -> None:
+    iterations: list[None] = []
+
+    class CountingStages(tuple[TraceStage, ...]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            iterations.append(None)
+            return super().__iter__()
+
+    stages = CountingStages(
+        (
+            TraceStage(
+                stage_id="model:one",
+                kind=TraceStageKind.MODEL,
+                status=TraceStageStatus.RUNNING,
+                entity_id="model-one",
+                run_id="run_root",
+                first_cursor=1,
+                last_cursor=1,
+                evidence_event_ids=("evt_1",),
+                evidence_cursors=(1,),
+            ),
+            TraceStage(
+                stage_id="tool:two",
+                kind=TraceStageKind.TOOL,
+                status=TraceStageStatus.RUNNING,
+                entity_id="tool-two",
+                run_id="run_child",
+                first_cursor=2,
+                last_cursor=2,
+                evidence_event_ids=("evt_2",),
+                evidence_cursors=(2,),
+            ),
+        )
+    )
+    interruptions = (
+        _event(3, "run.interrupted", {"run_id": "run_root"}),
+        _event(
+            4,
+            "run.interrupted",
+            {"run_id": "run_child"},
+            run_id="run_child",
+        ),
+    )
+
+    evidence = attribution_module._interrupted_external_evidence(
+        stages,
+        interruptions,
+    )
+
+    assert evidence == {"evt_1", "evt_2", "evt_3", "evt_4"}
+    assert len(iterations) == 1

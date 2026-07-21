@@ -226,7 +226,10 @@ class TraceService:
             payload = item.event.payload
             related = item.event.run_id in run_ids
             if workflow_id is not None and item.event.run_id == workflow_id:
-                related = True
+                related = (
+                    not item.event.type.startswith("workflow.node.")
+                    or payload.get("run_id") in run_ids
+                )
             if payload.get("subject_run_id") in run_ids:
                 related = True
             if payload.get("sender_run_id") in run_ids or payload.get("recipient_run_id") in run_ids:
@@ -246,6 +249,12 @@ class TraceService:
                 and item.event.run_id in prompt_manifest_ids
             ):
                 related = True
+            if (
+                workflow_id is not None
+                and item.event.run_id == workflow_id
+                and item.event.type.startswith("workflow.node.")
+            ):
+                related = payload.get("run_id") in run_ids
             if related:
                 selected.append(ObservedEvent(cursor=item.cursor, event=item.event))
         return snapshots, selected
@@ -353,7 +362,10 @@ class TraceService:
             run.workflow_run_id == workflow.workflow_run_id
             and run.session_id == workflow.session_id
             and run.workflow_node_id is not None
-            and any(node.node_id == run.workflow_node_id for node in workflow.nodes)
+            and any(
+                node.node_id == run.workflow_node_id and node.run_id == run.run_id
+                for node in workflow.nodes
+            )
         )
 
     async def _cursor(self) -> int:

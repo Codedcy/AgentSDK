@@ -84,6 +84,7 @@ def project_attribution(
     ordered = tuple(sorted(events, key=lambda item: item.cursor))
     cursor_by_id = {item.event.event_id: item.cursor for item in ordered}
     event_by_id = {item.event.event_id: item for item in ordered}
+    event_by_cursor = {item.cursor: item for item in ordered}
     contexts = _context_facts(ordered)
     indexes = _attribution_indexes(ordered, contexts, timeline.stages)
     manifest_evidence = _manifest_evidence_by_view(ordered)
@@ -92,7 +93,7 @@ def project_attribution(
     failure = (
         None
         if failure_stage is None
-        else _failure_attribution(failure_stage, event_by_id, cursor_by_id)
+        else _failure_attribution(failure_stage, event_by_cursor, cursor_by_id)
     )
 
     contributors: list[_ContributorFact] = []
@@ -121,7 +122,7 @@ def project_attribution(
             )
             continue
         if stage.kind is TraceStageKind.TOOL:
-            terminal = _terminal_event(stage, event_by_id)
+            terminal = _terminal_event(stage, event_by_cursor)
             if terminal is None:
                 tool_disposition: Literal[
                     "consumed", "unused", "terminal", "supporting"
@@ -220,7 +221,7 @@ def project_attribution(
             )
             continue
         if stage.kind is TraceStageKind.EVALUATION:
-            evaluation = _terminal_event(stage, event_by_id)
+            evaluation = _terminal_event(stage, event_by_cursor)
             verdict = "unknown"
             referenced: tuple[str, ...] = ()
             if evaluation is not None:
@@ -458,10 +459,10 @@ def _failure_stage(
 
 def _failure_attribution(
     stage: TraceStage,
-    event_by_id: Mapping[str, ObservedEvent],
+    event_by_cursor: Mapping[int, ObservedEvent],
     cursor_by_id: Mapping[str, int],
 ) -> FailureAttribution:
-    terminal = _terminal_event(stage, event_by_id)
+    terminal = _terminal_event(stage, event_by_cursor)
     code = None if terminal is None else _failure_code(terminal.event.payload)
     retryable = False
     if terminal is not None:
@@ -592,6 +593,14 @@ def _interrupted_external_evidence(
     stages: tuple[TraceStage, ...],
     events: tuple[ObservedEvent, ...],
 ) -> set[str]:
+    running_by_run: dict[str, list[TraceStage]] = {}
+    for stage in stages:
+        if (
+            stage.run_id is not None
+            and stage.kind in {TraceStageKind.MODEL, TraceStageKind.TOOL}
+            and stage.status is TraceStageStatus.RUNNING
+        ):
+            running_by_run.setdefault(stage.run_id, []).append(stage)
     interruptions = tuple(
         item for item in events if item.event.type == "run.interrupted"
     )
@@ -599,11 +608,8 @@ def _interrupted_external_evidence(
     for interruption in interruptions:
         open_external = tuple(
             stage
-            for stage in stages
-            if stage.kind in {TraceStageKind.MODEL, TraceStageKind.TOOL}
-            and stage.status is TraceStageStatus.RUNNING
-            and stage.first_cursor < interruption.cursor
-            and stage.run_id == interruption.event.run_id
+            for stage in running_by_run.get(interruption.event.run_id or "", ())
+            if stage.first_cursor < interruption.cursor
         )
         if open_external:
             result.add(interruption.event.event_id)
@@ -614,14 +620,9 @@ def _interrupted_external_evidence(
 
 def _terminal_event(
     stage: TraceStage,
-    event_by_id: Mapping[str, ObservedEvent],
+    event_by_cursor: Mapping[int, ObservedEvent],
 ) -> ObservedEvent | None:
-    candidates = tuple(
-        event_by_id[evidence_id]
-        for evidence_id in stage.evidence_event_ids
-        if evidence_id in event_by_id
-    )
-    return None if not candidates else max(candidates, key=lambda item: item.cursor)
+    return event_by_cursor.get(stage.last_cursor)
 
 
 def _sorted_evidence(
