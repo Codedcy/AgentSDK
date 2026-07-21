@@ -5,6 +5,7 @@ import gc
 import weakref
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,24 @@ from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.models import ToolContext, ToolResult, ToolResultStatus, ToolSpec
 from agent_sdk.workflow import WorkflowExecutor
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
+)
+
+
+def _assert_general_prompt_then_messages(
+    actual: object,
+    expected: list[dict[str, Any]],
+) -> None:
+    assert isinstance(actual, list)
+    assert actual[0] == {
+        "role": "system",
+        "content": _GENERAL_SYSTEM_PROMPT,
+    }
+    assert actual[1:] == expected
 
 
 async def _unused_acompletion(**_: object) -> Any:
@@ -2394,9 +2413,13 @@ async def test_ready_for_model_resume_preserves_exact_checkpoint_state() -> None
         )
         assert result.tool_results == checkpoint.tool_results
         assert len(provider_requests) == 1
-        assert provider_requests[0]["messages"] == [
-            dict(message) for message in checkpoint.model_dump(mode="json")["messages"]
-        ]
+        _assert_general_prompt_then_messages(
+            provider_requests[0]["messages"],
+            [
+                dict(message)
+                for message in checkpoint.model_dump(mode="json")["messages"]
+            ],
+        )
         events = [
             stored.event
             for stored in await store.read_events(after_cursor=0)
@@ -2672,13 +2695,20 @@ async def test_ready_for_tool_resume_executes_pending_call_once_before_model() -
         messages = provider_requests[0]["messages"]
         assert isinstance(messages, list)
         assert [message["role"] for message in messages] == [
+            "system",
             "user",
             "assistant",
             "tool",
         ]
         assert len([message for message in messages if message["role"] == "assistant"]) == 1
-        assert messages[:2] == checkpoint.model_dump(mode="json")["messages"]
-        assert messages[2]["tool_call_id"] == "call_resume"
+        _assert_general_prompt_then_messages(
+            messages,
+            [
+                *checkpoint.model_dump(mode="json")["messages"],
+                messages[3],
+            ],
+        )
+        assert messages[3]["tool_call_id"] == "call_resume"
         assert result.output_text == "draft recovered"
         assert len(result.tool_results) == 1
         assert result.tool_results[0].value == {"answer": 42}
@@ -2834,9 +2864,10 @@ async def test_ready_for_model_resume_survives_real_sqlite_reopen(
 
         assert result.output_text == "prior recovered"
         assert result.tool_results == checkpoint.tool_results
-        assert provider_requests[0]["messages"] == checkpoint.model_dump(mode="json")[
-            "messages"
-        ]
+        _assert_general_prompt_then_messages(
+            provider_requests[0]["messages"],
+            checkpoint.model_dump(mode="json")["messages"],
+        )
     finally:
         await reopened.close()
 
@@ -3725,15 +3756,20 @@ async def test_multi_turn_ready_tool_authoritative_history_resumes_after_reopen(
         assert tool_calls == ["pending"]
         assert len(provider_messages) == 1
         assert [message["role"] for message in provider_messages[0]] == [
+            "system",
             "user",
             "assistant",
             "tool",
             "assistant",
             "tool",
         ]
-        assert provider_messages[0][:4] == checkpoint.model_dump(mode="json")[
-            "messages"
-        ]
+        _assert_general_prompt_then_messages(
+            provider_messages[0],
+            [
+                *checkpoint.model_dump(mode="json")["messages"],
+                provider_messages[0][5],
+            ],
+        )
         assert result.output_text == "historical pending recovered"
         assert len(result.tool_results) == 2
     finally:
