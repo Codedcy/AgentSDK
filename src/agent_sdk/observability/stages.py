@@ -490,9 +490,18 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
         )
 
     ids = {lookup: _stage_id(*lookup) for lookup in stages}
+    fallback_run_usage = _aggregate_model_usage(stages.values())
     projected: list[TraceStage] = []
     for lookup, stage in sorted(stages.items(), key=lambda item: item[1].first_cursor):
         parent_id = ids.get(stage.parent_hint) if stage.parent_hint is not None else None
+        usage = stage.usage
+        if (
+            usage is None
+            and stage.kind is TraceStageKind.RUN
+            and stage.status
+            in {TraceStageStatus.FAILED, TraceStageStatus.INTERRUPTED}
+        ):
+            usage = fallback_run_usage.get(stage.run_id)
         duration_ms: int | None = None
         if stage.started_at is not None and stage.ended_at is not None:
             seconds = (stage.ended_at - stage.started_at).total_seconds()
@@ -513,8 +522,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 last_cursor=stage.last_cursor,
                 input_refs=stage.input_refs,
                 output_refs=stage.output_refs,
-                usage=stage.usage,
-                cost_usd=(None if stage.usage is None else stage.usage.cost_usd),
+                usage=usage,
+                cost_usd=(None if usage is None else usage.cost_usd),
                 error_code=stage.error_code,
                 retryable=stage.retryable,
                 evidence_event_ids=stage.evidence_event_ids,
@@ -522,6 +531,60 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             )
         )
     return tuple(projected)
+
+
+def _aggregate_model_usage(
+    stages: Iterable[_MutableStage],
+) -> dict[str, TokenUsage]:
+    totals: dict[str, TokenUsage] = {}
+    for stage in sorted(stages, key=lambda item: item.first_cursor):
+        usage = stage.usage
+        if (
+            stage.kind is not TraceStageKind.MODEL
+            or usage is None
+            or not _has_usage_fact(usage)
+        ):
+            continue
+        current = totals.get(stage.run_id)
+        totals[stage.run_id] = usage if current is None else _add_usage(current, usage)
+    return totals
+
+
+def _has_usage_fact(usage: TokenUsage) -> bool:
+    return any(
+        value is not None
+        for value in (
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+            usage.cost_usd,
+        )
+    )
+
+
+def _add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    def add(first: int | None, second: int | None) -> int | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return first + second
+
+    left_cost = left.cost_usd
+    right_cost = right.cost_usd
+    cost = (
+        right_cost
+        if left_cost is None
+        else left_cost
+        if right_cost is None
+        else left_cost + right_cost
+    )
+    return TokenUsage(
+        prompt_tokens=add(left.prompt_tokens, right.prompt_tokens),
+        completion_tokens=add(left.completion_tokens, right.completion_tokens),
+        total_tokens=add(left.total_tokens, right.total_tokens),
+        cost_usd=cost,
+    )
 
 
 def _with_derived_child_events(

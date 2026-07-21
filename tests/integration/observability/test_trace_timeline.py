@@ -405,3 +405,107 @@ async def test_public_trace_shape_survives_sqlite_reopen(tmp_path: Path) -> None
         assert run.cost_usd == 0.125
     finally:
         await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_run_aggregates_model_usage_across_sqlite_reopen(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "failed-trace.sqlite3"
+    turn = 0
+
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        nonlocal turn
+        turn += 1
+        if turn == 2:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "private provider failure",
+                retryable=False,
+            )
+
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_failed_trace",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"value":7}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5,
+                    "cost": 0.25,
+                },
+            }
+
+        return chunks()
+
+    sdk = AgentSDK.for_test(
+        database_path=database,
+        acompletion=provider,
+        permission_default="allow",
+        enable_builtin_tools=False,
+    )
+
+    async def handler(_context: ToolContext, *, value: int) -> object:
+        return {"value": value}
+
+    sdk.tools.register(
+        ToolSpec(
+            name="lookup",
+            description="lookup",
+            input_schema={
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+        handler,
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        handle = await sdk.runs.start(
+            session.session_id,
+            AgentSpec(name="failed-trace", model="fake/model"),
+            "private input",
+        )
+        with pytest.raises(AgentSDKError):
+            await handle.result()
+        run_id = handle.run_id
+        before = await sdk.trace.timeline(run_id)
+        model = next(
+            stage
+            for stage in before.stages
+            if stage.kind is TraceStageKind.MODEL and stage.usage is not None
+        )
+        run = next(
+            stage
+            for stage in before.stages
+            if stage.kind is TraceStageKind.RUN and stage.entity_id == run_id
+        )
+        assert model.cost_usd == 0.25
+        assert run.usage == model.usage
+        assert run.cost_usd == 0.25
+    finally:
+        await sdk.close()
+
+    reopened = AgentSDK.for_test(database_path=database, acompletion=provider)
+    try:
+        after = await reopened.trace.timeline(run_id)
+        assert after == before
+    finally:
+        await reopened.close()

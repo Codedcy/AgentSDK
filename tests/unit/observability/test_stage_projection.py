@@ -568,3 +568,136 @@ def test_malformed_public_reference_fails_closed() -> None:
 
     assert captured.value.code is ErrorCode.INTERNAL
     assert captured.value.message == "failed to project trace stages"
+
+
+def test_interrupted_runs_aggregate_only_their_own_model_usage() -> None:
+    stages = project_stages(
+        (
+            _event(1, "run.started", {"run_id": "run_1"}),
+            _event(2, "model.call.started", {"operation_id": "root_model"}),
+            _event(
+                3,
+                "model.usage.reported",
+                {
+                    "operation_id": "root_model",
+                    "prompt_tokens": 2,
+                    "completion_tokens": 3,
+                    "total_tokens": 5,
+                    "cost_usd": 0.25,
+                },
+            ),
+            _event(4, "model.call.completed", {"operation_id": "root_model"}),
+            _event(5, "model.call.started", {"operation_id": "root_model_2"}),
+            _event(
+                6,
+                "model.usage.reported",
+                {
+                    "operation_id": "root_model_2",
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                    "cost_usd": 0.25,
+                },
+            ),
+            _event(7, "model.call.completed", {"operation_id": "root_model_2"}),
+            _event(
+                8,
+                "run.created",
+                {"run_id": "run_child", "parent_run_id": "run_1"},
+                run_id="run_child",
+            ),
+            _event(
+                9,
+                "run.started",
+                {"run_id": "run_child"},
+                run_id="run_child",
+            ),
+            _event(
+                10,
+                "model.call.started",
+                {"operation_id": "child_model"},
+                run_id="run_child",
+            ),
+            _event(
+                11,
+                "model.usage.reported",
+                {
+                    "operation_id": "child_model",
+                    "prompt_tokens": 7,
+                    "completion_tokens": 11,
+                    "total_tokens": 18,
+                    "cost_usd": 0.75,
+                },
+                run_id="run_child",
+            ),
+            _event(
+                12,
+                "model.call.completed",
+                {"operation_id": "child_model"},
+                run_id="run_child",
+            ),
+            _event(
+                13,
+                "run.interrupted",
+                {"run_id": "run_child"},
+                run_id="run_child",
+            ),
+            _event(14, "run.interrupted", {"run_id": "run_1"}),
+        )
+    )
+
+    runs = {
+        stage.entity_id: stage
+        for stage in stages
+        if stage.kind is TraceStageKind.RUN
+    }
+    root = runs["run_1"]
+    child = runs["run_child"]
+    assert root.usage is not None
+    assert root.usage.model_dump() == {
+        "prompt_tokens": 3,
+        "completion_tokens": 4,
+        "total_tokens": 7,
+        "cost_usd": 0.5,
+    }
+    assert root.cost_usd == 0.5
+    assert child.usage is not None
+    assert child.usage.model_dump() == {
+        "prompt_tokens": 7,
+        "completion_tokens": 11,
+        "total_tokens": 18,
+        "cost_usd": 0.75,
+    }
+    assert child.cost_usd == 0.75
+
+
+def test_failed_run_without_model_usage_keeps_usage_absent() -> None:
+    run = next(
+        stage
+        for stage in project_stages(
+            (
+                _event(1, "run.started", {"run_id": "run_1"}),
+                _event(2, "model.call.started", {"operation_id": "model_1"}),
+                _event(
+                    3,
+                    "model.call.failed",
+                    {
+                        "operation_id": "model_1",
+                        "error": {"code": "internal", "retryable": False},
+                    },
+                ),
+                _event(
+                    4,
+                    "run.failed",
+                    {
+                        "run_id": "run_1",
+                        "error": {"code": "internal", "retryable": False},
+                    },
+                ),
+            )
+        )
+        if stage.kind is TraceStageKind.RUN
+    )
+
+    assert run.usage is None
+    assert run.cost_usd is None

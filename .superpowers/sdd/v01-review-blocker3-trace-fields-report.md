@@ -97,3 +97,44 @@ high-water behavior, public JSON serialization, malformed reference fail-closed,
 SQLite reopen equality, and existing v1/v2 recovery behavior. The public v0.1
 acceptance test now asserts `root_kind`, Session identity, and non-empty owning
 identity through installed SDK interfaces.
+
+## Whole-review I1 follow-up: failed/interrupted Run usage
+
+The first whole review accepted the public shape but returned `C0/I1/M0`: a failed
+or interrupted Run whose terminal event omitted aggregate usage exposed Model
+usage/cost on its Model stages while leaving the owning Run stage at `None`.
+
+Strict RED used a real public SQLite Run: its first Model call completed with
+usage/cost, a Tool completed, and its second Model call failed. The same timeline
+was queried before and after SDK reopen. A second projector test covered interrupted
+parent and Child Runs. Initial result:
+
+```text
+2 failed in 3.44s
+```
+
+Both failures showed Model usage/cost present and Run usage absent. The projector
+now preserves authenticated Run-terminal aggregate usage when present. Only for a
+failed/interrupted Run with no aggregate usage, it sums each authenticated Model
+stage with the exact same owning `run_id`, once, in stable first-cursor order.
+Child Model usage cannot enter its parent, Workflow control stages are excluded,
+and a Run with no known Model usage remains `None`. `TokenUsage` validation keeps
+aggregate cost finite and non-negative; invalid overflow fails closed.
+
+Fresh focused gate, including two Model calls summed once, Child isolation, missing
+usage, real public failure, and SQLite reopen equality:
+
+```text
+3 passed in 3.16s
+```
+
+Follow-up verification:
+
+```text
+complete observability/attribution: 114 passed in 5.22s
+public v0.1 release/reference: 2 passed in 76.58s
+affected runtime/context/workflow recovery: 168 passed in 82.74s
+Ruff: All checks passed
+mypy --strict: Success, 107 source files
+git diff --check: no errors (Windows line-ending notices only)
+```
