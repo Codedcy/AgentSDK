@@ -77,6 +77,11 @@ class ContextCompactor:
         *,
         capsule_ids: tuple[str, ...] = (),
     ) -> CompactionResult:
+        if not capsules:
+            return CompactionResult(
+                capsule=None,
+                usage=UsageReported(None, None, None),
+            )
         try:
             if capsule_ids and len(capsule_ids) != len(capsules):
                 raise ValueError("capsule ids must correspond to capsules")

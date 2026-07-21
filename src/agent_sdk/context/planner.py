@@ -964,6 +964,7 @@ class ContextPlanner:
                 "message_refs": list(view.message_refs),
                 "source_refs": list(view.source_refs),
                 "transformations": list(view.transformations),
+                "consumed_message_ids": list(view.consumed_message_ids),
                 "compaction_usage": (
                     usage.to_payload() if usage is not None else None
                 ),

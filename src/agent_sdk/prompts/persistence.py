@@ -36,6 +36,7 @@ class PromptManifestPersistence:
                 "layers": [
                     {
                         "layer_id": layer.layer_id,
+                        "version": layer.version,
                         "sha256": layer.sha256,
                     }
                     for layer in manifest.layers

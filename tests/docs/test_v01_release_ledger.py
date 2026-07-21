@@ -226,3 +226,19 @@ def test_active_roadmap_links_the_v01_plan_index() -> None:
     expected = "2026-07-17-agent-sdk-v0.1-implementation-index.md"
     assert expected in (root / "docs/plans/00-roadmap.md").read_text(encoding="utf-8")
     assert expected in (root / "docs/plans/tasks/index.md").read_text(encoding="utf-8")
+
+
+def test_r3_plan_hands_r4_to_capability_intersection_before_mailbox() -> None:
+    root = Path(__file__).parents[2]
+    plan = (
+        root
+        / "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
+    ).read_text(encoding="utf-8")
+
+    assert R4_TASK1_TEST in plan
+    assert "first expected RED" in plan
+    assert "R4 Task 1" in plan
+    assert "R4 Task 2" in plan
+    assert R4_TASK2_MAILBOX_TEST in plan
+    assert plan.index(R4_TASK1_TEST) < plan.index(R4_TASK2_MAILBOX_TEST)
+    assert "uv run pytest tests/unit/subagents/test_mailbox.py -q" not in plan

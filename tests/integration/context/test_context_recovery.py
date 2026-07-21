@@ -336,6 +336,36 @@ async def _tamper_prepared_reference(
             data["manifest_id"] = "pmf_other"
         elif corruption == "manifest_link":
             data["context_view_id"] = "view_other"
+        elif corruption == "manifest_tools_sha256":
+            data["tools_sha256"] = "f" * 64
+        elif corruption == "manifest_sha256":
+            data["sha256"] = "f" * 64
+        elif corruption == "manifest_layer_sha256":
+            data["layers"][0]["sha256"] = "f" * 64
+        elif corruption == "manifest_layer_version":
+            data["layers"][0]["version"] = "tampered"
+        elif corruption == "manifest_layer_order":
+            data["layers"] = list(reversed(data["layers"]))
+        elif corruption == "view_level":
+            data["recommended_level"] = "L1"
+            data["applied_level"] = "L1"
+        elif corruption == "view_refs":
+            data["source_refs"] = [*data["source_refs"], "evt_tampered"]
+        elif corruption == "view_transformations":
+            data["transformations"] = [
+                *data["transformations"],
+                "tampered:evt_tampered",
+            ]
+        elif corruption == "view_consumed_message_ids":
+            data["consumed_message_ids"] = ["msg_tampered"]
+        elif corruption == "view_budget":
+            budget = data["budget"]
+            budget["output_reserve"] += 1
+            budget["available_input_tokens"] -= 1
+            budget["watermark_ratio"] = (
+                budget["projected_source_tokens"]
+                / budget["available_input_tokens"]
+            )
         else:
             raise AssertionError(f"unknown corruption: {corruption}")
         store._snapshots[target] = SnapshotWrite(
@@ -377,6 +407,41 @@ async def _tamper_prepared_reference(
                 snapshot_data["manifest_id"] = "pmf_other"
             elif corruption == "manifest_link":
                 snapshot_data["context_view_id"] = "view_other"
+            elif corruption == "manifest_tools_sha256":
+                snapshot_data["tools_sha256"] = "f" * 64
+            elif corruption == "manifest_sha256":
+                snapshot_data["sha256"] = "f" * 64
+            elif corruption == "manifest_layer_sha256":
+                snapshot_data["layers"][0]["sha256"] = "f" * 64
+            elif corruption == "manifest_layer_version":
+                snapshot_data["layers"][0]["version"] = "tampered"
+            elif corruption == "manifest_layer_order":
+                snapshot_data["layers"] = list(
+                    reversed(snapshot_data["layers"])
+                )
+            elif corruption == "view_level":
+                snapshot_data["recommended_level"] = "L1"
+                snapshot_data["applied_level"] = "L1"
+            elif corruption == "view_refs":
+                snapshot_data["source_refs"] = [
+                    *snapshot_data["source_refs"],
+                    "evt_tampered",
+                ]
+            elif corruption == "view_transformations":
+                snapshot_data["transformations"] = [
+                    *snapshot_data["transformations"],
+                    "tampered:evt_tampered",
+                ]
+            elif corruption == "view_consumed_message_ids":
+                snapshot_data["consumed_message_ids"] = ["msg_tampered"]
+            elif corruption == "view_budget":
+                budget = snapshot_data["budget"]
+                budget["output_reserve"] += 1
+                budget["available_input_tokens"] -= 1
+                budget["watermark_ratio"] = (
+                    budget["projected_source_tokens"]
+                    / budget["available_input_tokens"]
+                )
             else:
                 raise AssertionError(f"unknown corruption: {corruption}")
             await store._connection.execute(
@@ -410,6 +475,16 @@ async def _tamper_prepared_reference(
         "view_identity",
         "manifest_identity",
         "manifest_link",
+        "manifest_tools_sha256",
+        "manifest_sha256",
+        "manifest_layer_sha256",
+        "manifest_layer_version",
+        "manifest_layer_order",
+        "view_level",
+        "view_refs",
+        "view_transformations",
+        "view_consumed_message_ids",
+        "view_budget",
     ],
 )
 async def test_recovery_rejects_unauthenticated_prepared_references(
@@ -439,7 +514,11 @@ async def test_recovery_rejects_unauthenticated_prepared_references(
         nonlocal tool_calls
         tool_calls += 1
 
-    spec = AgentSpec(name="reference-auth", model="test/model")
+    spec = AgentSpec(
+        name="reference-auth",
+        model="test/model",
+        system_prompt="Application recovery constraints.",
+    )
     sdk = AgentSDK.for_test(
         store=store,
         acompletion=hanging_provider,

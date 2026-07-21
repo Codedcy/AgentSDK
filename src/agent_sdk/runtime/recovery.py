@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -4659,6 +4660,32 @@ class RunRecoveryService:
                 or manifest.model != operation.provider_identity
             ):
                 raise ValueError("prepared reference identity mismatch")
+            events = await self._store.read_events(
+                after_cursor=0,
+                session_id=session_id,
+            )
+            view_events = tuple(
+                stored
+                for stored in events
+                if stored.event.type == "context.view.created"
+                and stored.event.run_id == context_view_id
+            )
+            manifest_events = tuple(
+                stored
+                for stored in events
+                if stored.event.type == "prompt.manifest.created"
+                and stored.event.run_id == prompt_manifest_id
+            )
+            if len(view_events) != 1 or len(manifest_events) != 1:
+                raise ValueError("prepared creation evidence is missing")
+            view_stored = view_events[0]
+            manifest_stored = manifest_events[0]
+            self._authenticate_context_view_event(view, view_stored.event)
+            self._authenticate_prompt_manifest_event(
+                operation,
+                manifest,
+                manifest_stored.event,
+            )
             await self._store.commit(
                 CommitBatch(
                     events=(),
@@ -4676,12 +4703,147 @@ class RunRecoveryService:
                             data=manifest.model_dump(mode="json"),
                         ),
                     ),
+                    event_preconditions=(
+                        EventPrecondition(
+                            view_stored.event.event_id,
+                            view_stored.cursor,
+                            view_stored.event.session_id,
+                            view_stored.event.run_id,
+                            view_stored.event.type,
+                            view_stored.event.sequence,
+                        ),
+                        EventPrecondition(
+                            manifest_stored.event.event_id,
+                            manifest_stored.cursor,
+                            manifest_stored.event.session_id,
+                            manifest_stored.event.run_id,
+                            manifest_stored.event.type,
+                            manifest_stored.event.sequence,
+                        ),
+                    ),
                 )
             )
         except RecoveryStateConflictError:
             raise
         except (AgentSDKError, SnapshotPreconditionError, TypeError, ValueError):
             raise RecoveryStateConflictError from None
+
+    @staticmethod
+    def _authenticate_context_view_event(
+        view: ContextView,
+        event: EventEnvelope,
+    ) -> None:
+        if (
+            event.session_id != view.session_id
+            or event.run_id != view.view_id
+            or event.type != "context.view.created"
+        ):
+            raise ValueError("context View creation identity mismatch")
+        payload = dict(event.payload)
+        usage = payload.get("compaction_usage")
+        if usage is not None and not RunRecoveryService._valid_usage_payload(usage):
+            raise ValueError("context View usage evidence is invalid")
+        expected = {
+            "view_id": view.view_id,
+            "capsule_id": view.capsule_id,
+            "recommended_level": view.recommended_level.value,
+            "applied_level": view.applied_level.value,
+            "fallback_from": (
+                view.fallback_from.value
+                if view.fallback_from is not None
+                else None
+            ),
+            "estimated_tokens": view.estimated_tokens,
+            "budget": (
+                view.budget.model_dump(mode="json")
+                if view.budget is not None
+                else None
+            ),
+            "message_refs": list(view.message_refs),
+            "source_refs": list(view.source_refs),
+            "transformations": list(view.transformations),
+            "consumed_message_ids": list(view.consumed_message_ids),
+            "compaction_usage": usage,
+        }
+        if payload != expected:
+            raise ValueError("context View creation projection mismatch")
+
+    @staticmethod
+    def _authenticate_prompt_manifest_event(
+        operation: ModelCallOperation,
+        manifest: PromptManifest,
+        event: EventEnvelope,
+    ) -> None:
+        if (
+            event.session_id != operation.session_id
+            or event.run_id != manifest.manifest_id
+            or event.type != "prompt.manifest.created"
+        ):
+            raise ValueError("prompt Manifest creation identity mismatch")
+        expected = {
+            "manifest_id": manifest.manifest_id,
+            "context_view_id": manifest.context_view_id,
+            "sha256": manifest.sha256,
+            "model": manifest.model,
+            "tools_sha256": manifest.tools_sha256,
+            "layers": [
+                {
+                    "layer_id": layer.layer_id,
+                    "version": layer.version,
+                    "sha256": layer.sha256,
+                }
+                for layer in manifest.layers
+            ],
+        }
+        if dict(event.payload) != expected:
+            raise ValueError("prompt Manifest creation projection mismatch")
+        if operation.prepared_request is None:
+            raise ValueError("prepared request is missing")
+        request = deserialize_model_request(thaw_json(operation.prepared_request))
+        if request.model != manifest.model or len(request.messages) < len(
+            manifest.layers
+        ):
+            raise ValueError("prepared prompt request mismatch")
+        layer_texts: list[str] = []
+        for layer, message in zip(manifest.layers, request.messages, strict=False):
+            if (
+                set(message) != {"role", "content"}
+                or message.get("role") != "system"
+                or not isinstance(message.get("content"), str)
+            ):
+                raise ValueError("prepared prompt layer shape mismatch")
+            content = message["content"]
+            if hashlib.sha256(content.encode("utf-8")).hexdigest() != layer.sha256:
+                raise ValueError("prepared prompt layer hash mismatch")
+            layer_texts.append(content)
+        aggregate = hashlib.sha256("\n\n".join(layer_texts).encode("utf-8")).hexdigest()
+        if aggregate != manifest.sha256:
+            raise ValueError("prepared prompt aggregate hash mismatch")
+        canonical_tools = json.dumps(
+            list(request.tools),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            hashlib.sha256(canonical_tools.encode("utf-8")).hexdigest()
+            != manifest.tools_sha256
+        ):
+            raise ValueError("prepared Tool schema hash mismatch")
+
+    @staticmethod
+    def _valid_usage_payload(value: object) -> bool:
+        if not isinstance(value, Mapping) or set(value) != {
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+        }:
+            return False
+        return all(
+            item is None or (type(item) is int and item >= 0)
+            for item in value.values()
+        )
 
     @staticmethod
     def _is_pristine_created(evidence: _RecoveryEvidence) -> bool:

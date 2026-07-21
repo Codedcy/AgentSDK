@@ -1156,14 +1156,26 @@ async def test_sqlite_reopen_retrieval_order_and_session_deletion(tmp_path: Path
     store = await SQLiteStore.open(database)
     await _seed_projection(store)
 
-    async def acompletion(**_: object) -> dict[str, object]:
+    async def acompletion(**kwargs: object) -> dict[str, object]:
+        document = json.loads(kwargs["messages"][-1]["content"])
+        if document["operation"] == "summarize":
+            return _structured_response(
+                ["evt_projection_user", "evt_projection_assistant"]
+            )
         return _structured_response(
             [
-                "evt_projection_latest",
-                "evt_projection_user",
+                document["capsule_ids"][0],
                 "evt_projection_tool",
+                "evt_projection_latest",
             ]
         )
+
+    prior = await _planner(store, acompletion).build(
+        "ses_projection",
+        force_level="L3",
+        protected_event_ids={"evt_projection_tool"},
+    )
+    assert prior.capsule_id is not None
 
     view = await _planner(store, acompletion).build(
         "ses_projection",
@@ -1181,15 +1193,20 @@ async def test_sqlite_reopen_retrieval_order_and_session_deletion(tmp_path: Path
             session_id="ses_projection",
         )
         assert capsule.source_event_ids == (
-            "evt_projection_latest",
-            "evt_projection_user",
+            prior.capsule_id,
             "evt_projection_tool",
+            "evt_projection_latest",
         )
         sources = await retrieval.read_sources(
             view.capsule_id,
             session_id="ses_projection",
         )
-        assert tuple(item.event.event_id for item in sources) == capsule.source_event_ids
+        assert tuple(item.event.event_id for item in sources) == (
+            "evt_projection_user",
+            "evt_projection_assistant",
+            "evt_projection_tool",
+            "evt_projection_latest",
+        )
         with pytest.raises(AgentSDKError):
             await retrieval.read_sources(
                 view.capsule_id,

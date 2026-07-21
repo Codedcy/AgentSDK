@@ -184,4 +184,3 @@ pre-existing built-in-Tool capability mismatch described in the Task 4 report
 diff does not change the capability gate that raises those failures, so it is
 not counted as a Task 4 finding. It remains a project-level release-suite debt
 that Task 5 must not silently present as a fully green repository.
-

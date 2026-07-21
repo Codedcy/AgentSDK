@@ -304,11 +304,15 @@ async def test_runtime_prompt_orders_layers_and_persists_manifest_by_reference()
             "context_view_id": view.view_id,
             "sha256": built.manifest.sha256,
             "model": spec.model,
-            "tools_sha256": built.manifest.tools_sha256,
-            "layers": [
-                {"layer_id": layer.layer_id, "sha256": layer.sha256}
-                for layer in built.manifest.layers
-            ],
+                "tools_sha256": built.manifest.tools_sha256,
+                "layers": [
+                    {
+                        "layer_id": layer.layer_id,
+                        "version": layer.version,
+                        "sha256": layer.sha256,
+                    }
+                    for layer in built.manifest.layers
+                ],
         }
         public_payload = json.dumps(created.payload, sort_keys=True)
         for raw_text in (

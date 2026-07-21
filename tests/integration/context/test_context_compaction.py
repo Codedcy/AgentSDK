@@ -309,6 +309,53 @@ async def test_forced_l3_with_empty_closed_slice_skips_model_and_falls_back() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("force_level", [None, "L4"])
+async def test_first_use_l4_without_prior_capsule_falls_back_without_model_call(
+    force_level: str | None,
+) -> None:
+    store = InMemoryStore()
+    await _seed(store)
+    model_calls = 0
+
+    async def acompletion(**_: object) -> dict[str, object]:
+        nonlocal model_calls
+        model_calls += 1
+        return _response(
+            "evt_recent_answer",
+            "evt_latest_user",
+            objective="incomplete first rebase",
+        )
+
+    view = await _planner(store, acompletion, token_count=96).build(
+        "ses_task2",
+        force_level=force_level,
+    )
+
+    assert view.recommended_level is CompactionLevel.L4
+    assert view.applied_level is CompactionLevel.L2
+    assert view.fallback_from is CompactionLevel.L4
+    assert view.capsule_id is None
+    assert model_calls == 0
+    assert view.source_refs == (
+        "evt_old_user",
+        "evt_old_answer",
+        "evt_old_tool",
+        "evt_recent_answer",
+        "evt_latest_user",
+    )
+    events = await store.read_events(after_cursor=0, session_id="ses_task2")
+    failed = [
+        item.event for item in events if item.event.type == "context.compaction.failed"
+    ]
+    assert failed[-1].payload["requested_level"] == "L4"
+    assert failed[-1].payload["usage"] == {
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+    }
+
+
+@pytest.mark.asyncio
 async def test_l4_rebases_prior_capsule_evidence() -> None:
     store = InMemoryStore()
     await _seed(store)
