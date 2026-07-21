@@ -8,6 +8,7 @@ import pytest
 from agent_sdk import (
     AgentNode,
     AgentSDK,
+    AgentSDKError,
     AgentSpec,
     AttributionSummary,
     ToolContext,
@@ -179,5 +180,57 @@ async def test_run_attribution_includes_its_real_workflow_node_evidence() -> Non
         )
         assert workflow_contributor.status == "completed"
         assert workflow_contributor.evidence_ids
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_loop_node_run_attribution_includes_real_loop_failure() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        async def chunks() -> AsyncIterator[dict[str, object]]:
+            yield {
+                "choices": [
+                    {"delta": {"content": '{"progress":1}'}, "finish_reason": "stop"}
+                ]
+            }
+
+        return chunks()
+
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        enable_builtin_tools=False,
+    )
+    sdk.agents.define(AgentSpec(name="worker", revision="1", model="fake/model"))
+    try:
+        session = await sdk.sessions.create(workspaces=[])
+        workflow = """
+api_version: agent-sdk/v1
+kind: Workflow
+name: bounded-attribution
+steps:
+  - id: improve
+    kind: loop
+    until: {path: outputs.review.done, op: exists}
+    max_iterations: 1
+    body:
+      - {id: review, kind: agent, agent_revision: worker:1, input: review}
+"""
+        handle = await sdk.workflows.start(session.session_id, workflow)
+        with pytest.raises(AgentSDKError, match="reached its iteration limit"):
+            await handle.result()
+        snapshot = await sdk.workflows.get(handle.workflow_run_id)
+        node_run_id = next(node.run_id for node in snapshot.nodes if node.node_id == "review")
+        assert node_run_id is not None
+
+        summary = await sdk.trace.attribution(node_run_id)
+
+        assert "workflow_loop_limit" in {hint.code for hint in summary.hints}
+        assert any(
+            item.kind == "workflow"
+            and item.entity_id == handle.workflow_run_id
+            and item.status == "failed"
+            for item in summary.contributors
+        )
     finally:
         await sdk.close()

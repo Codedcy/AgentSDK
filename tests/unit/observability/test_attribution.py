@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+from pydantic import ValidationError
+
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.observability import (
     AttributionContributor,
+    FailureAttribution,
+    ImprovementHint,
     ObservedEvent,
+    TraceStage,
     TraceStageKind,
+    TraceStageStatus,
     TraceTimeline,
     project_attribution,
     project_stages,
@@ -479,3 +486,303 @@ def test_explicit_evaluation_pass_fail_and_unknown_are_preserved() -> None:
         "evaluation-unknown",
     )
     assert summary.method == "deterministic_event_evidence_v1"
+
+
+def test_child_messages_require_parent_recipient_and_strictly_later_context() -> None:
+    events = [
+        _event(1, "run.started", {"run_id": "run_root"}),
+    ]
+    cursor = 2
+    for child_id in ("child-valid", "child-future", "child-wrong-recipient"):
+        events.extend(
+            (
+                _event(
+                    cursor,
+                    "run.created",
+                    {"run_id": child_id, "parent_run_id": "run_root"},
+                    run_id=child_id,
+                ),
+                _event(
+                    cursor + 1,
+                    "run.started",
+                    {"run_id": child_id},
+                    run_id=child_id,
+                ),
+                _event(
+                    cursor + 2,
+                    "run.completed",
+                    {"run_id": child_id},
+                    run_id=child_id,
+                ),
+            )
+        )
+        cursor += 3
+    events.extend(
+        (
+            _event(
+                11,
+                "agent.message.sent",
+                {
+                    "message_id": "msg-valid",
+                    "sender_run_id": "child-valid",
+                    "recipient_run_id": "run_root",
+                },
+                run_id="msg-valid",
+            ),
+            _event(
+                12,
+                "agent.message.sent",
+                {
+                    "message_id": "msg-wrong",
+                    "sender_run_id": "child-wrong-recipient",
+                    "recipient_run_id": "run_other",
+                },
+                run_id="msg-wrong",
+            ),
+            _context(13, "view-valid", consumed_message_ids=("msg-valid",)),
+            _event(
+                14,
+                "model.call.started",
+                {"operation_id": "model-valid", "context_view_id": "view-valid"},
+                schema_version=2,
+            ),
+            _event(
+                15,
+                "model.call.completed",
+                {"operation_id": "model-valid", "finish_reason": "stop"},
+                schema_version=2,
+            ),
+            _context(16, "view-future", consumed_message_ids=("msg-future",)),
+            _event(
+                17,
+                "agent.message.sent",
+                {
+                    "message_id": "msg-future",
+                    "sender_run_id": "child-future",
+                    "recipient_run_id": "run_root",
+                },
+                run_id="msg-future",
+            ),
+            _event(
+                18,
+                "model.call.started",
+                {"operation_id": "model-future", "context_view_id": "view-future"},
+                schema_version=2,
+            ),
+            _event(
+                19,
+                "model.call.completed",
+                {"operation_id": "model-future", "finish_reason": "stop"},
+                schema_version=2,
+            ),
+            _context(20, "view-wrong", consumed_message_ids=("msg-wrong",)),
+            _event(
+                21,
+                "model.call.started",
+                {"operation_id": "model-wrong", "context_view_id": "view-wrong"},
+                schema_version=2,
+            ),
+            _event(
+                22,
+                "model.call.completed",
+                {"operation_id": "model-wrong", "finish_reason": "stop"},
+                schema_version=2,
+            ),
+            _event(23, "run.completed", {"run_id": "run_root"}),
+        )
+    )
+
+    summary = _summary(tuple(events), RunStatus.COMPLETED)
+
+    assert _contributor(summary.contributors, "child-valid").disposition == "consumed"
+    assert _contributor(summary.contributors, "child-future").disposition == "unused"
+    assert (
+        _contributor(summary.contributors, "child-wrong-recipient").disposition
+        == "unused"
+    )
+
+
+def test_completed_child_final_model_is_terminal_independently_of_parent_consumption() -> None:
+    events = (
+        _event(1, "run.started", {"run_id": "run_root"}),
+        _event(
+            2,
+            "run.created",
+            {"run_id": "run_child", "parent_run_id": "run_root"},
+            run_id="run_child",
+        ),
+        _event(3, "run.started", {"run_id": "run_child"}, run_id="run_child"),
+        _event(
+            4,
+            "model.call.started",
+            {"operation_id": "child-model-1"},
+            run_id="run_child",
+            schema_version=2,
+        ),
+        _event(
+            5,
+            "model.call.completed",
+            {"operation_id": "child-model-1", "finish_reason": "stop"},
+            run_id="run_child",
+            schema_version=2,
+        ),
+        _event(
+            6,
+            "model.call.started",
+            {"operation_id": "child-model-2"},
+            run_id="run_child",
+            schema_version=2,
+        ),
+        _event(
+            7,
+            "model.call.completed",
+            {"operation_id": "child-model-2", "finish_reason": "stop"},
+            run_id="run_child",
+            schema_version=2,
+        ),
+        _event(8, "run.completed", {"run_id": "run_child"}, run_id="run_child"),
+        _context(9, "view-parent", source_refs=("run_child",)),
+        _event(
+            10,
+            "model.call.started",
+            {"operation_id": "parent-model", "context_view_id": "view-parent"},
+            schema_version=2,
+        ),
+        _event(
+            11,
+            "model.call.completed",
+            {"operation_id": "parent-model", "finish_reason": "stop"},
+            schema_version=2,
+        ),
+        _event(12, "run.completed", {"run_id": "run_root"}),
+    )
+
+    summary = _summary(events, RunStatus.COMPLETED)
+
+    assert _contributor(summary.contributors, "child-model-1").disposition == "consumed"
+    assert _contributor(summary.contributors, "child-model-2").disposition == "terminal"
+    assert _contributor(summary.contributors, "run_child").disposition == "consumed"
+
+
+def test_public_evidence_ids_are_uniformly_bounded_and_oversized_manifest_is_dropped() -> None:
+    oversized = "e" * 257
+    manifest = _event(
+        3,
+        "prompt.manifest.created",
+        {"manifest_id": "manifest-1", "context_view_id": "view-1"},
+        run_id="manifest-1",
+    )
+    manifest = manifest.model_copy(
+        update={"event": manifest.event.model_copy(update={"event_id": oversized})}
+    )
+    events = (
+        _event(1, "run.started", {"run_id": "run_root"}),
+        _context(2, "view-1"),
+        manifest,
+        _event(
+            4,
+            "model.call.started",
+            {
+                "operation_id": "model-1",
+                "context_view_id": "view-1",
+                "prompt_manifest_id": "manifest-1",
+            },
+            schema_version=2,
+        ),
+        _event(
+            5,
+            "model.call.completed",
+            {"operation_id": "model-1", "finish_reason": "stop"},
+            schema_version=2,
+        ),
+        _event(6, "run.completed", {"run_id": "run_root"}),
+    )
+
+    summary = _summary(events, RunStatus.COMPLETED)
+
+    assert oversized not in _contributor(summary.contributors, "view-1").evidence_ids
+    assert all(
+        1 <= len(evidence_id) <= 256
+        for contributor in summary.contributors
+        for evidence_id in contributor.evidence_ids
+    )
+
+
+def test_trace_and_attribution_models_share_evidence_element_bounds() -> None:
+    legal = "e" * 256
+    AttributionContributor(
+        kind="model",
+        entity_id="model-1",
+        status="completed",
+        disposition="terminal",
+        evidence_ids=(legal,),
+    )
+    TraceStage(
+        stage_id="stage-1",
+        kind=TraceStageKind.MODEL,
+        status=TraceStageStatus.COMPLETED,
+        entity_id="model-1",
+        first_cursor=1,
+        last_cursor=1,
+        evidence_event_ids=(legal,),
+        evidence_cursors=(1,),
+    )
+    FailureAttribution(
+        stage_id="stage-1",
+        stage_kind=TraceStageKind.MODEL,
+        code="model_failed",
+        retryable=False,
+        evidence_ids=(legal,),
+    )
+    ImprovementHint(
+        code="context_fallback",
+        summary="Context compaction fell back to a lower level.",
+        evidence_ids=(legal,),
+    )
+
+    with pytest.raises(ValidationError):
+        AttributionContributor(
+            kind="model",
+            entity_id="model-1",
+            status="completed",
+            disposition="terminal",
+            evidence_ids=("e" * 257,),
+        )
+    with pytest.raises(ValidationError):
+        TraceStage(
+            stage_id="stage-1",
+            kind=TraceStageKind.MODEL,
+            status=TraceStageStatus.COMPLETED,
+            entity_id="model-1",
+            first_cursor=1,
+            last_cursor=1,
+            evidence_event_ids=("e" * 257,),
+            evidence_cursors=(1,),
+        )
+    with pytest.raises(ValidationError):
+        FailureAttribution(
+            stage_id="stage-1",
+            stage_kind=TraceStageKind.MODEL,
+            code="model_failed",
+            retryable=False,
+            evidence_ids=("e" * 257,),
+        )
+    with pytest.raises(ValidationError):
+        ImprovementHint(
+            code="context_fallback",
+            summary="Context compaction fell back to a lower level.",
+            evidence_ids=("e" * 257,),
+        )
+
+
+def test_historical_stage_with_oversized_event_id_remains_projectable_without_evidence() -> None:
+    event = _event(1, "tool.call.completed", {"call_id": "call-1"})
+    event = event.model_copy(
+        update={"event": event.event.model_copy(update={"event_id": "e" * 257})}
+    )
+
+    stage = project_stages((event,))[0]
+
+    assert stage.entity_id == "call-1"
+    assert stage.evidence_event_ids == ()
+    assert stage.evidence_cursors == ()

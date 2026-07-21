@@ -18,6 +18,7 @@ from .models import (
     TraceStageKind,
     TraceStageStatus,
     TraceTimeline,
+    is_public_evidence_id,
 )
 
 
@@ -65,6 +66,14 @@ class _ContributorFact:
     contributor: AttributionContributor
 
 
+@dataclass(frozen=True)
+class _AttributionIndexes:
+    context_cursor_by_consumer_ref: Mapping[tuple[str, str], int]
+    messages_by_route: Mapping[tuple[str, str], tuple[tuple[str, int], ...]]
+    last_model_stage_id_by_run: Mapping[str, str]
+    completed_run_ids: frozenset[str]
+
+
 def project_attribution(
     *,
     root_run_id: str,
@@ -76,6 +85,7 @@ def project_attribution(
     cursor_by_id = {item.event.event_id: item.cursor for item in ordered}
     event_by_id = {item.event.event_id: item for item in ordered}
     contexts = _context_facts(ordered)
+    indexes = _attribution_indexes(ordered, contexts, timeline.stages)
     manifest_evidence = _manifest_evidence_by_view(ordered)
     child_parents = _child_parents(ordered)
     failure_stage = _failure_stage(root_run_id, terminal_status, timeline.stages)
@@ -90,17 +100,12 @@ def project_attribution(
     unused_successful_tools: list[str] = []
     evaluations: list[tuple[int, str]] = []
 
-    model_stages = tuple(
-        stage for stage in timeline.stages if stage.kind is TraceStageKind.MODEL
-    )
     for stage in timeline.stages:
         evidence_ids = _sorted_evidence(stage.evidence_event_ids, cursor_by_id)
         if stage.kind is TraceStageKind.MODEL:
             model_disposition = _model_disposition(
                 stage,
-                model_stages,
-                root_run_id=root_run_id,
-                terminal_status=terminal_status,
+                indexes=indexes,
             )
             contributors.append(
                 _ContributorFact(
@@ -127,7 +132,7 @@ def project_attribution(
                 tool_terminals.append((stage, terminal))
                 tool_disposition = (
                     "consumed"
-                    if _tool_is_consumed(stage, terminal, contexts)
+                    if _tool_is_consumed(stage, terminal, indexes=indexes)
                     else "unused"
                 )
                 raw_status = terminal.event.payload.get("status")
@@ -205,8 +210,7 @@ def project_attribution(
                             if _child_is_consumed(
                                 stage,
                                 child_parents=child_parents,
-                                events=ordered,
-                                contexts=contexts,
+                                indexes=indexes,
                             )
                             else "unused"
                         ),
@@ -348,6 +352,58 @@ def _context_facts(events: tuple[ObservedEvent, ...]) -> tuple[_ContextFact, ...
     return tuple(result)
 
 
+def _attribution_indexes(
+    events: tuple[ObservedEvent, ...],
+    contexts: tuple[_ContextFact, ...],
+    stages: tuple[TraceStage, ...],
+) -> _AttributionIndexes:
+    context_cursors: dict[tuple[str, str], int] = {}
+    for context in contexts:
+        if context.owner_run_id is None:
+            continue
+        for ref in context.refs:
+            key = (context.owner_run_id, ref)
+            context_cursors[key] = max(context.cursor, context_cursors.get(key, 0))
+
+    messages: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    completed_run_ids: set[str] = set()
+    for item in events:
+        event = item.event
+        if event.type == "run.completed" and event.run_id is not None:
+            completed_run_ids.add(event.run_id)
+        if event.type != "agent.message.sent":
+            continue
+        message_id = event.payload.get("message_id")
+        sender_run_id = event.payload.get("sender_run_id")
+        recipient_run_id = event.payload.get("recipient_run_id")
+        if not all(
+            isinstance(value, str) and value
+            for value in (message_id, sender_run_id, recipient_run_id)
+        ):
+            continue
+        route = (cast(str, sender_run_id), cast(str, recipient_run_id))
+        messages.setdefault(route, []).append((cast(str, message_id), item.cursor))
+
+    last_models: dict[str, TraceStage] = {}
+    for stage in stages:
+        if stage.kind is not TraceStageKind.MODEL or stage.run_id is None:
+            continue
+        current = last_models.get(stage.run_id)
+        if current is None or (stage.first_cursor, stage.last_cursor) > (
+            current.first_cursor,
+            current.last_cursor,
+        ):
+            last_models[stage.run_id] = stage
+    return _AttributionIndexes(
+        context_cursor_by_consumer_ref=context_cursors,
+        messages_by_route={route: tuple(items) for route, items in messages.items()},
+        last_model_stage_id_by_run={
+            run_id: stage.stage_id for run_id, stage in last_models.items()
+        },
+        completed_run_ids=frozenset(completed_run_ids),
+    )
+
+
 def _child_parents(events: tuple[ObservedEvent, ...]) -> dict[str, str]:
     result: dict[str, str] = {}
     for item in events:
@@ -446,19 +502,16 @@ def _failure_code(payload: Mapping[str, object]) -> str | None:
 
 def _model_disposition(
     stage: TraceStage,
-    models: tuple[TraceStage, ...],
     *,
-    root_run_id: str,
-    terminal_status: RunStatus,
+    indexes: _AttributionIndexes,
 ) -> Literal["consumed", "unused", "terminal", "supporting"]:
     if stage.status is not TraceStageStatus.COMPLETED:
         return "supporting"
-    if any(
-        other.run_id == stage.run_id and other.first_cursor > stage.last_cursor
-        for other in models
-    ):
+    if stage.run_id is None:
+        return "supporting"
+    if indexes.last_model_stage_id_by_run.get(stage.run_id) != stage.stage_id:
         return "consumed"
-    if terminal_status is RunStatus.COMPLETED and stage.run_id == root_run_id:
+    if stage.run_id in indexes.completed_run_ids:
         return "terminal"
     return "supporting"
 
@@ -466,18 +519,20 @@ def _model_disposition(
 def _tool_is_consumed(
     stage: TraceStage,
     terminal: ObservedEvent,
-    contexts: tuple[_ContextFact, ...],
+    *,
+    indexes: _AttributionIndexes,
 ) -> bool:
+    if stage.run_id is None:
+        return False
     result_refs = {terminal.event.event_id}
     for key in ("result_id", "result_ref"):
         value = terminal.event.payload.get(key)
         if isinstance(value, str) and value:
             result_refs.add(value)
     return any(
-        context.cursor > terminal.cursor
-        and context.owner_run_id == stage.run_id
-        and not result_refs.isdisjoint(context.refs)
-        for context in contexts
+        indexes.context_cursor_by_consumer_ref.get((stage.run_id, ref), 0)
+        > terminal.cursor
+        for ref in result_refs
     )
 
 
@@ -485,27 +540,24 @@ def _child_is_consumed(
     stage: TraceStage,
     *,
     child_parents: Mapping[str, str],
-    events: tuple[ObservedEvent, ...],
-    contexts: tuple[_ContextFact, ...],
+    indexes: _AttributionIndexes,
 ) -> bool:
     parent_id = child_parents.get(stage.entity_id)
     if parent_id is None:
         return False
-    refs = {stage.entity_id}
-    for item in events:
-        if item.event.type != "agent.message.sent":
-            continue
-        payload = item.event.payload
-        if payload.get("sender_run_id") != stage.entity_id:
-            continue
-        message_id = payload.get("message_id")
-        if isinstance(message_id, str) and message_id:
-            refs.add(message_id)
+    result_cursor = indexes.context_cursor_by_consumer_ref.get(
+        (parent_id, stage.entity_id),
+        0,
+    )
+    if result_cursor > stage.last_cursor:
+        return True
     return any(
-        context.cursor > stage.last_cursor
-        and context.owner_run_id == parent_id
-        and not refs.isdisjoint(context.refs)
-        for context in contexts
+        indexes.context_cursor_by_consumer_ref.get((parent_id, message_id), 0)
+        > message_cursor
+        for message_id, message_cursor in indexes.messages_by_route.get(
+            (stage.entity_id, parent_id),
+            (),
+        )
     )
 
 
@@ -579,7 +631,7 @@ def _sorted_evidence(
     unique = {
         item
         for item in evidence_ids
-        if item in cursor_by_id
+        if item in cursor_by_id and is_public_evidence_id(item)
     }
     return tuple(sorted(unique, key=lambda item: cursor_by_id[item]))
 

@@ -4,12 +4,28 @@ from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.models import RunSnapshot
+
+
+EVIDENCE_ID_MAX_BYTES = 256
+
+
+def is_public_evidence_id(value: str) -> bool:
+    return bool(value) and len(value.encode("utf-8")) <= EVIDENCE_ID_MAX_BYTES
+
+
+def _evidence_id(value: str) -> str:
+    if not is_public_evidence_id(value):
+        raise ValueError("evidence id exceeds the public bound")
+    return value
+
+
+EvidenceId = Annotated[str, AfterValidator(_evidence_id)]
 
 
 def _freeze(value: Any) -> Any:
@@ -125,7 +141,7 @@ class TraceStage(BaseModel):
     first_cursor: int = Field(ge=1)
     last_cursor: int = Field(ge=1)
     usage: "TokenUsage | None" = None
-    evidence_event_ids: tuple[str, ...] = ()
+    evidence_event_ids: tuple[EvidenceId, ...] = ()
     evidence_cursors: tuple[int, ...] = ()
 
 
@@ -144,7 +160,7 @@ class AttributionContributor(BaseModel):
     entity_id: str = Field(min_length=1, max_length=256)
     status: str = Field(min_length=1, max_length=128)
     disposition: Literal["consumed", "unused", "terminal", "supporting"]
-    evidence_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[EvidenceId, ...] = ()
 
 
 class FailureAttribution(BaseModel):
@@ -154,7 +170,7 @@ class FailureAttribution(BaseModel):
     stage_kind: TraceStageKind
     code: str = Field(min_length=1, max_length=128)
     retryable: bool
-    evidence_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[EvidenceId, ...] = ()
 
 
 ImprovementHintCode = Literal[
@@ -173,7 +189,7 @@ class ImprovementHint(BaseModel):
 
     code: ImprovementHintCode
     summary: str = Field(min_length=1, max_length=256)
-    evidence_ids: tuple[str, ...] = ()
+    evidence_ids: tuple[EvidenceId, ...] = ()
 
 
 class AttributionSummary(BaseModel):

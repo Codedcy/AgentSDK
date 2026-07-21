@@ -11,7 +11,13 @@ from typing import Literal
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.runtime.models import TokenUsage
 
-from .models import ObservedEvent, TraceStage, TraceStageKind, TraceStageStatus
+from .models import (
+    ObservedEvent,
+    TraceStage,
+    TraceStageKind,
+    TraceStageStatus,
+    is_public_evidence_id,
+)
 
 
 @dataclass(frozen=True)
@@ -168,14 +174,14 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 usage_stage = stages[stage_key]
                 if usage_stage.terminal:
                     raise _ProjectionFailure
-                event_id = _bounded_identifier(event.event_id)
+                evidence_ids, evidence_cursors = _evidence(observed)
                 stages[stage_key] = replace(
                     usage_stage,
                     usage=usage,
                     first_cursor=min(usage_stage.first_cursor, observed.cursor),
                     last_cursor=max(usage_stage.last_cursor, observed.cursor),
-                    evidence_event_ids=(*usage_stage.evidence_event_ids, event_id),
-                    evidence_cursors=(*usage_stage.evidence_cursors, observed.cursor),
+                    evidence_event_ids=(*usage_stage.evidence_event_ids, *evidence_ids),
+                    evidence_cursors=(*usage_stage.evidence_cursors, *evidence_cursors),
                 )
             continue
         if rule is None:
@@ -184,7 +190,7 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
         lookup = (rule.kind, key)
         current = stages.get(lookup)
         status = _effective_status(rule.status, event.payload)
-        event_id = _bounded_identifier(event.event_id)
+        evidence_ids, evidence_cursors = _evidence(observed)
         run_id = _event_run_id(observed, context_parents)
         if rule.transition == "start":
             if current is not None:
@@ -201,16 +207,19 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 if pending_observed is None
                 else min(pending_observed.cursor, observed.cursor)
             )
-            start_evidence_event_ids: tuple[str, ...] = (event_id,)
-            start_evidence_cursors: tuple[int, ...] = (observed.cursor,)
+            start_evidence_event_ids = evidence_ids
+            start_evidence_cursors = evidence_cursors
             if pending_observed is not None and pending_observed.cursor < observed.cursor:
+                pending_evidence_ids, pending_evidence_cursors = _evidence(
+                    pending_observed
+                )
                 start_evidence_event_ids = (
-                    _bounded_identifier(pending_observed.event.event_id),
-                    event_id,
+                    *pending_evidence_ids,
+                    *evidence_ids,
                 )
                 start_evidence_cursors = (
-                    pending_observed.cursor,
-                    observed.cursor,
+                    *pending_evidence_cursors,
+                    *evidence_cursors,
                 )
             stages[lookup] = _MutableStage(
                 kind=rule.kind,
@@ -239,8 +248,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 ended_at=event.occurred_at,
                 first_cursor=observed.cursor,
                 last_cursor=observed.cursor,
-                evidence_event_ids=(event_id,),
-                evidence_cursors=(observed.cursor,),
+                evidence_event_ids=evidence_ids,
+                evidence_cursors=evidence_cursors,
                 parent_hint=_parent_hint(rule.kind, observed, run_parents, context_parents),
                 terminal=True,
             )
@@ -258,16 +267,19 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
                 if pending_observed is None
                 else min(pending_observed.cursor, observed.cursor)
             )
-            terminal_evidence_event_ids: tuple[str, ...] = (event_id,)
-            terminal_evidence_cursors: tuple[int, ...] = (observed.cursor,)
+            terminal_evidence_event_ids = evidence_ids
+            terminal_evidence_cursors = evidence_cursors
             if pending_observed is not None and pending_observed.cursor < observed.cursor:
+                pending_evidence_ids, pending_evidence_cursors = _evidence(
+                    pending_observed
+                )
                 terminal_evidence_event_ids = (
-                    _bounded_identifier(pending_observed.event.event_id),
-                    event_id,
+                    *pending_evidence_ids,
+                    *evidence_ids,
                 )
                 terminal_evidence_cursors = (
-                    pending_observed.cursor,
-                    observed.cursor,
+                    *pending_evidence_cursors,
+                    *evidence_cursors,
                 )
             stages[lookup] = _MutableStage(
                 kind=rule.kind,
@@ -309,8 +321,8 @@ def _project_stages(events: tuple[ObservedEvent, ...]) -> tuple[TraceStage, ...]
             status=status,
             ended_at=event.occurred_at,
             last_cursor=observed.cursor,
-            evidence_event_ids=(*current.evidence_event_ids, event_id),
-            evidence_cursors=(*current.evidence_cursors, observed.cursor),
+            evidence_event_ids=(*current.evidence_event_ids, *evidence_ids),
+            evidence_cursors=(*current.evidence_cursors, *evidence_cursors),
             usage=(
                 terminal_usage
                 or current.usage
@@ -618,6 +630,12 @@ def _bounded_identifier(value: str) -> str:
     if not value or len(value.encode("utf-8")) > 256:
         raise _ProjectionFailure
     return value
+
+
+def _evidence(observed: ObservedEvent) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    if not is_public_evidence_id(observed.event.event_id):
+        return (), ()
+    return (observed.event.event_id,), (observed.cursor,)
 
 
 def _sha256_reference(value: object) -> str | None:

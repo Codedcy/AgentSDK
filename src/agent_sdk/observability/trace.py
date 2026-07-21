@@ -95,6 +95,10 @@ class TraceService:
                         "trace root not found",
                         retryable=False,
                     )
+            elif run.workflow_run_id is not None:
+                workflow = await self._workflow(run.workflow_run_id)
+                if workflow is None or not self._bound_workflow_matches(run, workflow):
+                    self._internal()
             cursor = await self._cursor()
             stored = await self._read_through(cursor)
             try:
@@ -156,11 +160,15 @@ class TraceService:
                     raise ValueError
                 if (
                     (isinstance(parent_id, str) and parent_id in run_ids)
-                    or (workflow_id is not None and bound_workflow == workflow_id)
+                    or (
+                        root_run is None
+                        and workflow_id is not None
+                        and bound_workflow == workflow_id
+                    )
                 ) and run_id not in run_ids:
                     run_ids.add(run_id)
                     changed = True
-            if workflow_id is not None:
+            if root_run is None and workflow_id is not None:
                 for item in stored:
                     if item.cursor > cursor or not item.event.type.startswith("workflow.node."):
                         continue
@@ -335,6 +343,18 @@ class TraceService:
             return None if data is None else WorkflowRunSnapshot.model_validate(data)
         except Exception:
             self._internal()
+
+    @staticmethod
+    def _bound_workflow_matches(
+        run: RunSnapshot,
+        workflow: WorkflowRunSnapshot,
+    ) -> bool:
+        return (
+            run.workflow_run_id == workflow.workflow_run_id
+            and run.session_id == workflow.session_id
+            and run.workflow_node_id is not None
+            and any(node.node_id == run.workflow_node_id for node in workflow.nodes)
+        )
 
     async def _cursor(self) -> int:
         try:
