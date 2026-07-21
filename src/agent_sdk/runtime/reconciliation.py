@@ -47,14 +47,10 @@ _TERMINATION_REASON_MAX_UTF8_BYTES = 256
 _TERMINATION_ACTOR_MAX_UTF8_BYTES = 1024
 _ADDITIONAL_SENSITIVE_METADATA_KEYS = frozenset(
     {
-        "authorization",
         "credential",
         "secret",
         "token",
     }
-)
-_BEARER_SECRET = re.compile(
-    r"(?i)(\bauthorization\s*:\s*bearer)\s+[^\s,;]+"
 )
 _ASSIGNED_METADATA = re.compile(
     r"(?i)(?<![a-z0-9_-])(?P<quote>['\"]?)(?P<key>[a-z][a-z0-9_-]*)"
@@ -74,11 +70,6 @@ def _contains_sensitive_assignment(value: str) -> bool:
         if is_credential_key(key):
             return True
         if normalized not in _ADDITIONAL_SENSITIVE_METADATA_KEYS:
-            continue
-        assignment = match.group("value")
-        if normalized == "authorization" and assignment.casefold().startswith(
-            "bearer "
-        ):
             continue
         return True
     return False
@@ -104,16 +95,6 @@ def _contains_sensitive_metadata(value: Any) -> bool:
     return False
 
 
-def _redact_metadata_strings(value: Any) -> Any:
-    if isinstance(value, str):
-        return _BEARER_SECRET.sub(r"\1 [REDACTED]", value)
-    if isinstance(value, dict):
-        return {key: _redact_metadata_strings(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_redact_metadata_strings(item) for item in value]
-    return value
-
-
 def _sanitize_termination_resolution(
     actor: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -128,7 +109,6 @@ def _sanitize_termination_resolution(
         raise ValueError("termination resolution reason is empty")
     if _contains_sensitive_assignment(reason):
         raise ValueError("termination resolution reason is unsafe")
-    reason = cast(str, _redact_metadata_strings(reason))
     if len(reason.encode("utf-8")) > _TERMINATION_REASON_MAX_UTF8_BYTES:
         raise ValueError("termination resolution reason is too large")
     try:
@@ -138,8 +118,6 @@ def _sanitize_termination_resolution(
             canonical_actor
         ):
             raise ValueError("termination resolution actor is unsafe")
-        canonical_actor = _redact_metadata_strings(canonical_actor)
-        assert isinstance(canonical_actor, dict)
         encoded_actor = json.dumps(
             canonical_actor,
             ensure_ascii=False,

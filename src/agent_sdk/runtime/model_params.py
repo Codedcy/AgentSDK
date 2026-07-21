@@ -17,6 +17,7 @@ _CREDENTIAL_KEYS = frozenset(
         "apisecret",
         "apitoken",
         "applicationsecret",
+        "authorization",
         "authtoken",
         "awssecretaccesskey",
         "azureadtoken",

@@ -20,8 +20,9 @@ executed, and it does not add an exactly-once guarantee.
   rejects assignments to any key in the shared credential-key policy, and is
   limited to 256 UTF-8 bytes after sanitization.
 - Actor metadata is canonical JSON, recursively rejects secret-bearing keys,
-  rejects credential assignments in string values, redacts complete bearer
-  values, and is limited to 1,024 UTF-8 bytes.
+  rejects credential assignments in string values, and is limited to 1,024
+  UTF-8 bytes. Authorization bearer values are rejected, not persisted in
+  redacted form.
 - The existing `commit_run_progress` transaction and CAS preconditions are
   reused for both Memory and SQLite. No new table, Store protocol, transaction,
   state machine, or persistence mechanism was introduced.
@@ -86,17 +87,17 @@ accepted in nested actor metadata or a reason assignment and become durable.
 
 The correction exposes one internal `is_credential_key` predicate from the
 existing model-parameter durability policy. Both model-parameter validation and
-termination metadata now use that same normalized 15-key deny set; the
+termination metadata now use that same normalized 16-key deny set, including
+`authorization`; the
 termination layer retains only its additional generic metadata names. Actor
 metadata is checked recursively and with the existing depth/item bounds before
 canonicalization. Reason and actor-string credential assignments are rejected
 as a whole with the sanitized public error `reconciliation decision is
-invalid`; no partial credential value is redacted and stored. Full bearer values
-remain redacted under the pre-existing bounded behavior.
+invalid`; no partial credential or authorization value is redacted and stored.
 
 Strict public-API RED tests reproduced the defect for both Memory and SQLite:
 the first normalized actor key was accepted and the next attempt observed a
-conflict (`2 failed`). The GREEN test traverses all 15 shared credential names,
+conflict (`2 failed`). The GREEN test traverses all 16 shared credential names,
 using mixed case, underscores, and hyphens, in both deeply nested actor keys and
 direct `=` and quoted `:` reason assignments. The quoted-assignment extension
 also produced a strict `2 failed` RED before the parser accepted optional key
@@ -104,14 +105,34 @@ quotes. The final test proves the sentinel is absent from error
 `str`/`repr`, events, snapshots, complete Store state, and every SQLite database
 sidecar byte stream.
 
+## Authorization bearer re-review correction
+
+The first secret-safety correction still treated `Authorization: Bearer ...` as
+a redaction exception, while normalized authorization assignments using another
+separator could follow the shared rejection path. Strict RED tests demonstrated
+the mismatch: three normalized `authorization` variants were accepted by model
+parameters, and public TERMINATE accepted an actor-string bearer assignment for
+both Memory and SQLite (`5 failed, 15 passed`).
+
+The final correction adds normalized `authorization` to the single shared
+credential-key deny set and removes the termination-specific authorization key,
+Bearer allow branch, and Bearer redactor. Nested actor headers and actor/reason
+assignments using `:`, `=`, quoted keys, case, underscores, or hyphens are now
+rejected before any durable mutation. The public error remains sanitized and
+the sentinel is absent from exceptions, events, snapshots, Store state, and all
+SQLite database/sidecar bytes.
+
 ## Verification
 
 - Full reconciliation-resolution suite: `372 passed in 102.32s`.
 - Public v0.1 release acceptance: `1 passed in 72.80s`.
-- Selected observability, recovery, Workflow, Child, control, documentation, and
-  public-release suites after the secret correction: `727 passed in 290.77s`.
-- Final terminate-focused selection: `18 passed, 358 deselected in 10.75s`.
-- Strict shared-policy sentinel selection: `2 passed, 374 deselected in 3.43s`.
+- Model-parameter secret, observability, recovery, Workflow, Child, control,
+  documentation, and public-release suites after the authorization correction:
+  `768 passed in 285.32s`.
+- Model-parameter secret plus terminate-focused selection:
+  `59 passed, 358 deselected in 7.01s`.
+- Strict authorization/shared-policy selection after its RED:
+  `20 passed, 397 deselected in 3.52s`.
 - Documentation release gate: `1 passed`.
 - Ruff: `All checks passed!`
 - Strict mypy: `Success: no issues found in 103 source files`.

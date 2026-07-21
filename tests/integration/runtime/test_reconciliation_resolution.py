@@ -5469,14 +5469,12 @@ async def test_terminate_unknown_tool_fails_run_without_replay_and_reopens_exact
         tool_calls.append(value)
         raise AssertionError("terminate must not call the Tool")
 
-    actor_secret = "abort-actor-secret"
     actor = {
         "type": "operator",
         "id": "release-controller",
-        "note": f"Authorization: Bearer {actor_secret}",
+        "note": "manual release decision",
     }
-    raw_secret = "abort-bearer-secret"
-    evidence = {"reason": f"operator abort; Authorization: Bearer {raw_secret}"}
+    evidence = {"reason": "operator abort after external outcome review"}
     sdk = AgentSDK.for_test(
         store=store,
         acompletion=forbidden_provider,
@@ -5499,14 +5497,10 @@ async def test_terminate_unknown_tool_fails_run_without_replay_and_reopens_exact
 
         assert resolved.status is ReconciliationStatus.RESOLVED
         assert resolved.resolution is not None
-        assert dict(resolved.resolution.actor)["note"] == (
-            "Authorization: Bearer [REDACTED]"
-        )
+        assert dict(resolved.resolution.actor)["note"] == "manual release decision"
         assert dict(resolved.resolution.evidence) == {
-            "reason": "operator abort; Authorization: Bearer [REDACTED]"
+            "reason": "operator abort after external outcome review"
         }
-        assert raw_secret not in resolved.model_dump_json()
-        assert actor_secret not in resolved.model_dump_json()
         assert provider_calls == []
         assert tool_calls == []
         run = await sdk.runs.get(run_id)
@@ -5514,7 +5508,7 @@ async def test_terminate_unknown_tool_fails_run_without_replay_and_reopens_exact
         assert run.error is not None
         assert run.error.model_dump(mode="json") == {
             "code": "application_resolution_aborted",
-            "message": "operator abort; Authorization: Bearer [REDACTED]",
+            "message": "operator abort after external outcome review",
             "retryable": False,
         }
         operation = await store.get_external_operation(operation_id)
@@ -5711,6 +5705,9 @@ async def test_terminate_rejects_shared_credential_policy_without_secret_leak(
         "azure_ad_token",
         "bearer-token",
         "client_secret",
+        "Authorization",
+        "AUTH_ORIZATION",
+        "author-ization",
         "credentials",
         "password",
         "PRIVATE-KEY",
@@ -5719,6 +5716,55 @@ async def test_terminate_rejects_shared_credential_policy_without_secret_leak(
     )
     try:
         before = await _resolution_domain_state(store)
+        authorization_attempts = (
+            (
+                {
+                    "type": "operator",
+                    "note": f"AUTH_ORIZATION=Bearer {sentinel}",
+                },
+                {"reason": "operator abort"},
+            ),
+            (
+                {
+                    "type": "operator",
+                    "nested": {
+                        "headers": {"Authorization": f"Bearer {sentinel}"}
+                    },
+                },
+                {"reason": "operator abort"},
+            ),
+            (
+                {"type": "operator"},
+                {"reason": f"operator abort; Authorization: Bearer {sentinel}"},
+            ),
+            (
+                {"type": "operator"},
+                {"reason": f"operator abort; authorization=Bearer {sentinel}"},
+            ),
+            (
+                {"type": "operator"},
+                {"reason": f'operator abort; "AUTHORIZATION": "{sentinel}"'},
+            ),
+            (
+                {"type": "operator"},
+                {"reason": f'operator abort; "author-ization"="{sentinel}"'},
+            ),
+        )
+        for actor, evidence in authorization_attempts:
+            with pytest.raises(AgentSDKError) as caught:
+                await sdk.recovery.resolve(
+                    request.request_id,
+                    ReconciliationAction.TERMINATE,
+                    actor=actor,
+                    evidence=evidence,
+                )
+            assert caught.value.code is ErrorCode.INVALID_STATE
+            assert caught.value.message == "reconciliation decision is invalid"
+            assert caught.value.retryable is False
+            assert sentinel not in str(caught.value)
+            assert sentinel not in repr(caught.value)
+            assert await _resolution_domain_state(store) == before
+
         for index, credential_key in enumerate(credential_key_spellings):
             reason_assignment = (
                 f"{credential_key}={sentinel}"

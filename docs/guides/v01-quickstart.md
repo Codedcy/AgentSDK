@@ -11,9 +11,9 @@ environment instead. Credential names are matched exactly after case-folding and
 removing underscores or hyphens: `api_key`, `api_secret`, `api_token`,
 `access_token`, `auth_token`, `bearer_token`, `client_secret`,
 `application_secret`, `secret_access_key`, `aws_secret_access_key`,
-`azure_ad_token`, `credentials`, `service_account`, `private_key`, and
-`password`. This is not substring matching: ordinary LiteLLM parameters such as
-`max_tokens` and response token-count fields remain valid.
+`azure_ad_token`, `authorization`, `credentials`, `service_account`,
+`private_key`, and `password`. This is not substring matching: ordinary LiteLLM
+parameters such as `max_tokens` and response token-count fields remain valid.
 
 ```powershell
 python -m pip install agent-sdk
