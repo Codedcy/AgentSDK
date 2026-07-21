@@ -353,6 +353,11 @@ v0.1 R4 Task 3 delivered shared API/Workflow Child coordination, durable depth/p
 v0.1 R4 Task 3 final gates: 42 focused passed; 353 broad subagent/Workflow passed; Task 1/2 smoke 79 passed; strict mypy clean across 96 source files; Ruff and diff-check clean.
 v0.1 current implementation status: R0-R3 and R4 Tasks 1-3 completed; R4 Task 4 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\subagents\test_child_tools.py -q`
+v0.1 R4 Task 4: complete (implementation `c1e570b`; independent review Spec approved / Quality approved; Critical 0 / Important 0 / Minor 0)
+v0.1 R4 Task 4 delivered `spawn_agent`, `send_message`, `wait_child`, and `list_children` through the normal Tool/permission/trace pipeline, ToolContext-derived identity, shared Coordinator/Mailbox handlers, builtin registration/collision behavior, and a deterministic bidirectional parent/Child v0.1 E2E.
+v0.1 R4 Task 4 final gates: 17 focused passed; Workflow 274 passed; Task 1-3 smoke 121 passed; broad subagent/Context/v0.1 gate 198 passed with one proven baseline recovery node deselected; strict mypy clean across 97 source files; Ruff and diff-check clean.
+v0.1 current implementation status: R0-R3 and R4 Tasks 1-4 completed; R4 Task 5 checkpoint pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents tests\integration\subagents tests\integration\context tests\e2e\test_v01_release.py -q -k "not authoritative_recovery_receives_exact_stored_prepared_request"`
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
