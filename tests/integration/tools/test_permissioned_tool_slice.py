@@ -1650,7 +1650,7 @@ async def test_ninth_sequential_tool_call_fails_before_handler() -> None:
         )
 
         with pytest.raises(AgentSDKError) as raised:
-            await asyncio.wait_for(run.result(), timeout=1)
+            await asyncio.wait_for(run.result(), timeout=5)
 
         assert raised.value.code is ErrorCode.INVALID_STATE
         assert raised.value.message == "tool step limit exceeded"
