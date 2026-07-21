@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from types import MappingProxyType
 from typing import Any
 
 
@@ -13,18 +12,26 @@ class FrozenMapping(Mapping[str, Any]):
     def __init__(self, values: dict[str, Any]) -> None:
         if type(values) is not dict:
             raise TypeError("FrozenMapping requires a built-in dict")
-        self.__values = MappingProxyType(values.copy())
+        self.__values = values.copy()
 
     def __getitem__(self, key: str) -> Any:
-        return self.__values[key]
+        values = self._builtin_values()
+        if values is None:
+            raise TypeError("FrozenMapping backing is invalid")
+        return dict.__getitem__(values, key)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self.__values)
+        values = self._builtin_values()
+        if values is None:
+            raise TypeError("FrozenMapping backing is invalid")
+        return dict.__iter__(values)
 
     def __len__(self) -> int:
-        return len(self.__values)
+        values = self._builtin_values()
+        if values is None:
+            raise TypeError("FrozenMapping backing is invalid")
+        return dict.__len__(values)
 
-    @classmethod
-    def trusted_items(cls, value: FrozenMapping) -> tuple[tuple[str, Any], ...]:
-        values = object.__getattribute__(value, "_FrozenMapping__values")
-        return tuple(values.items())
+    def _builtin_values(self) -> dict[str, Any] | None:
+        values = object.__getattribute__(self, "_FrozenMapping__values")
+        return values if type(values) is dict else None

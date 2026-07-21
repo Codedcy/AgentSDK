@@ -62,7 +62,23 @@ work. SDK-owned frozen JSON now uses an exact `FrozenMapping` wrapper backed by
 a copied built-in dict. Both model-parameter freezing and idempotency-result
 freezing use that container, preserving dump/validate, Workflow replay, and
 recovery roundtrips without trusting user-defined mapping behavior. The final
-focused secret suite is 32 passed.
+focused secret suite at that review point was 32 passed.
+
+## Second re-review correction
+
+The exact outer `FrozenMapping` type could still be forged with
+`object.__new__` and `object.__setattr__`, replacing its private backing with a
+custom Mapping. Strict RED tests reproduced sentinel-bearing exceptions at the
+direct validator, `AgentSpec`, `DurableAgentSpec`, `AgentRegistry`,
+`ExecutionDescriptor`, and public `runs.start` boundaries: six failures, with
+zero Store access at the public boundary.
+
+The final correction stores a copied exact built-in dict as the legitimate
+backing. Both the validator and every `FrozenMapping` mapping operation verify
+`type(backing) is dict` before length, item, or iterator access; validator
+rejection remains the stable sanitized shape error. The six forged-boundary
+tests pass without invoking the Trap, the focused secret suite is 38 passed,
+and the focused suite plus Workflow idempotent replay is 39 passed.
 
 The two pre-existing privacy tests that used credential-shaped keys as opaque
 test markers now use non-credential marker keys; their original traceback and
@@ -70,8 +86,8 @@ public-event redaction assertions are unchanged.
 
 ## Fresh verification
 
-- Affected persistence/recovery command after re-review correction:
-  `458 passed in 105.64s`.
+- Affected persistence/recovery command after the second re-review correction:
+  `464 passed in 106.66s`.
   It covered the focused tests, execution descriptors, Prompt persistence,
   atomic live progress, Context recovery, public recovery API, Workflow Session
   ownership/recovery admission, and provider recovery.

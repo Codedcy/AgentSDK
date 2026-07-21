@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from agent_sdk import AgentSDK, AgentSDKError, AgentSpec, ErrorCode
+from agent_sdk._frozen import FrozenMapping
 from agent_sdk.runtime.agents import AgentRegistry
 from agent_sdk.runtime.execution import (
     DurableAgentSpec,
@@ -163,6 +164,13 @@ def _proxy_trap() -> tuple[Mapping[str, object], _ProxyTrapMapping]:
     return MappingProxyType(trap), trap
 
 
+def _forged_frozen_trap() -> tuple[FrozenMapping, _ProxyTrapMapping]:
+    trap = _ProxyTrapMapping()
+    forged = object.__new__(FrozenMapping)
+    object.__setattr__(forged, "_FrozenMapping__values", trap)
+    return forged, trap
+
+
 def _assert_sanitized_proxy_rejection(
     captured: pytest.ExceptionInfo[AgentSDKError],
     trap: _ProxyTrapMapping,
@@ -201,6 +209,46 @@ def test_untrusted_mapping_proxy_is_rejected_without_executing_custom_mapping(
                     "model": "fake/model",
                     "model_params": proxy,
                 }
+            )
+
+    _assert_sanitized_proxy_rejection(captured, trap)
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["validator", "agent", "durable", "registry", "descriptor"],
+)
+def test_forged_frozen_mapping_is_rejected_before_backing_mapping_execution(
+    boundary: str,
+) -> None:
+    forged, trap = _forged_frozen_trap()
+    bypassed = AgentSpec.model_construct(
+        name="forged-frozen-test",
+        model="fake/model",
+        model_params=forged,
+    )
+
+    with pytest.raises(AgentSDKError) as captured:
+        if boundary == "validator":
+            validate_model_params_for_durability(forged)
+        elif boundary == "agent":
+            AgentSpec(name="forged-test", model="fake/model", model_params=forged)
+        elif boundary == "durable":
+            DurableAgentSpec.model_validate(
+                {
+                    "name": "forged-durable-test",
+                    "model": "fake/model",
+                    "model_params": forged,
+                }
+            )
+        elif boundary == "registry":
+            AgentRegistry().define(bypassed)
+        else:
+            ExecutionDescriptor.create(
+                agent=bypassed,
+                messages=({"role": "user", "content": "hello"},),
+                tools=(),
+                policy=ExecutionPolicyDescriptor.create(permission_default="deny"),
             )
 
     _assert_sanitized_proxy_rejection(captured, trap)
@@ -336,6 +384,36 @@ async def test_public_start_rejects_untrusted_mapping_proxy_without_side_effects
         name="proxy-public-test",
         model="fake/model",
         model_params=proxy,
+    )
+
+    try:
+        with pytest.raises(AgentSDKError) as captured:
+            await sdk.runs.start("missing-session", bypassed, "do not persist this")
+        _assert_sanitized_proxy_rejection(captured, trap)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_start_rejects_forged_frozen_mapping_before_store_access() -> None:
+    store = _ZeroAccessStore()
+
+    async def must_not_call_provider(**_: Any) -> object:
+        raise AssertionError("provider called for rejected model params")
+
+    sdk = AgentSDK.for_test(
+        store=store,  # type: ignore[arg-type]
+        acompletion=must_not_call_provider,
+        enable_builtin_tools=False,
+    )
+    assert sdk._startup_scan_task is not None
+    await sdk._startup_scan_task
+    store.arm()
+    forged, trap = _forged_frozen_trap()
+    bypassed = AgentSpec.model_construct(
+        name="forged-public-test",
+        model="fake/model",
+        model_params=forged,
     )
 
     try:

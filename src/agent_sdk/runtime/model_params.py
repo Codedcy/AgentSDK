@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import Any, NoReturn
 
 from agent_sdk._frozen import FrozenMapping
 from agent_sdk.errors import AgentSDKError, ErrorCode
@@ -64,10 +64,13 @@ def validate_model_params_for_durability(value: Any) -> None:
                     _reject(_LIMIT_ERROR)
                 items = item.items()
             else:
-                items = FrozenMapping.trusted_items(item)
-                item_count += len(items)
+                values = FrozenMapping._builtin_values(item)
+                if values is None:
+                    _reject(_SHAPE_ERROR)
+                item_count += dict.__len__(values)
                 if item_count > _MAX_ITEMS:
                     _reject(_LIMIT_ERROR)
+                items = dict.items(values)
             for key, nested in items:
                 if type(key) is not str:
                     _reject(_SHAPE_ERROR)
@@ -97,7 +100,7 @@ def _normalize_key(key: str) -> str:
     return str.casefold(key).replace("_", "").replace("-", "")
 
 
-def _reject(message: str) -> None:
+def _reject(message: str) -> NoReturn:
     raise AgentSDKError(ErrorCode.INVALID_STATE, message, retryable=False)
 
 
