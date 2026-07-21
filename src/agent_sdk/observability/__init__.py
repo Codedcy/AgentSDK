@@ -1,8 +1,13 @@
+from .attribution import project_attribution
 from .models import (
+    AttributionContributor,
+    AttributionSummary,
     EventFilter,
     EventQueryResult,
     ExecutionTree,
     ExecutionTreeNode,
+    FailureAttribution,
+    ImprovementHint,
     ObservedEvent,
     ObservedRun,
     RunTimeline,
@@ -17,10 +22,14 @@ from .subscriptions import SubscriptionService
 from .trace import TraceService
 
 __all__ = [
+    "AttributionContributor",
+    "AttributionSummary",
     "EventFilter",
     "EventQueryResult",
     "ExecutionTree",
     "ExecutionTreeNode",
+    "FailureAttribution",
+    "ImprovementHint",
     "ObservedEvent",
     "ObservedRun",
     "QueryService",
@@ -34,4 +43,5 @@ __all__ = [
     "TraceStageStatus",
     "TraceTimeline",
     "project_stages",
+    "project_attribution",
 ]

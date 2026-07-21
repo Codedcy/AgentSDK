@@ -29,6 +29,7 @@ from agent_sdk.permissions.models import PermissionDecision, PermissionRequest
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.permissions.rules import PermissionRule
 from agent_sdk.observability import (
+    AttributionSummary,
     EventFilter,
     EventQueryResult,
     ExecutionTree,
@@ -1018,6 +1019,10 @@ class TraceAPI:
     async def timeline(self, root_id: str) -> TraceTimeline:
         async with self._lifecycle.admit():
             return await self._traces.timeline(root_id)
+
+    async def attribution(self, run_id: str) -> AttributionSummary:
+        async with self._lifecycle.admit():
+            return await self._traces.attribution(run_id)
 
     def subscribe(
         self,

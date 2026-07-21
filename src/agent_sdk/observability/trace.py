@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import NoReturn
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
-from agent_sdk.runtime.models import RunSnapshot, run_created_event_matches
+from agent_sdk.runtime.models import RunSnapshot, RunStatus, run_created_event_matches
 from agent_sdk.storage.base import StateStore, StoredEvent
 from agent_sdk.storage.validation import validate_event_page, validate_latest_cursor
 from agent_sdk.workflow.models import WorkflowRunSnapshot
 
-from .models import ObservedEvent, TraceTimeline
+from .attribution import project_attribution
+from .models import AttributionSummary, ObservedEvent, TraceTimeline
 from .stages import project_stages
 
 _STABLE_READ_ATTEMPTS = 4
@@ -41,11 +43,47 @@ class _LoadFailure(Enum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True)
+class _LoadedTrace:
+    root_run: RunSnapshot | None
+    timeline: TraceTimeline
+    events: tuple[ObservedEvent, ...]
+
+
 class TraceService:
     def __init__(self, store: StateStore) -> None:
         self._store = store
 
     async def timeline(self, root_id: str) -> TraceTimeline:
+        return (await self._load(root_id)).timeline
+
+    async def attribution(self, run_id: str) -> AttributionSummary:
+        loaded = await self._load(run_id)
+        root = loaded.root_run
+        if root is None:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "attribution root is not a run",
+                retryable=False,
+            )
+        if root.status not in {
+            RunStatus.COMPLETED,
+            RunStatus.FAILED,
+            RunStatus.INTERRUPTED,
+        }:
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "run is not terminal",
+                retryable=False,
+            )
+        return project_attribution(
+            root_run_id=root.run_id,
+            terminal_status=root.status,
+            timeline=loaded.timeline,
+            events=loaded.events,
+        )
+
+    async def _load(self, root_id: str) -> _LoadedTrace:
         for _ in range(_STABLE_READ_ATTEMPTS):
             run = await self._run(root_id)
             workflow: WorkflowRunSnapshot | None = None
@@ -75,10 +113,15 @@ class TraceService:
                 cursor=cursor,
             ):
                 continue
-            return TraceTimeline(
-                root_id=root_id,
-                stages=project_stages(tuple(selected)),
-                as_of_cursor=cursor,
+            events = tuple(selected)
+            return _LoadedTrace(
+                root_run=run,
+                timeline=TraceTimeline(
+                    root_id=root_id,
+                    stages=project_stages(events),
+                    as_of_cursor=cursor,
+                ),
+                events=events,
             )
         raise AgentSDKError(
             ErrorCode.CONFLICT,
@@ -160,6 +203,13 @@ class TraceService:
             for context_view_id in (item.event.payload.get("context_view_id"),)
             if isinstance(context_view_id, str)
         }
+        prompt_manifest_ids = {
+            prompt_manifest_id
+            for item in stored
+            if item.cursor <= cursor and item.event.run_id in run_ids
+            for prompt_manifest_id in (item.event.payload.get("prompt_manifest_id"),)
+            if isinstance(prompt_manifest_id, str)
+        }
 
         selected: list[ObservedEvent] = []
         for item in stored:
@@ -174,8 +224,18 @@ class TraceService:
             if payload.get("sender_run_id") in run_ids or payload.get("recipient_run_id") in run_ids:
                 related = True
             if (
+                item.event.type.startswith("workflow.node.")
+                and payload.get("run_id") in run_ids
+            ):
+                related = True
+            if (
                 item.event.type == "context.view.created"
                 and item.event.run_id in context_view_ids
+            ):
+                related = True
+            if (
+                item.event.type == "prompt.manifest.created"
+                and item.event.run_id in prompt_manifest_ids
             ):
                 related = True
             if related:

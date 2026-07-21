@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -137,6 +137,59 @@ class TraceTimeline(BaseModel):
     as_of_cursor: int = Field(ge=0)
 
 
-from agent_sdk.runtime.models import TokenUsage  # noqa: E402
+class AttributionContributor(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["model", "tool", "context", "workflow", "child", "evaluation"]
+    entity_id: str = Field(min_length=1, max_length=256)
+    status: str = Field(min_length=1, max_length=128)
+    disposition: Literal["consumed", "unused", "terminal", "supporting"]
+    evidence_ids: tuple[str, ...] = ()
+
+
+class FailureAttribution(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    stage_id: str = Field(min_length=1, max_length=128)
+    stage_kind: TraceStageKind
+    code: str = Field(min_length=1, max_length=128)
+    retryable: bool
+    evidence_ids: tuple[str, ...] = ()
+
+
+ImprovementHintCode = Literal[
+    "repeated_tool_failure",
+    "unused_tool_output",
+    "context_fallback",
+    "workflow_loop_limit",
+    "child_failure",
+    "permission_denied",
+    "interrupted_external_work",
+]
+
+
+class ImprovementHint(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    code: ImprovementHintCode
+    summary: str = Field(min_length=1, max_length=256)
+    evidence_ids: tuple[str, ...] = ()
+
+
+class AttributionSummary(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    root_run_id: str = Field(min_length=1, max_length=256)
+    terminal_status: "RunStatus"
+    failure: FailureAttribution | None
+    contributors: tuple[AttributionContributor, ...]
+    evaluation_ids: tuple[str, ...]
+    hints: tuple[ImprovementHint, ...]
+    method: Literal["deterministic_event_evidence_v1"] = "deterministic_event_evidence_v1"
+    as_of_cursor: int = Field(ge=0)
+
+
+from agent_sdk.runtime.models import RunStatus, TokenUsage  # noqa: E402
 
 TraceStage.model_rebuild()
+AttributionSummary.model_rebuild()
