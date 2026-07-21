@@ -549,7 +549,7 @@ async def test_execution_tree_rejects_relevant_unknown_schema_created(
         user_input="root",
     )
     child = RunSnapshot(
-        run_id=f"run_schema_2_{window}",
+        run_id=f"run_schema_unknown_{window}",
         session_id=owner.session_id,
         agent_revision="child:1",
         status=RunStatus.CREATED,
@@ -557,7 +557,7 @@ async def test_execution_tree_rejects_relevant_unknown_schema_created(
         parent_run_id=root.run_id,
     )
     created = EventEnvelope.new(
-        schema_version=2,
+        schema_version=999,
         type="run.created",
         session_id=owner.session_id,
         run_id=child.run_id,

@@ -465,7 +465,7 @@ def _run_creation(
     try:
         if schema_version == 1:
             return RunSnapshot.model_validate(data)
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             return RunCreatedEventPayload.model_validate(data)
     except Exception:
         pass
@@ -520,7 +520,7 @@ def _tree_tail_status(
                     continue
                 if parent_run_id not in descendants:
                     continue
-                if event.schema_version not in {1, 2} or event.session_id != session_id:
+                if event.schema_version not in {1, 2, 3} or event.session_id != session_id:
                     return _TreeTailStatus.INVALID
                 return _TreeTailStatus.CHANGED
             if (

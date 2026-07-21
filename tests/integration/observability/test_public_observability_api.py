@@ -62,6 +62,8 @@ async def test_public_sdk_queries_subscribes_evaluates_and_aggregates() -> None:
             after_cursor=0,
             limit=3,
         )
+        created = next(event for event in page.events if event.event.type == "run.created")
+        assert created.event.schema_version == 3
         tree = await sdk.queries.execution_tree(handle.run_id)
         stream = sdk.events.subscribe(
             filters=EventFilter(

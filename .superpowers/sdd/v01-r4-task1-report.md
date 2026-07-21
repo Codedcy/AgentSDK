@@ -212,3 +212,46 @@ Baseline check for the separate recovery API suite: the five checkpoint-message
 failures reproduce unchanged in a clean `5466757` worktree. Each expects a
 provider request without the existing ContextMiddleware system prompt; no
 prompt/recovery-composition change is included in this hardening.
+
+## Second re-review follow-up (public execution-tree schema-v3)
+
+### Root cause / RED
+
+After `RuntimeCommands` began emitting schema-v3 `run.created` events, the
+public observability regression consistently failed at `execution_tree()` with
+an internal error. The event query proved the primary event was schema v3;
+`_run_creation()` accepted only v1/v2 and rejected it before tree assembly.
+
+Audit: recovery already admits `{1, 2, 3}`. The only current-event
+closed-world observability consumers were `_run_creation()` and
+`_tree_tail_status()`. Context source/planner readers are schema-agnostic
+(they only read `payload.user_input`); SQLite's v1-only path is an isolated
+legacy snapshot-precondition/migration validator, not a current-event reader.
+
+The focused RED command yielded the expected public execution-tree failure;
+the unknown-schema `999` initial and tail cases already failed closed.
+
+### GREEN
+
+`_run_creation()` now parses the same public payload model for schemas v2/v3,
+and the tail stability allow-list is `{1, 2, 3}`. Unknown schemas remain
+rejected. The public API regression now explicitly asserts that the queried
+`run.created` event is v3 before exercising the execution tree.
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests/integration/observability -q
+```
+
+Result: `67 passed in 4.24s`.
+
+Final verification:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin [Task 1 184-test target set] -q
+.\.venv\Scripts\python.exe -m mypy --strict src/agent_sdk
+.\.venv\Scripts\python.exe -m ruff check [changed observability source and tests]
+git diff --check
+```
+
+Result: `184 passed, 5 skipped in 10.17s`; strict mypy (93 source files),
+Ruff, and diff-check passed.
