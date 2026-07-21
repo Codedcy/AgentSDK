@@ -381,3 +381,8 @@ v0.1 R4 checkpoint fresh raw gate: `tests/unit/subagents tests/integration/subag
 v0.1 R4 clean gate: the exact-node `--deselect` command above produced 198 passed / 1 deselected in 13.33s. Ruff plan scope passed; strict mypy passed for the 31 planned source files and all 97 `src/agent_sdk` files. The deselected clean gate does not turn the raw aggregate into a PASS.
 v0.1 R4 Task 5 final ledger gate: corrected the stale R4-pending contract and the R5 Task 1 resume target; `tests/docs/test_v01_release_ledger.py` produced 3 passed in 0.04s, Ruff clean, diff-check clean.
 v0.1 R4 final independent review: APPROVE for `4eb84b5..0071094`; Critical 0 / Important 0 / Minor 0; Spec PASS; Code Quality PASS. Final controller gate: 201 passed / 1 known-debt node deselected; Ruff clean; strict mypy clean across 97 source files; whole-range diff-check clean. R5 remains pending.
+v0.1 R5 Task 1: complete (commits `5673ae3`, `a3a2ebb`, `0b1793b`; final independent review Critical 0 / Important 0 / Minor 0; Spec approved / Quality approved).
+v0.1 R5 Task 1 delivered normalized sanitized Trace stages, stable Run/Workflow timelines, public `sdk.trace.timeline/subscribe`, finite provider cost capture, authenticated Child/Tool/permission correlations, and strict schema-v1/v2 recovery compatibility.
+v0.1 R5 Task 1 final controller gate: 85 passed across public observability and real recovery-permission timeline; strict mypy clean across 100 source files; Ruff and diff-check clean.
+v0.1 current implementation status: R0-R4 and R5 Task 1 completed; R5 Task 2 pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\observability\test_attribution.py -q`
