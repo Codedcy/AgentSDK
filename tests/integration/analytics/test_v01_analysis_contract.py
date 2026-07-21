@@ -16,14 +16,20 @@ from agent_sdk import (
     EvaluationVerdict,
     EventFilter,
     ExactOutputEvaluator,
+    ObservedEvent,
+    RunStatus,
     ToolContext,
-    ToolResult,
     ToolSpec,
     TraceStageKind,
     TraceStageStatus,
 )
 from agent_sdk.events.models import EventEnvelope
-from agent_sdk.storage.base import CommitBatch, StateStore
+from agent_sdk.storage.base import (
+    CommitBatch,
+    CommitResult,
+    RunProgressBatch,
+    StateStore,
+)
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -64,6 +70,45 @@ class _AlwaysPassEvaluator:
             confidence=1.0,
             evidence_event_ids=(terminal,),
         )
+
+
+class _UnusedToolBoundaryStore:
+    def __init__(self, delegate: StateStore) -> None:
+        self.delegate = delegate
+        self.completion_event_id: str | None = None
+        self.boundary_failed = False
+        self._failure_enabled = True
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit_run_progress(self, batch: RunProgressBatch) -> CommitResult:
+        result = await self.delegate.commit_run_progress(batch)
+        for event in batch.events:
+            if (
+                event.type == "tool.call.completed"
+                and event.payload.get("tool_name") == "unused_probe"
+                and event.payload.get("status") == "succeeded"
+            ):
+                self.completion_event_id = event.event_id
+        return result
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        if (
+            self._failure_enabled
+            and self.completion_event_id is not None
+            and any(
+                event.type == "context.view.created"
+                and self.completion_event_id in event.payload.get("source_refs", ())
+                for event in batch.events
+            )
+        ):
+            self.boundary_failed = True
+            raise RuntimeError("injected post-Tool Context boundary failure")
+        return await self.delegate.commit(batch)
+
+    def allow_recovery(self) -> None:
+        self._failure_enabled = False
 
 
 def _tool_call(
@@ -130,7 +175,12 @@ async def _scripted_provider(**params: Any) -> AsyncIterator[dict[str, object]]:
             }
             return
 
-        tool_name = "always_fail" if "always-fail" in user_input else "lookup"
+        if "unused-boundary" in user_input:
+            tool_name = "unused_probe"
+        elif "always-fail" in user_input:
+            tool_name = "always_fail"
+        else:
+            tool_name = "lookup"
         mode = "fail" if "lookup-fail" in user_input else "ok"
         call_id = "call_" + user_input.replace(" ", "_").replace("-", "_")
         yield {
@@ -164,6 +214,11 @@ async def _always_fail(_context: ToolContext, *, mode: str) -> object:
     raise RuntimeError("normalized all-failed sample")
 
 
+async def _unused_probe(_context: ToolContext, *, mode: str) -> object:
+    assert mode == "ok"
+    return {"persisted": True}
+
+
 def _register_tools(sdk: AgentSDK) -> None:
     schema = {
         "type": "object",
@@ -182,6 +237,14 @@ def _register_tools(sdk: AgentSDK) -> None:
             input_schema=schema,
         ),
         _always_fail,
+    )
+    sdk.tools.register(
+        ToolSpec(
+            name="unused_probe",
+            description="succeeds before an injected Context boundary",
+            input_schema=schema,
+        ),
+        _unused_probe,
     )
 
 
@@ -204,10 +267,37 @@ def _assert_metric_evidence_types(
     assert {event_types[event_id] for event_id in evidence_ids} == {expected_type}
 
 
+async def _all_events(
+    sdk: AgentSDK,
+    filters: EventFilter | None = None,
+    *,
+    page_size: int = 17,
+) -> tuple[tuple[ObservedEvent, ...], int]:
+    events: list[ObservedEvent] = []
+    after_cursor = 0
+    as_of_cursor: int | None = None
+    while as_of_cursor is None or after_cursor < as_of_cursor:
+        page = await sdk.queries.query_events(
+            filters,
+            after_cursor=after_cursor,
+            limit=page_size,
+        )
+        if as_of_cursor is None:
+            as_of_cursor = page.as_of_cursor
+        assert page.as_of_cursor == as_of_cursor
+        assert page.next_cursor > after_cursor or page.next_cursor == as_of_cursor
+        events.extend(page.events)
+        after_cursor = page.next_cursor
+    assert as_of_cursor is not None
+    assert after_cursor == as_of_cursor
+    return tuple(events), as_of_cursor
+
+
 @pytest.mark.asyncio
 async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -> None:
+    boundary_store = _UnusedToolBoundaryStore(store)
     sdk = AgentSDK.for_test(
-        store=store,
+        store=boundary_store,
         acompletion=_scripted_provider,
         permission_default="allow",
         enable_builtin_tools=False,
@@ -255,19 +345,6 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
             ExactOutputEvaluator(expected="pass"),
         )
 
-        retained_timeline = await sdk.queries.timeline(retained_all_fail)
-        unused_result = ToolResult.succeeded(
-            "call_unused_contract",
-            "unused_probe",
-            {"unused": True},
-        )
-        unused_event = EventEnvelope.new(
-            type="tool.call.completed",
-            session_id=retained.session_id,
-            run_id=retained_all_fail,
-            sequence=max(item.event.sequence for item in retained_timeline.events) + 1,
-            payload=unused_result.model_dump(mode="json"),
-        )
         invalid_evaluation = EventEnvelope.new(
             type="evaluation.completed",
             session_id=retained.session_id,
@@ -291,7 +368,7 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
             },
         )
         await store.commit(
-            CommitBatch(events=(unused_event, invalid_evaluation, invalid_tool))
+            CommitBatch(events=(invalid_evaluation, invalid_tool))
         )
 
         failed_handle = await sdk.runs.start(
@@ -302,6 +379,21 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
         with pytest.raises(AgentSDKError) as failed:
             await failed_handle.result()
         assert failed.value.code is ErrorCode.INVALID_STATE
+
+        unused_handle = await sdk.runs.start(
+            retained.session_id,
+            AgentSpec(name="analysis-contract", model="fake/model"),
+            "retained unused-boundary output-pass",
+        )
+        with pytest.raises(AgentSDKError):
+            await unused_handle.result()
+        assert boundary_store.boundary_failed
+        assert boundary_store.completion_event_id is not None
+        assert (await sdk.runs.get(unused_handle.run_id)).status is RunStatus.RUNNING
+        boundary_store.allow_recovery()
+        await sdk.recovery.scan()
+        unused_snapshot = await sdk.runs.get(unused_handle.run_id)
+        assert unused_snapshot.status is RunStatus.INTERRUPTED
 
         overall = await sdk.analytics.success_rate()
         exact = await sdk.analytics.success_rate(evaluator_id="exact_output")
@@ -334,25 +426,28 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
         assert all_failed_rate.value == 1.0
         assert all_failed_rate.sample_count == 2
 
-        observed = await sdk.queries.query_events(limit=100)
+        observed, observed_cursor = await _all_events(sdk)
+        assert observed_cursor == overall.as_of_cursor
         event_types = {
-            item.event.event_id: item.event.type for item in observed.events
+            item.event.event_id: item.event.type for item in observed
         }
-        _assert_metric_evidence_types(
-            overall.evidence_event_ids,
-            event_types,
-            "evaluation.completed",
-        )
-        _assert_metric_evidence_types(
-            exact.evidence_event_ids,
-            event_types,
-            "evaluation.completed",
-        )
-        _assert_metric_evidence_types(
-            lookup_rate.evidence_event_ids,
-            event_types,
-            "tool.call.completed",
-        )
+        for metric in (overall, exact):
+            _assert_metric_evidence_types(
+                metric.evidence_event_ids,
+                event_types,
+                "evaluation.completed",
+            )
+        for metric in (
+            lookup_failures,
+            lookup_rate,
+            all_failed_count,
+            all_failed_rate,
+        ):
+            _assert_metric_evidence_types(
+                metric.evidence_event_ids,
+                event_types,
+                "tool.call.completed",
+            )
         assert {
             removed_lookup_evaluation.evaluation_id,
             removed_alternate_evaluation.evaluation_id,
@@ -360,18 +455,36 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
             retained_pass_evaluation.evaluation_id,
         } <= {
             item.event.payload.get("evaluation_id")
-            for item in observed.events
+            for item in observed
             if item.event.event_id in overall.evidence_event_ids
         }
 
-        attribution = await sdk.trace.attribution(retained_all_fail)
+        attribution = await sdk.trace.attribution(unused_handle.run_id)
+        unused_run_timeline = await sdk.queries.timeline(unused_handle.run_id)
+        assert unused_run_timeline.events[-1].event.type == "run.interrupted"
+        assert [item.event.sequence for item in unused_run_timeline.events] == list(
+            range(1, len(unused_run_timeline.events) + 1)
+        )
+        completion = next(
+            item
+            for item in unused_run_timeline.events
+            if item.event.event_id == boundary_store.completion_event_id
+        )
+        assert completion.event.type == "tool.call.completed"
+        assert completion.cursor < unused_run_timeline.events[-1].cursor
+        assert not any(
+            item.event.type == "context.view.created"
+            and completion.event.event_id in item.event.payload["source_refs"]
+            for item in observed
+        )
         unused = next(
             item
             for item in attribution.contributors
-            if item.kind == "tool" and item.entity_id == "call_unused_contract"
+            if item.kind == "tool"
+            and item.entity_id == completion.event.payload["call_id"]
         )
         assert unused.disposition == "unused"
-        assert unused_event.event_id in unused.evidence_ids
+        assert completion.event.event_id in unused.evidence_ids
 
         failed_attribution = await sdk.trace.attribution(failed_handle.run_id)
         failed_timeline = await sdk.trace.timeline(failed_handle.run_id)
@@ -404,11 +517,11 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
         await sdk.sessions.close(removed.session_id)
         await sdk.sessions.delete(removed.session_id)
 
-        deleted_events = await sdk.queries.query_events(
+        deleted_events, deleted_as_of_cursor = await _all_events(
+            sdk,
             EventFilter(session_id=removed.session_id),
-            limit=100,
         )
-        assert deleted_events.events == ()
+        assert deleted_events == ()
         for load in (
             sdk.sessions.get(removed.session_id),
             sdk.runs.get(removed_lookup),
@@ -441,18 +554,31 @@ async def test_v01_cross_run_analysis_and_deletion_contract(store: StateStore) -
         assert all_failed_after_delete.value == 1.0
         assert all_failed_after_delete.sample_count == 1
         assert all_failed_after_delete.missing_count == 0
+        assert deleted_as_of_cursor == after_delete.as_of_cursor
         removed_evaluation_ids = {
             removed_lookup_evaluation.evaluation_id,
             removed_alternate_evaluation.evaluation_id,
         }
+        remaining_events, remaining_as_of_cursor = await _all_events(sdk)
+        assert remaining_as_of_cursor == after_delete.as_of_cursor
+        remaining_event_types = {
+            item.event.event_id: item.event.type for item in remaining_events
+        }
+        for metric in (after_delete, exact_after_delete):
+            _assert_metric_evidence_types(
+                metric.evidence_event_ids,
+                remaining_event_types,
+                "evaluation.completed",
+            )
+        for metric in (lookup_after_delete, all_failed_after_delete):
+            _assert_metric_evidence_types(
+                metric.evidence_event_ids,
+                remaining_event_types,
+                "tool.call.completed",
+            )
         remaining_evidence = {
             item.event.payload.get("evaluation_id")
-            for item in (
-                await sdk.queries.query_events(
-                    EventFilter(event_types=("evaluation.completed",)),
-                    limit=100,
-                )
-            ).events
+            for item in remaining_events
             if item.event.event_id in after_delete.evidence_event_ids
         }
         assert removed_evaluation_ids.isdisjoint(remaining_evidence)
