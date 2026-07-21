@@ -342,6 +342,58 @@ class _BarrierViewStore:
         return await self.delegate.commit(batch)
 
 
+class _EmptyReadSendRaceStore:
+    def __init__(self, delegate: InMemoryStore) -> None:
+        self.delegate = delegate
+        self.first_view_waiting = asyncio.Event()
+        self.release_first_view = asyncio.Event()
+        self.view_commits = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        if any(event.type == "context.view.created" for event in batch.events):
+            self.view_commits += 1
+            if self.view_commits == 1:
+                self.first_view_waiting.set()
+                await self.release_first_view.wait()
+        return await self.delegate.commit(batch)
+
+
+@pytest.mark.asyncio
+async def test_send_after_empty_read_rebuilds_first_committed_view() -> None:
+    durable = InMemoryStore()
+    session_id, parent_id, child_id, checkpoint = await _seed_mailbox(durable)
+    store = _EmptyReadSendRaceStore(durable)
+
+    preparing = asyncio.create_task(
+        _prepare(
+            _planner(store),
+            session_id=session_id,
+            run_id=child_id,
+            checkpoint=checkpoint,
+        )
+    )
+    await store.first_view_waiting.wait()
+    message = await MailboxService(store).send(
+        parent_id,
+        child_id,
+        "arrived during prepare",
+    )
+    store.release_first_view.set()
+    planned = await preparing
+
+    assert store.view_commits == 2
+    assert planned.view.consumed_message_ids == (message.message_id,)
+    assert message.message_id in planned.view.message_refs
+    assert any(
+        item.get("role") == "user"
+        and message.content in str(item.get("content"))
+        for item in planned.messages
+    )
+
+
 @pytest.mark.asyncio
 async def test_cursor_conflict_reloads_and_rebuilds_context() -> None:
     durable = InMemoryStore()

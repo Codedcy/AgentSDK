@@ -989,12 +989,12 @@ class ContextPlanner:
         if mailbox is None:
             return (), ()
         advanced = mailbox.advanced_cursor()
-        if advanced is None:
-            return (), ()
         current_mailbox = mailbox.mailbox
         current_cursor = mailbox.cursor
         return (
-            (
+            ()
+            if advanced is None
+            else (
                 SnapshotWrite(
                     "mailbox_cursor",
                     advanced.recipient_run_id,

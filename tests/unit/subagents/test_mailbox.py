@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -9,13 +10,26 @@ from pathlib import Path
 import pytest
 
 from agent_sdk import AgentSDKError, ErrorCode
+from agent_sdk.events.models import EventEnvelope
 from agent_sdk.runtime.commands import RuntimeCommands
-from agent_sdk.runtime.models import RunSnapshot, RunStatus, TokenUsage
+from agent_sdk.runtime.execution import (
+    ExecutionDescriptor,
+    ExecutionPolicyDescriptor,
+)
+from agent_sdk.runtime.models import (
+    AgentSpec,
+    RunCreatedEventPayload,
+    RunSnapshot,
+    RunStatus,
+    TokenUsage,
+    run_created_event_matches,
+)
 from agent_sdk.storage.base import (
     CommitBatch,
     CommitResult,
     SnapshotPrecondition,
     SnapshotWrite,
+    StateStore,
 )
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
@@ -37,6 +51,162 @@ async def _related_runs(
         agent_revision="child:1",
         user_input="child",
         parent_run_id=parent.run_id,
+    )
+    return session.session_id, parent.run_id, child.run_id
+
+
+def _canonical_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _pre_r4_run_data(run: RunSnapshot) -> dict[str, object]:
+    data = run.model_dump(mode="json")
+    descriptor = data["execution_descriptor"]
+    assert isinstance(descriptor, dict)
+    agent = descriptor["agent"]
+    assert isinstance(agent, dict)
+    agent.pop("tool_allowlist")
+    agent.pop("workspace_allowlist")
+    descriptor.pop("workspace_scopes")
+    descriptor["agent_hash"] = _canonical_hash(agent)
+    descriptor["descriptor_hash"] = _canonical_hash(
+        {key: value for key, value in descriptor.items() if key != "descriptor_hash"}
+    )
+    return data
+
+
+def _schema_v2_created_payload(
+    run: RunSnapshot,
+    raw_data: dict[str, object],
+) -> dict[str, object]:
+    descriptor = raw_data["execution_descriptor"]
+    assert isinstance(descriptor, dict)
+    payload = RunCreatedEventPayload.from_snapshot(run).model_copy(
+        update={
+            "agent_hash": descriptor["agent_hash"],
+            "execution_descriptor_hash": descriptor["descriptor_hash"],
+        }
+    )
+    upgraded = RunSnapshot.model_validate(raw_data)
+    assert run_created_event_matches(
+        upgraded,
+        payload.model_dump(mode="json"),
+        schema_version=2,
+    )
+    return payload.model_dump(mode="json")
+
+
+async def _pre_r4_related_runs(
+    store: StateStore,
+) -> tuple[str, str, str]:
+    session = await RuntimeCommands(store).create_session(workspaces=[])
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="legacy", model="test/model"),
+        messages=({"role": "user", "content": "legacy"},),
+        tools=(),
+        workspace_scopes=None,
+        policy=ExecutionPolicyDescriptor.create(permission_default="allow"),
+    )
+    parent = RunSnapshot(
+        run_id="run_legacy_parent",
+        session_id=session.session_id,
+        agent_revision="legacy:1",
+        status=RunStatus.CREATED,
+        user_input="legacy",
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    )
+    child = RunSnapshot(
+        run_id="run_legacy_child",
+        session_id=session.session_id,
+        agent_revision="legacy:1",
+        status=RunStatus.CREATED,
+        user_input="legacy",
+        parent_run_id=parent.run_id,
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    )
+    parent_data = _pre_r4_run_data(parent)
+    child_data = _pre_r4_run_data(child)
+    updated_session = session.model_copy(
+        update={
+            "active_run_ids": tuple(sorted((parent.run_id, child.run_id))),
+            "version": session.version + 2,
+        }
+    )
+    await store.commit(
+        CommitBatch(
+            events=(
+                EventEnvelope.new(
+                    type="session.run.attached",
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=session.version + 1,
+                    payload={"run_id": parent.run_id},
+                ),
+                EventEnvelope.new(
+                    type="session.run.attached",
+                    session_id=session.session_id,
+                    run_id=None,
+                    sequence=session.version + 2,
+                    payload={"run_id": child.run_id},
+                ),
+                EventEnvelope.new(
+                    type="run.created",
+                    session_id=session.session_id,
+                    run_id=parent.run_id,
+                    sequence=1,
+                    schema_version=2,
+                    payload=_schema_v2_created_payload(parent, parent_data),
+                ),
+                EventEnvelope.new(
+                    type="run.created",
+                    session_id=session.session_id,
+                    run_id=child.run_id,
+                    sequence=1,
+                    schema_version=2,
+                    payload=_schema_v2_created_payload(child, child_data),
+                ),
+            ),
+            snapshots=(
+                SnapshotWrite(
+                    "session",
+                    session.session_id,
+                    session.session_id,
+                    updated_session.version,
+                    updated_session.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    "run",
+                    parent.run_id,
+                    parent.session_id,
+                    parent.version,
+                    parent_data,
+                ),
+                SnapshotWrite(
+                    "run",
+                    child.run_id,
+                    child.session_id,
+                    child.version,
+                    child_data,
+                ),
+            ),
+            preconditions=(
+                SnapshotPrecondition(
+                    "session",
+                    session.session_id,
+                    session.version,
+                    session.session_id,
+                    session.model_dump(mode="json"),
+                ),
+            ),
+        )
     )
     return session.session_id, parent.run_id, child.run_id
 
@@ -72,6 +242,49 @@ async def test_send_assigns_monotonic_recipient_sequence() -> None:
 
     assert (first.sequence, second.sequence) == (1, 2)
     assert await mailbox.unread(child_id) == (first, second)
+
+
+@pytest.mark.asyncio
+async def test_memory_send_authenticates_pre_r4_raw_run_snapshots() -> None:
+    store = InMemoryStore()
+    _, parent_id, child_id = await _pre_r4_related_runs(store)
+
+    message = await MailboxService(store).send(parent_id, child_id, "legacy raw")
+
+    assert await MailboxService(store).unread(child_id) == (message,)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_reopen_send_authenticates_pre_r4_raw_run_snapshots(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy-raw-mailbox.db"
+    store = await SQLiteStore.open(database)
+    try:
+        _, parent_id, child_id = await _pre_r4_related_runs(store)
+    finally:
+        await store.close()
+
+    reopened = await SQLiteStore.open(database)
+    try:
+        message = await MailboxService(reopened).send(
+            parent_id,
+            child_id,
+            "legacy raw",
+            idempotency_key="legacy-raw-send",
+        )
+        assert (
+            await MailboxService(reopened).send(
+                parent_id,
+                child_id,
+                "legacy raw",
+                idempotency_key="legacy-raw-send",
+            )
+            == message
+        )
+        assert await MailboxService(reopened).unread(child_id) == (message,)
+    finally:
+        await reopened.close()
 
 
 @pytest.mark.asyncio

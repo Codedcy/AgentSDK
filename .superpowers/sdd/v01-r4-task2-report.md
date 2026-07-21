@@ -82,7 +82,7 @@ Plan-specified focused gate:
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py tests\integration\subagents\test_mailbox_context.py tests\integration\context\test_runtime_middleware.py -q
 ```
 
-Result: `36 passed in 3.53s`.
+Final post-review result: `39 passed in 5.22s`.
 
 Expanded subagent regression gate:
 
@@ -90,7 +90,7 @@ Expanded subagent regression gate:
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents tests\integration\subagents -q
 ```
 
-Result: `45 passed in 4.65s`.
+Final post-review result: `48 passed in 5.74s`.
 
 Context regression gate, excluding one proven baseline failure described
 below:
@@ -99,7 +99,7 @@ below:
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\context tests\integration\context -q -k "not authoritative_recovery_receives_exact_stored_prepared_request"
 ```
 
-Result: `144 passed, 1 deselected in 8.63s`.
+Final post-review result: `144 passed, 1 deselected in 10.62s`.
 
 Static and diff gates:
 
@@ -110,6 +110,14 @@ git diff --check
 ```
 
 Results: strict mypy passed for 94 source files; Ruff passed; diff check passed.
+
+Task 1 capability/workspace smoke gate:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py tests\integration\runtime\test_run_tool_catalog.py tests\unit\runtime\test_execution_descriptors.py tests\unit\runtime\test_session_workspace_roots.py tests\integration\runtime\test_builtin_tool_recovery.py tests\integration\runtime\test_live_run_progress.py tests\integration\subagents\test_child_run_slice.py tests\integration\workflow\test_workflow_child_slice.py tests\integration\tools\test_builtin_tools.py tests\unit\tools\test_workspace_paths.py tests\integration\prompts\test_runtime_prompt.py -q
+```
+
+Result: `184 passed, 5 skipped in 12.51s`.
 
 ## Proven pre-existing recovery failure
 
@@ -155,3 +163,65 @@ failure point. Recovery code was therefore not changed outside Task 2 scope.
   mapped to non-leaking internal errors or rejected during SQLite reopen.
 - Existing generic snapshot storage is reused; no migration or Task 3/4 API is
   introduced.
+
+## Independent review hardening (legacy exact data / empty-read race)
+
+The independent review identified two major correctness gaps in commit
+`ae6aa89432d7301f945c8dfa4655409ec50b9115`.
+
+### Legacy raw Run authentication RED
+
+The regressions construct genuine schema-v2/pre-R4 Run projections: the raw
+Agent omits `tool_allowlist` and `workspace_allowlist`, the raw descriptor
+omits `workspace_scopes`, its legacy hashes are recomputed, and matching
+schema-v2 `run.created` evidence is persisted. Both Memory and SQLite reopen
+then failed mailbox send after the bounded retries with
+`mailbox state changed concurrently`:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py::test_memory_send_authenticates_pre_r4_raw_run_snapshots tests\unit\subagents\test_mailbox.py::test_sqlite_reopen_send_authenticates_pre_r4_raw_run_snapshots -q
+```
+
+RED result: `2 failed`. Root cause: `RunSnapshot.model_validate()` correctly
+upgraded the historical descriptor defaults/hashes, but `_exact_run` then used
+the upgraded `model_dump()` instead of the exact raw projection returned by
+the keyed lookup.
+
+The fix carries a private authenticated Run record containing both the
+validated model and untouched raw data. It checks the model/raw keyed Run
+identity and uses the lookup Run id, validated Session owner/version, and raw
+data in every mailbox bootstrap, send, and replay exact precondition. The
+SQLite regression additionally verifies same-key replay and unread cursor
+bootstrap after reopen. No StateStore compatibility rule was relaxed.
+
+### Empty-read/send race RED
+
+A controlled store barrier pauses the first L0 View commit after an empty
+mailbox read, commits a parent message, then releases the old View batch. The
+old implementation committed that View once without the message:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\subagents\test_mailbox_context.py::test_send_after_empty_read_rebuilds_first_committed_view -q
+```
+
+RED result: `1 failed`; `view_commits` was 1 instead of the required rebuild
+count 2.
+
+The fix retains exact mailbox and cursor preconditions even when `messages` is
+empty, while correctly emitting no cursor write. The concurrent send now
+invalidates the stale View batch; `prepare` reloads and its first successful
+View contains, renders, and consumes the message.
+
+Mailbox/cursor exact preconditions remain based on their parsed model dumps.
+This is stable for Task 2 because every SDK mailbox/cursor snapshot is emitted
+from the same closed-world models with all defaults materialized; unlike Run
+descriptors, they have no legacy normalization/upgrade path. SQLite reopen and
+the focused concurrency tests exercise those exact projections.
+
+Combined GREEN:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents\test_mailbox.py::test_memory_send_authenticates_pre_r4_raw_run_snapshots tests\unit\subagents\test_mailbox.py::test_sqlite_reopen_send_authenticates_pre_r4_raw_run_snapshots tests\integration\subagents\test_mailbox_context.py::test_send_after_empty_read_rebuilds_first_committed_view -q
+```
+
+Result: `3 passed in 3.35s`.

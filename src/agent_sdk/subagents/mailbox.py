@@ -49,6 +49,28 @@ class MailboxRead:
         )
 
 
+@dataclass(frozen=True)
+class _AuthenticatedRun:
+    snapshot: RunSnapshot
+    raw_data: dict[str, object]
+
+    @property
+    def run_id(self) -> str:
+        return self.snapshot.run_id
+
+    @property
+    def session_id(self) -> str:
+        return self.snapshot.session_id
+
+    @property
+    def parent_run_id(self) -> str | None:
+        return self.snapshot.parent_run_id
+
+    @property
+    def status(self) -> RunStatus:
+        return self.snapshot.status
+
+
 class MailboxService:
     def __init__(self, store: StateStore) -> None:
         self._store = store
@@ -266,7 +288,7 @@ class MailboxService:
             retryable=True,
         )
 
-    async def _load_run(self, run_id: str) -> RunSnapshot:
+    async def _load_run(self, run_id: str) -> _AuthenticatedRun:
         try:
             data = await self._store.get_snapshot("run", run_id)
             if data is None:
@@ -275,7 +297,14 @@ class MailboxService:
                     "run not found",
                     retryable=False,
                 )
-            return RunSnapshot.model_validate(data)
+            snapshot = RunSnapshot.model_validate(data)
+            if (
+                data.get("run_id") != run_id
+                or data.get("session_id") != snapshot.session_id
+                or snapshot.run_id != run_id
+            ):
+                raise ValueError("run owner mismatch")
+            return _AuthenticatedRun(snapshot=snapshot, raw_data=data)
         except AgentSDKError:
             raise
         except Exception:
@@ -286,7 +315,10 @@ class MailboxService:
             ) from None
 
     @staticmethod
-    def _validate_relation(sender: RunSnapshot, recipient: RunSnapshot) -> None:
+    def _validate_relation(
+        sender: _AuthenticatedRun,
+        recipient: _AuthenticatedRun,
+    ) -> None:
         direct = (
             sender.run_id != recipient.run_id
             and (
@@ -309,7 +341,10 @@ class MailboxService:
                 retryable=False,
             )
 
-    async def _ensure_mailbox(self, recipient: RunSnapshot) -> MailboxSnapshot:
+    async def _ensure_mailbox(
+        self,
+        recipient: _AuthenticatedRun,
+    ) -> MailboxSnapshot:
         data = await self._store.get_snapshot("mailbox", recipient.run_id)
         if data is not None:
             return self._validated_mailbox(data, recipient)
@@ -342,7 +377,7 @@ class MailboxService:
 
     async def _ensure_cursor(
         self,
-        recipient: RunSnapshot,
+        recipient: _AuthenticatedRun,
     ) -> MailboxCursorSnapshot:
         data = await self._store.get_snapshot("mailbox_cursor", recipient.run_id)
         if data is not None:
@@ -378,7 +413,7 @@ class MailboxService:
     def _validated_mailbox(
         cls,
         data: object,
-        recipient: RunSnapshot,
+        recipient: _AuthenticatedRun,
     ) -> MailboxSnapshot:
         try:
             mailbox = MailboxSnapshot.model_validate(data)
@@ -395,7 +430,7 @@ class MailboxService:
     def _validated_cursor(
         cls,
         data: object,
-        recipient: RunSnapshot,
+        recipient: _AuthenticatedRun,
     ) -> MailboxCursorSnapshot:
         try:
             cursor = MailboxCursorSnapshot.model_validate(data)
@@ -420,7 +455,7 @@ class MailboxService:
     def _bootstrap_write(
         *,
         kind: str,
-        recipient: RunSnapshot,
+        recipient: _AuthenticatedRun,
         result: dict[str, object],
     ) -> IdempotencyWrite:
         command = f"{kind}.bootstrap"
@@ -439,13 +474,13 @@ class MailboxService:
         )
 
     @staticmethod
-    def _exact_run(run: RunSnapshot) -> SnapshotPrecondition:
+    def _exact_run(run: _AuthenticatedRun) -> SnapshotPrecondition:
         return SnapshotPrecondition(
             "run",
             run.run_id,
-            run.version,
+            run.snapshot.version,
             run.session_id,
-            run.model_dump(mode="json"),
+            run.raw_data,
         )
 
     @staticmethod
@@ -473,8 +508,8 @@ class MailboxService:
         *,
         result: object,
         mailbox: MailboxSnapshot,
-        sender: RunSnapshot,
-        recipient: RunSnapshot,
+        sender: _AuthenticatedRun,
+        recipient: _AuthenticatedRun,
         content: str,
     ) -> AgentMessage:
         try:
