@@ -127,9 +127,9 @@ def _resolved(request: ReconciliationRequest) -> ReconciliationRequest:
         update={
             "status": ReconciliationStatus.RESOLVED,
             "resolution": ReconciliationResolution(
-                action=ReconciliationAction.TERMINATE,
+                action=ReconciliationAction.RETRY,
                 actor={"type": "operator", "id": "user_1"},
-                evidence={"reason": "provider result unavailable"},
+                evidence={"acknowledge_duplicate_side_effect_risk": True},
                 decided_at=NOW,
                 event_id="evt_reconciliation_resolved",
             ),
@@ -151,7 +151,7 @@ def _resolution_event(resolved: ReconciliationRequest) -> EventEnvelope:
             "operation_id": resolved.operation_id,
             "action": resolution.action.value,
             "actor": {"type": "operator", "id": "user_1"},
-            "evidence": {"reason": "provider result unavailable"},
+            "evidence": {"acknowledge_duplicate_side_effect_risk": True},
         },
         occurred_at=resolution.decided_at,
     )
