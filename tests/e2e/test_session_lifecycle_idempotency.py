@@ -529,10 +529,21 @@ async def test_retained_deleting_session_resumes_real_sqlite_cleanup(
                 "SELECT COUNT(*) FROM snapshots WHERE session_id = ?",
                 (session.session_id,),
             ).fetchone()[0] > 1
-            assert connection.execute(
-                "SELECT COUNT(*) FROM idempotency_records WHERE session_id = ?",
-                (session.session_id,),
-            ).fetchone()[0] == 2
+            assert set(
+                connection.execute(
+                    "SELECT scope, key FROM idempotency_records "
+                    "WHERE session_id = ?",
+                    (session.session_id,),
+                )
+            ) == {
+                ("session.create", "retained-session"),
+                (
+                    f"session/{session.session_id}/run.start",
+                    "retained-run",
+                ),
+                (f"run/{run.run_id}/mailbox.bootstrap", "v1"),
+                (f"run/{run.run_id}/mailbox_cursor.bootstrap", "v1"),
+            }
             connection.execute("DROP TRIGGER fail_session_cleanup")
             connection.commit()
 
