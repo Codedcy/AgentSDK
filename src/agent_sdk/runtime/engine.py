@@ -580,14 +580,15 @@ class _RunEmitter:
                     "operation_id": operation.operation_id,
                 }
             )
-            event = self._new_event(
-                "tool.call.started",
-                {
-                    "call_id": call.call_id,
-                    "tool_name": call.name,
-                    "step_id": self._current_step_id,
-                },
-            )
+            event_payload = {
+                "call_id": call.call_id,
+                "tool_name": call.name,
+            }
+            if self._current_step_id is not None:
+                event_payload["step_id"] = self._current_step_id
+            event = self._new_event("tool.call.started", event_payload)
+            if self._current_step_id is None:
+                event = event.model_copy(update={"schema_version": 1})
             await _commit_progress(
                 self._store,
                 RunProgressBatch(
@@ -679,7 +680,18 @@ class _RunEmitter:
             selected = dict(payload or {})
             if event_type.startswith("step.") and self._current_step_id is not None:
                 selected.setdefault("step_id", self._current_step_id)
-            await self._emit_locked(event_type, selected, snapshot=snapshot)
+            schema_version = (
+                1
+                if event_type in {"step.completed", "step.failed", "step.timed_out"}
+                and self._current_step_id is None
+                else None
+            )
+            await self._emit_locked(
+                event_type,
+                selected,
+                snapshot=snapshot,
+                schema_version=schema_version,
+            )
             if event_type in {"step.completed", "step.failed", "step.timed_out"}:
                 self._current_step_id = None
 
@@ -897,9 +909,12 @@ class _RunEmitter:
         payload: dict[str, Any],
         *,
         snapshot: RunSnapshot | None = None,
+        schema_version: int | None = None,
     ) -> None:
         self._ensure_lease_current()
         event = self._new_event(event_type, payload)
+        if schema_version is not None:
+            event = event.model_copy(update={"schema_version": schema_version})
         if snapshot is not None and snapshot.status in RUN_LIFECYCLE_FINAL_STATUSES:
             await self._commit_terminal(event, snapshot)
             return

@@ -4039,6 +4039,31 @@ async def test_confirmed_partial_tool_call_recovers_and_replays(
         assert result.output_text == "partial-confirmeddone"
         assert tool_calls == [7]
         assert provider_calls == [1]
+        recovered_events = await store.read_events(after_cursor=0)
+        uncorrelated_step_terminals = tuple(
+            stored.event
+            for stored in recovered_events
+            if stored.event.run_id == run_id
+            and stored.event.type == "step.completed"
+            and not stored.event.payload
+        )
+        assert uncorrelated_step_terminals
+        assert all(
+            event.schema_version == 1 for event in uncorrelated_step_terminals
+        )
+        uncorrelated_tool_starts = tuple(
+            stored.event
+            for stored in recovered_events
+            if stored.event.run_id == run_id
+            and stored.event.type == "tool.call.started"
+            and stored.event.payload.get("step_id") is None
+        )
+        assert uncorrelated_tool_starts
+        assert all(event.schema_version == 1 for event in uncorrelated_tool_starts)
+        assert all(
+            set(event.payload) == {"call_id", "tool_name"}
+            for event in uncorrelated_tool_starts
+        )
 
         replay = await recovery.recovery.resolve(
             request.request_id,
