@@ -7482,7 +7482,7 @@ class RunRecoveryService:
                     evidence.session,
                     checkpoint,
                     refenced,
-                    provider_request.model_request,
+                    base_request,
                     result,
                     lease,
                     sequence=sequence + 1,

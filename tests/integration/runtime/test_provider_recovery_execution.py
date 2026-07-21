@@ -2028,12 +2028,14 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
     second_model_cancelled = asyncio.Event()
     tool_calls: list[int] = []
     query_calls = 0
+    provider_requests: list[ProviderRecoveryRequest] = []
     query_started = asyncio.Event()
     release_query = asyncio.Event()
 
     async def query(request: ProviderRecoveryRequest) -> ProviderRecoveryResult:
         nonlocal query_calls
         query_calls += 1
+        provider_requests.append(request)
         query_started.set()
         await release_query.wait()
         return ProviderRecoveryResult(
@@ -2112,6 +2114,12 @@ async def test_tool_recovery_to_interrupted_model_can_cross_kind_recover(
         release_query.set()
         result = await third_handle.result()
         assert result.output_text == "provider:1"
+        durable = await third.runs.get(seed_handle.run_id)
+        assert durable.execution_descriptor is not None
+        assert tuple(map(dict, durable.execution_descriptor.messages)) == (
+            {"role": "user", "content": "cross kind"},
+        )
+        assert provider_requests[0].model_request.messages[0]["role"] == "system"
         assert tool_calls == [3]
         assert query_calls == 1
         event_types = [
