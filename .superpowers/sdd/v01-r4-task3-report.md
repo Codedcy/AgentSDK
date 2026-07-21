@@ -57,6 +57,44 @@ Child failure is returned as `ChildWaitResult(status="failed", error=RunFailure)
 rather than raised. Invalid identity/ownership/storage remains an
 `AgentSDKError`.
 
+## Independent-review remediation
+
+The follow-up review suite first ran RED with `10 failed, 2 passed`. A
+controlled recovery callback showed that `_recovery_waiter` awaited recovery
+before creating the observed task, so a zero/short timeout could not bound that
+phase. Recovery and `handle.result()` now run inside one immediately created,
+tracked `_recover_and_wait` task. Concurrent waits reuse it; timeout returns
+pending without cancellation, and the done callback safely retrieves ordinary
+exceptions. Runtime timeout validation rejects booleans, non-numbers, NaN,
+infinities, and negative values, while finite non-negative values are clamped to
+the configured maximum.
+
+Wait now authenticates the Child's complete durable parent chain before any
+recovery side effect: the direct parent must exist in the same Session, every
+Run must match exactly one compatible `run.created` event, Snapshot ownership is
+checked through exact no-op preconditions, and missing/cross-Session/cyclic or
+corrupt chains fail closed. Coordinator-only
+`expected_parent_run_id` constrains the direct caller relation without expanding
+the simple public `ChildAPI.wait` signature. Root Runs and unrelated expected
+parents are rejected before recovery.
+
+Spawn now carries one authoritative root-to-direct-parent `_DurableRun` chain
+from Coordinator validation through depth/limit/capability computation. Every
+ancestor raw Snapshot is bound to `RuntimeCommands.start_run` with an exact
+`SnapshotPrecondition`; `SubagentService` does not re-read a Coordinator-supplied
+chain. Its direct compatibility path independently authenticates the chain and
+binds the same preconditions. A controlled non-direct-ancestor descriptor
+mutation now conflicts before `run.created`, so a stale spawn cannot expand a
+newly restricted capability. Corrupt owner/event, legacy intermediate, and
+normal creation cases are covered.
+
+The first complete-file run exposed one false conflict in SQLite: wait had also
+bound the live Child Snapshot itself, which legitimately changes during
+execution. The minimal correction binds the authenticated ancestor chain only;
+the Child remains authenticated by its exact `run.created` evidence. The exact
+SQLite reopen regression then passed, and the complete coordinator file passed
+31 tests.
+
 ## Durable relation, counting, and progress audit
 
 `ChildCoordinator` authenticates keyed `RunSnapshot` data against its exact
@@ -106,20 +144,20 @@ Task 3 focused gate:
 ```text
 tests/integration/subagents/test_child_coordinator.py
 tests/integration/subagents/test_child_run_slice.py
-28 passed in 5.85s
+42 passed in 4.04s
 ```
 
 Subagent and Workflow regression gate:
 
 ```text
 tests/unit/subagents tests/integration/subagents tests/integration/workflow
-339 passed in 73.56s
+353 passed in 56.32s
 ```
 
 Task 1/2 capability/mailbox/context smoke:
 
 ```text
-79 passed in 4.01s
+79 passed in 4.16s
 ```
 
 Static and diff gates:

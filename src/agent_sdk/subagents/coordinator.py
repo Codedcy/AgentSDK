@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -17,7 +18,13 @@ from agent_sdk.runtime.models import (
     RunStatus,
     run_created_event_matches,
 )
-from agent_sdk.storage.base import StateStore, StoredEvent
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    StateStore,
+    StoredEvent,
+)
 from agent_sdk.subagents.models import (
     ChildLimits,
     ChildProgress,
@@ -35,6 +42,7 @@ from agent_sdk.permissions.policy import PolicyEngine
 class _DurableRun:
     snapshot: RunSnapshot
     created: StoredEvent
+    raw_data: dict[str, object]
 
 
 class ChildCoordinator:
@@ -95,7 +103,16 @@ class ChildCoordinator:
                     retryable=False,
                 )
             runs = await self._session_runs(selected_session_id)
-            depth = await self._child_depth(parent.snapshot, runs)
+            parent = next(
+                (
+                    durable
+                    for durable in runs
+                    if durable.snapshot.run_id == parent_run_id
+                ),
+                parent,
+            )
+            ancestor_chain = self._spawn_ancestor_chain(parent, runs)
+            depth = len(ancestor_chain)
             self._enforce_limits(
                 parent_run_id=parent_run_id,
                 depth=depth,
@@ -110,6 +127,12 @@ class ChildCoordinator:
                 workflow_node_execution=workflow_node_execution,
                 agent_revision=agent_revision,
                 task=task,
+                authenticated_ancestors=tuple(
+                    ancestor.snapshot for ancestor in ancestor_chain
+                ),
+                ancestor_preconditions=tuple(
+                    self._exact_run(ancestor) for ancestor in ancestor_chain
+                ),
             )
 
     async def await_result(self, child_run_id: str) -> ChildResult:
@@ -128,24 +151,41 @@ class ChildCoordinator:
         child_run_id: str,
         *,
         timeout_seconds: float | None = None,
+        expected_parent_run_id: str | None = None,
     ) -> ChildWaitResult:
         timeout = self._limits.max_wait_seconds
         if timeout_seconds is not None:
-            if timeout_seconds < 0:
+            if (
+                isinstance(timeout_seconds, bool)
+                or not isinstance(timeout_seconds, (int, float))
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds < 0
+            ):
                 raise AgentSDKError(
                     ErrorCode.INVALID_STATE,
-                    "child wait timeout must be non-negative",
+                    "child wait timeout must be a finite non-negative number",
                     retryable=False,
                 )
-            timeout = min(timeout_seconds, timeout)
+            timeout = min(float(timeout_seconds), timeout)
         durable = await self._load_durable_run(child_run_id)
         self._validate_child(durable.snapshot)
+        ancestors = await self._ancestor_chain(durable)
+        await self._assert_exact_runs(ancestors)
+        if (
+            expected_parent_run_id is not None
+            and durable.snapshot.parent_run_id != expected_parent_run_id
+        ):
+            raise AgentSDKError(
+                ErrorCode.INVALID_STATE,
+                "child does not belong to the expected parent",
+                retryable=False,
+            )
         terminal = await self._terminal_wait_result(durable.snapshot)
         if terminal is not None:
             return terminal
         task = self._service.task_for(child_run_id)
         if task is None:
-            task = await self._recovery_waiter(child_run_id)
+            task = self._recovery_waiter(child_run_id)
         if task is None:
             return ChildWaitResult(child_run_id=child_run_id, status="pending")
         done, _pending = await asyncio.wait((task,), timeout=timeout)
@@ -163,7 +203,7 @@ class ChildCoordinator:
             return result
         return ChildWaitResult(child_run_id=child_run_id, status="pending")
 
-    async def _recovery_waiter(
+    def _recovery_waiter(
         self,
         child_run_id: str,
     ) -> asyncio.Task[RunResult] | None:
@@ -173,8 +213,7 @@ class ChildCoordinator:
         recover = self._recover_run
         if recover is None:
             return None
-        handle = await recover(child_run_id)
-        waiter = asyncio.create_task(handle.result())
+        waiter = asyncio.create_task(self._recover_and_wait(child_run_id, recover))
         self._recovery_waiters[child_run_id] = waiter
         waiter.add_done_callback(
             lambda settled: self._release_recovery_waiter(child_run_id, settled)
@@ -182,6 +221,14 @@ class ChildCoordinator:
         if self._track_task is not None:
             self._track_task(waiter)
         return waiter
+
+    @staticmethod
+    async def _recover_and_wait(
+        child_run_id: str,
+        recover: Callable[[str], Awaitable[RunHandle]],
+    ) -> RunResult:
+        handle = await recover(child_run_id)
+        return await handle.result()
 
     def _release_recovery_waiter(
         self,
@@ -305,7 +352,11 @@ class ChildCoordinator:
             )
             if len(matches) != 1:
                 raise ValueError("run creation identity is invalid")
-            return _DurableRun(snapshot=snapshot, created=matches[0])
+            return _DurableRun(
+                snapshot=snapshot,
+                created=matches[0],
+                raw_data=raw,
+            )
         except AgentSDKError:
             raise
         except Exception:
@@ -367,8 +418,73 @@ class ChildCoordinator:
                     "stored child relations are invalid",
                     retryable=False,
                 ) from None
-            runs.append(_DurableRun(snapshot=snapshot, created=stored))
+            runs.append(
+                _DurableRun(
+                    snapshot=snapshot,
+                    created=stored,
+                    raw_data=raw,
+                )
+            )
         return tuple(runs)
+
+    async def _ancestor_chain(
+        self,
+        descendant: _DurableRun,
+    ) -> tuple[_DurableRun, ...]:
+        ancestors: list[_DurableRun] = []
+        current = descendant
+        visited = {current.snapshot.run_id}
+        while current.snapshot.parent_run_id is not None:
+            try:
+                ancestor = await self._load_durable_run(
+                    current.snapshot.parent_run_id
+                )
+            except AgentSDKError as error:
+                if error.code is ErrorCode.NOT_FOUND:
+                    raise AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "stored child relation is invalid",
+                        retryable=False,
+                    ) from None
+                raise
+            if (
+                ancestor.snapshot.session_id != descendant.snapshot.session_id
+                or ancestor.snapshot.run_id in visited
+            ):
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "stored child relation is invalid",
+                    retryable=False,
+                )
+            visited.add(ancestor.snapshot.run_id)
+            ancestors.append(ancestor)
+            current = ancestor
+        return tuple(reversed(ancestors))
+
+    async def _assert_exact_runs(self, runs: tuple[_DurableRun, ...]) -> None:
+        try:
+            await self._store.commit(
+                CommitBatch(
+                    events=(),
+                    preconditions=tuple(self._exact_run(run) for run in runs),
+                )
+            )
+        except SnapshotPreconditionError:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "stored child relation is invalid",
+                retryable=False,
+            ) from None
+
+    @staticmethod
+    def _exact_run(run: _DurableRun) -> SnapshotPrecondition:
+        return SnapshotPrecondition(
+            "run",
+            run.snapshot.run_id,
+            run.snapshot.version,
+            run.snapshot.session_id,
+            run.raw_data,
+        )
 
     async def _child_depth(
         self,
@@ -396,6 +512,32 @@ class ChildCoordinator:
             depth += 1
             current = ancestor
         return depth
+
+    @staticmethod
+    def _spawn_ancestor_chain(
+        parent: _DurableRun,
+        runs: tuple[_DurableRun, ...],
+    ) -> tuple[_DurableRun, ...]:
+        by_id = {run.snapshot.run_id: run for run in runs}
+        chain = [parent]
+        current = parent
+        visited = {parent.snapshot.run_id}
+        while current.snapshot.parent_run_id is not None:
+            ancestor = by_id.get(current.snapshot.parent_run_id)
+            if (
+                ancestor is None
+                or ancestor.snapshot.session_id != parent.snapshot.session_id
+                or ancestor.snapshot.run_id in visited
+            ):
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "stored child relation is invalid",
+                    retryable=False,
+                )
+            visited.add(ancestor.snapshot.run_id)
+            chain.append(ancestor)
+            current = ancestor
+        return tuple(reversed(chain))
 
     def _enforce_limits(
         self,

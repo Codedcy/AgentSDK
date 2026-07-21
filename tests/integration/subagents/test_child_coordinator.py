@@ -28,8 +28,14 @@ from agent_sdk.runtime.execution import (
 )
 from agent_sdk.runtime.failures import RunFailure
 from agent_sdk.runtime.models import RunFailure as ModelsRunFailure, RunStatus
+from agent_sdk.storage.base import CommitBatch, CommitResult, SnapshotWrite, StoredEvent
 from agent_sdk.storage.memory import InMemoryStore
-from agent_sdk.subagents import ChildLimits, SubagentService, TaskEnvelope
+from agent_sdk.subagents import (
+    ChildCoordinator,
+    ChildLimits,
+    SubagentService,
+    TaskEnvelope,
+)
 from agent_sdk.subagents import models as child_models
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.tools.registry import ToolRegistry
@@ -873,3 +879,552 @@ async def test_deleted_session_children_do_not_consume_new_session_limit() -> No
     )
 
     assert (await coordinator.await_result(second_child.run_id)).output_text == "done"
+
+
+@pytest.mark.asyncio
+async def test_recovery_start_is_bounded_by_wait_timeout_and_reused() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    registry = AgentRegistry()
+    tracked: list[asyncio.Task[Any]] = []
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        registry,
+        limits=ChildLimits(max_wait_seconds=0.01),
+        track_task=tracked.append,
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="parent:1",
+            user_input="parent",
+        )
+    ).value
+    child = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="worker:1",
+            user_input="child",
+            parent_run_id=parent.run_id,
+            task_envelope=TaskEnvelope(objective="recover"),
+        )
+    ).value
+    recovery_started = asyncio.Event()
+    release_recovery = asyncio.Event()
+    recovery_calls = 0
+
+    class _RecoveredHandle:
+        async def result(self) -> Any:
+            return None
+
+    async def recover(run_id: str) -> Any:
+        nonlocal recovery_calls
+        assert run_id == child.run_id
+        recovery_calls += 1
+        recovery_started.set()
+        await release_recovery.wait()
+        return _RecoveredHandle()
+
+    coordinator.set_recover_run(recover)
+    try:
+        zero = await asyncio.wait_for(
+            coordinator.wait(child.run_id, timeout_seconds=0),
+            timeout=0.2,
+        )
+        await asyncio.wait_for(recovery_started.wait(), timeout=0.2)
+        short = await asyncio.wait_for(
+            coordinator.wait(child.run_id, timeout_seconds=0.001),
+            timeout=0.2,
+        )
+        clamped = await asyncio.wait_for(
+            coordinator.wait(child.run_id, timeout_seconds=999.0),
+            timeout=0.2,
+        )
+        assert (zero.status, short.status, clamped.status) == (
+            "pending",
+            "pending",
+            "pending",
+        )
+        assert recovery_calls == 1
+        assert len(tracked) == 1
+        assert not tracked[0].cancelled()
+    finally:
+        release_recovery.set()
+        if tracked:
+            await asyncio.gather(*tracked, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_timeout",
+    [True, "1", float("nan"), float("inf"), float("-inf"), -0.1],
+)
+async def test_wait_rejects_invalid_timeout_values(invalid_timeout: Any) -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        AgentRegistry(),
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="parent:1",
+            user_input="parent",
+        )
+    ).value
+    child = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="worker:1",
+            user_input="child",
+            parent_run_id=parent.run_id,
+            task_envelope=TaskEnvelope(objective="wait"),
+        )
+    ).value
+
+    with pytest.raises(AgentSDKError) as raised:
+        await coordinator.wait(child.run_id, timeout_seconds=invalid_timeout)
+
+    assert raised.value.code is ErrorCode.INVALID_STATE
+
+
+@pytest.mark.asyncio
+async def test_wait_rejects_missing_cross_session_and_cyclic_parent_chains() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        AgentRegistry(),
+    )
+    first = await commands.create_session(workspaces=[])
+    second = await commands.create_session(workspaces=[])
+    foreign_parent = (
+        await commands.start_run(
+            second.session_id,
+            agent_revision="parent:1",
+            user_input="foreign",
+        )
+    ).value
+    missing = (
+        await commands.start_run(
+            first.session_id,
+            agent_revision="worker:1",
+            user_input="missing",
+            parent_run_id="missing-parent",
+            task_envelope=TaskEnvelope(objective="missing"),
+        )
+    ).value
+    cross_session = (
+        await commands.start_run(
+            first.session_id,
+            agent_revision="worker:1",
+            user_input="cross",
+            parent_run_id=foreign_parent.run_id,
+            task_envelope=TaskEnvelope(objective="cross"),
+        )
+    ).value
+    cycle_a = (
+        await commands.start_run(
+            first.session_id,
+            run_id="cycle-a",
+            agent_revision="worker:1",
+            user_input="cycle a",
+            parent_run_id="cycle-b",
+            task_envelope=TaskEnvelope(objective="cycle a"),
+        )
+    ).value
+    await commands.start_run(
+        first.session_id,
+        run_id="cycle-b",
+        agent_revision="worker:1",
+        user_input="cycle b",
+        parent_run_id=cycle_a.run_id,
+        task_envelope=TaskEnvelope(objective="cycle b"),
+    )
+
+    for child_run_id in (missing.run_id, cross_session.run_id, cycle_a.run_id):
+        with pytest.raises(AgentSDKError):
+            await coordinator.wait(child_run_id, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_wait_rejects_root_run_before_recovery() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        AgentRegistry(),
+    )
+    session = await commands.create_session(workspaces=[])
+    root = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="root:1",
+            user_input="root",
+        )
+    ).value
+    recovery_calls = 0
+
+    async def recover(_: str) -> Any:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        raise AssertionError("recovery must not start")
+
+    coordinator.set_recover_run(recover)
+
+    with pytest.raises(AgentSDKError, match="run is not a child"):
+        await coordinator.wait(root.run_id, timeout_seconds=0)
+
+    assert recovery_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_rejects_corrupt_parent_creation_evidence_and_owner() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    for corrupt in ("event", "owner"):
+        store = InMemoryStore()
+        commands = RuntimeCommands(store)
+        coordinator = ChildCoordinator(
+            store,
+            commands,
+            RunEngine(store, LiteLLMGateway._for_test(provider)),
+            AgentRegistry(),
+        )
+        session = await commands.create_session(workspaces=[])
+        parent = (
+            await commands.start_run(
+                session.session_id,
+                agent_revision="parent:1",
+                user_input="parent",
+            )
+        ).value
+        child = (
+            await commands.start_run(
+                session.session_id,
+                agent_revision="worker:1",
+                user_input="child",
+                parent_run_id=parent.run_id,
+                task_envelope=TaskEnvelope(objective="corrupt"),
+            )
+        ).value
+        if corrupt == "event":
+            for index, stored in enumerate(store._events):
+                if stored.event.run_id == parent.run_id:
+                    payload = dict(stored.event.payload)
+                    payload["agent_revision"] = "tampered:1"
+                    store._events[index] = StoredEvent(
+                        stored.cursor,
+                        stored.event.model_copy(update={"payload": payload}),
+                    )
+                    break
+        else:
+            current = store._snapshots[("run", parent.run_id)]
+            store._snapshots[("run", parent.run_id)] = SnapshotWrite(
+                current.kind,
+                current.entity_id,
+                "wrong-session-owner",
+                current.version,
+                current.data,
+            )
+
+        with pytest.raises(AgentSDKError):
+            await coordinator.wait(child.run_id, timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_spawn_rejects_corrupt_parent_creation_evidence_and_owner() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    for corrupt in ("event", "owner"):
+        store = InMemoryStore()
+        commands = RuntimeCommands(store)
+        registry = AgentRegistry()
+        registry.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+        coordinator = ChildCoordinator(
+            store,
+            commands,
+            RunEngine(store, LiteLLMGateway._for_test(provider)),
+            registry,
+        )
+        session = await commands.create_session(workspaces=[])
+        parent = (
+            await commands.start_run(
+                session.session_id,
+                agent_revision="parent:1",
+                user_input="parent",
+            )
+        ).value
+        if corrupt == "event":
+            for index, stored in enumerate(store._events):
+                if stored.event.run_id == parent.run_id:
+                    payload = dict(stored.event.payload)
+                    payload["agent_revision"] = "tampered:1"
+                    store._events[index] = StoredEvent(
+                        stored.cursor,
+                        stored.event.model_copy(update={"payload": payload}),
+                    )
+                    break
+        else:
+            current = store._snapshots[("run", parent.run_id)]
+            store._snapshots[("run", parent.run_id)] = SnapshotWrite(
+                current.kind,
+                current.entity_id,
+                "wrong-session-owner",
+                current.version,
+                current.data,
+            )
+        before = await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+
+        with pytest.raises(AgentSDKError):
+            await coordinator.spawn(
+                parent_run_id=parent.run_id,
+                agent_revision="worker:1",
+                task=TaskEnvelope(objective="must not start"),
+            )
+
+        assert await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        ) == before
+
+
+@pytest.mark.asyncio
+async def test_wait_expected_parent_mismatch_has_no_recovery_side_effect() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        AgentRegistry(),
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="parent:1",
+            user_input="parent",
+        )
+    ).value
+    unrelated = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="other:1",
+            user_input="other",
+        )
+    ).value
+    child = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="worker:1",
+            user_input="child",
+            parent_run_id=parent.run_id,
+            task_envelope=TaskEnvelope(objective="expected parent"),
+        )
+    ).value
+    recovery_calls = 0
+
+    async def recover(_: str) -> Any:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        raise AssertionError("recovery must not start")
+
+    coordinator.set_recover_run(recover)
+
+    with pytest.raises(AgentSDKError):
+        await coordinator.wait(
+            child.run_id,
+            timeout_seconds=0,
+            expected_parent_run_id=unrelated.run_id,
+        )
+
+    assert recovery_calls == 0
+
+
+class _AncestorMutationStore(InMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self._mutation: tuple[str, ExecutionDescriptor] | None = None
+
+    def arm(self, run_id: str, descriptor: ExecutionDescriptor) -> None:
+        self._mutation = (run_id, descriptor)
+
+    async def commit(self, batch: CommitBatch) -> CommitResult:
+        mutation = self._mutation
+        if mutation is not None and any(
+            event.type == "run.created" and event.payload.get("parent_run_id") is not None
+            for event in batch.events
+        ):
+            self._mutation = None
+            run_id, descriptor = mutation
+            current = self._snapshots[("run", run_id)]
+            data = dict(current.data)
+            data["execution_descriptor"] = descriptor.model_dump(mode="json")
+            self._snapshots[("run", run_id)] = SnapshotWrite(
+                current.kind,
+                current.entity_id,
+                current.session_id,
+                current.version,
+                data,
+            )
+        return await super().commit(batch)
+
+
+@pytest.mark.asyncio
+async def test_spawn_binds_every_authenticated_ancestor_snapshot_exactly() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = _AncestorMutationStore()
+    commands = RuntimeCommands(store)
+    tools = ToolRegistry()
+    for name in ("read", "write"):
+        tools.register(_tool(name), _unused_tool)
+    registry = AgentRegistry()
+    registry.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    coordinator = ChildCoordinator(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider), tools),
+        registry,
+        tools=tools,
+    )
+    session = await commands.create_session(workspaces=[])
+    root_agent = AgentSpec(name="root", revision="1", model="fake/root")
+    messages = ({"role": "user", "content": "root"},)
+
+    def descriptor(names: tuple[str, ...]) -> ExecutionDescriptor:
+        return ExecutionDescriptor.create(
+            agent=root_agent,
+            messages=messages,
+            tools=tuple(
+                ToolCapabilityDescriptor.from_spec(spec)
+                for spec in tools.select(names).list()
+            ),
+            workspace_scopes=(),
+            policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+        )
+
+    root = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="root:1",
+            user_input="root",
+            execution_descriptor=descriptor(("read", "write")),
+        )
+    ).value
+    legacy_middle = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="legacy:1",
+            user_input="legacy",
+            parent_run_id=root.run_id,
+            task_envelope=TaskEnvelope(objective="legacy"),
+        )
+    ).value
+    before = tuple(
+        stored
+        for stored in await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        if stored.event.type == "run.created"
+    )
+    store.arm(root.run_id, descriptor(("read",)))
+
+    with pytest.raises(AgentSDKError) as raised:
+        await coordinator.spawn(
+            parent_run_id=legacy_middle.run_id,
+            agent_revision="worker:1",
+            task=TaskEnvelope(objective="must not expand"),
+        )
+
+    assert raised.value.code is ErrorCode.CONFLICT
+    after = tuple(
+        stored
+        for stored in await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        if stored.event.type == "run.created"
+    )
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_direct_service_spawn_binds_parent_snapshot_owner() -> None:
+    async def provider(**_: Any) -> AsyncIterator[dict[str, object]]:
+        return _response("unused")
+
+    store = InMemoryStore()
+    commands = RuntimeCommands(store)
+    registry = AgentRegistry()
+    registry.define(AgentSpec(name="worker", revision="1", model="fake/worker"))
+    service = SubagentService(
+        store,
+        commands,
+        RunEngine(store, LiteLLMGateway._for_test(provider)),
+        registry,
+    )
+    session = await commands.create_session(workspaces=[])
+    parent = (
+        await commands.start_run(
+            session.session_id,
+            agent_revision="parent:1",
+            user_input="parent",
+        )
+    ).value
+    current = store._snapshots[("run", parent.run_id)]
+    store._snapshots[("run", parent.run_id)] = SnapshotWrite(
+        current.kind,
+        current.entity_id,
+        "wrong-session-owner",
+        current.version,
+        current.data,
+    )
+    before = await store.read_events(after_cursor=0, session_id=session.session_id)
+
+    with pytest.raises(AgentSDKError):
+        await service.spawn(
+            session_id=session.session_id,
+            parent_run_id=parent.run_id,
+            agent_revision="worker:1",
+            task=TaskEnvelope(objective="owner bound"),
+        )
+
+    assert await store.read_events(
+        after_cursor=0,
+        session_id=session.session_id,
+    ) == before

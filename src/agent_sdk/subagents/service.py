@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -27,8 +28,13 @@ from agent_sdk.runtime.models import (
     intersect_names,
     intersect_workspaces,
     mutable_model_params,
+    run_created_event_matches,
 )
-from agent_sdk.storage.base import StateStore
+from agent_sdk.storage.base import (
+    SnapshotPrecondition,
+    StateStore,
+    StoredEvent,
+)
 from agent_sdk.subagents.models import ChildResult, ChildUsage, TaskEnvelope
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk.tools.registry import ToolRegistry
@@ -36,6 +42,13 @@ from agent_sdk.tools.registry import ToolRegistry
 
 class _ChildTaskFailure(Enum):
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _AuthenticatedRun:
+    snapshot: RunSnapshot
+    raw_data: dict[str, Any]
+    created: StoredEvent
 
 
 class SubagentService:
@@ -82,6 +95,8 @@ class SubagentService:
         workflow_node_execution: int | None = None,
         agent_revision: str,
         task: TaskEnvelope,
+        authenticated_ancestors: tuple[RunSnapshot, ...] | None = None,
+        ancestor_preconditions: tuple[SnapshotPrecondition, ...] = (),
     ) -> RunSnapshot:
         if (workflow_run_id is None) != (workflow_node_id is None):
             raise AgentSDKError(
@@ -108,7 +123,24 @@ class SubagentService:
                 "agent revision is invalid",
                 retryable=False,
             ) from None
-        parent = await self._load_run(parent_run_id, missing_message="parent run not found")
+        if authenticated_ancestors is None:
+            authenticated = await self._authenticated_ancestor_chain(
+                parent_run_id,
+                session_id=session_id,
+            )
+            ancestors = tuple(run.snapshot for run in authenticated)
+            related_preconditions = tuple(
+                self._exact_run(run) for run in authenticated
+            )
+        else:
+            ancestors = self._validated_supplied_ancestors(
+                authenticated_ancestors,
+                ancestor_preconditions,
+                parent_run_id=parent_run_id,
+                session_id=session_id,
+            )
+            related_preconditions = ancestor_preconditions
+        parent = ancestors[-1]
         if parent.session_id != session_id:
             raise AgentSDKError(
                 ErrorCode.NOT_FOUND,
@@ -118,10 +150,7 @@ class SubagentService:
         session = await self._commands.get_session(session_id)
         available_specs = self._available_tool_specs()
         available_names = tuple(spec.name for spec in available_specs)
-        ancestor_tools, ancestor_workspaces = await self._ancestor_capabilities(
-            parent,
-            session_id=session_id,
-        )
+        ancestor_tools, ancestor_workspaces = self._ancestor_capabilities(ancestors)
         for allowlist in (
             *ancestor_tools,
             task.allowed_tools,
@@ -171,6 +200,7 @@ class SubagentService:
             workflow_node_execution=workflow_node_execution,
             task_envelope=task,
             execution_descriptor=descriptor,
+            related_preconditions=related_preconditions,
         )
         created = outcome.value
         request = ModelRequest(
@@ -194,38 +224,173 @@ class SubagentService:
             self._track_task(execution)
         return created
 
-    async def _ancestor_capabilities(
-        self,
-        parent: RunSnapshot,
-        *,
-        session_id: str,
+    @staticmethod
+    def _ancestor_capabilities(
+        ancestors: tuple[RunSnapshot, ...],
     ) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
         tool_scopes: list[tuple[str, ...]] = []
         workspace_scopes: list[tuple[str, ...]] = []
-        current = parent
-        visited: set[str] = set()
-        while True:
-            if current.session_id != session_id or current.run_id in visited:
-                raise AgentSDKError(
-                    ErrorCode.INTERNAL,
-                    "stored child relation is invalid",
-                    retryable=False,
-                )
-            visited.add(current.run_id)
-            descriptor = current.execution_descriptor
+        for ancestor in ancestors:
+            descriptor = ancestor.execution_descriptor
             if descriptor is not None:
                 tool_scopes.append(
                     tuple(capability.spec.name for capability in descriptor.tools)
                 )
                 if descriptor.workspace_scopes is not None:
                     workspace_scopes.append(descriptor.workspace_scopes)
-            if current.parent_run_id is None:
-                break
-            current = await self._load_run(
-                current.parent_run_id,
-                missing_message="ancestor run not found",
+        return tuple(tool_scopes), tuple(workspace_scopes)
+
+    async def _authenticated_ancestor_chain(
+        self,
+        parent_run_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[_AuthenticatedRun, ...]:
+        current = await self._load_authenticated_run(
+            parent_run_id,
+            missing_message="parent run not found",
+        )
+        if current.snapshot.session_id != session_id:
+            raise AgentSDKError(
+                ErrorCode.NOT_FOUND,
+                "parent run not found",
+                retryable=False,
             )
-        return tuple(reversed(tool_scopes)), tuple(reversed(workspace_scopes))
+        chain: list[_AuthenticatedRun] = []
+        visited: set[str] = set()
+        while True:
+            if (
+                current.snapshot.session_id != session_id
+                or current.snapshot.run_id in visited
+            ):
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "stored child relation is invalid",
+                    retryable=False,
+                )
+            visited.add(current.snapshot.run_id)
+            chain.append(current)
+            if current.snapshot.parent_run_id is None:
+                break
+            try:
+                current = await self._load_authenticated_run(
+                    current.snapshot.parent_run_id,
+                    missing_message="ancestor run not found",
+                )
+            except AgentSDKError as error:
+                if error.code is ErrorCode.NOT_FOUND:
+                    raise AgentSDKError(
+                        ErrorCode.INTERNAL,
+                        "stored child relation is invalid",
+                        retryable=False,
+                    ) from None
+                raise
+        return tuple(reversed(chain))
+
+    @staticmethod
+    def _validated_supplied_ancestors(
+        ancestors: tuple[RunSnapshot, ...],
+        preconditions: tuple[SnapshotPrecondition, ...],
+        *,
+        parent_run_id: str,
+        session_id: str,
+    ) -> tuple[RunSnapshot, ...]:
+        if not ancestors or len(ancestors) != len(preconditions):
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "authenticated ancestor chain is invalid",
+                retryable=False,
+            )
+        previous_run_id: str | None = None
+        visited: set[str] = set()
+        for ancestor, precondition in zip(ancestors, preconditions, strict=True):
+            if (
+                ancestor.session_id != session_id
+                or ancestor.run_id in visited
+                or ancestor.parent_run_id != previous_run_id
+                or precondition.kind != "run"
+                or precondition.entity_id != ancestor.run_id
+                or precondition.version != ancestor.version
+                or precondition.session_id != session_id
+                or precondition.data is None
+            ):
+                raise AgentSDKError(
+                    ErrorCode.INTERNAL,
+                    "authenticated ancestor chain is invalid",
+                    retryable=False,
+                )
+            visited.add(ancestor.run_id)
+            previous_run_id = ancestor.run_id
+        if ancestors[-1].run_id != parent_run_id:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "authenticated ancestor chain is invalid",
+                retryable=False,
+            )
+        return ancestors
+
+    async def _load_authenticated_run(
+        self,
+        run_id: str,
+        *,
+        missing_message: str,
+    ) -> _AuthenticatedRun:
+        try:
+            raw = await self._store.get_snapshot("run", run_id)
+            if raw is None:
+                raise AgentSDKError(
+                    ErrorCode.NOT_FOUND,
+                    missing_message,
+                    retryable=False,
+                )
+            snapshot = RunSnapshot.model_validate(raw)
+            if (
+                snapshot.run_id != run_id
+                or raw.get("run_id") != run_id
+                or raw.get("session_id") != snapshot.session_id
+            ):
+                raise ValueError("run owner mismatch")
+            events = await self._store.read_events(
+                after_cursor=0,
+                session_id=snapshot.session_id,
+            )
+            matches = tuple(
+                stored
+                for stored in events
+                if stored.event.type == "run.created"
+                and stored.event.run_id == run_id
+                and stored.event.session_id == snapshot.session_id
+                and run_created_event_matches(
+                    snapshot,
+                    stored.event.payload,
+                    schema_version=stored.event.schema_version,
+                )
+            )
+            if len(matches) != 1:
+                raise ValueError("run creation identity is invalid")
+            return _AuthenticatedRun(
+                snapshot=snapshot,
+                raw_data=raw,
+                created=matches[0],
+            )
+        except AgentSDKError:
+            raise
+        except Exception:
+            raise AgentSDKError(
+                ErrorCode.INTERNAL,
+                "stored run is invalid",
+                retryable=False,
+            ) from None
+
+    @staticmethod
+    def _exact_run(run: _AuthenticatedRun) -> SnapshotPrecondition:
+        return SnapshotPrecondition(
+            "run",
+            run.snapshot.run_id,
+            run.snapshot.version,
+            run.snapshot.session_id,
+            run.raw_data,
+        )
 
     async def _execute_immediately(
         self,
