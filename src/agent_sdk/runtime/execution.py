@@ -10,7 +10,10 @@ from typing import Any, Literal, Self, cast
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from agent_sdk.context_runtime import ContextRuntimeConfig
-from agent_sdk.runtime.model_params import validate_model_params_for_durability
+from agent_sdk.runtime.model_params import (
+    freeze_model_params,
+    validate_model_params_for_durability,
+)
 from agent_sdk.tools.models import ToolSpec
 from agent_sdk._workflow_validation import validate_canonical_workflow_program
 
@@ -100,9 +103,7 @@ class DurableAgentSpec(_RevalidatedDescriptor):
     @field_validator("model_params", mode="after")
     @classmethod
     def _model_params(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        frozen = _freeze_json(value)
-        assert isinstance(frozen, Mapping)
-        return frozen
+        return freeze_model_params(value)
 
     @field_serializer("model_params")
     def _serialize_model_params(self, value: Mapping[str, Any]) -> dict[str, Any]:

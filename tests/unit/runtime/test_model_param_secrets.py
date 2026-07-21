@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from agent_sdk.runtime.execution import (
     ExecutionDescriptor,
     ExecutionPolicyDescriptor,
 )
+from agent_sdk.runtime.model_params import validate_model_params_for_durability
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 
@@ -22,6 +24,7 @@ _SECRET = "SECRET-SENTINEL-7F6C9D2E"
 _SAFE_ERROR = "model params must not contain credential-bearing keys"
 _LIMIT_ERROR = "model params exceed validation limits"
 _SHAPE_ERROR = "model params must contain only built-in JSON-like values"
+_PROXY_SECRET = "PROXY-MAPPING-THREW-SECRET-1D55F8"
 
 
 @pytest.mark.parametrize(
@@ -138,6 +141,38 @@ class _TrapMapping(Mapping[str, object]):
         raise AssertionError("custom mapping length executed")
 
 
+class _ProxyTrapMapping(Mapping[str, object]):
+    def __init__(self) -> None:
+        self.executed: list[str] = []
+
+    def __getitem__(self, key: str) -> object:
+        self.executed.append("getitem")
+        raise RuntimeError(f"{_PROXY_SECRET}:{key}")
+
+    def __iter__(self) -> Iterator[str]:
+        self.executed.append("iter")
+        raise RuntimeError(_PROXY_SECRET)
+
+    def __len__(self) -> int:
+        self.executed.append("len")
+        raise RuntimeError(_PROXY_SECRET)
+
+
+def _proxy_trap() -> tuple[Mapping[str, object], _ProxyTrapMapping]:
+    trap = _ProxyTrapMapping()
+    return MappingProxyType(trap), trap
+
+
+def _assert_sanitized_proxy_rejection(
+    captured: pytest.ExceptionInfo[AgentSDKError],
+    trap: _ProxyTrapMapping,
+) -> None:
+    assert captured.value.message == _SHAPE_ERROR
+    assert _PROXY_SECRET not in str(captured.value)
+    assert _PROXY_SECRET not in repr(captured.value)
+    assert trap.executed == []
+
+
 def test_agent_spec_rejects_custom_mapping_without_executing_it() -> None:
     custom = _TrapMapping()
 
@@ -146,6 +181,29 @@ def test_agent_spec_rejects_custom_mapping_without_executing_it() -> None:
 
     assert captured.value.message == _SHAPE_ERROR
     assert custom.executed is False
+
+
+@pytest.mark.parametrize("boundary", ["validator", "agent", "durable"])
+def test_untrusted_mapping_proxy_is_rejected_without_executing_custom_mapping(
+    boundary: str,
+) -> None:
+    proxy, trap = _proxy_trap()
+
+    with pytest.raises(AgentSDKError) as captured:
+        if boundary == "validator":
+            validate_model_params_for_durability(proxy)
+        elif boundary == "agent":
+            AgentSpec(name="proxy-test", model="fake/model", model_params=proxy)
+        else:
+            DurableAgentSpec.model_validate(
+                {
+                    "name": "proxy-durable-test",
+                    "model": "fake/model",
+                    "model_params": proxy,
+                }
+            )
+
+    _assert_sanitized_proxy_rejection(captured, trap)
 
 
 def test_durable_agent_spec_rejects_secret_without_leaking() -> None:
@@ -210,6 +268,7 @@ def test_safe_litellm_params_remain_durable_and_recoverable() -> None:
     recovered = ExecutionDescriptor.model_validate(descriptor.model_dump(mode="json"))
 
     assert recovered.agent.model_dump(mode="json")["model_params"] == params
+    validate_model_params_for_durability(recovered.agent.model_params)
 
 
 class _ZeroAccessStore:
@@ -253,6 +312,36 @@ async def test_public_start_rejects_bypassed_secret_before_store_access() -> Non
         assert captured.value.message == _SAFE_ERROR
         assert _SECRET not in str(captured.value)
         assert _SECRET not in repr(captured.value)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_public_start_rejects_untrusted_mapping_proxy_without_side_effects() -> None:
+    store = _ZeroAccessStore()
+
+    async def must_not_call_provider(**_: Any) -> object:
+        raise AssertionError("provider called for rejected model params")
+
+    sdk = AgentSDK.for_test(
+        store=store,  # type: ignore[arg-type]
+        acompletion=must_not_call_provider,
+        enable_builtin_tools=False,
+    )
+    assert sdk._startup_scan_task is not None
+    await sdk._startup_scan_task
+    store.arm()
+    proxy, trap = _proxy_trap()
+    bypassed = AgentSpec.model_construct(
+        name="proxy-public-test",
+        model="fake/model",
+        model_params=proxy,
+    )
+
+    try:
+        with pytest.raises(AgentSDKError) as captured:
+            await sdk.runs.start("missing-session", bypassed, "do not persist this")
+        _assert_sanitized_proxy_rejection(captured, trap)
     finally:
         await sdk.close()
 

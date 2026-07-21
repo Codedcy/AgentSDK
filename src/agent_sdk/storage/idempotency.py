@@ -4,10 +4,11 @@ import json
 import math
 from collections.abc import Mapping
 from hashlib import sha256
-from types import MappingProxyType
 from typing import Any, NamedTuple, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_serializer, field_validator
+
+from agent_sdk._frozen import FrozenMapping
 
 
 class IdempotencyError(ValueError):
@@ -37,7 +38,7 @@ def _freeze_json(value: Any) -> Any:
             if not isinstance(key, str):
                 raise ValueError("JSON object keys must be strings")
             frozen[key] = _freeze_json(item)
-        return MappingProxyType(frozen)
+        return FrozenMapping(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
     if isinstance(value, float) and not math.isfinite(value):

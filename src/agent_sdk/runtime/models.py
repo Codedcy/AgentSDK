@@ -2,7 +2,6 @@ import hashlib
 import json
 from enum import StrEnum
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any, Literal, Self
 
 from collections.abc import Mapping
@@ -22,7 +21,10 @@ from agent_sdk.tools.builtins.workspace import canonical_workspace_scope
 from agent_sdk.subagents.models import TaskEnvelope
 from agent_sdk.runtime.execution import ExecutionDescriptor
 from agent_sdk.runtime.failures import RunFailure as RunFailure
-from agent_sdk.runtime.model_params import validate_model_params_for_durability
+from agent_sdk.runtime.model_params import (
+    freeze_model_params,
+    validate_model_params_for_durability,
+)
 
 
 def intersect_names(
@@ -87,18 +89,6 @@ class SessionStatus(StrEnum):
     DELETING = "deleting"
 
 
-def _freeze_model_param(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze_model_param(item) for key, item in value.items()}
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_model_param(item) for item in value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    raise ValueError("model params must contain only JSON-like values")
-
-
 def mutable_model_params(value: Mapping[str, Any]) -> dict[str, Any]:
     def thaw(item: Any) -> Any:
         if isinstance(item, Mapping):
@@ -133,9 +123,7 @@ class AgentSpec(BaseModel):
     @field_validator("model_params", mode="after")
     @classmethod
     def _freeze_params(cls, value: Mapping[str, Any]) -> Mapping[str, Any]:
-        frozen = _freeze_model_param(value)
-        assert isinstance(frozen, Mapping)
-        return frozen
+        return freeze_model_params(value)
 
     @field_serializer("model_params")
     def _serialize_params(self, value: Mapping[str, Any]) -> dict[str, Any]:

@@ -16,7 +16,8 @@ No secret resolver, secret store, or `SecretRef` feature was added.
 ## Contract
 
 - Validation is recursive over exact built-in dictionaries, lists, tuples, and
-  the SDK's frozen mapping proxies.
+  the SDK-owned exact `FrozenMapping` type. Arbitrary `MappingProxyType` values
+  are rejected before any mapping protocol method is called.
 - Key matching is exact after case folding and removing underscores/hyphens.
 - The v0.1 deny set is: `api_key`, `api_secret`, `api_token`, `access_token`,
   `auth_token`, `bearer_token`, `client_secret`, `application_secret`,
@@ -44,8 +45,24 @@ No secret resolver, secret store, or `SecretRef` feature was added.
 6. `api_secret` RED: one failure; GREEN after adding the exact normalized key.
 7. Cycle RED: recursive freezing raised `RecursionError`; GREEN after fail-closed
    cycle detection.
-8. Final focused GREEN: 28 passed, including SQLite raw-byte and durable-record
+8. Initial-review focused GREEN: 28 passed, including SQLite raw-byte and durable-record
    sentinel checks.
+
+## Re-review correction
+
+The first review fix incorrectly treated every `MappingProxyType` as trusted.
+A proxy backed by an application-defined Mapping could therefore invoke its
+`__len__` method and leak the exception text. Strict RED tests reproduced this
+at the direct validator, `AgentSpec`, `DurableAgentSpec`, and public
+`runs.start` boundaries; all four exposed the Trap sentinel before the fix.
+
+The corrected implementation rejects every arbitrary mapping proxy before
+`len`, iteration, item access, serialization, Store access, or provider/Tool
+work. SDK-owned frozen JSON now uses an exact `FrozenMapping` wrapper backed by
+a copied built-in dict. Both model-parameter freezing and idempotency-result
+freezing use that container, preserving dump/validate, Workflow replay, and
+recovery roundtrips without trusting user-defined mapping behavior. The final
+focused secret suite is 32 passed.
 
 The two pre-existing privacy tests that used credential-shaped keys as opaque
 test markers now use non-credential marker keys; their original traceback and
@@ -53,7 +70,8 @@ public-event redaction assertions are unchanged.
 
 ## Fresh verification
 
-- Affected persistence/recovery command: `454 passed in 109.59s`.
+- Affected persistence/recovery command after re-review correction:
+  `458 passed in 105.64s`.
   It covered the focused tests, execution descriptors, Prompt persistence,
   atomic live progress, Context recovery, public recovery API, Workflow Session
   ownership/recovery admission, and provider recovery.
