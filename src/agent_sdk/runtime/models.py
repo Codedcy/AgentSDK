@@ -409,10 +409,12 @@ def run_created_event_matches(
             historical = RunSnapshot.model_validate(dict(payload))
             return historical == created
         if schema_version == 2:
-            return (
-                RunCreatedEventPayload.model_validate(dict(payload))
-                == RunCreatedEventPayload.from_snapshot(snapshot)
-            )
+            historical_event = RunCreatedEventPayload.model_validate(dict(payload))
+            current = RunCreatedEventPayload.from_snapshot(snapshot)
+            if historical_event == current:
+                return True
+            legacy = _pre_r4_run_created_event_payload(snapshot)
+            return legacy is not None and historical_event == legacy
     except Exception:
         return False
     return False
@@ -422,6 +424,45 @@ def _canonical_sha256(value: Any) -> str:
     canonical = json.dumps(
         value,
         ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _pre_r4_run_created_event_payload(
+    snapshot: RunSnapshot,
+) -> RunCreatedEventPayload | None:
+    """Project an upgraded R3 descriptor into its immutable schema-v2 shape."""
+    descriptor = snapshot.execution_descriptor
+    if (
+        descriptor is None
+        or descriptor.agent.tool_allowlist is not None
+        or descriptor.agent.workspace_allowlist is not None
+        or descriptor.workspace_scopes is not None
+    ):
+        return None
+    raw_descriptor = descriptor.model_dump(mode="json")
+    raw_agent = dict(raw_descriptor["agent"])
+    raw_agent.pop("tool_allowlist")
+    raw_agent.pop("workspace_allowlist")
+    raw_descriptor["agent"] = raw_agent
+    raw_descriptor["agent_hash"] = _descriptor_sha256(raw_agent)
+    raw_descriptor.pop("workspace_scopes")
+    raw_descriptor.pop("descriptor_hash")
+    return RunCreatedEventPayload.from_snapshot(snapshot).model_copy(
+        update={
+            "agent_hash": raw_descriptor["agent_hash"],
+            "execution_descriptor_hash": _descriptor_sha256(raw_descriptor),
+        }
+    )
+
+
+def _descriptor_sha256(value: Any) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
     )

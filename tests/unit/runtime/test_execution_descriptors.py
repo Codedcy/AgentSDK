@@ -17,6 +17,7 @@ from agent_sdk.runtime.execution import (
 )
 from agent_sdk.runtime.models import (
     AgentSpec,
+    RunCreatedEventPayload,
     RunSnapshot,
     RunStatus,
     SessionSnapshot,
@@ -306,6 +307,54 @@ def test_schema_v1_run_creation_authenticates_genuine_legacy_descriptor_hashes()
         wrong_descriptor_hash,
         schema_version=1,
     )
+
+
+def test_schema_v2_event_authenticates_a_genuine_pre_r4_descriptor_projection() -> None:
+    descriptor = ExecutionDescriptor.create(
+        agent=AgentSpec(name="coder", model="openai/test"),
+        messages=({"role": "user", "content": "hello"},),
+        tools=(),
+        workspace_scopes=(),
+        policy=ExecutionPolicyDescriptor.create(permission_default="ask"),
+    )
+    legacy_descriptor = descriptor.model_dump(mode="json")
+    for field in ("tool_allowlist", "workspace_allowlist"):
+        legacy_descriptor["agent"].pop(field)
+    legacy_descriptor.pop("workspace_scopes")
+    legacy_descriptor["agent_hash"] = _canonical_hash(legacy_descriptor["agent"])
+    legacy_descriptor["descriptor_hash"] = _canonical_hash(
+        {
+            key: value
+            for key, value in legacy_descriptor.items()
+            if key != "descriptor_hash"
+        }
+    )
+    raw_snapshot = RunSnapshot(
+        run_id="run_r3_v2",
+        session_id="ses_r3_v2",
+        agent_revision="coder:1",
+        status=RunStatus.CREATED,
+        user_input="hello",
+        execution_compatibility="current",
+        execution_descriptor=descriptor,
+    ).model_dump(mode="json")
+    raw_snapshot["execution_descriptor"] = legacy_descriptor
+    upgraded = RunSnapshot.model_validate(raw_snapshot)
+    payload = RunCreatedEventPayload(
+        run_id=upgraded.run_id,
+        session_id=upgraded.session_id,
+        agent_revision=upgraded.agent_revision,
+        execution_compatibility="current",
+        user_input=upgraded.user_input,
+        user_input_sha256=_canonical_hash(upgraded.user_input),
+        execution_descriptor_hash=legacy_descriptor["descriptor_hash"],
+        agent_hash=legacy_descriptor["agent_hash"],
+    ).model_dump(mode="json")
+
+    assert run_created_event_matches(upgraded, payload, schema_version=2)
+
+    payload["agent_hash"] = "a" * 64
+    assert not run_created_event_matches(upgraded, payload, schema_version=2)
 
 
 def test_execution_descriptor_rejects_rehashed_noncanonical_agent() -> None:

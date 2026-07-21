@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,32 @@ def _current_run(
         execution_compatibility="current",
         execution_descriptor=descriptor,
     )
+
+
+def _pre_r4_run_data(run: RunSnapshot) -> dict[str, object]:
+    data = run.model_dump(mode="json")
+    descriptor = data["execution_descriptor"]
+    assert isinstance(descriptor, dict)
+    agent = descriptor["agent"]
+    assert isinstance(agent, dict)
+    agent.pop("tool_allowlist")
+    agent.pop("workspace_allowlist")
+    descriptor.pop("workspace_scopes")
+    descriptor["agent_hash"] = _canonical_hash(agent)
+    descriptor["descriptor_hash"] = _canonical_hash(
+        {key: value for key, value in descriptor.items() if key != "descriptor_hash"}
+    )
+    return data
+
+
+def _canonical_hash(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -177,7 +205,7 @@ async def test_legacy_run_workspace_scope_falls_back_to_session_roots(
                     run.run_id,
                     run.session_id,
                     run.version,
-                    run.model_dump(mode="json"),
+                    _pre_r4_run_data(run),
                 ),
             ),
         )
@@ -208,7 +236,7 @@ async def test_explicit_empty_run_workspace_scope_does_not_inherit_session_roots
                 SnapshotWrite(
                     "run",
                     run.run_id,
-                    run.run_id,
+                    run.session_id,
                     run.version,
                     run.model_dump(mode="json"),
                 ),
@@ -221,3 +249,146 @@ async def test_explicit_empty_run_workspace_scope_does_not_inherit_session_roots
     assert roots == ()
     with pytest.raises(ToolAccessDenied):
         resolve_workspace_path(roots, "denied.txt", for_write=False)
+
+
+@pytest.mark.asyncio
+async def test_run_workspace_scope_requires_same_storage_owner_and_session_containment(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    child = root / "child"
+    root.mkdir()
+    outside.mkdir()
+    child.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+
+    wrong_owner = _current_run(
+        run_id="run_wrong_owner",
+        session_id=session.session_id,
+        workspace_scopes=(str(child),),
+    )
+    outside_scope = _current_run(
+        run_id="run_outside_scope",
+        session_id=session.session_id,
+        workspace_scopes=(str(outside),),
+    )
+    valid_scope = _current_run(
+        run_id="run_child_scope",
+        session_id=session.session_id,
+        workspace_scopes=(str(child),),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    wrong_owner.run_id,
+                    "ses_wrong_owner",
+                    wrong_owner.version,
+                    wrong_owner.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    "run",
+                    outside_scope.run_id,
+                    outside_scope.session_id,
+                    outside_scope.version,
+                    outside_scope.model_dump(mode="json"),
+                ),
+                SnapshotWrite(
+                    "run",
+                    valid_scope.run_id,
+                    valid_scope.session_id,
+                    valid_scope.version,
+                    valid_scope.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id=wrong_owner.run_id)
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id=outside_scope.run_id)
+    assert await workspace_roots(store, session.session_id, run_id=valid_scope.run_id) == (
+        child.resolve(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sqlite_run_workspace_scope_rejects_a_wrong_storage_owner(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "state.sqlite3"
+    root = tmp_path / "workspace"
+    root.mkdir()
+    store = await SQLiteStore.open(database)
+    try:
+        session = await RuntimeCommands(store).create_session(workspaces=(root,))
+        run = _current_run(
+            run_id="run_sqlite_wrong_owner",
+            session_id=session.session_id,
+            workspace_scopes=(str(root),),
+        )
+        await store.commit(
+            CommitBatch(
+                events=(),
+                snapshots=(
+                    SnapshotWrite(
+                        "run",
+                        run.run_id,
+                        "ses_wrong_owner",
+                        run.version,
+                        run.model_dump(mode="json"),
+                    ),
+                ),
+            )
+        )
+
+        with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+            await workspace_roots(store, session.session_id, run_id=run.run_id)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_run_workspace_scope_rejects_a_symlink_redirected_outside(
+    tmp_path: Path,
+) -> None:
+    store = InMemoryStore()
+    root = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    child = root / "child"
+    child.mkdir()
+    session = await RuntimeCommands(store).create_session(workspaces=(root,))
+    run = _current_run(
+        run_id="run_redirected_scope",
+        session_id=session.session_id,
+        workspace_scopes=(str(child),),
+    )
+    await store.commit(
+        CommitBatch(
+            events=(),
+            snapshots=(
+                SnapshotWrite(
+                    "run",
+                    run.run_id,
+                    run.session_id,
+                    run.version,
+                    run.model_dump(mode="json"),
+                ),
+            ),
+        )
+    )
+    child.rmdir()
+    try:
+        child.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    with pytest.raises(ToolAccessDenied, match="run workspace is unavailable"):
+        await workspace_roots(store, session.session_id, run_id=run.run_id)

@@ -118,3 +118,53 @@ are therefore reported as pre-existing/out-of-scope, not as a green suite.
   outside Task 1 scope and are not hidden by production fallbacks.
 - Child/workflow envelope fields now preserve inherit-vs-empty semantics;
   Task 1 does not expand into later workflow capability work.
+
+## Post-review hardening (C0 / I2 / M1)
+
+Reviewer conclusion: legacy schema-v2 event hashes needed a narrowly-scoped
+pre-R4 projection, and run-scoped workspace authorization needed storage-owner
+authentication plus current filesystem containment checks.
+
+### RED
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests/unit/runtime/test_execution_descriptors.py::test_schema_v2_event_authenticates_a_genuine_pre_r4_descriptor_projection tests/unit/runtime/test_session_workspace_roots.py -q
+```
+
+Observed: a genuine R3-era schema-v2 immutable `run.created` payload did not
+match its upgraded descriptor; a same-data Run under a wrong storage owner was
+accepted. The new outside/symlink-scope tests established the missing
+containment requirement. (The symlink test is skipped only when Windows link
+creation is unavailable.)
+
+### GREEN
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests/unit/runtime/test_execution_descriptors.py tests/unit/runtime/test_session_workspace_roots.py -q
+```
+
+Result: `35 passed, 1 skipped in 3.18s`.
+
+The schema-v2 matcher first requires the strict current projection. Only an
+upgraded descriptor whose three R4 fields are all legacy `None` is eligible for
+the reconstructed pre-R4 hash projection; corrupted old hashes and every new
+restricted descriptor remain rejected. Schema-v1 behavior is unchanged.
+
+`workspace_roots(run_id=...)` now authenticates the original raw Session and
+Run snapshot data with exact no-op preconditions, fails closed on owner/data
+conflicts, re-resolves Session roots and descriptor scopes through the existing
+symlink-aware canonical path logic, and requires each explicit scope to be a
+current descendant of a canonical Session root. Explicit empty remains empty;
+only an authenticated legacy `None` descriptor scope inherits Session roots.
+
+Final post-review gate:
+
+```powershell
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests/unit/runtime/test_capability_intersection.py tests/integration/runtime/test_run_tool_catalog.py tests/unit/runtime/test_execution_descriptors.py tests/unit/runtime/test_session_workspace_roots.py tests/integration/runtime/test_builtin_tool_recovery.py tests/integration/runtime/test_live_run_progress.py tests/integration/subagents/test_child_run_slice.py tests/integration/workflow/test_workflow_child_slice.py tests/integration/tools/test_builtin_tools.py tests/unit/tools/test_workspace_paths.py -q
+.\.venv\Scripts\python.exe -m mypy --strict src/agent_sdk
+.\.venv\Scripts\python.exe -m ruff check src/agent_sdk/runtime/models.py src/agent_sdk/tools/builtins/files.py tests/unit/runtime/test_execution_descriptors.py tests/unit/runtime/test_session_workspace_roots.py
+git diff --check
+```
+
+Result: `159 passed, 4 skipped in 6.40s`; strict mypy (93 source files),
+Ruff, and diff-check passed.

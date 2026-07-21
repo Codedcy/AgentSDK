@@ -8,8 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from agent_sdk.runtime.models import RunSnapshot, SessionSnapshot
-from agent_sdk.storage.base import StateStore
-from agent_sdk.tools.builtins.workspace import resolve_workspace_path
+from agent_sdk.storage.base import (
+    CommitBatch,
+    SnapshotPrecondition,
+    SnapshotPreconditionError,
+    StateStore,
+)
+from agent_sdk.tools.builtins.workspace import (
+    canonical_workspace_scope,
+    resolve_workspace_path,
+)
 from agent_sdk.tools.errors import ToolAccessDenied
 from agent_sdk.tools.models import ToolContext
 
@@ -25,13 +33,17 @@ async def workspace_roots(
     run_id: str | None = None,
 ) -> tuple[Path, ...]:
     try:
-        data = await store.get_snapshot("session", session_id)
-        if data is None:
+        session_data = await store.get_snapshot("session", session_id)
+        if session_data is None:
             raise ValueError
-        session = SessionSnapshot.model_validate(data)
+        session = SessionSnapshot.model_validate(session_data)
+        if any(not Path(root).is_absolute() for root in session.workspaces):
+            raise ValueError
+        session_roots = tuple(
+            canonical_workspace_scope(root) for root in session.workspaces
+        )
     except Exception as error:
         raise ToolAccessDenied("session workspace is unavailable") from error
-    roots = tuple(Path(root) for root in session.workspaces)
     if run_id is not None:
         try:
             run_data = await store.get_snapshot("run", run_id)
@@ -40,14 +52,50 @@ async def workspace_roots(
             run = RunSnapshot.model_validate(run_data)
             if run.session_id != session_id:
                 raise ValueError
+            await store.commit(
+                CommitBatch(
+                    events=(),
+                    preconditions=(
+                        SnapshotPrecondition(
+                            "session",
+                            session_id,
+                            session_id=session_id,
+                            data=session_data,
+                        ),
+                        SnapshotPrecondition(
+                            "run",
+                            run_id,
+                            session_id=session_id,
+                            data=run_data,
+                        ),
+                    ),
+                )
+            )
             descriptor = run.execution_descriptor
             if descriptor is not None and descriptor.workspace_scopes is not None:
-                roots = tuple(Path(root) for root in descriptor.workspace_scopes)
+                scopes = tuple(
+                    canonical_workspace_scope(scope)
+                    for scope in descriptor.workspace_scopes
+                )
+                if any(
+                    not any(_is_within(scope, root) for root in session_roots)
+                    for scope in scopes
+                ):
+                    raise ValueError
+                return scopes
+        except SnapshotPreconditionError as error:
+            raise ToolAccessDenied("run workspace is unavailable") from error
         except Exception as error:
             raise ToolAccessDenied("run workspace is unavailable") from error
-    if any(not root.is_absolute() for root in roots):
-        raise ToolAccessDenied("session workspace is unavailable")
-    return roots
+    return session_roots
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def relative_display_path(target: Path, roots: tuple[Path, ...]) -> str:
