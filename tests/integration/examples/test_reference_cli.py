@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 from collections.abc import AsyncIterator
+from importlib import resources
 import json
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,13 @@ from examples.reference_cli.runner import (
     _settle_permission_waiter,
     execute_run,
     run_workflow_if_approved,
+)
+
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
 )
 
 
@@ -118,10 +126,14 @@ class ReferenceRunnerModel:
 class ReferenceApplicationModel:
     def __init__(self) -> None:
         self.main_calls = 0
-        self.first_user_message = ""
+        self.first_request_messages: tuple[dict[str, Any], ...] = ()
+        self.structured_request_messages: tuple[dict[str, Any], ...] = ()
 
     async def __call__(self, **params: Any) -> object:
         if params["stream"] is False:
+            self.structured_request_messages = tuple(
+                dict(message) for message in params["messages"]
+            )
             document = json.loads(params["messages"][1]["content"])
             return {
                 "choices": [
@@ -151,7 +163,9 @@ class ReferenceApplicationModel:
         if model == "fake/main":
             self.main_calls += 1
             if self.main_calls == 1:
-                self.first_user_message = str(params["messages"][0]["content"])
+                self.first_request_messages = tuple(
+                    dict(message) for message in params["messages"]
+                )
                 return _tool_stream(
                     "write_note",
                     '{"content":"hello"}',
@@ -463,10 +477,24 @@ temporary skill instructions
         )
 
         assert (workspace / "result.txt").read_text(encoding="utf-8") == "hello"
-        assert "temporary skill instructions" in model.first_user_message
-        assert "temporary reference" in model.first_user_message
+        assert [message["role"] for message in model.first_request_messages] == [
+            "system",
+            "user",
+        ]
+        assert model.first_request_messages[0] == {
+            "role": "system",
+            "content": _GENERAL_SYSTEM_PROMPT,
+        }
+        first_user_message = str(model.first_request_messages[1]["content"])
+        assert "temporary skill instructions" in first_user_message
+        assert "temporary reference" in first_user_message
+        assert first_user_message.endswith("\n\nwrite the result and propose a workflow")
         assert permission_names == ["write_note"]
-        assert result.context_view.capsule_id is not None
+        assert result.context_view.capsule_id is None
+        assert result.context_view.applied_level.value == "L2"
+        assert result.context_view.fallback_from is not None
+        assert result.context_view.fallback_from.value == "L3"
+        assert model.structured_request_messages == ()
         assert result.prompt.manifest.context_view_id == result.context_view.view_id
         assert result.workflow is not None
         assert result.workflow.status is WorkflowRunStatus.COMPLETED

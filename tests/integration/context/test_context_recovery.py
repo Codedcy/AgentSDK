@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,13 @@ from agent_sdk.storage.base import SnapshotWrite, StateStore
 from agent_sdk.storage.memory import InMemoryStore
 from agent_sdk.storage.sqlite import SQLiteStore
 from agent_sdk.tools.models import ToolContext, thaw_json
+
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
+)
 
 
 @pytest.mark.asyncio
@@ -76,6 +84,10 @@ async def test_in_flight_model_operation_stores_exact_prepared_request() -> None
         assert isinstance(prepared, dict)
         request = reconciliation.deserialize_model_request(prepared)
         assert request.messages == tuple(observed[0]["messages"])
+        assert request.messages == (
+            {"role": "system", "content": _GENERAL_SYSTEM_PROMPT},
+            {"role": "user", "content": "Persist this exact request."},
+        )
         assert request.tools == tuple(observed[0]["tools"])
         assert _model_request_fingerprint(request) == operation.request_fingerprint
 
@@ -94,9 +106,12 @@ async def test_in_flight_model_operation_stores_exact_prepared_request() -> None
             "context_view_id": operation.context_view_id,
             "prompt_manifest_id": operation.prompt_manifest_id,
             "request_fingerprint": operation.request_fingerprint,
+            "operation_id": operation.operation_id,
+            "step_id": operation.operation_id,
         }
+        assert started.schema_version == 2
         assert "Persist this exact request." not in public_payload
-        assert "You are" not in public_payload
+        assert _GENERAL_SYSTEM_PROMPT not in public_payload
     finally:
         release.set()
         if handle is not None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from importlib import resources
 import json
 from pathlib import Path
 import sys
@@ -21,6 +22,13 @@ from agent_sdk import (
     WorkflowRunStatus,
 )
 from examples.reference_cli.main import build_parser, run_application
+
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
+)
 
 
 WORKFLOW_YAML = """\
@@ -99,7 +107,7 @@ class ScriptedVerticalModel:
     def __init__(self) -> None:
         self.main_calls = 0
         self.total_calls = 0
-        self.first_user_message = ""
+        self.first_request_messages: tuple[dict[str, Any], ...] = ()
 
     async def __call__(self, **params: Any) -> object:
         self.total_calls += 1
@@ -134,7 +142,9 @@ class ScriptedVerticalModel:
         if model == "fake/main":
             self.main_calls += 1
             if self.main_calls == 1:
-                self.first_user_message = str(params["messages"][0]["content"])
+                self.first_request_messages = tuple(
+                    dict(message) for message in params["messages"]
+                )
                 return _tool_stream(
                     "call_write",
                     "write_note",
@@ -262,8 +272,19 @@ async def test_complete_vertical_slice_survives_reopen_and_delete(
         assert permission_names == ["write_note", "mcp.demo.echo"]
         assert len(approved_workflows) == 1
         assert (workspace / "result.txt").read_text(encoding="utf-8") == "hello"
-        assert "# Coding Demo" in scripted.first_user_message
-        assert "Confirm result.txt exists" in scripted.first_user_message
+        assert [
+            message["role"] for message in scripted.first_request_messages
+        ] == ["system", "user"]
+        assert scripted.first_request_messages[0] == {
+            "role": "system",
+            "content": _GENERAL_SYSTEM_PROMPT,
+        }
+        first_user_message = str(scripted.first_request_messages[1]["content"])
+        assert "# Coding Demo" in first_user_message
+        assert "Confirm result.txt exists" in first_user_message
+        assert first_user_message.endswith(
+            "\n\nWrite result.txt, call the MCP echo Tool, then return Workflow YAML"
+        )
         assert view.capsule_id is not None
         capsule = await sdk.context.get_capsule(
             view.capsule_id,

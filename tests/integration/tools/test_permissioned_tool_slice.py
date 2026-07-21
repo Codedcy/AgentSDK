@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,13 @@ from agent_sdk.permissions.broker import InProcessPermissionBridge
 from agent_sdk.permissions.policy import PolicyEngine
 from agent_sdk.storage.base import CommitResult, RunProgressBatch
 from agent_sdk.storage.memory import InMemoryStore
+
+
+_GENERAL_SYSTEM_PROMPT = (
+    resources.files("agent_sdk.prompts.profiles")
+    .joinpath("general", "system.md")
+    .read_text(encoding="utf-8")
+)
 
 
 class AddInput(BaseModel):
@@ -437,7 +445,11 @@ async def test_tool_waits_for_permission_then_runs_second_model_step() -> None:
                 },
             }
         ]
-        assert model_requests[1]["messages"] == [
+        assert model_requests[0]["messages"] == [
+            {"role": "system", "content": _GENERAL_SYSTEM_PROMPT},
+            {"role": "user", "content": "add 2 and 3"},
+        ]
+        expected_history = [
             {"role": "user", "content": "add 2 and 3"},
             {
                 "role": "assistant",
@@ -460,6 +472,13 @@ async def test_tool_waits_for_permission_then_runs_second_model_step() -> None:
                 "content": "5",
             },
         ]
+        second_messages = model_requests[1]["messages"]
+        assert isinstance(second_messages, list)
+        assert second_messages[0] == {
+            "role": "system",
+            "content": _GENERAL_SYSTEM_PROMPT,
+        }
+        assert second_messages[1:] == expected_history
         events = [
             stored
             for stored in await store.read_events(after_cursor=0)
@@ -1410,17 +1429,23 @@ async def test_two_sequential_model_tool_calls_complete_in_order() -> None:
         )
         messages = requests[2]["messages"]
         assert isinstance(messages, list)
-        assert [message["role"] for message in messages] == [
+        assert messages[0] == {
+            "role": "system",
+            "content": _GENERAL_SYSTEM_PROMPT,
+        }
+        history = messages[1:]
+        assert [message["role"] for message in history] == [
             "user",
             "assistant",
             "tool",
             "assistant",
             "tool",
         ]
-        assert messages[1]["tool_calls"][0]["id"] == "call_one"
-        assert messages[2]["tool_call_id"] == "call_one"
-        assert messages[3]["tool_calls"][0]["id"] == "call_two"
-        assert messages[4]["tool_call_id"] == "call_two"
+        assert history[0] == {"role": "user", "content": "two sequential calls"}
+        assert history[1]["tool_calls"][0]["id"] == "call_one"
+        assert history[2]["tool_call_id"] == "call_one"
+        assert history[3]["tool_calls"][0]["id"] == "call_two"
+        assert history[4]["tool_call_id"] == "call_two"
         snapshot = await sdk.runs.get(run.run_id)
         assert snapshot.status is RunStatus.COMPLETED
         assert [item.value for item in snapshot.tool_results] == [3, 7]
