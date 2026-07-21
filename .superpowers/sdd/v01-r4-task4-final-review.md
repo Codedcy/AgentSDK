@@ -23,4 +23,3 @@
 - Ruff: clean.
 - Strict mypy: clean.
 - Reviewed commit: `c1e570b`.
-

@@ -25,4 +25,3 @@
 - Ruff: clean.
 - `git diff --check fd6d728 f320642`: clean.
 - Reviewed HEAD: `f320642`.
-

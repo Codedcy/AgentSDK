@@ -21,4 +21,3 @@
 - Task 2 focused gate: 39 passed.
 - R4 Task 1 capability/recovery smoke: 184 passed, 5 skipped.
 - Reviewed fix: `1326fb8`.
-
