@@ -67,7 +67,9 @@ class V01Harness:
     database_path: Path
     workspace: Path
     outside_file: Path
+    skill_root: Path
     acompletion: Callable[..., Awaitable[object]]
+    model_request_system_messages: list[tuple[str, ...]]
 
     def open(self) -> AgentSDK:
         return AgentSDK.for_test(
@@ -75,6 +77,7 @@ class V01Harness:
             acompletion=self.acompletion,
             permission_default="allow",
             permission_rules=(PermissionRule(outcome="ask", tool="read"),),
+            skill_roots=(self.skill_root,),
         )
 
     def reopen(
@@ -86,6 +89,7 @@ class V01Harness:
             acompletion=acompletion or self.acompletion,
             permission_default="allow",
             permission_rules=(PermissionRule(outcome="ask", tool="read"),),
+            skill_roots=(self.skill_root,),
         )
 
 
@@ -97,8 +101,21 @@ def v01_harness(tmp_path: Path) -> V01Harness:
     outside_file.write_text("outside fixture", encoding="utf-8")
     model_calls = 0
 
-    async def acompletion(**_: object) -> object:
+    model_request_system_messages: list[tuple[str, ...]] = []
+
+    async def acompletion(**params: object) -> object:
         nonlocal model_calls
+        raw_messages = params["messages"]
+        assert isinstance(raw_messages, (list, tuple))
+        system_messages = tuple(
+            str(message["content"])
+            for message in raw_messages
+            if isinstance(message, dict) and message.get("role") == "system"
+        )
+        model_request_system_messages.append(system_messages)
+        assert "# General Agent Profile" in system_messages[0]
+        assert system_messages[1] == "Application release policy."
+        assert "Follow this demo skill." in system_messages[2]
         model_calls += 1
         if model_calls == 1:
             return _tool_stream(
@@ -155,7 +172,9 @@ def v01_harness(tmp_path: Path) -> V01Harness:
         database_path=tmp_path / "agent-sdk.sqlite3",
         workspace=workspace,
         outside_file=outside_file,
+        skill_root=Path(__file__).parent / "skills",
         acompletion=acompletion,
+        model_request_system_messages=model_request_system_messages,
     )
 
 

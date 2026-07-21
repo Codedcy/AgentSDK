@@ -29,6 +29,34 @@ tagging, building release artifacts, or publishing. R5 Task 5 remains pending.
   `6 passed in 45.23s`; Ruff passed; strict mypy passed for the reference example
   with `MYPYPATH=src`; `git diff --check` was clean.
 
+## Review-rejection fixes
+
+The follow-up review rejected three acceptance-test gaps. The repair changes only
+tests, their fixture, and this report; production code remains unchanged.
+
+- RED: requiring the real demo Skill and inspecting the real provider request
+  exposed both the missing baseline Skill root and the missing failure cleanup.
+  The old baseline did not exit before the 24-second outer timeout after failure
+  because its live monitor, MCP process, and SDK were not protected by cleanup.
+- C0: the Context acceptance no longer imports `ContextPlanner`, accepts a
+  `monkeypatch` fixture, or replaces `_estimate_messages`. Six real differently
+  sized inputs share a public `ContextRuntimeConfig(model_window=1000, ...)` and
+  exercise the normal local LiteLLM token counter to recommend and apply L0-L4.
+- I2: every actual baseline model request is inspected for the packaged general
+  profile, application prompt, and activated demo Skill instructions. Public
+  `query_events` projects each actual `prompt.manifest.created` payload into the
+  public `PromptManifest`; its ID and Context View are correlated with the real
+  `model.call.started` event, and layer/whole hashes are checked against the
+  actual provider request. The standalone `PromptComposer.compose` false positive
+  was removed.
+- M1: the baseline now uses nested `try/finally` cleanup to cancel and await its
+  live monitor, then close the MCP manager and SDK even after assertion failure.
+  The reopened SDK is independently protected by `try/finally`.
+- GREEN: the focused thirteen-step acceptance passed (`1 passed in 41.55s`). The
+  final Task4 aggregate passed (`6 passed in 44.36s`); Ruff passed; strict mypy
+  passed for the reference example and changed fixture (`2 source files`); and
+  `git diff --check 85d4ba2` was clean.
+
 ## Actual smoke JSON
 
 ```json

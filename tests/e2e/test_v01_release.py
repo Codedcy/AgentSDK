@@ -4,8 +4,10 @@ import asyncio
 import json
 import sys
 from collections.abc import AsyncIterator
+from contextlib import suppress
+from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -13,7 +15,6 @@ from agent_sdk import (
     AgentSDK,
     AgentSDKError,
     AgentSpec,
-    ContextPlanner,
     ContextRuntimeConfig,
     ErrorCode,
     EvaluationVerdict,
@@ -22,7 +23,7 @@ from agent_sdk import (
     MCPManager,
     MCPServerConfig,
     PermissionDecision,
-    PromptComposer,
+    PromptManifest,
     ReconciliationAction,
     RunStatus,
     StdioMCPTransport,
@@ -110,141 +111,200 @@ async def _accept_steps_1_2_5_10_11_13(
     workspace_file.write_text("application-owned", encoding="utf-8")
 
     sdk: AgentSDK = v01_harness.open()
+    manager = MCPManager(sdk.tools)
+    live_monitor: asyncio.Task[None] | None = None
+    session_id: str | None = None
+    run_id: str | None = None
+
     async def app_echo(_: ToolContext, *, text: str) -> dict[str, str]:
         return {"text": text}
 
-    sdk.tools.register(
-        ToolSpec(
-            name="app_echo",
-            description="Echo application text",
-            input_schema={
-                "type": "object",
-                "properties": {"text": {"type": "string"}},
-                "required": ["text"],
-                "additionalProperties": False,
-            },
-            effects=("application.read",),
-        ),
-        app_echo,
-    )
-    manager = MCPManager(sdk.tools)
-    await asyncio.wait_for(
-        manager.connect(
-            MCPServerConfig(
-                name="demo",
-                transport=StdioMCPTransport(
-                    command=sys.executable,
-                    args=(
-                        str(
-                            Path(__file__).parents[1]
-                            / "fixtures"
-                            / "mcp_server.py"
-                        ),
-                    ),
-                    cwd=v01_harness.workspace,
-                ),
-            )
-        ),
-        timeout=10,
-    )
-    session = await sdk.sessions.create(
-        workspaces=(v01_harness.workspace,),
-        idempotency_key="v01-session",
-    )
-    agent = sdk.agents.define(
-        AgentSpec(
-            name="release-agent",
-            model="test/model",
-            system_prompt="Application release policy.",
+    try:
+        sdk.tools.register(
+            ToolSpec(
+                name="app_echo",
+                description="Echo application text",
+                input_schema={
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                },
+                effects=("application.read",),
+            ),
+            app_echo,
         )
-    )
-    live_event_types: list[str] = []
-    live_monitor = asyncio.create_task(
-        _collect_until_run_completed(sdk, session.session_id, live_event_types)
-    )
-    handle = await sdk.runs.start(
-        session.session_id,
-        agent,
-        "baseline",
-        idempotency_key="v01-run",
-    )
-    permission = await asyncio.wait_for(
-        sdk.permissions.next_request(handle.run_id),
-        timeout=2,
-    )
-    assert permission.tool_name == "read"
-    assert permission.arguments["path"] == str(workspace_file.resolve())
-    await asyncio.wait_for(
-        sdk.permissions.resolve(
-            permission.request_id,
-            PermissionDecision.allow_once(),
-        ),
-        timeout=2,
-    )
-    terminal = await asyncio.wait_for(handle.result(), timeout=5)
-    await asyncio.wait_for(live_monitor, timeout=5)
-    await asyncio.wait_for(manager.close(), timeout=5)
-    assert terminal.output_text == "baseline complete"
-    assert [result.tool_name for result in terminal.tool_results] == [
-        "app_echo",
-        "write",
-        "read",
-        "bash",
-        "write",
-        "mcp.demo.echo",
-    ]
-    assert [result.status for result in terminal.tool_results] == [
-        ToolResultStatus.SUCCEEDED,
-        ToolResultStatus.SUCCEEDED,
-        ToolResultStatus.SUCCEEDED,
-        ToolResultStatus.SUCCEEDED,
-        ToolResultStatus.DENIED,
-        ToolResultStatus.SUCCEEDED,
-    ]
-    assert (v01_harness.workspace / "generated.txt").read_text(
-        encoding="utf-8"
-    ) == "created by builtin write"
-    assert terminal.tool_results[2].value["content"] == "application-owned"
-    assert (
-        "builtin bash complete"
-        in terminal.tool_results[3].value["stdout"]
-    )
-    assert v01_harness.outside_file.read_text(
-        encoding="utf-8"
-    ) == "outside fixture"
-    timeline = await sdk.queries.timeline(handle.run_id)
-    assert timeline.run_id == handle.run_id
-    event_types = [item.event.type for item in timeline.events]
-    assert event_types.count("permission.requested") == 1
-    assert event_types.count("permission.resolved") == 1
-    assert event_types.count("tool.call.completed") == 6
-    assert event_types.count("tool.call.started") == 5
-    assert "run.completed" in live_event_types
-    trace = await sdk.trace.timeline(handle.run_id)
-    assert trace.root_id == handle.run_id
-    assert any(stage.kind is TraceStageKind.PERMISSION for stage in trace.stages)
-    evaluation = await sdk.evaluations.evaluate(
-        handle.run_id,
-        ExactOutputEvaluator(expected="baseline complete"),
-    )
-    assert evaluation.verdict is EvaluationVerdict.PASS
-    success_rate = await sdk.analytics.success_rate(evaluator_id="exact_output")
-    assert success_rate.value == 1.0
-    assert success_rate.sample_count == 1
-    tool_failure_rate = await sdk.analytics.tool_failure_rate()
-    assert tool_failure_rate.value == pytest.approx(1 / 6)
-    assert tool_failure_rate.sample_count == 6
-    attribution = await sdk.trace.attribution(handle.run_id)
-    assert attribution.method == "deterministic_event_evidence_v1"
-    assert attribution.terminal_status is RunStatus.COMPLETED
-    assert attribution.failure is None
-    assert {contributor.kind for contributor in attribution.contributors} >= {
-        "context",
-        "evaluation",
-        "model",
-        "tool",
-    }
-    await asyncio.wait_for(sdk.close(), timeout=5)
+        await asyncio.wait_for(
+            manager.connect(
+                MCPServerConfig(
+                    name="demo",
+                    transport=StdioMCPTransport(
+                        command=sys.executable,
+                        args=(
+                            str(
+                                Path(__file__).parents[1]
+                                / "fixtures"
+                                / "mcp_server.py"
+                            ),
+                        ),
+                        cwd=v01_harness.workspace,
+                    ),
+                )
+            ),
+            timeout=10,
+        )
+        session = await sdk.sessions.create(
+            workspaces=(v01_harness.workspace,),
+            idempotency_key="v01-session",
+        )
+        session_id = session.session_id
+        agent = sdk.agents.define(
+            AgentSpec(
+                name="release-agent",
+                model="test/model",
+                system_prompt="Application release policy.",
+                skills=("demo",),
+            )
+        )
+        live_event_types: list[str] = []
+        live_monitor = asyncio.create_task(
+            _collect_until_run_completed(sdk, session_id, live_event_types)
+        )
+        handle = await sdk.runs.start(
+            session_id,
+            agent,
+            "baseline",
+            idempotency_key="v01-run",
+        )
+        run_id = handle.run_id
+        permission = await asyncio.wait_for(
+            sdk.permissions.next_request(run_id),
+            timeout=2,
+        )
+        assert permission.tool_name == "read"
+        assert permission.arguments["path"] == str(workspace_file.resolve())
+        await asyncio.wait_for(
+            sdk.permissions.resolve(
+                permission.request_id,
+                PermissionDecision.allow_once(),
+            ),
+            timeout=2,
+        )
+        terminal = await asyncio.wait_for(handle.result(), timeout=5)
+        await asyncio.wait_for(live_monitor, timeout=5)
+        assert terminal.output_text == "baseline complete"
+        assert [result.tool_name for result in terminal.tool_results] == [
+            "app_echo",
+            "write",
+            "read",
+            "bash",
+            "write",
+            "mcp.demo.echo",
+        ]
+        assert [result.status for result in terminal.tool_results] == [
+            ToolResultStatus.SUCCEEDED,
+            ToolResultStatus.SUCCEEDED,
+            ToolResultStatus.SUCCEEDED,
+            ToolResultStatus.SUCCEEDED,
+            ToolResultStatus.DENIED,
+            ToolResultStatus.SUCCEEDED,
+        ]
+        assert (v01_harness.workspace / "generated.txt").read_text(
+            encoding="utf-8"
+        ) == "created by builtin write"
+        assert terminal.tool_results[2].value["content"] == "application-owned"
+        assert "builtin bash complete" in terminal.tool_results[3].value["stdout"]
+        assert v01_harness.outside_file.read_text(
+            encoding="utf-8"
+        ) == "outside fixture"
+        timeline = await sdk.queries.timeline(run_id)
+        assert timeline.run_id == run_id
+        event_types = [item.event.type for item in timeline.events]
+        assert event_types.count("permission.requested") == 1
+        assert event_types.count("permission.resolved") == 1
+        assert event_types.count("tool.call.completed") == 6
+        assert event_types.count("tool.call.started") == 5
+        assert "run.completed" in live_event_types
+        session_events = (
+            await sdk.queries.query_events(
+                EventFilter(session_id=session_id),
+                after_cursor=0,
+                limit=1_000,
+            )
+        ).events
+        model_starts = [
+            stored.event
+            for stored in session_events
+            if stored.event.type == "model.call.started"
+            and stored.event.run_id == run_id
+        ]
+        manifests = {
+            manifest.manifest_id: manifest
+            for manifest in (
+                PromptManifest.model_validate(stored.event.payload)
+                for stored in session_events
+                if stored.event.type == "prompt.manifest.created"
+            )
+        }
+        assert len(model_starts) == len(v01_harness.model_request_system_messages)
+        for started, request_layers in zip(
+            model_starts,
+            v01_harness.model_request_system_messages,
+            strict=True,
+        ):
+            manifest = manifests[str(started.payload["prompt_manifest_id"])]
+            assert manifest.context_view_id == started.payload["context_view_id"]
+            assert manifest.layer_names == (
+                "profile:general",
+                "application",
+                "skill:demo",
+            )
+            assert tuple(layer.sha256 for layer in manifest.layers) == tuple(
+                sha256(text.encode("utf-8")).hexdigest()
+                for text in request_layers
+            )
+            assert manifest.sha256 == sha256(
+                "\n\n".join(request_layers).encode("utf-8")
+            ).hexdigest()
+        trace = await sdk.trace.timeline(run_id)
+        assert trace.root_id == run_id
+        assert any(stage.kind is TraceStageKind.PERMISSION for stage in trace.stages)
+        evaluation = await sdk.evaluations.evaluate(
+            run_id,
+            ExactOutputEvaluator(expected="baseline complete"),
+        )
+        assert evaluation.verdict is EvaluationVerdict.PASS
+        success_rate = await sdk.analytics.success_rate(evaluator_id="exact_output")
+        assert success_rate.value == 1.0
+        assert success_rate.sample_count == 1
+        tool_failure_rate = await sdk.analytics.tool_failure_rate()
+        assert tool_failure_rate.value == pytest.approx(1 / 6)
+        assert tool_failure_rate.sample_count == 6
+        attribution = await sdk.trace.attribution(run_id)
+        assert attribution.method == "deterministic_event_evidence_v1"
+        assert attribution.terminal_status is RunStatus.COMPLETED
+        assert attribution.failure is None
+        assert {contributor.kind for contributor in attribution.contributors} >= {
+            "context",
+            "evaluation",
+            "model",
+            "tool",
+        }
+    finally:
+        try:
+            if live_monitor is not None:
+                if not live_monitor.done():
+                    live_monitor.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.wait_for(live_monitor, timeout=5)
+        finally:
+            try:
+                await asyncio.wait_for(manager.close(), timeout=5)
+            finally:
+                await asyncio.wait_for(sdk.close(), timeout=5)
+
+    assert session_id is not None
+    assert run_id is not None
 
     provider_calls = 0
 
@@ -254,18 +314,20 @@ async def _accept_steps_1_2_5_10_11_13(
         raise AssertionError("completed Run must not call LiteLLM after reopen")
 
     reopened = v01_harness.reopen(must_not_call)
-    observed = await reopened.queries.get_run(handle.run_id)
-    assert observed.snapshot.status is RunStatus.COMPLETED
-    await reopened.sessions.close(session.session_id)
-    await reopened.sessions.delete(session.session_id)
-    with pytest.raises(AgentSDKError) as deleted:
-        await reopened.sessions.get(session.session_id)
-    assert deleted.value.code is ErrorCode.NOT_FOUND
-    assert workspace_file.read_text(encoding="utf-8") == "application-owned"
-    assert v01_harness.outside_file.read_text(
-        encoding="utf-8"
-    ) == "outside fixture"
-    await asyncio.wait_for(reopened.close(), timeout=5)
+    try:
+        observed = await reopened.queries.get_run(run_id)
+        assert observed.snapshot.status is RunStatus.COMPLETED
+        await reopened.sessions.close(session_id)
+        await reopened.sessions.delete(session_id)
+        with pytest.raises(AgentSDKError) as deleted:
+            await reopened.sessions.get(session_id)
+        assert deleted.value.code is ErrorCode.NOT_FOUND
+        assert workspace_file.read_text(encoding="utf-8") == "application-owned"
+        assert v01_harness.outside_file.read_text(
+            encoding="utf-8"
+        ) == "outside fixture"
+    finally:
+        await asyncio.wait_for(reopened.close(), timeout=5)
     assert provider_calls == 0
 
 
@@ -379,36 +441,15 @@ steps:
 
 
 async def _accept_steps_3_4_and_6(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    stage_tokens = {
-        "stage-l0": 10,
-        "stage-l1": 70,
-        "stage-l2": 80,
-        "stage-l3-invalid": 90,
-        "stage-l3-valid": 90,
-        "stage-l4": 96,
-    }
-
-    def controlled_estimate(
-        _planner: ContextPlanner,
-        messages: list[dict[str, Any]],
-    ) -> int:
-        serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
-        latest = max(
-            (
-                (serialized.rfind(stage), tokens)
-                for stage, tokens in stage_tokens.items()
-            ),
-            key=lambda item: item[0],
-        )
-        return latest[1] if latest[0] >= 0 else 10
-
-    monkeypatch.setattr(
-        ContextPlanner,
-        "_estimate_messages",
-        controlled_estimate,
+    stage_inputs = (
+        ("stage-l0", 100),
+        ("stage-l1", 600),
+        ("stage-l2", 80),
+        ("stage-l3-invalid", 80),
+        ("stage-l3-valid", 1),
+        ("stage-l4", 80),
     )
 
     def text_stream() -> AsyncIterator[dict[str, object]]:
@@ -483,21 +524,22 @@ async def _accept_steps_3_4_and_6(
     )
     try:
         session = await sdk.sessions.create(workspaces=[])
-        agent = AgentSpec(
-            name="automatic-context",
-            model="test/context",
-            system_prompt="Application runtime policy.",
-            skills=("demo",),
-            context=ContextRuntimeConfig(
-                model_window=100,
-                output_reserve=0,
-                safety_reserve=0,
-                recent_messages=2,
-            ),
-        )
         run_ids: list[str] = []
-        for stage in stage_tokens:
-            handle = await sdk.runs.start(session.session_id, agent, stage)
+        for stage, evidence_words in stage_inputs:
+            agent = AgentSpec(
+                name="automatic-context",
+                model="test/context",
+                system_prompt="Application runtime policy.",
+                skills=("demo",),
+                context=ContextRuntimeConfig(
+                    model_window=1_000,
+                    output_reserve=0,
+                    safety_reserve=0,
+                    recent_messages=2,
+                ),
+            )
+            input_text = f"{stage} " + ("evidence " * evidence_words)
+            handle = await sdk.runs.start(session.session_id, agent, input_text)
             result = await handle.result()
             assert result.output_text == "completed"
             run_ids.append(handle.run_id)
@@ -513,12 +555,26 @@ async def _accept_steps_3_4_and_6(
             for item in events
             if item.event.type == "context.view.created"
         ]
-        assert [
+        recommended_levels = [
             event.payload["recommended_level"] for event in views
-        ] == ["L0", "L1", "L2", "L3", "L3", "L4"]
-        assert [
-            event.payload["applied_level"] for event in views
-        ] == ["L0", "L1", "L2", "L2", "L3", "L4"]
+        ]
+        assert recommended_levels == [
+            "L0",
+            "L1",
+            "L2",
+            "L3",
+            "L3",
+            "L4",
+        ], recommended_levels
+        applied_levels = [event.payload["applied_level"] for event in views]
+        assert applied_levels == [
+            "L0",
+            "L1",
+            "L2",
+            "L2",
+            "L3",
+            "L4",
+        ], applied_levels
         assert views[3].payload["fallback_from"] == "L3"
         assert compaction_operations == ["summarize", "summarize", "rebase"]
 
@@ -549,27 +605,6 @@ async def _accept_steps_3_4_and_6(
         manifest_id = str(last_started.payload["prompt_manifest_id"])
         assert manifest_id.startswith("pmf_")
         assert last_started.payload["context_view_id"] == final_view_id
-        manifest_view = await sdk.context.build(
-            session.session_id,
-            model="test/context",
-            model_window=100,
-            force_level="L2",
-        )
-        activated = sdk.skills.activate("demo")
-        prompt = PromptComposer().compose(
-            profile="general",
-            context_view=manifest_view,
-            model="test/context",
-            application="Application runtime policy.",
-            skills=(activated,),
-        )
-        assert "Follow this demo skill." in activated.instructions
-        assert prompt.manifest.context_view_id == manifest_view.view_id
-        assert prompt.manifest.layer_names == (
-            "profile:general",
-            "application",
-            "skill:demo",
-        )
     finally:
         await sdk.close()
 
@@ -1014,7 +1049,6 @@ async def _accept_step_12_unknown_inflight(
 @pytest.mark.asyncio
 async def test_v01_release_public_acceptance_thirteen_steps(
     v01_harness: V01Harness,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """Prove the installed/public v0.1 contract as one ordered acceptance.
@@ -1026,7 +1060,7 @@ async def test_v01_release_public_acceptance_thirteen_steps(
     12 safe reopen plus interrupted explicit recovery; 13 delete history, keep files.
     """
     await _accept_steps_1_2_5_10_11_13(v01_harness)
-    await _accept_steps_3_4_and_6(monkeypatch, tmp_path)
+    await _accept_steps_3_4_and_6(tmp_path)
     await _accept_steps_7_8_and_12_safe_boundary(tmp_path)
     await _accept_step_9_and_child_trace(tmp_path)
     await _accept_step_12_unknown_inflight(tmp_path)
