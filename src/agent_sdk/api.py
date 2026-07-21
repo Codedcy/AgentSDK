@@ -92,6 +92,7 @@ from agent_sdk.subagents.models import (
     ChildWaitResult,
     TaskEnvelope,
 )
+from agent_sdk.subagents.tools import register_child_control_tools
 from agent_sdk.tools.registry import ToolRegistry
 from agent_sdk.tools.builtins.registration import register_builtin_tools
 from agent_sdk.workflow import (
@@ -1205,6 +1206,13 @@ class AgentSDK:
             limits=child_limits,
             track_task=self._track_task,
         )
+        mailbox = MailboxService(store)
+        if enable_builtin_tools:
+            register_child_control_tools(
+                registry=tools,
+                coordinator=children,
+                mailbox=mailbox,
+            )
         workflows = WorkflowExecutor(
             store,
             commands,
@@ -1233,7 +1241,7 @@ class AgentSDK:
         )
         self.children = ChildAPI(
             children,
-            MailboxService(store),
+            mailbox,
             self._lifecycle,
         )
         self.context = ContextAPI(store, models, self._lifecycle)

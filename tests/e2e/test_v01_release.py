@@ -32,6 +32,55 @@ if TYPE_CHECKING:
 pytest_plugins = ("tests.fixtures.v01_runtime",)
 
 
+def _v01_text_stream(text: str) -> AsyncIterator[dict[str, object]]:
+    async def chunks() -> AsyncIterator[dict[str, object]]:
+        yield {
+            "choices": [
+                {"delta": {"content": text}, "finish_reason": "stop"}
+            ]
+        }
+        yield {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+            },
+        }
+
+    return chunks()
+
+
+def _v01_tool_stream(
+    *,
+    call_id: str,
+    name: str,
+    arguments: dict[str, object],
+) -> AsyncIterator[dict[str, object]]:
+    async def chunks() -> AsyncIterator[dict[str, object]]:
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": call_id,
+                                "function": {
+                                    "name": name,
+                                    "arguments": json.dumps(arguments),
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+
+    return chunks()
+
+
 class _CancelAfterSecondLoopIteration:
     def __init__(self, delegate: StateStore) -> None:
         self.delegate = delegate
@@ -430,4 +479,330 @@ async def test_v01_runtime_automatically_compacts_l0_through_l4(
             "skill:demo",
         )
     finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_v01_parent_controls_child_and_consumes_mailbox_context(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    nested_evidence = workspace / "evidence" / "nested"
+    nested_evidence.mkdir(parents=True)
+    allow_child_message = asyncio.Event()
+    child_context_received = asyncio.Event()
+    allow_child_complete = asyncio.Event()
+    parent_calls = 0
+    child_calls = 0
+    child_run_id: str | None = None
+
+    def tool_names(params: dict[str, object]) -> tuple[str, ...]:
+        raw_tools = params["tools"]
+        assert isinstance(raw_tools, (list, tuple))
+        names: list[str] = []
+        for raw in raw_tools:
+            assert isinstance(raw, dict)
+            function = raw["function"]
+            assert isinstance(function, dict)
+            names.append(str(function["name"]))
+        return tuple(names)
+
+    def messages(params: dict[str, object]) -> tuple[dict[str, object], ...]:
+        raw = params["messages"]
+        assert isinstance(raw, (list, tuple))
+        assert all(isinstance(item, dict) for item in raw)
+        return tuple(raw)  # type: ignore[return-value]
+
+    def last_tool_value(
+        params: dict[str, object],
+        expected_name: str,
+    ) -> dict[str, object]:
+        tool_messages = [
+            message
+            for message in messages(params)
+            if message.get("role") == "tool"
+        ]
+        assert tool_messages
+        latest = tool_messages[-1]
+        assert latest["name"] == expected_name
+        value = json.loads(str(latest["content"]))
+        assert isinstance(value, dict)
+        return value
+
+    async def provider(**raw_params: object) -> object:
+        nonlocal parent_calls, child_calls, child_run_id
+        params = dict(raw_params)
+        model = params["model"]
+        if model == "test/child":
+            child_calls += 1
+            assert tool_names(params) == ("send_message",)
+            if child_calls == 1:
+                await asyncio.wait_for(allow_child_message.wait(), timeout=2)
+                assert child_run_id is not None
+                assert parent_run_id
+                return _v01_tool_stream(
+                    call_id="child-message",
+                    name="send_message",
+                    arguments={
+                        "target_run_id": parent_run_id,
+                        "content": "child update: source evt-2 accepted",
+                    },
+                )
+            assert child_calls == 2
+            assert any(
+                "Agent message from" in str(message.get("content"))
+                and "Use source evt-2" in str(message.get("content"))
+                for message in messages(params)
+            )
+            child_context_received.set()
+            await asyncio.wait_for(allow_child_complete.wait(), timeout=2)
+            return _v01_text_stream("verified child finding from evt-2")
+
+        assert model == "test/parent"
+        parent_calls += 1
+        assert tool_names(params) == (
+            "list_children",
+            "send_message",
+            "spawn_agent",
+            "wait_child",
+        )
+        if parent_calls == 1:
+            return _v01_tool_stream(
+                call_id="parent-spawn",
+                name="spawn_agent",
+                arguments={
+                    "agent_revision": "researcher:1",
+                    "task": {
+                        "objective": "Inspect the evidence",
+                        "success_criteria": ["return one finding"],
+                        "evidence_refs": ["evt-1"],
+                        "allowed_tools": ["read", "send_message"],
+                        "workspace_scopes": [str(workspace / "evidence")],
+                    },
+                },
+            )
+        if parent_calls == 2:
+            spawned = last_tool_value(params, "spawn_agent")
+            child_run_id = str(spawned["child_run_id"])
+            assert spawned["status"] == "queued"
+            return _v01_tool_stream(
+                call_id="parent-message",
+                name="send_message",
+                arguments={
+                    "target_run_id": child_run_id,
+                    "content": "Use source evt-2",
+                },
+            )
+        assert child_run_id is not None
+        if parent_calls == 3:
+            sent = last_tool_value(params, "send_message")
+            assert sent["recipient_run_id"] == child_run_id
+            return _v01_tool_stream(
+                call_id="parent-list",
+                name="list_children",
+                arguments={},
+            )
+        if parent_calls == 4:
+            listed = json.loads(
+                str(
+                    next(
+                        message["content"]
+                        for message in reversed(messages(params))
+                        if message.get("role") == "tool"
+                        and message.get("name") == "list_children"
+                    )
+                )
+            )
+            assert isinstance(listed, list)
+            assert listed[0]["run_id"] == child_run_id
+            allow_child_message.set()
+            await asyncio.wait_for(child_context_received.wait(), timeout=2)
+            return _v01_tool_stream(
+                call_id="parent-wait-pending",
+                name="wait_child",
+                arguments={
+                    "child_run_id": child_run_id,
+                    "timeout_seconds": 0,
+                },
+            )
+        if parent_calls == 5:
+            pending = last_tool_value(params, "wait_child")
+            assert pending["status"] == "pending"
+            assert any(
+                "Agent message from" in str(message.get("content"))
+                and "child update: source evt-2 accepted"
+                in str(message.get("content"))
+                for message in messages(params)
+            )
+            allow_child_complete.set()
+            return _v01_tool_stream(
+                call_id="parent-wait-terminal",
+                name="wait_child",
+                arguments={
+                    "child_run_id": child_run_id,
+                    "timeout_seconds": 1,
+                },
+            )
+        assert parent_calls == 6
+        terminal = last_tool_value(params, "wait_child")
+        assert terminal["status"] == "completed"
+        assert terminal["result"]["output_text"] == (
+            "verified child finding from evt-2"
+        )
+        return _v01_text_stream(
+            "parent used verified child finding from evt-2"
+        )
+
+    store = InMemoryStore()
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=provider,
+        permission_default="allow",
+    )
+    parent_agent = AgentSpec(
+        name="parent",
+        revision="1",
+        model="test/parent",
+        tool_allowlist=(
+            "spawn_agent",
+            "send_message",
+            "list_children",
+            "wait_child",
+        ),
+        workspace_allowlist=(str(workspace),),
+    )
+    sdk.agents.define(
+        AgentSpec(
+            name="researcher",
+            revision="1",
+            model="test/child",
+            tool_allowlist=("read", "send_message"),
+            workspace_allowlist=(str(nested_evidence),),
+        )
+    )
+    session = await sdk.sessions.create(workspaces=(workspace,))
+    parent_run_id = ""
+    try:
+        parent = await sdk.runs.start(
+            session.session_id,
+            parent_agent,
+            "coordinate child evidence",
+        )
+        parent_run_id = parent.run_id
+        result = await asyncio.wait_for(parent.result(), timeout=5)
+        assert result.output_text == "parent used verified child finding from evt-2"
+        assert [tool.tool_name for tool in result.tool_results] == [
+            "spawn_agent",
+            "send_message",
+            "list_children",
+            "wait_child",
+            "wait_child",
+        ]
+        assert child_run_id is not None
+
+        child = await sdk.runs.get(child_run_id)
+        assert child.parent_run_id == parent_run_id
+        assert child.execution_descriptor is not None
+        assert tuple(
+            capability.spec.name
+            for capability in child.execution_descriptor.tools
+        ) == ("send_message",)
+        assert child.execution_descriptor.workspace_scopes == (
+            str(nested_evidence.resolve()),
+        )
+        assert child.output_text == "verified child finding from evt-2"
+        assert [tool.tool_name for tool in child.tool_results] == ["send_message"]
+
+        progress = await sdk.children.list(parent_run_id)
+        assert len(progress) == 1
+        assert progress[0].run_id == child_run_id
+        assert progress[0].parent_run_id == parent_run_id
+        assert progress[0].status == "completed"
+        tree = await sdk.queries.execution_tree(parent_run_id)
+        assert [(node.snapshot.run_id, node.parent_run_id) for node in tree.nodes] == [
+            (parent_run_id, None),
+            (child_run_id, parent_run_id),
+        ]
+        assert all(node.snapshot.status is RunStatus.COMPLETED for node in tree.nodes)
+
+        events = await store.read_events(
+            after_cursor=0,
+            session_id=session.session_id,
+        )
+        messages_sent = [
+            stored.event
+            for stored in events
+            if stored.event.type == "agent.message.sent"
+        ]
+        assert len(messages_sent) == 2
+        parent_message = next(
+            event
+            for event in messages_sent
+            if event.payload["sender_run_id"] == parent_run_id
+        )
+        child_message = next(
+            event
+            for event in messages_sent
+            if event.payload["sender_run_id"] == child_run_id
+        )
+        parent_view_ids = {
+            stored.event.payload["context_view_id"]
+            for stored in events
+            if stored.event.type == "model.call.started"
+            and stored.event.run_id == parent_run_id
+        }
+        child_view_ids = {
+            stored.event.payload["context_view_id"]
+            for stored in events
+            if stored.event.type == "model.call.started"
+            and stored.event.run_id == child_run_id
+        }
+        parent_views = [
+            stored.event
+            for stored in events
+            if stored.event.type == "context.view.created"
+            and stored.event.payload["view_id"] in parent_view_ids
+        ]
+        child_views = [
+            stored.event
+            for stored in events
+            if stored.event.type == "context.view.created"
+            and stored.event.payload["view_id"] in child_view_ids
+        ]
+        assert len(parent_views) == 6
+        assert len(child_views) == 2
+        assert any(
+            child_message.payload["message_id"]
+            in event.payload["consumed_message_ids"]
+            and child_message.payload["message_id"] in event.payload["message_refs"]
+            for event in parent_views
+        )
+        assert any(
+            parent_message.payload["message_id"]
+            in event.payload["consumed_message_ids"]
+            and parent_message.payload["message_id"] in event.payload["message_refs"]
+            for event in child_views
+        )
+
+        parent_timeline = await sdk.queries.timeline(parent_run_id)
+        child_timeline = await sdk.queries.timeline(child_run_id)
+        parent_types = [item.event.type for item in parent_timeline.events]
+        child_types = [item.event.type for item in child_timeline.events]
+        for event_type in (
+            "tool.call.proposed",
+            "tool.call.authorized",
+            "tool.call.started",
+            "tool.call.completed",
+        ):
+            assert parent_types.count(event_type) == 5
+            assert child_types.count(event_type) == 1
+        assert parent_types.count("model.call.started") == 6
+        assert child_types.count("model.call.started") == 2
+        assert parent_types[0] == "run.created"
+        assert parent_types[-1] == "run.completed"
+        assert child_types[0] == "run.created"
+        assert child_types[-1] == "run.completed"
+    finally:
+        allow_child_message.set()
+        allow_child_complete.set()
         await sdk.close()
