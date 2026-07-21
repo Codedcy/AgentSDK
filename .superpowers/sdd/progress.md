@@ -243,7 +243,7 @@ v0.1 executable plans: R0 release harness; R1 built-in Tools/policy; R2 Workflow
 v0.1 goal: release a usable functional closed loop before further production-grade hardening
 v0.1 recovery contract: resume from the last committed safe boundary; unknown in-flight Model/Tool work becomes interrupted and is never automatically replayed
 v0.1 required slices: R0 scope reset/release harness; R1 built-in read/write/bash and basic policy; R2 Workflow conditions/bounded loops; R3 automatic L0-L4 Context; R4 spawn/message/wait/list Child tools and mailbox; R5 Trace attribution/package/release
-v0.1 current implementation status: R0-R3 completed; R4 pending
+v0.1 current implementation status: R0-R4 completed; R5 pending. R4 checkpoint is recorded with one known pre-R4 recovery debt; its raw aggregate is not PASS.
 v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
 v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
 v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
@@ -356,8 +356,8 @@ v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\p
 v0.1 R4 Task 4: complete (implementation `c1e570b`; independent review Spec approved / Quality approved; Critical 0 / Important 0 / Minor 0)
 v0.1 R4 Task 4 delivered `spawn_agent`, `send_message`, `wait_child`, and `list_children` through the normal Tool/permission/trace pipeline, ToolContext-derived identity, shared Coordinator/Mailbox handlers, builtin registration/collision behavior, and a deterministic bidirectional parent/Child v0.1 E2E.
 v0.1 R4 Task 4 final gates: 17 focused passed; Workflow 274 passed; Task 1-3 smoke 121 passed; broad subagent/Context/v0.1 gate 198 passed with one proven baseline recovery node deselected; strict mypy clean across 97 source files; Ruff and diff-check clean.
-v0.1 current implementation status: R0-R3 and R4 Tasks 1-4 completed; R4 Task 5 checkpoint pending.
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents tests\integration\subagents tests\integration\context tests\e2e\test_v01_release.py -q -k "not authoritative_recovery_receives_exact_stored_prepared_request"`
+v0.1 current implementation status: R0-R4 completed; R5 pending. R4 Task 5 checkpoint is complete with the known pre-R4 recovery debt retained, so the raw aggregate is not PASS.
+v0.1 R4 checkpoint recovery command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\subagents tests\integration\subagents tests\integration\context tests\e2e\test_v01_release.py -q --deselect=tests/integration/context/test_context_recovery.py::test_authoritative_recovery_receives_exact_stored_prepared_request`
 v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
 v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
@@ -373,7 +373,9 @@ v0.1 R3 Task 4 final approval: Critical 0 / Important 0 / Minor 0; Spec PASS; Qu
 v0.1 R3 Task 4 delivered ContextMiddleware preparation before each new model call, durable exact prepared requests, authenticated Context View/Prompt Manifest bindings, strict provider request validation, and no-side-effect failure for corrupted recovery evidence.
 v0.1 R3 checkpoint: complete (2026-07-20; Tasks 1-4 approved)
 v0.1 R3 checkpoint fresh evidence: 221 passed, 1 skipped in 25.32s across unit/context, integration/context, integration/prompts, reconciliation models, and v0.1 E2E; Ruff clean; strict mypy clean across 93 source files.
-v0.1 current implementation status: R0-R3 completed; R4 pending
-v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md
-v0.1 `tests/unit/runtime/test_capability_intersection.py` is created by R4 Task 1; it does not exist yet and the resume command is the first expected RED, not a current code failure.
-v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py -q`
+v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r5-trace-release.md
+v0.1 R5 first expected RED: `tests/unit/observability/test_attribution.py` does not yet exist because R5 Task 1 creates it. It is expected RED work, not an existing failure.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\observability\test_attribution.py -q`
+v0.1 R4 checkpoint (2026-07-21): complete with scope confined to Child Tool/mailbox exchange. R4 Tasks 1-4 are independently approved: capability persistence/catalog selection (`23c2c39`, `5466757`, `fd6d728`, `f320642`); direct durable mailbox plus atomic Context consumption (`ae6aa89`, `1326fb8`); bounded Child coordination and public API (`b90c8f7`, `3e71c9a`); and ordinary Tool-pipeline child controls (`c1e570b`). Each final review reports Critical 0 / Important 0 / Minor 0, Spec approved, and Quality approved.
+v0.1 R4 checkpoint fresh raw gate: `tests/unit/subagents tests/integration/subagents tests/integration/context tests/e2e/test_v01_release.py -q` with `.venv`, `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, and explicit `pytest_asyncio.plugin` produced 198 passed / 1 failed in 14.05s. The sole failure is the known pre-R4 recovery debt `tests/integration/context/test_context_recovery.py::test_authoritative_recovery_receives_exact_stored_prepared_request` (`AgentSDKError: recovery required`), previously proven with the same shape at Tasks 2 and 4. Raw R4 checkpoint status is therefore NOT PASS; the node was not changed or repaired.
+v0.1 R4 clean gate: the exact-node `--deselect` command above produced 198 passed / 1 deselected in 13.33s. Ruff plan scope passed; strict mypy passed for the 31 planned source files and all 97 `src/agent_sdk` files. The deselected clean gate does not turn the raw aggregate into a PASS.
