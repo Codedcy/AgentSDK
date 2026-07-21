@@ -24,6 +24,10 @@ from pydantic import (
 
 from agent_sdk.errors import AgentSDKError, ErrorCode
 from agent_sdk.models.litellm_gateway import ModelRequest
+from agent_sdk.runtime.model_params import (
+    is_credential_key,
+    validate_model_params_for_durability,
+)
 from agent_sdk.runtime.models import (
     RunFailure,
     RunSnapshot,
@@ -41,14 +45,10 @@ from agent_sdk.tools.models import ToolResult, ToolResultStatus, freeze_json, th
 
 _TERMINATION_REASON_MAX_UTF8_BYTES = 256
 _TERMINATION_ACTOR_MAX_UTF8_BYTES = 1024
-_SENSITIVE_METADATA_KEYS = frozenset(
+_ADDITIONAL_SENSITIVE_METADATA_KEYS = frozenset(
     {
-        "api_key",
-        "apikey",
         "authorization",
         "credential",
-        "credentials",
-        "password",
         "secret",
         "token",
     }
@@ -56,29 +56,57 @@ _SENSITIVE_METADATA_KEYS = frozenset(
 _BEARER_SECRET = re.compile(
     r"(?i)(\bauthorization\s*:\s*bearer)\s+[^\s,;]+"
 )
-_ASSIGNED_SECRET = re.compile(
-    r"(?i)\b(api[_-]?key|access[_-]?token|password|credential|secret)"
-    r"\s*[:=]\s*[^\s,;]+"
+_ASSIGNED_METADATA = re.compile(
+    r"(?i)(?<![a-z0-9_-])(?P<quote>['\"]?)(?P<key>[a-z][a-z0-9_-]*)"
+    r"(?P=quote)\s*[:=]\s*"
+    r"(?P<value>(?:bearer\s+)?[^\s,;]+)"
 )
 
 
-def _contains_sensitive_metadata_key(value: Any) -> bool:
+def _normalize_metadata_key(key: str) -> str:
+    return key.casefold().replace("_", "").replace("-", "")
+
+
+def _contains_sensitive_assignment(value: str) -> bool:
+    for match in _ASSIGNED_METADATA.finditer(value):
+        key = match.group("key")
+        normalized = _normalize_metadata_key(key)
+        if is_credential_key(key):
+            return True
+        if normalized not in _ADDITIONAL_SENSITIVE_METADATA_KEYS:
+            continue
+        assignment = match.group("value")
+        if normalized == "authorization" and assignment.casefold().startswith(
+            "bearer "
+        ):
+            continue
+        return True
+    return False
+
+
+def _contains_sensitive_metadata(value: Any) -> bool:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            normalized = key.lower().replace("-", "_") if isinstance(key, str) else ""
-            if normalized in _SENSITIVE_METADATA_KEYS:
+            if not isinstance(key, str):
                 return True
-            if _contains_sensitive_metadata_key(nested):
+            normalized = _normalize_metadata_key(key)
+            if (
+                is_credential_key(key)
+                or normalized in _ADDITIONAL_SENSITIVE_METADATA_KEYS
+            ):
+                return True
+            if _contains_sensitive_metadata(nested):
                 return True
     elif isinstance(value, (list, tuple)):
-        return any(_contains_sensitive_metadata_key(item) for item in value)
+        return any(_contains_sensitive_metadata(item) for item in value)
+    elif isinstance(value, str):
+        return _contains_sensitive_assignment(value)
     return False
 
 
 def _redact_metadata_strings(value: Any) -> Any:
     if isinstance(value, str):
-        value = _BEARER_SECRET.sub(r"\1 [REDACTED]", value)
-        return _ASSIGNED_SECRET.sub(r"\1=[REDACTED]", value)
+        return _BEARER_SECRET.sub(r"\1 [REDACTED]", value)
     if isinstance(value, dict):
         return {key: _redact_metadata_strings(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -98,12 +126,17 @@ def _sanitize_termination_resolution(
     reason = " ".join(cast(str, evidence["reason"]).split())
     if not reason:
         raise ValueError("termination resolution reason is empty")
+    if _contains_sensitive_assignment(reason):
+        raise ValueError("termination resolution reason is unsafe")
     reason = cast(str, _redact_metadata_strings(reason))
     if len(reason.encode("utf-8")) > _TERMINATION_REASON_MAX_UTF8_BYTES:
         raise ValueError("termination resolution reason is too large")
     try:
+        validate_model_params_for_durability(actor)
         canonical_actor = thaw_json(freeze_json(actor))
-        if not isinstance(canonical_actor, dict) or _contains_sensitive_metadata_key(canonical_actor):
+        if not isinstance(canonical_actor, dict) or _contains_sensitive_metadata(
+            canonical_actor
+        ):
             raise ValueError("termination resolution actor is unsafe")
         canonical_actor = _redact_metadata_strings(canonical_actor)
         assert isinstance(canonical_actor, dict)
@@ -126,13 +159,19 @@ def _is_sanitized_termination_resolution(
     evidence: Mapping[str, Any],
 ) -> bool:
     try:
+        thawed_actor = thaw_json(actor)
+        thawed_evidence = thaw_json(evidence)
+        if not isinstance(thawed_actor, dict) or not isinstance(
+            thawed_evidence, dict
+        ):
+            return False
         expected_actor, expected_evidence = _sanitize_termination_resolution(
-            actor,
-            evidence,
+            thawed_actor,
+            thawed_evidence,
         )
     except ValueError:
         return False
-    return dict(actor) == expected_actor and dict(evidence) == expected_evidence
+    return thawed_actor == expected_actor and thawed_evidence == expected_evidence
 
 
 class ExternalOperationKind(StrEnum):

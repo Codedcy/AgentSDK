@@ -5676,6 +5676,102 @@ async def test_terminate_rejects_unbounded_or_unsafe_reason_without_mutation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ("memory", "sqlite"))
+async def test_terminate_rejects_shared_credential_policy_without_secret_leak(
+    backend: str,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / f"credential-terminate-{backend}.sqlite3"
+    store: Any = (
+        InMemoryStore() if backend == "memory" else await SQLiteStore.open(database)
+    )
+    run_id, spec, _operation_id, request = await _seed_pending_model_reconciliation(
+        store
+    )
+    provider_calls: list[int] = []
+
+    async def forbidden_provider(**_: object) -> Any:
+        provider_calls.append(1)
+        raise AssertionError("invalid terminate must not call provider")
+
+    sdk = AgentSDK.for_test(
+        store=store,
+        acompletion=forbidden_provider,
+        permission_default="allow",
+    )
+    sdk.agents.define(spec)
+    sentinel = "TERMINATE-CREDENTIAL-SENTINEL-9f43"
+    credential_key_spellings = (
+        "ACCESS-TOKEN",
+        "api_key",
+        "Api-Secret",
+        "api_token",
+        "application-secret",
+        "auth_token",
+        "aws-secret-access-key",
+        "azure_ad_token",
+        "bearer-token",
+        "client_secret",
+        "credentials",
+        "password",
+        "PRIVATE-KEY",
+        "secret_access_key",
+        "service-account",
+    )
+    try:
+        before = await _resolution_domain_state(store)
+        for index, credential_key in enumerate(credential_key_spellings):
+            reason_assignment = (
+                f"{credential_key}={sentinel}"
+                if index % 2 == 0
+                else f'"{credential_key}": "{sentinel}"'
+            )
+            attempts = (
+                (
+                    {
+                        "type": "operator",
+                        "nested": [{"metadata": {credential_key: sentinel}}],
+                    },
+                    {"reason": "operator abort"},
+                ),
+                (
+                    {"type": "operator"},
+                    {"reason": f"operator abort; {reason_assignment}"},
+                ),
+            )
+            for actor, evidence in attempts:
+                with pytest.raises(AgentSDKError) as caught:
+                    await sdk.recovery.resolve(
+                        request.request_id,
+                        ReconciliationAction.TERMINATE,
+                        actor=actor,
+                        evidence=evidence,
+                    )
+                assert caught.value.code is ErrorCode.INVALID_STATE
+                assert caught.value.message == "reconciliation decision is invalid"
+                assert caught.value.retryable is False
+                assert sentinel not in str(caught.value)
+                assert sentinel not in repr(caught.value)
+                assert await _resolution_domain_state(store) == before
+
+        run = await sdk.runs.get(run_id)
+        events = await store.read_events(after_cursor=0)
+        assert run.status is RunStatus.WAITING_RECONCILIATION
+        assert sentinel not in run.model_dump_json()
+        assert sentinel not in repr(events)
+        assert sentinel not in repr(await _resolution_domain_state(store))
+        assert provider_calls == []
+    finally:
+        await sdk.close()
+        if backend == "sqlite":
+            await store.close()
+
+    if backend == "sqlite":
+        for sqlite_file in database.parent.glob(f"{database.name}*"):
+            assert sentinel.encode() not in sqlite_file.read_bytes()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ("memory", "sqlite"))
 async def test_resolution_replay_and_unsupported_actions_are_zero_mutation(
     backend: str,
     tmp_path: Path,

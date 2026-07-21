@@ -17,10 +17,11 @@ executed, and it does not add an exactly-once guarantee.
 ## Durable contract
 
 - The resolution reason is normalized, must contain only `{"reason": str}`,
-  and is limited to 256 UTF-8 bytes after sanitization.
+  rejects assignments to any key in the shared credential-key policy, and is
+  limited to 256 UTF-8 bytes after sanitization.
 - Actor metadata is canonical JSON, recursively rejects secret-bearing keys,
-  redacts recognizable bearer/credential assignments in string values, and is
-  limited to 1,024 UTF-8 bytes.
+  rejects credential assignments in string values, redacts complete bearer
+  values, and is limited to 1,024 UTF-8 bytes.
 - The existing `commit_run_progress` transaction and CAS preconditions are
   reused for both Memory and SQLite. No new table, Store protocol, transaction,
   state machine, or persistence mechanism was introduced.
@@ -76,13 +77,41 @@ or a broader trace redesign.
    branch and a fresh-SQLite abort branch. Abort verifies terminal failure,
    exact-repeat idempotency, reopen behavior, and zero external replay.
 
+## Secret-safety review correction
+
+The initial abort implementation used a local, narrower credential-key list and
+assignment regex. Consequently normalized shared-policy names such as
+`client_secret`, `private_key`, and several hyphen/case variants could be
+accepted in nested actor metadata or a reason assignment and become durable.
+
+The correction exposes one internal `is_credential_key` predicate from the
+existing model-parameter durability policy. Both model-parameter validation and
+termination metadata now use that same normalized 15-key deny set; the
+termination layer retains only its additional generic metadata names. Actor
+metadata is checked recursively and with the existing depth/item bounds before
+canonicalization. Reason and actor-string credential assignments are rejected
+as a whole with the sanitized public error `reconciliation decision is
+invalid`; no partial credential value is redacted and stored. Full bearer values
+remain redacted under the pre-existing bounded behavior.
+
+Strict public-API RED tests reproduced the defect for both Memory and SQLite:
+the first normalized actor key was accepted and the next attempt observed a
+conflict (`2 failed`). The GREEN test traverses all 15 shared credential names,
+using mixed case, underscores, and hyphens, in both deeply nested actor keys and
+direct `=` and quoted `:` reason assignments. The quoted-assignment extension
+also produced a strict `2 failed` RED before the parser accepted optional key
+quotes. The final test proves the sentinel is absent from error
+`str`/`repr`, events, snapshots, complete Store state, and every SQLite database
+sidecar byte stream.
+
 ## Verification
 
 - Full reconciliation-resolution suite: `372 passed in 102.32s`.
 - Public v0.1 release acceptance: `1 passed in 72.80s`.
 - Selected observability, recovery, Workflow, Child, control, documentation, and
-  public-release suites: `725 passed in 283.29s`.
-- Final focused metadata/reconciliation selection: `16 passed, 358 deselected`.
+  public-release suites after the secret correction: `727 passed in 290.77s`.
+- Final terminate-focused selection: `18 passed, 358 deselected in 10.75s`.
+- Strict shared-policy sentinel selection: `2 passed, 374 deselected in 3.43s`.
 - Documentation release gate: `1 passed`.
 - Ruff: `All checks passed!`
 - Strict mypy: `Success: no issues found in 103 source files`.

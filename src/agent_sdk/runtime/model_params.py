@@ -74,7 +74,7 @@ def validate_model_params_for_durability(value: Any) -> None:
             for key, nested in items:
                 if type(key) is not str:
                     _reject(_SHAPE_ERROR)
-                if _normalize_key(key) in _CREDENTIAL_KEYS:
+                if is_credential_key(key):
                     _reject(_CREDENTIAL_ERROR)
                 pending.append((nested, depth + 1))
         elif item_type is MappingProxyType:
@@ -94,6 +94,11 @@ def validate_model_params_for_durability(value: Any) -> None:
             continue
         else:
             _reject(_SHAPE_ERROR)
+
+
+def is_credential_key(key: str) -> bool:
+    """Return whether an exact normalized key is credential-bearing."""
+    return _normalize_key(key) in _CREDENTIAL_KEYS
 
 
 def _normalize_key(key: str) -> str:
