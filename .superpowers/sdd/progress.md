@@ -386,3 +386,8 @@ v0.1 R5 Task 1 delivered normalized sanitized Trace stages, stable Run/Workflow 
 v0.1 R5 Task 1 final controller gate: 85 passed across public observability and real recovery-permission timeline; strict mypy clean across 100 source files; Ruff and diff-check clean.
 v0.1 current implementation status: R0-R4 and R5 Task 1 completed; R5 Task 2 pending.
 v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\observability\test_attribution.py -q`
+v0.1 R5 Task 2: complete (commits `ae4ee7d`, `26c78f9`, `4e7345c`, `648190e`; final independent review Critical 0 / Important 0 / Minor 0; Spec approved / Quality approved).
+v0.1 R5 Task 2 delivered deterministic evidence-linked Run attribution, strict Tool/Child/Model dispositions, first-terminal failure selection, evaluation evidence, and seven fixed deduplicated improvement hints without LLM or causal claims.
+v0.1 R5 Task 2 final controller gate: complete observability suite 106 passed; strict mypy clean across 9 Task 2 source files; Ruff and diff-check clean.
+v0.1 current implementation status: R0-R4 and R5 Tasks 1-2 completed; R5 Task 3 pending.
+v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; $env:PYTHONPATH='src'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\integration\analytics\test_v01_analysis_contract.py tests\integration\analytics\test_analytics_queries.py -q`
