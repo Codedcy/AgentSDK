@@ -102,6 +102,10 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
+`workspaces=(workspace,)` is intentional: it is a one-element Python tuple, and
+the trailing comma creates the tuple. `SessionAPI.create` accepts any iterable of
+`str` or `Path`, so `workspaces=[workspace]` is equivalent.
+
 When `AgentSpec.system_prompt` is omitted, the packaged general system prompt is
 used. Set it to add an application-specific prompt. Activated Skills are composed
 as separate prompt layers and recorded in the Prompt Manifest. Raw credential
@@ -163,26 +167,31 @@ from pathlib import Path
 from agent_sdk import AgentSDK, AgentSDKConfig, PermissionDecision
 from agent_sdk.permissions import PermissionRule
 
-workspace = Path(".").resolve()
-sdk = AgentSDK(
-    AgentSDKConfig(
-        database_path=Path(".agent-sdk/state.db"),
-        permission_default="ask",
-        permission_rules=(
-            PermissionRule(outcome="allow", tool="read", path_prefix=workspace),
-            PermissionRule(
-                outcome="allow",
-                tool="bash",
-                path_prefix=workspace,
-                command_prefix=("git", "status"),
+
+def create_sdk(workspace: Path) -> AgentSDK:
+    return AgentSDK(
+        AgentSDKConfig(
+            database_path=Path(".agent-sdk/state.db"),
+            permission_default="ask",
+            permission_rules=(
+                PermissionRule(
+                    outcome="allow",
+                    tool="read",
+                    path_prefix=workspace,
+                ),
+                PermissionRule(
+                    outcome="allow",
+                    tool="bash",
+                    path_prefix=workspace,
+                    command_prefix=("git", "status"),
+                ),
+                PermissionRule(outcome="deny", tool="write"),
             ),
-            PermissionRule(outcome="deny", tool="write"),
-        ),
+        )
     )
-)
 
 
-async def resolve_next_request(run_id: str) -> None:
+async def resolve_next_request(sdk: AgentSDK, run_id: str) -> None:
     request = await sdk.permissions.next_request(run_id)
     await sdk.permissions.resolve(
         request.request_id,
@@ -198,21 +207,31 @@ decides when and how to show it, then calls `allow_once()` or
 Connect an MCP server to the same Tool registry and authorization path:
 
 ```python
-from agent_sdk import MCPManager, MCPServerConfig, StdioMCPTransport
+from pathlib import Path
 
-manager = MCPManager(sdk.tools)
-await manager.connect(
-    MCPServerConfig(
-        name="company",
-        transport=StdioMCPTransport(
-            command="python",
-            args=("mcp_server.py",),
-            cwd=workspace,
-        ),
+from agent_sdk import AgentSDK, MCPManager, MCPServerConfig, StdioMCPTransport
+
+
+async def connect_company_mcp(
+    sdk: AgentSDK,
+    workspace: Path,
+) -> MCPManager:
+    manager = MCPManager(sdk.tools)
+    await manager.connect(
+        MCPServerConfig(
+            name="company",
+            transport=StdioMCPTransport(
+                command="python",
+                args=("mcp_server.py",),
+                cwd=workspace,
+            ),
+        )
     )
-)
-# Close the manager after its Runs settle: await manager.close()
+    return manager
 ```
+
+The caller owns the returned manager and must run `await manager.close()` after
+its Runs settle.
 
 ## Generated Workflow admission
 
@@ -220,12 +239,23 @@ Model-generated YAML is untrusted candidate text. Compile and validate it first,
 obtain explicit application confirmation, and only then start it:
 
 ```python
-candidate = sdk.workflows.compile(generated_yaml)  # validates; does not execute
-if not await application_confirms(candidate):
-    raise RuntimeError("workflow was not approved")
+from collections.abc import Awaitable, Callable
 
-handle = await sdk.workflows.start(session.session_id, candidate)
-workflow_result = await handle.result()
+from agent_sdk import AgentSDK, WorkflowIR, WorkflowResult
+
+
+async def run_confirmed_workflow(
+    sdk: AgentSDK,
+    session_id: str,
+    generated_yaml: str,
+    application_confirms: Callable[[WorkflowIR], Awaitable[bool]],
+) -> WorkflowResult:
+    candidate = sdk.workflows.compile(generated_yaml)  # validates; no execution
+    if not await application_confirms(candidate):
+        raise RuntimeError("workflow was not approved")
+
+    handle = await sdk.workflows.start(session_id, candidate)
+    return await handle.result()
 ```
 
 Conditions select a branch from persisted inputs/outputs. Loops require a finite
@@ -315,6 +345,6 @@ python -m ruff check .
 python -m mypy
 ```
 
-The current supported v0.1 full-suite evidence is 2,956 passed with 6 expected
-platform skips. The release ledger records the reproducible environment and the
-remaining post-v0.1 work.
+The v0.1 release checkpoint recorded 2,956 passed with 6 expected platform
+skips. The release ledger records that reproducible historical environment and
+the remaining post-v0.1 work; rerun the checks above for the current tree.

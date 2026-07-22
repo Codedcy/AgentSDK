@@ -1,8 +1,10 @@
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
+QUICKSTART = ROOT / "docs" / "guides" / "v01-quickstart.md"
 
 
 def _readme() -> str:
@@ -52,3 +54,27 @@ def test_readme_does_not_claim_unsupported_distribution_or_badges() -> None:
     assert "published on pypi" not in readme
     assert "pypi.org" not in readme
     assert "shields.io" not in readme
+
+
+def test_public_getting_started_docs_use_source_install() -> None:
+    for document in (README, QUICKSTART):
+        text = document.read_text(encoding="utf-8")
+        assert "git clone https://github.com/Codedcy/AgentSDK.git" in text
+        assert "python -m pip install ." in text
+        assert "python -m pip install agent-sdk" not in text
+
+
+def test_readme_python_examples_are_valid_modules() -> None:
+    readme = _readme()
+    blocks = re.findall(r"```python\n(.*?)```", readme, flags=re.DOTALL)
+
+    assert blocks
+    for index, block in enumerate(blocks, start=1):
+        compile(block, f"README.md python block {index}", "exec")
+
+
+def test_readme_labels_the_full_suite_count_as_historical() -> None:
+    readme = _readme()
+
+    assert "current supported v0.1 full-suite evidence" not in readme
+    assert "v0.1 release checkpoint" in readme

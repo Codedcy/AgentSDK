@@ -16,7 +16,9 @@ removing underscores or hyphens: `api_key`, `api_secret`, `api_token`,
 parameters such as `max_tokens` and response token-count fields remain valid.
 
 ```powershell
-python -m pip install agent-sdk
+git clone https://github.com/Codedcy/AgentSDK.git
+Set-Location AgentSDK
+python -m pip install .
 ```
 
 Run the installed deterministic reference without provider credentials:
