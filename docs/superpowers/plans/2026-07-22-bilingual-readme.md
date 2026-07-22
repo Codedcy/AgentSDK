@@ -21,16 +21,17 @@
 
 ---
 
-### Task 1: Add reciprocal language entry points
+### Task 1: Add the complete bilingual README
 
 **Files:**
 - Modify: `README.md:1-4`
-- Create: `README.zh-CN.md`
+- Create: `README.zh-CN.md` as a complete translation before commit
 - Test: `tests/docs/test_public_readme.py`
 
 **Interfaces:**
 - Consumes: Existing `README.md` title and repository-relative Markdown links.
-- Produces: `ZH_README: Path` test constant and reciprocal selector lines used by Task 2.
+- Produces: `ZH_README: Path`, reciprocal language selectors, the complete
+  Simplified Chinese README, and cross-language drift tests.
 
 - [ ] **Step 1: Write the failing language-selector test**
 
@@ -80,20 +81,14 @@ Create the Chinese entry with this exact initial content:
 Agent SDK `0.1.0` 是一个异步 Python 基础 SDK，用于构建可恢复、可观测的 Agent。
 ```
 
-- [ ] **Step 4: Run the selector test and confirm GREEN**
+- [ ] **Step 4: Run the selector test and confirm GREEN before continuing**
 
 Run the command from Step 2.
 
-Expected: `1 passed`.
+Expected: `1 passed`. Do not commit the incomplete entry file; continue directly
+to the complete translation steps below.
 
-- [ ] **Step 5: Commit the language entry points**
-
-```powershell
-git add README.md README.zh-CN.md tests/docs/test_public_readme.py
-git commit -m "docs: add chinese readme entry"
-```
-
-### Task 2: Complete and lock the Simplified Chinese translation
+#### Complete and lock the Simplified Chinese translation
 
 **Files:**
 - Modify: `README.zh-CN.md`
@@ -101,7 +96,8 @@ git commit -m "docs: add chinese readme entry"
 - Test: `tests/docs/test_public_readme.py`
 
 **Interfaces:**
-- Consumes: `README`, `ZH_README`, `_readme()`, and the reciprocal selectors from Task 1.
+- Consumes: `README`, `ZH_README`, `_readme()`, and the reciprocal selectors from
+  the preceding steps.
 - Produces: A full Chinese public landing page whose executable blocks and factual anchors match `README.md`.
 
 - [ ] **Step 1: Write failing translation-completeness tests**
