@@ -74,7 +74,7 @@ For hexadecimal tokens of length 7-40 in tracked UTF-8 text, replace only a uniq
 
 Add the target identity, rewritten commit count, backup location, validation results, remote boundary, and rewritten release/checkpoint hashes to the v0.1 ledger and progress log.
 
-- [ ] **Step 4: Commit the repaired documentation**
+- [x] **Step 4: Commit the repaired documentation**
 
 Commit as `docs: record author history rewrite` using the configured target identity.
 
@@ -88,18 +88,18 @@ Commit as `docs: record author history rewrite` using the configured target iden
 - Consumes: rewritten history and repaired documentation
 - Produces: clean local `master` ready for an explicitly approved force-push
 
-- [ ] **Step 1: Run focused documentation verification**
+- [x] **Step 1: Run focused documentation verification**
 
 Run documentation tests, Ruff on changed Python tests/scripts if any, the old-hash residue audit, identity audit, and `git diff --check`.
 
-- [ ] **Step 2: Run the complete supported test gate**
+- [x] **Step 2: Run the complete supported test gate**
 
 Run the complete pytest suite under supported Python with the asyncio plugin and require zero failures.
 
-- [ ] **Step 3: Remove temporary local rewrite refs**
+- [x] **Step 3: Remove temporary local rewrite refs**
 
 After the bundle and mapping are verified, delete `refs/original` and temporary rewrite refs so `master` is the only local branch history while keeping the bundle.
 
-- [ ] **Step 4: Stop before remote mutation**
+- [x] **Step 4: Stop before remote mutation**
 
 Report the exact local/remote divergence and request explicit approval before `git push --force-with-lease origin master`.
