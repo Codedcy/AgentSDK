@@ -179,7 +179,7 @@ async def resolve_next_request(sdk: AgentSDK, run_id: str) -> None:
     )
 ```
 
-内置 `read`、`write` 和 `bash` 同时执行 Session workspace 根目录和已配置策略。SDK 会暂停 `ask` 决策；宿主应用决定何时以及如何展示该请求，然后调用 `allow_once()` 或 `PermissionDecision.deny(...)`。
+内置 `read`、`write` 和 `bash` 会同时强制执行 Session 的 workspace 根目录约束和已配置策略。SDK 会暂停 `ask` 决策；宿主应用决定何时以及如何展示该请求，然后调用 `allow_once()` 或 `PermissionDecision.deny(...)`。
 
 将 MCP 服务器接入相同的 Tool 注册表和授权路径：
 
@@ -259,7 +259,7 @@ async def terminate_unknown_attempt(
     )
 ```
 
-终止不会执行重放，也不会声明中断的外部尝试是否已执行。它以原子方式使 Run 失败，错误代码为 `application_resolution_aborted`。删除 Session 会移除 SDK 所有的持久化历史、事件和快照；不会删除应用所有的 workspace 文件。
+终止不会执行重放，也不会声明中断的外部尝试是否已执行。它以原子方式使 Run 失败，错误代码为 `application_resolution_aborted`。删除 Session 会移除该 Session 中由 SDK 持久化的历史、事件和快照；不会删除任何由应用拥有的 workspace 文件。
 
 ## v0.1 边界
 
