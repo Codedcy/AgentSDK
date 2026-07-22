@@ -1,131 +1,320 @@
 # Agent SDK
 
-Agent SDK is an async Python library for recoverable, observable Agent Runs,
-Workflows, Tools, Skills, Child agents, and SQLite-backed history. It supports
-Python 3.12 and 3.13.
+Agent SDK `0.1.0` is an async Python foundation for building recoverable and
+observable agents. It combines a LiteLLM-backed Agent Loop with Tools, MCP,
+Skills, validated Workflows, Child agents, automatic L0-L4 Context compaction,
+and SQLite-backed execution history.
 
-## Install and run with SQLite
+The current release supports Python 3.12 and 3.13. It is a usable single-process
+SDK baseline: applications own the user interface, approval experience, provider
+credentials, and decisions about which Trace information to expose.
+
+## Why Agent SDK
+
+- Recoverable by default: SQLite is the standard store; an in-memory store is
+  available for transient and test composition.
+- One Tool pipeline: built-ins, application Tools, MCP Tools, and Child-control
+  Tools share validation, authorization, execution, and Trace events.
+- Structured orchestration: Workflows support conditions, bounded loops, and
+  agent nodes; Child agents support durable two-way messages and result handoff.
+- Bounded Context: the runtime automatically selects and records L0-L4 views
+  without deleting source events.
+- Evidence first: live events, historical timelines, token usage, evaluation,
+  deterministic attribution, success rate, and Tool-failure metrics are public
+  SDK capabilities.
+
+## Install from source
+
+Clone the repository and install it with Python 3.12 or 3.13:
 
 ```powershell
-python -m pip install agent-sdk
+git clone https://github.com/Codedcy/AgentSDK.git
+Set-Location AgentSDK
+python -m pip install .
+```
+
+The repository is the supported distribution path for v0.1; no package-index
+release is assumed by this README.
+
+## Five-minute deterministic smoke run
+
+```powershell
 python examples/v01_reference.py --smoke --database .agent-sdk/state.db --workspace .
 ```
 
-The deterministic `--smoke` flow makes no network calls and prints one JSON
-line derived from public SDK results. It demonstrates automatic L0-L4 Context,
-a selected Workflow condition and two bounded-loop iterations, Agent-driven
-Child spawn plus two-way messages/list/wait/result consumption, live and
-historical Trace, evaluation and attribution, completed-boundary SQLite reopen
-without replay, and Session deletion that preserves an application-owned
-workspace marker.
+`--smoke` performs no provider or network calls. It emits one JSON line derived
+from public SDK results and verifies:
 
-For a real provider, set the LiteLLM credentials in the application environment,
-omit `--smoke`, and select a LiteLLM model name with `--model`.
-Raw credential fields are rejected in durable `AgentSpec.model_params`; see the
-quickstart for the exact v0.1 key policy.
+- automatic L0-L4 Context selection;
+- a Workflow condition and two bounded-loop iterations;
+- Agent-driven Child spawn, two-way messaging, wait, and result consumption;
+- live and historical Trace, evaluation, and evidence-linked attribution;
+- reopening completed SQLite work without replay;
+- Session deletion while application-owned workspace files remain intact.
 
-The reference uses `permission_default="allow"` so its Child-control sequence is
-non-interactive. Applications should replace that demo setting with explicit
-allow/ask/deny rules before admitting untrusted work.
+The reference uses `permission_default="allow"` only to remain non-interactive.
+Applications should configure explicit allow, ask, and deny rules before
+admitting untrusted work.
+
+## Run a real LiteLLM-backed Agent
+
+Set the credential expected by your chosen LiteLLM provider in the application
+environment. For example, with an OpenAI model:
+
+```powershell
+$env:OPENAI_API_KEY="your-key"
+```
+
+Then run the SDK from an async application:
+
+```python
+import asyncio
+from pathlib import Path
+
+from agent_sdk import AgentSDK, AgentSDKConfig, AgentSpec
+
+
+async def main() -> None:
+    workspace = Path(".").resolve()
+    sdk = AgentSDK(
+        AgentSDKConfig(database_path=Path(".agent-sdk/state.db"))
+    )
+    try:
+        session = await sdk.sessions.create(workspaces=(workspace,))
+        agent = sdk.agents.define(
+            AgentSpec(
+                name="assistant",
+                model="openai/gpt-4o-mini",
+                tool_allowlist=(),
+            )
+        )
+        handle = await sdk.runs.start(
+            session.session_id,
+            agent,
+            "Give me a two-sentence overview of this project.",
+        )
+        result = await handle.result()
+        print(result.output_text)
+    finally:
+        await sdk.close()
+
+
+asyncio.run(main())
+```
+
+When `AgentSpec.system_prompt` is omitted, the packaged general system prompt is
+used. Set it to add an application-specific prompt. Activated Skills are composed
+as separate prompt layers and recorded in the Prompt Manifest. Raw credential
+fields are rejected in durable `AgentSpec.model_params`; keep secrets in the
+application environment or provider credential system.
+
+## v0.1 capability matrix
+
+| Area | Shipped in v0.1 | Important boundary |
+| --- | --- | --- |
+| Agent Loop | Async streaming model calls, Tool calls, bounded turns, cancellation, token accounting | LiteLLM is the only model gateway |
+| Storage and recovery | SQLite by default, in-memory option, event/snapshot history, safe-boundary reopen, explicit reconciliation | Documented recovery uses one SDK instance in one process |
+| Tools and permissions | Built-in `read`, `write`, and argv-based `bash`; custom Tool registration; allow/ask/deny rules by Tool, path, and command prefix | The application owns interactive permission decisions |
+| MCP | Stdio and streamable HTTP servers register namespaced Tools in the normal Tool registry | MCP Tools use the same application authorization policy |
+| Skills and prompts | Configurable Skill roots, strict `SKILL.md` activation, packaged and custom system prompts, Prompt Manifest | Applications choose which Skills an Agent may activate |
+| Workflow | Validated YAML/object definitions, explicit start, conditions, bounded loops, agent nodes, durable state | Generated text is only a candidate until compile, application confirmation, and start |
+| Child agents | Tool-driven spawn/send/list/wait, direct API access, bounded depth/count, durable mailbox, parent result consumption | Child capabilities remain constrained by application policy |
+| Context | Automatic L0-L4 planning and compaction before model calls, source-event references, configurable budgets | Compaction is bounded summarization, not deletion of source history |
+| Trace and analysis | Live subscriptions, historical timelines, execution trees, per-Run attribution, evaluation, success rate, Tool failures and failure rate | Attribution is deterministic evidence analysis, not causal proof |
+| Extensibility | Application Tools, permission rules, Skills, prompts, Workflows, provider recovery adapters, Trace consumers | The SDK supplies primitives; the host application supplies product policy and presentation |
+
+## Tools and permission decisions
+
+Application Tools join the same registry as built-ins and MCP Tools:
+
+```python
+from agent_sdk import AgentSDK, ToolContext, ToolSpec
+
+
+def register_lookup(sdk: AgentSDK) -> None:
+    async def lookup(
+        context: ToolContext,
+        *,
+        key: str,
+    ) -> dict[str, str]:
+        return {"run_id": context.run_id, "value": key.upper()}
+
+    sdk.tools.register(
+        ToolSpec(
+            name="lookup",
+            description="Look up an application value",
+            input_schema={
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+                "additionalProperties": False,
+            },
+            effects=("application.read",),
+        ),
+        lookup,
+    )
+```
+
+Configure workspace and command policy when creating the SDK:
 
 ```python
 from pathlib import Path
-from agent_sdk import AgentSDK, AgentSDKConfig, AgentSpec
 
-sdk = AgentSDK(AgentSDKConfig(database_path=Path(".agent-sdk/state.db")))
-session = await sdk.sessions.create(workspaces=(Path(".").resolve(),))
-agent = sdk.agents.define(AgentSpec(name="assistant", model="openai/gpt-4o-mini"))
-result = await (await sdk.runs.start(session.session_id, agent, "Summarize README.md")).result()
-print(result.output_text)
-await sdk.close()
-```
+from agent_sdk import AgentSDK, AgentSDKConfig, PermissionDecision
+from agent_sdk.permissions import PermissionRule
 
-`AgentSpec.system_prompt=None` uses the packaged default profile. Set
-`system_prompt="Follow the application's review policy."` for an application
-layer; activated Skills are composed as separate prompt layers and recorded in
-the Prompt Manifest.
-
-## Tools and permissions
-
-Register an application Tool before starting a Run:
-
-```python
-from agent_sdk import ToolContext, ToolSpec
-
-async def lookup(context: ToolContext, *, key: str) -> dict[str, str]:
-    return {"run_id": context.run_id, "value": key.upper()}
-
-sdk.tools.register(
-    ToolSpec(
-        name="lookup",
-        description="Look up an application value",
-        input_schema={"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
-        effects=("application.read",),
-    ),
-    lookup,
+workspace = Path(".").resolve()
+sdk = AgentSDK(
+    AgentSDKConfig(
+        database_path=Path(".agent-sdk/state.db"),
+        permission_default="ask",
+        permission_rules=(
+            PermissionRule(outcome="allow", tool="read", path_prefix=workspace),
+            PermissionRule(
+                outcome="allow",
+                tool="bash",
+                path_prefix=workspace,
+                command_prefix=("git", "status"),
+            ),
+            PermissionRule(outcome="deny", tool="write"),
+        ),
+    )
 )
+
+
+async def resolve_next_request(run_id: str) -> None:
+    request = await sdk.permissions.next_request(run_id)
+    await sdk.permissions.resolve(
+        request.request_id,
+        PermissionDecision.allow_once(),
+    )
 ```
 
-Configure `PermissionRule` entries for `allow`, `ask`, or `deny`. Built-in
-`read`, `write`, and `bash` also enforce configured workspace roots and command
-permissions. For `ask`, receive `sdk.permissions.next_request(run_id)` and call
-`sdk.permissions.resolve(request.request_id, PermissionDecision.allow_once())`
-or `PermissionDecision.deny("application denied")`.
+Built-in `read`, `write`, and `bash` enforce both the Session workspace roots and
+the configured policy. The SDK suspends an `ask` decision; the host application
+decides when and how to show it, then calls `allow_once()` or
+`PermissionDecision.deny(...)`.
 
-An MCP server registers namespaced Tools in the same registry and therefore uses
-the same authorization path:
+Connect an MCP server to the same Tool registry and authorization path:
 
 ```python
 from agent_sdk import MCPManager, MCPServerConfig, StdioMCPTransport
 
 manager = MCPManager(sdk.tools)
-await manager.connect(MCPServerConfig(
-    name="company",
-    transport=StdioMCPTransport(command="python", args=("server.py",)),
-))
-# ... run Agents, then: await manager.close()
+await manager.connect(
+    MCPServerConfig(
+        name="company",
+        transport=StdioMCPTransport(
+            command="python",
+            args=("mcp_server.py",),
+            cwd=workspace,
+        ),
+    )
+)
+# Close the manager after its Runs settle: await manager.close()
 ```
 
-Point `AgentSDKConfig.skill_roots` at directories containing `SKILL.md`, then set
-`AgentSpec(skills=("review",))`. Use `sdk.skills.activate("review")` to inspect
-the activated Skill and `PromptComposer.compose(...)` when the application needs
-the resulting Prompt Manifest directly.
+## Generated Workflow admission
 
-## Workflow, Child agents, Trace, and recovery
-
-Treat generated YAML as a candidate: validate it with
-`candidate = sdk.workflows.compile(text)`, obtain application confirmation, and
-only then call `sdk.workflows.start(session.session_id, candidate)`. v0.1 supports
-conditions, bounded loops, and agent nodes. Parent Agents can use the ordinary
-authorized control Tools `spawn_agent`, `send_message`, `list_children`, and
-`wait_child`; the direct `sdk.children` facade is also available.
-
-Subscribe while work is active with `sdk.trace.subscribe(...)`. Afterwards use
-`await sdk.trace.timeline(run_id)` and `await sdk.trace.attribution(run_id)`;
-evaluation and basic success/Tool-failure rates are exposed by `sdk.evaluations`
-and `sdk.analytics`.
-
-On reopen, completed safe-boundary work is read rather than repeated. Unknown
-in-flight work remains interrupted until the application inspects
-`sdk.recovery.pending_requests(run_id)` and calls `sdk.recovery.resolve(...)` to
-retry with duplicate-effect acknowledgement, confirm an evidenced outcome, or
-terminally abort without replay:
+Model-generated YAML is untrusted candidate text. Compile and validate it first,
+obtain explicit application confirmation, and only then start it:
 
 ```python
-await sdk.recovery.resolve(
-    request.request_id,
-    ReconciliationAction.TERMINATE,
-    actor={"type": "operator", "id": "user-123"},
-    evidence={"reason": "application chose not to retry"},
-)
+candidate = sdk.workflows.compile(generated_yaml)  # validates; does not execute
+if not await application_confirms(candidate):
+    raise RuntimeError("workflow was not approved")
+
+handle = await sdk.workflows.start(session.session_id, candidate)
+workflow_result = await handle.result()
 ```
 
-Abort atomically fails the Run with error code `application_resolution_aborted`.
-It does not call the provider or Tool and does not claim whether the interrupted
-external attempt executed.
-See the [quickstart](docs/guides/v01-quickstart.md),
-[recovery guide](docs/guides/v01-recovery.md), and
-[tracing and analysis guide](docs/guides/v01-tracing-and-analysis.md).
+Conditions select a branch from persisted inputs/outputs. Loops require a finite
+`max_iterations`, so a generated Workflow cannot request an unbounded loop.
 
-Normal Session deletion removes SDK-owned events and snapshots, but never deletes
-application-owned workspace files.
+## Observe and recover work
+
+While work is active, use `sdk.trace.subscribe(...)` to consume normalized live
+events. Afterwards, use `sdk.trace.timeline(run_id)` and
+`sdk.trace.attribution(run_id)` to inspect stages, Tool calls, Child progress,
+Workflow state, token usage, evidence, failure stage, contributors, and suggested
+improvements. `sdk.evaluations` and `sdk.analytics` expose deterministic
+evaluation, success-rate, Tool-failure, and Tool-failure-rate queries.
+
+Parent Agents can receive the ordinary authorized `spawn_agent`, `send_message`,
+`list_children`, and `wait_child` Tools. The same operations are available
+directly through `sdk.children`; mailbox messages, progress, and terminal Child
+results are persisted and included in the parent's later Context.
+
+After restart, completed safe-boundary work is read rather than repeated. Unknown
+in-flight work remains interrupted until the application inspects
+`sdk.recovery.pending_requests(run_id)` and resolves it. A terminal decision can
+abort without provider or Tool replay:
+
+```python
+from agent_sdk import AgentSDK, ReconciliationAction
+
+
+async def terminate_unknown_attempt(
+    sdk: AgentSDK,
+    request_id: str,
+) -> None:
+    await sdk.recovery.resolve(
+        request_id,
+        ReconciliationAction.TERMINATE,
+        actor={"type": "operator", "id": "user-123"},
+        evidence={"reason": "application chose not to retry"},
+    )
+```
+
+Termination performs no replay and does not claim whether the interrupted
+external attempt executed. It atomically fails the Run with error code
+`application_resolution_aborted`. Deleting a Session removes SDK-owned
+persisted history, events, and snapshots; it does not delete application-owned
+workspace files.
+
+## v0.1 boundaries
+
+- Python 3.12 and 3.13 are supported; Python 3.14 is outside this release.
+- Install from this repository's source. A package-index release is not assumed.
+- The documented recovery model is one SDK instance in one process; coordinated
+  multi-worker recovery is not part of v0.1.
+- External effects have no exactly-once guarantee. Unknown attempts require an
+  explicit application reconciliation decision.
+- Generated Workflows are never automatically executed after generation; they
+  require compile, validation, application confirmation, and explicit start.
+- Aggregate cross-run multidimensional Trace analysis, useless-result scoring,
+  advanced scheduling, exporters, and additional reliability hardening are
+  post-v0.1 work.
+
+## Documentation
+
+- [v0.1 quickstart](docs/guides/v01-quickstart.md)
+- [Recovery guide](docs/guides/v01-recovery.md)
+- [Tracing and analysis guide](docs/guides/v01-tracing-and-analysis.md)
+- [High-level design](docs/design/00-high-level-design.md)
+- [v0.1 release ledger](docs/plans/releases/v0.1.md)
+
+## Development and verification
+
+Create an isolated Python 3.12 or 3.13 environment, install the project in
+editable mode, and install the development dependencies declared in
+`pyproject.toml`:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -e .
+python -m pip install "pytest>=8,<9" "pytest-asyncio>=0.25,<1" "hypothesis>=6,<7" "ruff>=0.9,<1" "mypy>=1.14,<2" "types-jsonschema>=4.23,<5" "types-PyYAML>=6,<7"
+```
+
+Run the release checks:
+
+```powershell
+python -m pytest -q
+python -m ruff check .
+python -m mypy
+```
+
+The current supported v0.1 full-suite evidence is 2,956 passed with 6 expected
+platform skips. The release ledger records the reproducible environment and the
+remaining post-v0.1 work.
