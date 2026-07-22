@@ -13,10 +13,10 @@ same-operation-id resend adapters remain Phase 3D; Workflow recovery remains
 Phase 4.
 
 The original implementation was based on
-`4e6c13879d1f5b57a997b837c637abc1c9b8f62d`; this correction is based on the
-reviewed Phase 3C2 commit `9f7728e390d7541c657fe14088ebb4b41c450894`.
+`d8b4f99f06c2881a62a8f1f5db3765a16800fd8d`; this correction is based on the
+reviewed Phase 3C2 commit `d5d14ab455982248c589aac2843d3e2b4511f164`.
 The second correction is based on the first fix commit
-`8b33a54b9531d4f9111b44c901538311ee49a0f1`.
+`6876851b8e08a7ceef4d5b6f368eb8762335804b`.
 
 ## Post-review corrections
 

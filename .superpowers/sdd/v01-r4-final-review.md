@@ -1,7 +1,7 @@
 # Agent SDK v0.1 R4 Final Independent Review
 
 Date: 2026-07-21
-Reviewed range: `4eb84b5..0071094`
+Reviewed range: `64d3afe..25f552d`
 
 ## Verdict
 

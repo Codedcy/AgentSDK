@@ -56,7 +56,7 @@ under both baseline v1 and current v2 emission (`1 passed` each).
 
 Provider recovery regression comparison, same 106-test file and command:
 
-- baseline `3b0d094`: `68 passed, 38 failed`;
+- baseline `9c09380`: `68 passed, 38 failed`;
 - current Task 1: `88 passed, 18 failed`;
 - current failures are all members of the baseline failure set; no new failure.
 

@@ -10,7 +10,7 @@
 - Approval: BLOCKED until both Important findings are fixed and independently
   re-reviewed.
 
-Reviewed range: `224219b..2ea0464`.
+Reviewed range: `85f0e0e..2f2048c`.
 
 ## Important findings
 

@@ -4,7 +4,7 @@
 
 Implemented Task 4 only from
 `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md` on baseline
-`d1b2e64`.
+`aaacb5b`.
 
 The change registers the exact Agent control Tool names `spawn_agent`,
 `send_message`, `wait_child`, and `list_children`, routes them through the normal

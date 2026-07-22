@@ -9,9 +9,9 @@ No production code was modified and R2 was not started.
 
 ## Recorded implementation commits
 
-- R1 Task 1: `8fc36ad`, `8c2982b`
-- R1 Task 2: `e6d9f3b`, `2b145a7`
-- R1 Task 3: `e8ce3db`, `8fb3836`, `cd82a6f`
+- R1 Task 1: `621d14e`, `15cd330`
+- R1 Task 2: `15e5d80`, `c6d77a7`
+- R1 Task 3: `0fd4e54`, `5ec1541`, `5d61e25`
 
 ## Historical initial checkpoint evidence
 
@@ -124,10 +124,10 @@ No production code or R2 files were changed.
 ## Final checkpoint re-record
 
 After the R1 whole-slice review fixes, the documentation-only checkpoint was
-refreshed at production HEAD `2f0e922`. The final hardening commits are:
+refreshed at production HEAD `704db69`. The final hardening commits are:
 
-- `d4cd336` - bind and recover canonical built-in permission resources
-- `2f0e922` - repeat recovery of the same unresolved permission request
+- `88a3808` - bind and recover canonical built-in permission resources
+- `704db69` - repeat recovery of the same unresolved permission request
 
 The final independent review reports Critical 0 / Important 0 / Minor 0 and
 `Ready to proceed to R2: Yes`.

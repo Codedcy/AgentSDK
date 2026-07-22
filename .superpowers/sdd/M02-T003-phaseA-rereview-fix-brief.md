@@ -2,7 +2,7 @@
 
 ## Context and objective
 
-The independent re-review of `db7cd77` / `83c1d54` returned REQUEST CHANGES:
+The independent re-review of `b8888a2` / `fcc293b` returned REQUEST CHANGES:
 
 - Spec: C0 / I2 / M0
 - Quality: C0 / I3 / M0
@@ -12,7 +12,7 @@ entering Artifact publish/read/delete, Phase B, or M02-T004. Preserve the
 already-approved coordinator, read-snapshot, per-migration transaction,
 checksum bootstrap, schema-generation fence, and cancellation behavior.
 
-Use strict RED/GREEN. Each new regression test must fail against `83c1d54` for
+Use strict RED/GREEN. Each new regression test must fail against `fcc293b` for
 the expected reason before production code changes. Append exact evidence to
 `.superpowers/sdd/M02-T003-phaseA-review-fix-report.md`.
 

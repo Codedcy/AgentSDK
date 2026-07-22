@@ -4,7 +4,7 @@ Date: 2026-07-17 (Asia/Shanghai)
 
 Source brief: `.superpowers/sdd/M02-T002-phase5c-brief.md`
 
-Base approved Phase 5B commit: `381dc43`
+Base approved Phase 5B commit: `813c58d`
 
 ## Outcome
 
@@ -21,11 +21,11 @@ and no M02-T003 or M02-T004 behavior was implemented.
 
 ## Commits
 
-- `39686dc` - `docs: brief Phase 5C fault recovery gates`
-- `64b8854` - `test(faults): cover subprocess recovery boundaries`
-- `70fb21d` - `fix(recovery): resume committed tool outcomes after hard exit`
-- `5cb53e7` - `test(workflow): reach interruption through recovery scanner`
-- `b91c7c2` - `test(faults): execute MCP hard-exit recovery through manager`
+- `742ae1a` - `docs: brief Phase 5C fault recovery gates`
+- `68d2d2e` - `test(faults): cover subprocess recovery boundaries`
+- `7c50d23` - `fix(recovery): resume committed tool outcomes after hard exit`
+- `40711bd` - `test(workflow): reach interruption through recovery scanner`
+- `bccca14` - `test(faults): execute MCP hard-exit recovery through manager`
 
 The implementation changes only `src/agent_sdk/runtime/recovery.py`. The other
 Phase 5C changes are the approved brief, fault/E2E tests, the replacement of a
@@ -150,7 +150,7 @@ All checks passed!
 uv.exe run --frozen --python 3.13 mypy src
 Success: no issues found in 75 source files
 
-git diff --check 381dc43..HEAD
+git diff --check 813c58d..HEAD
 exit 0
 ```
 
@@ -165,7 +165,7 @@ Migration hashes remained:
 - `0002_idempotency.sql`: `ab0169f70c28946a0564cc57a8bce97b9f5164819930cad71b96aaba8d0bc02c`
 - `0003_leases.sql`: `63eaef03dcd1c10aabb6ce654374b8ae4d4bcc40477742a992ab2e26f933b7ee`
 
-The exact scope audit from `381dc43` found no diff in `pyproject.toml`,
+The exact scope audit from `813c58d` found no diff in `pyproject.toml`,
 `uv.lock`, storage, migrations, task ledgers, or progress ledgers.
 
 ## Distribution and clean-install gates
@@ -212,7 +212,7 @@ progress ledgers intentionally remain unchanged until those approvals.
 ## Independent review finding closure
 
 The first independent Phase 5C review returned no Critical finding and two
-test-evidence findings: I1 and M1. Commit `3c7fe7c` closes both without changing
+test-evidence findings: I1 and M1. Commit `78f6df6` closes both without changing
 production code, public API, schema, dependencies, or ledgers.
 
 ### I1 - distinguish the Tool side effect from the Store commit
@@ -284,10 +284,10 @@ All checks passed!
 mypy src
 Success: no issues found in 75 source files
 
-git diff --check 00f576b..HEAD
+git diff --check 72b9baf..HEAD
 exit 0
 ```
 
-The post-review scope from `00f576b` contains only
+The post-review scope from `72b9baf` contains only
 `tests/faults/test_subprocess_recovery.py` and this report. The task/progress
 ledgers and M02-T003/M02-T004 remain untouched pending fresh independent review.

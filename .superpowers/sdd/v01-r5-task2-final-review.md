@@ -1,7 +1,7 @@
 # v0.1 R5 Task 2 Final Independent Review
 
 Date: 2026-07-21
-Reviewed range: `0a1f68a..648190e`
+Reviewed range: `8656cae..a99be32`
 
 ## Verdict
 

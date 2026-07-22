@@ -1,6 +1,6 @@
 # M02-T002 Whole-Review Quality Fix Brief
 
-Source review: fresh whole-task review of `ff0e181..3732004`.
+Source review: fresh whole-task review of `24b624f..59e5ca5`.
 The review found Spec C0/I0/M0 and Task Quality C0/I2/M2. This fix closes only
 the two Important runtime scalability findings without entering M02-T003 or
 M02-T004 and without changing public APIs, Store protocol, migrations, or

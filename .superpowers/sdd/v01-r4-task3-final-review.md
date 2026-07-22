@@ -23,4 +23,4 @@
 - Strict mypy: clean.
 - Ruff: clean.
 - Diff check: clean.
-- Reviewed fix: `3e71c9a`.
+- Reviewed fix: `da14bb6`.

@@ -1,6 +1,6 @@
 # v0.1 R3 Task 3 Final Approval
 
-Review range: `f34d2fc..9fbcd16`
+Review range: `8825897..774ae6c`
 
 Verdict: **APPROVED**
 
@@ -94,7 +94,7 @@ All checks passed!
 mypy --strict src/agent_sdk
 Success: no issues found in 92 source files
 
-git diff --check f34d2fc..9fbcd16
+git diff --check 8825897..774ae6c
 clean
 ```
 

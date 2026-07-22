@@ -1,6 +1,6 @@
 # v0.1 R3 Task 3 Independent Review
 
-Review range: `c0c993f..adea2de`
+Review range: `794739f..f80a956`
 
 Verdict: **CHANGES_REQUIRED**
 
@@ -165,7 +165,7 @@ mypy --strict src/agent_sdk/context src/agent_sdk/context_runtime.py
               src/agent_sdk/storage/sqlite.py
 Success: no issues found in 22 source files
 
-git diff --check c0c993f..adea2de
+git diff --check 794739f..f80a956
 clean
 ```
 

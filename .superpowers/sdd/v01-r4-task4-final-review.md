@@ -22,4 +22,4 @@
 - Fresh focused gate: 17 passed.
 - Ruff: clean.
 - Strict mypy: clean.
-- Reviewed commit: `c1e570b`.
+- Reviewed commit: `441d3d4`.

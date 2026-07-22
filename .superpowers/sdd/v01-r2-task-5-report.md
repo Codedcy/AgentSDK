@@ -9,13 +9,13 @@ No production code was modified and R3 was not started.
 
 ## Recorded implementation commits and reviews
 
-- R2 Task 1: `e3494ae`, `1fc9c72` - final review Spec approved / Quality
+- R2 Task 1: `e225ac6`, `7e0b431` - final review Spec approved / Quality
   approved.
-- R2 Task 2: `9b23e5a`, `cfdf43a` - final review Spec approved / Quality
+- R2 Task 2: `68289d5`, `9b7fbb4` - final review Spec approved / Quality
   approved.
-- R2 Task 3: `e4624f7`, `36a7268` - final review Spec approved / Quality
+- R2 Task 3: `72f069a`, `81fb5b3` - final review Spec approved / Quality
   approved.
-- R2 Task 4: `04d8ee2` - final review Spec approved / Quality approved.
+- R2 Task 4: `52fde43` - final review Spec approved / Quality approved.
 
 ## Fresh checkpoint evidence
 

@@ -13,8 +13,8 @@ complete. It records no production-code change and does not start R4.
   Quality PASS.
 - Task 3 transition review: Critical 0 / Important 0 / Minor 0; Spec PASS;
   Quality PASS.
-- Task 4 implementation: `2ea0464`; recovery-evidence fix: `3a4b65f`; final
-  approval: `b98e93f`. The final re-review reports Critical 0 / Important 0 /
+- Task 4 implementation: `2f2048c`; recovery-evidence fix: `79996db`; final
+  approval: `ab1d082`. The final re-review reports Critical 0 / Important 0 /
   Minor 0; Spec PASS; Quality PASS.
 
 ## Ledger facts

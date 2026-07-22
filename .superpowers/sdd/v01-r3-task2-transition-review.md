@@ -11,7 +11,7 @@
 - Approval: **NOT APPROVED**
 
 The two changed transition documents accurately record Task 2 implementation
-commit `c3dc154`, final re-review commit `3d8458e`, C0/I0/M0, the 102-test
+commit `3f23363`, final re-review commit `e5c646f`, C0/I0/M0, the 102-test
 Context gate, and R3 as still `in_progress`. The Task 3 Step 1 file and the
 Windows pytest command with explicit `pytest_asyncio.plugin` are also accurate.
 One required durable-contract migration is missing.
@@ -31,7 +31,7 @@ One required durable-contract migration is missing.
   - `R3 Task 2 remains pending/unstarted`;
   - the exact old progress status saying Task 2 is pending.
 
-  Fresh verification after `1aed2b0`:
+  Fresh verification after `0f02efd`:
 
   ```text
   pytest tests/docs/test_v01_release_ledger.py -q
@@ -49,7 +49,7 @@ One required durable-contract migration is missing.
 
   - R3 remains `in_progress`;
   - Tasks 1-2 are complete;
-  - commits `c3dc154` and `3d8458e`;
+  - commits `3f23363` and `e5c646f`;
   - C0/I0/M0 and the 102-test evidence;
   - Task 3 Step 1,
     `tests/integration/prompts/test_runtime_prompt.py`, and the exact
@@ -60,8 +60,8 @@ One required durable-contract migration is missing.
 
 ## Fact and scope checks
 
-- `c3dc154` is the Task 2 safety-fix commit: **PASS**.
-- `3d8458e` is the final C0/I0/M0 independent re-review: **PASS**.
+- `3f23363` is the Task 2 safety-fix commit: **PASS**.
+- `e5c646f` is the final C0/I0/M0 independent re-review: **PASS**.
 - `102 passed`, Ruff clean, and strict mypy clean match the final evidence:
   **PASS**.
 - Both documents keep R3 `in_progress` and do not mark R3 complete: **PASS**.
@@ -69,9 +69,9 @@ One required durable-contract migration is missing.
   as expected before RED: **PASS**.
 - The Task 3 command matches this environment's disabled plugin autoload and
   explicit asyncio plugin requirement: **PASS**.
-- Commit `1aed2b0` changes only
+- Commit `0f02efd` changes only
   `docs/plans/releases/v0.1.md` and `.superpowers/sdd/progress.md`: **PASS**.
-- `git diff --check 3d8458e..1aed2b0`: **clean**.
+- `git diff --check e5c646f..0f02efd`: **clean**.
 
 The transition can be approved after the stale documentation contract test is
 migrated and passes.

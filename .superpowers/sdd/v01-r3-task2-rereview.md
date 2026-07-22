@@ -10,8 +10,8 @@
 - Summary: **C0 / I0 / M0**
 - Approval: **APPROVED**
 
-The fix commit `c3dc154` resolves both Important findings from the independent
-review at `36e0b91`. No remaining Critical or Important issue blocks Task 2.
+The fix commit `3f23363` resolves both Important findings from the independent
+review at `d016fcf`. No remaining Critical or Important issue blocks Task 2.
 
 ## Original finding verification
 
@@ -79,7 +79,7 @@ All checks passed!
 mypy --strict src/agent_sdk/context
 Success: no issues found in 9 source files
 
-git diff --check 36e0b91..c3dc154
+git diff --check d016fcf..3f23363
 clean
 ```
 

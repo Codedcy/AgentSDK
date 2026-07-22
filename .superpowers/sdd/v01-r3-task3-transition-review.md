@@ -1,6 +1,6 @@
 # v0.1 R3 Task 3 Transition Review
 
-Review range: `2bd48e3..e105dfe`
+Review range: `c94ea77..83a8b4d`
 
 Verdict: **APPROVED**
 
@@ -16,7 +16,7 @@ Verdict: **APPROVED**
   `.superpowers/sdd/progress.md`, `docs/plans/releases/v0.1.md`, and
   `tests/docs/test_v01_release_ledger.py`.
 - Both operational records mark R3 Task 3 complete and identify final
-  implementation/fix checkpoint `9fbcd16` and final approval `2bd48e3`.
+  implementation/fix checkpoint `774ae6c` and final approval `c94ea77`.
 - The recorded Task 3 approval is Critical 0 / Important 0 / Minor 0, Spec
   PASS, and Quality PASS. The retained implementation evidence
   (`521 passed, 1 skipped`; the 25-test Workflow/recovery/release gate; Ruff;
@@ -41,7 +41,7 @@ pytest -p pytest_asyncio.plugin tests/docs -q
 ruff check tests/docs/test_v01_release_ledger.py
 All checks passed!
 
-git diff --check 2bd48e3..e105dfe
+git diff --check c94ea77..83a8b4d
 clean
 ```
 

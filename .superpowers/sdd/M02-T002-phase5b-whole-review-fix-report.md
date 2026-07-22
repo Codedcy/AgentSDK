@@ -2,9 +2,9 @@
 
 Date: 2026-07-17
 
-Baseline: `d80e2e3`
+Baseline: `b5b5fc8`
 
-Implementation head: `9102544`
+Implementation head: `3d9f412`
 Source of truth: `M02-T002-phase5b-whole-review-fix-brief.md`
 
 ## Outcome
@@ -18,12 +18,12 @@ entered.
 
 Implementation commits:
 
-- `d605adb` — `fix(recovery): bound strict Tool evidence validation`
-- `74fcb16` — `fix(recovery): certify exact ready model histories`
-- `532839a` — `fix(recovery): normalize cumulative terminal decisions`
-- `9102544` — `fix(workflow): bind terminal recovery evidence atomically`
+- `8dfa921` — `fix(recovery): bound strict Tool evidence validation`
+- `7b168ac` — `fix(recovery): certify exact ready model histories`
+- `cd1397c` — `fix(recovery): normalize cumulative terminal decisions`
+- `3d9f412` — `fix(workflow): bind terminal recovery evidence atomically`
 
-The planning commit is `4b9c9da`.
+The planning commit is `879af4d`.
 
 ## Finding 4 — total strict Tool evidence validation
 
@@ -220,7 +220,7 @@ All checks passed!
 uv.exe run --python 3.13 mypy src
 Success: no issues found in 75 source files
 
-git diff --check d80e2e3..HEAD
+git diff --check b5b5fc8..HEAD
 exit 0
 ```
 
@@ -232,7 +232,7 @@ Fresh import/signature/schema smoke:
   `ReconciliationService.resolve` signatures;
 - SQLite schema version remains 3.
 
-The final scope audit from `d80e2e3` contains only the implementation, tests,
+The final scope audit from `b5b5fc8` contains only the implementation, tests,
 brief, and report listed above. `pyproject.toml`, `uv.lock`, migrations, docs,
 M02-T003, and M02-T004 are unchanged.
 
@@ -248,7 +248,7 @@ addendum below.
 
 ## Independent whole-Phase-5B re-review closure
 
-A fresh read-only review compared `d80e2e3..9102544`, read the complete repair
+A fresh read-only review compared `b5b5fc8..3d9f412`, read the complete repair
 brief, inspected every production and test diff, and traced each of I1–I4 through
 its public boundary and Store/Workflow integration.
 

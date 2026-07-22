@@ -2,8 +2,8 @@
 
 Date: 2026-07-17
 Branch: `feature/agent-sdk-implementation`
-Baseline: `ac7f0ca` (`feat(storage): add checksummed schema migration fence`)
-Implementation: `db7cd77` (`fix(storage): harden phase A migration boundaries`)
+Baseline: `065d4ef` (`feat(storage): add checksummed schema migration fence`)
+Implementation: `b8888a2` (`fix(storage): harden phase A migration boundaries`)
 
 ## Scope
 
@@ -148,7 +148,7 @@ results are the successful storage and full-project runs above.
 
 ### Status and scope
 
-DONE at implementation commit `f6e6b8f`. This second surgical repair closes
+DONE at implementation commit `9c0299c`. This second surgical repair closes
 all five findings in `M02-T003-phaseA-rereview-fix-brief.md`. Phase B remains
 blocked until a fresh independent review reports Spec C0/I0 and Quality C0/I0.
 No Artifact publish/read/delete behavior, Phase B implementation, M02-T004
@@ -247,7 +247,7 @@ All commands ran from
 
 ### Status and scope
 
-DONE at implementation commit `3bceab5`. This final surgical repair closes the
+DONE at implementation commit `a018ad0`. This final surgical repair closes the
 two findings in `M02-T003-phaseA-second-rereview-fix-brief.md`. Its production
 diff is limited to the private SQLite lexer and the migration inspection error
 boundary. Phase B and M02-T004 remain blocked pending a fresh independent
@@ -285,7 +285,7 @@ regressions:
 
 ### Strict RED/GREEN evidence
 
-- Tcl-variable RED against the `7ed2465` production baseline:
+- Tcl-variable RED against the `3777256` production baseline:
   `11 failed, 5 passed, 104 deselected in 3.29s`. The failures comprised five
   valid `::`/suffix longest-match forms rejected by the lexer, two
   whitespace/comment collisions, and four unclosed suffixes accepted by the

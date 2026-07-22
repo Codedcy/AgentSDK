@@ -6,7 +6,7 @@ Global Constraints and Step 4 Workflow paragraphs.
 
 ## Start point and ownership
 
-- Start from commit `7c234b7469f95cebc314f1d44c697805eb0ea274`.
+- Start from commit `9a486a6a0b3dac84691a444ff9da724204dcc50e`.
 - Work only in `D:\code\AgentSDK\.worktrees\agent-sdk-implementation`.
 - You own production/tests needed for Phase 4A, plus this slice report.
 - Preserve unrelated user work and all Phase 1-3 behavior.

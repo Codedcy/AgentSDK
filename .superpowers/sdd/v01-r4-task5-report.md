@@ -1,7 +1,7 @@
 # v0.1 R4 Task 5 Checkpoint Report
 
 Date: 2026-07-21
-Baseline HEAD: `af27bf3`
+Baseline HEAD: `f0cfcab`
 
 ## Scope
 
@@ -16,8 +16,8 @@ and `list_children`.
 
 Tasks 1-4 were independently approved, with final review outcomes of Critical 0
 / Important 0 / Minor 0, Spec approved, and Quality approved. Their commits are
-`23c2c39`, `5466757`, `fd6d728`, `f320642`, `ae6aa89`, `1326fb8`, `b90c8f7`,
-`3e71c9a`, and `c1e570b`.
+`72d4d57`, `68d79f6`, `6a48bac`, `88193ad`, `eb9f3b0`, `d7834b6`, `2aa2d38`,
+`da14bb6`, and `441d3d4`.
 
 ## Fresh checkpoint evidence
 

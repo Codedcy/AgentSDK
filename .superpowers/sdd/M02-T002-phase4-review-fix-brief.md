@@ -2,7 +2,7 @@
 
 ## Review verdict
 
-The whole-Phase-4 independent review of `7c234b7..39485e1` was **Not
+The whole-Phase-4 independent review of `9a486a6..92d389f` was **Not
 Approved**: Spec Compliance C0/I3/M0 and Task Quality C0/I1/M0. This brief is
 the complete fix boundary. Do not start Phase 5, M02-T003, or M02-T004.
 

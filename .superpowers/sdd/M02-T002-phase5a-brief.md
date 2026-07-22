@@ -4,8 +4,8 @@
 
 Implement strict reconciliation admission plus explicit
 `CONFIRM_NOT_EXECUTED` and `RETRY` transitions from
-`M02-T002-phase5-plan.md`. Phase 4 is approved at `20cf09e` with approval ledger
-`975ed73`. Do not implement `CONFIRM_COMPLETED`, T004 termination/cancellation,
+`M02-T002-phase5-plan.md`. Phase 4 is approved at `9e080e6` with approval ledger
+`dcb91f2`. Do not implement `CONFIRM_COMPLETED`, T004 termination/cancellation,
 subprocess release gates, M02-T003, or M02-T004 in this slice.
 
 ## Required API and exports

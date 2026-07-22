@@ -1,7 +1,7 @@
 # M02-T002 Whole Phase 5B Review-Fix Brief
 
 Source of truth: the approved Phase 5 operational plan and Phase 5B briefs,
-plus the fresh whole-Phase-5B read-only review at HEAD `d80e2e3`. This repair
+plus the fresh whole-Phase-5B read-only review at HEAD `b5b5fc8`. This repair
 slice closes four Important functional findings. It must not enter Phase 5C,
 T003, or T004.
 

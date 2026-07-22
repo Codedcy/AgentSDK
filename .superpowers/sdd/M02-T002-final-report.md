@@ -2,7 +2,7 @@
 
 Date: 2026-07-17 (Asia/Shanghai)
 
-Implementation range: `ff0e181..5ff955b`
+Implementation range: `24b624f..5da9e79`
 
 ## Outcome
 
@@ -50,7 +50,7 @@ the production scanner just beyond expiry, reopens the state, and proves:
 
 ## Independent verdict
 
-Final whole-task review at `5ff955b`:
+Final whole-task review at `5da9e79`:
 
 - Spec Compliance: C0 / I0 / M0.
 - Task Quality: C0 / I0 / M2.

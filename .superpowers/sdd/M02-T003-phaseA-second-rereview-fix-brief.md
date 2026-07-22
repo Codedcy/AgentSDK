@@ -2,7 +2,7 @@
 
 ## Context and scope
 
-Independent review of `fcf3986..ab00bb8` returned REQUEST CHANGES:
+Independent review of `cdb699d..663ecb0` returned REQUEST CHANGES:
 
 - Spec: C0 / I1 / M0
 - Quality: C0 / I1 / M0
@@ -13,7 +13,7 @@ transaction/cancellation, checksum bootstrap, schema-generation fence, busy,
 corrupt-content, and resource-boundary behavior. Do not enter Phase B or
 M02-T004 and do not edit task checkboxes/indexes.
 
-Use strict RED/GREEN against `ab00bb8`. Append exact evidence to
+Use strict RED/GREEN against `663ecb0`. Append exact evidence to
 `.superpowers/sdd/M02-T003-phaseA-review-fix-report.md`.
 
 ## Fix 1 - complete SQLite `$` variable token longest matching

@@ -3,7 +3,7 @@
 ## Scope
 
 This change fixes both Important findings from
-`v01-r3-task4-review.md` (review commit `ca52ffb`) without changing release or
+`v01-r3-task4-review.md` (review commit `4d0bb5b`) without changing release or
 progress documents:
 
 - I1: strictly validate every durable prepared provider message and Tool schema.

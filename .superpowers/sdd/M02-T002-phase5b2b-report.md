@@ -3,7 +3,7 @@
 ## Status
 
 DONE. Phase 5B2B integrates confirmed Run outcomes with the existing explicit
-Workflow recovery coordinator. The implementation commit is `3bacf27`
+Workflow recovery coordinator. The implementation commit is `489b60a`
 (`feat(recovery): certify workflow terminal projection`). It is ready for the
 required independent Spec and Quality review; this report does not claim that
 review approval.
@@ -242,7 +242,7 @@ any of those items.
 
 This addendum is authoritative over the earlier verification counts and scope
 summary. Independent review found two blocking gaps. Both are closed in
-implementation commit `069ec71` (`fix(recovery): close workflow projection
+implementation commit `15132ed` (`fix(recovery): close workflow projection
 review gaps`) and are ready for re-review; this report does not self-approve the
 independent review.
 
@@ -366,14 +366,14 @@ change. Phase 5C scope remains unchanged.
 ## Independent re-review closure addendum
 
 Independent re-review confirmed the original I1 and I2 findings closed, then
-found one new blocking regression introduced by `069ec71`. It is fixed in
-implementation commit `a5829c7` (`fix(workflow): require session for node
+found one new blocking regression introduced by `15132ed`. It is fixed in
+implementation commit `2f2db60` (`fix(workflow): require session for node
 transitions`) and is ready for another independent re-review. This report does
 not self-approve that review.
 
 ### Universal Session existence on node transitions
 
-`069ec71` replaced the former `_node_transition` precondition tuple while
+`15132ed` replaced the former `_node_transition` precondition tuple while
 adding exact terminal projection evidence. That accidentally removed the
 universal `SnapshotPrecondition("session", session_id)`. Terminal recovery still
 carried an exact Session precondition, but `start_node` and ordinary live

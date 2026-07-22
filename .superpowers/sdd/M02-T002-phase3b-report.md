@@ -12,7 +12,7 @@ Phase 3B does not scan stale Runs, extend `RunStatus`, expose recovery admission
 resume checkpoints, register provider recovery adapters, or change Workflow
 recovery/schema/public behavior.
 
-Base commit: `ade5f55d832f9fb76907cfcafc29adeb77178600`.
+Base commit: `c9cd6ef50f0e28b10b8744c1ebecadd7a6e64106`.
 
 ## Delivered behavior
 

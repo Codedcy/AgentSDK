@@ -169,7 +169,7 @@ git diff --check:                         exit 0 (line-ending notices only)
 
 The broader Workflow comparison (`test_program.py`, `test_control_execution.py`,
 and `test_control_recovery.py`) is `19 passed, 5 failed` both on the review-fix
-worktree and an isolated detached `ae4ee7d` baseline. The same five pre-existing
+worktree and an isolated detached `ade18c4` baseline. The same five pre-existing
 recovery tests fail with `related terminal run recovery evidence changed after
 certification`; therefore this review fix introduces no Workflow regression delta.
 

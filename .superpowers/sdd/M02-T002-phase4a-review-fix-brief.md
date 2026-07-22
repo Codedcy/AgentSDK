@@ -1,7 +1,7 @@
 # M02-T002 Phase 4A Review-Fix Brief
 
 Fix only the three independently reproduced Important findings from the review
-of `d74f04a..a50b050`. Source contracts remain
+of `8c22fa0..90d5e8f`. Source contracts remain
 `M02-T002-phase4-plan.md`, `M02-T002-phase4a-brief.md`, and the M02-T002 Step 4
 Workflow recovery paragraphs. Do not begin Phase 4B and do not add a Workflow
 lease/schema/state.

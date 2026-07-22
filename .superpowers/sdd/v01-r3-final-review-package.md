@@ -1,37 +1,37 @@
-# Review package: 2774a94..HEAD
+# Review package: aa2d410..HEAD
 
 ## Commits
-f50b96a docs: approve v0.1 R3 checkpoint fixes
-bc8e745 docs: correct R3 checkpoint handoff
-38a454b docs: review v0.1 R3 checkpoint
-a6a45aa docs: record v0.1 R3 checkpoint
-b98e93f test: approve R3 task 4 recovery fixes
-3a4b65f fix: authenticate prepared model recovery evidence
-ca52ffb test: review R3 task 4 recovery boundaries
-2ea0464 feat: apply durable context to every model call
-224219b test: review R3 task 3 transition
-e105dfe docs: advance R3 task 3 checkpoint
-2bd48e3 test: approve R3 task 3 prompt manifests
-9fbcd16 fix: authenticate legacy snapshot preconditions
-f34d2fc test: final review R3 task 3 compatibility
-aa3fcac fix: authenticate legacy run creation
-fc72ae4 test: rereview R3 task 3 fixes
-76c33ea fix: secure run creation and skill preflight
-1a7af37 test: review R3 task 3 prompt manifests
-adea2de feat: compose runtime prompt manifests
-c0c993f test: approve R3 task 2 transition
-ad32767 test: advance R3 release ledger contract
-9e88cf7 test: review R3 task 2 transition
-1aed2b0 docs: advance v0.1 R3 task 2 checkpoint
-3d8458e test: approve R3 task 2 fixes
-c3dc154 fix: enforce context compaction safety
-36e0b91 test: review R3 task 2 context levels
-e3fea50 test: migrate context compaction expectations
-b284c49 feat: implement automatic context levels
-103b98f docs: advance v0.1 R3 context checkpoint
-ead396b fix: validate context tool calls and refs
-ba9d05d fix: harden deterministic context strategies
-2bda910 feat: add deterministic context strategies
+72dd259 docs: approve v0.1 R3 checkpoint fixes
+1e44ee0 docs: correct R3 checkpoint handoff
+66107cb docs: review v0.1 R3 checkpoint
+fcc8829 docs: record v0.1 R3 checkpoint
+ab1d082 test: approve R3 task 4 recovery fixes
+79996db fix: authenticate prepared model recovery evidence
+4d0bb5b test: review R3 task 4 recovery boundaries
+2f2048c feat: apply durable context to every model call
+85f0e0e test: review R3 task 3 transition
+83a8b4d docs: advance R3 task 3 checkpoint
+c94ea77 test: approve R3 task 3 prompt manifests
+774ae6c fix: authenticate legacy snapshot preconditions
+8825897 test: final review R3 task 3 compatibility
+37e4698 fix: authenticate legacy run creation
+9c2abb8 test: rereview R3 task 3 fixes
+7f33d89 fix: secure run creation and skill preflight
+8f85363 test: review R3 task 3 prompt manifests
+f80a956 feat: compose runtime prompt manifests
+794739f test: approve R3 task 2 transition
+43b8c60 test: advance R3 release ledger contract
+7058cf2 test: review R3 task 2 transition
+0f02efd docs: advance v0.1 R3 task 2 checkpoint
+e5c646f test: approve R3 task 2 fixes
+3f23363 fix: enforce context compaction safety
+d016fcf test: review R3 task 2 context levels
+f187176 test: migrate context compaction expectations
+70b091e feat: implement automatic context levels
+285364d docs: advance v0.1 R3 context checkpoint
+93505aa fix: validate context tool calls and refs
+38e7d2d fix: harden deterministic context strategies
+dd93fb2 feat: add deterministic context strategies
 
 ## Files changed
  .superpowers/sdd/progress.md                       |  28 +-
@@ -119,10 +119,10 @@ index 0912d83..1801356 100644
 +v0.1 current implementation status: R0-R3 completed; R4 pending
  v0.1 M02-T003 decision: freeze after the committed Phase A focused checkpoint; absorb its pending full storage/project/build gates into the one release-candidate gate
  v0.1 deferred work: M02-T003 Artifact Phases B-D, M02-T004 advanced controls/sync, multi-worker exact recovery, complex Workflow scheduling, advanced Child scheduling, vector retrieval, advanced analytics/exporters, compatibility/performance/conformance hardening
- v0.1 R0 Task 1: complete (commits 0edb3c9 and 723f118; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
- v0.1 R0 plan ordering correction: 83dce26
- v0.1 R0 Task 2: complete (commits 908fe01 and 1a59ad2; review Spec approved / Quality approved; fresh 3 tests passed and Ruff clean)
- v0.1 R0 checkpoint: complete (2026-07-17; commit: 74c1e3b)
+ v0.1 R0 Task 1: complete (commits 2e0d164 and 6ff31b0; review Spec approved / Quality approved; fresh 2 tests passed and Ruff clean)
+ v0.1 R0 plan ordering correction: e94b18c
+ v0.1 R0 Task 2: complete (commits bd12f29 and 1ce4980; review Spec approved / Quality approved; fresh 3 tests passed and Ruff clean)
+ v0.1 R0 checkpoint: complete (2026-07-17; commit: ef0e4da)
  v0.1 R0 checkpoint exact fresh evidence:
  ```text
  $ .\.venv\Scripts\python.exe -m pytest tests\docs\test_v01_release_ledger.py tests\e2e\test_v01_release.py tests\e2e\test_vertical_slice.py -q
@@ -135,7 +135,7 @@ index 0912d83..1801356 100644
  $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
  Success: no issues found in 10 source files
 
- $ git diff --check 56d60a8..309d63c
+ $ git diff --check f9beb63..826a32b
  clean
  ```
 -v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md
@@ -145,17 +145,17 @@ index 0912d83..1801356 100644
 -v0.1 R3 remains pending; R3 implementation has not started
 +v0.1 active next plan: docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md
 +v0.1 resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py -q`
-+v0.1 R3 Task 1 deterministic L0-L2 is complete (commits 2bda910, ba9d05d, and ead396b; began with `tests/unit/context/test_deterministic_strategies.py`)
++v0.1 R3 Task 1 deterministic L0-L2 is complete (commits dd93fb2, 38e7d2d, and 93505aa; began with `tests/unit/context/test_deterministic_strategies.py`)
 +v0.1 R3 Task 1 final review: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 +v0.1 R3 Task 1 controller gates: 42 deterministic strategy tests; 48 context integration tests; Ruff clean; strict mypy clean across 4 files; diff-check clean
 +v0.1 R3 Task 2: complete (automatic L0-L4 recommendation/application; `allow_lossy=False` caps L3/L4 at exact L2; distinct LiteLLM L3 summary and L4 rebase with purpose `context_compaction`; same-Session recursive evidence; atomic Context View/capsule/event persistence)
 +v0.1 R3 Task 2 fallback contract: invalid, timeout, schema, reference, input-bound, or output-budget L3/L4 results use the exact deterministic L2 renderer without failing the main Run
-+v0.1 R3 Task 2 final safety fix: `c3dc154`; final independent re-review: `3d8458e`, Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
++v0.1 R3 Task 2 final safety fix: `3f23363`; final independent re-review: `e5c646f`, Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 +v0.1 R3 Task 2 fresh gates: Context 102 passed; Ruff clean; strict mypy clean; diff-check clean
-+v0.1 R3 Task 3: complete (implementation `9fbcd16`; final approval `2bd48e3`; Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS)
++v0.1 R3 Task 3: complete (implementation `774ae6c`; final approval `c94ea77`; Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS)
 +v0.1 R3 Task 3 delivered durable `AgentSpec`/`DurableAgentSpec` prompt and Context fields; public `SkillRegistry` exposure with one shared direct/Workflow/subagent preflight; ordered default/application/Skill prompt layers with persisted manifest; redacted public `run.created` schema v2; and authenticated genuine R2 schema-v1 recovery compatibility.
 +v0.1 R3 Task 3 effective evidence: controller mainline 201 passed; implementer gate 521 passed, 1 skipped; Workflow/recovery/release gate 25 passed; Ruff clean; strict mypy clean across 92 source files.
-+v0.1 R3 Task 4: complete (implementation `2ea0464`; recovery-evidence fix `3a4b65f`; final approval `b98e93f`; Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS)
++v0.1 R3 Task 4: complete (implementation `2f2048c`; recovery-evidence fix `79996db`; final approval `ab1d082`; Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS)
 +v0.1 R3 Task 4 final approval: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS
 +v0.1 R3 Task 4 delivered ContextMiddleware preparation before each new model call, durable exact prepared requests, authenticated Context View/Prompt Manifest bindings, strict provider request validation, and no-side-effect failure for corrupted recovery evidence.
 +v0.1 R3 checkpoint: complete (2026-07-20; Tasks 1-4 approved)
@@ -174,7 +174,7 @@ index 0000000..a380022
 +
 +## Status
 +
-+PASS. Independent review findings `C0 / I2 / M0` from `36e0b91` are fixed.
++PASS. Independent review findings `C0 / I2 / M0` from `d016fcf` are fixed.
 +
 +## Scope
 +
@@ -273,8 +273,8 @@ index 0000000..5cf9f57
 +- Summary: **C0 / I0 / M0**
 +- Approval: **APPROVED**
 +
-+The fix commit `c3dc154` resolves both Important findings from the independent
-+review at `36e0b91`. No remaining Critical or Important issue blocks Task 2.
++The fix commit `3f23363` resolves both Important findings from the independent
++review at `d016fcf`. No remaining Critical or Important issue blocks Task 2.
 +
 +## Original finding verification
 +
@@ -342,7 +342,7 @@ index 0000000..5cf9f57
 +mypy --strict src/agent_sdk/context
 +Success: no issues found in 9 source files
 +
-+git diff --check 36e0b91..c3dc154
++git diff --check d016fcf..3f23363
 +clean
 +```
 +
@@ -463,7 +463,7 @@ index 0000000..62ce6cd
 +mypy --strict src/agent_sdk/context
 +Success: no issues found in 9 source files
 +
-+git diff --check 103b98f..e3fea50
++git diff --check 285364d..f187176
 +clean
 +```
 +
@@ -488,15 +488,15 @@ index 0000000..b0f4744
 +- Summary: **C0 / I0 / M0**
 +- Approval: **APPROVED**
 +
-+Commit `ad32767` closes the sole Important finding from the transition review at
-+`9e88cf7`.
++Commit `43b8c60` closes the sole Important finding from the transition review at
++`7058cf2`.
 +
 +## I1 verification
 +
 +**Resolved.**
 +
 +- The documentation contract now requires Task 2 implementation/review commits
-+  `c3dc154` and `3d8458e`, the 102-test evidence, and Task 2 completion.
++  `3f23363` and `e5c646f`, the 102-test evidence, and Task 2 completion.
 +- It requires the Task 3 Step 1 resume point,
 +  `tests/integration/prompts/test_runtime_prompt.py`, and the exact Windows
 +  pytest command with disabled plugin autoload plus explicit
@@ -518,7 +518,7 @@ index 0000000..b0f4744
 +ruff check tests/docs/test_v01_release_ledger.py
 +All checks passed!
 +
-+git diff --check 9e88cf7..ad32767
++git diff --check 7058cf2..43b8c60
 +clean
 +```
 +
@@ -542,7 +542,7 @@ index 0000000..022ae79
 +- Approval: **NOT APPROVED**
 +
 +The two changed transition documents accurately record Task 2 implementation
-+commit `c3dc154`, final re-review commit `3d8458e`, C0/I0/M0, the 102-test
++commit `3f23363`, final re-review commit `e5c646f`, C0/I0/M0, the 102-test
 +Context gate, and R3 as still `in_progress`. The Task 3 Step 1 file and the
 +Windows pytest command with explicit `pytest_asyncio.plugin` are also accurate.
 +One required durable-contract migration is missing.
@@ -562,7 +562,7 @@ index 0000000..022ae79
 +  - `R3 Task 2 remains pending/unstarted`;
 +  - the exact old progress status saying Task 2 is pending.
 +
-+  Fresh verification after `1aed2b0`:
++  Fresh verification after `0f02efd`:
 +
 +  ```text
 +  pytest tests/docs/test_v01_release_ledger.py -q
@@ -580,7 +580,7 @@ index 0000000..022ae79
 +
 +  - R3 remains `in_progress`;
 +  - Tasks 1-2 are complete;
-+  - commits `c3dc154` and `3d8458e`;
++  - commits `3f23363` and `e5c646f`;
 +  - C0/I0/M0 and the 102-test evidence;
 +  - Task 3 Step 1,
 +    `tests/integration/prompts/test_runtime_prompt.py`, and the exact
@@ -591,8 +591,8 @@ index 0000000..022ae79
 +
 +## Fact and scope checks
 +
-+- `c3dc154` is the Task 2 safety-fix commit: **PASS**.
-+- `3d8458e` is the final C0/I0/M0 independent re-review: **PASS**.
++- `3f23363` is the Task 2 safety-fix commit: **PASS**.
++- `e5c646f` is the final C0/I0/M0 independent re-review: **PASS**.
 +- `102 passed`, Ruff clean, and strict mypy clean match the final evidence:
 +  **PASS**.
 +- Both documents keep R3 `in_progress` and do not mark R3 complete: **PASS**.
@@ -600,9 +600,9 @@ index 0000000..022ae79
 +  as expected before RED: **PASS**.
 +- The Task 3 command matches this environment's disabled plugin autoload and
 +  explicit asyncio plugin requirement: **PASS**.
-+- Commit `1aed2b0` changes only
++- Commit `0f02efd` changes only
 +  `docs/plans/releases/v0.1.md` and `.superpowers/sdd/progress.md`: **PASS**.
-+- `git diff --check 3d8458e..1aed2b0`: **clean**.
++- `git diff --check e5c646f..0f02efd`: **clean**.
 +
 +The transition can be approved after the stale documentation contract test is
 +migrated and passes.
@@ -614,7 +614,7 @@ index 0000000..8a6693f
 @@ -0,0 +1,101 @@
 +# v0.1 R3 Task 3 Final Approval
 +
-+Review range: `f34d2fc..9fbcd16`
++Review range: `8825897..774ae6c`
 +
 +Verdict: **APPROVED**
 +
@@ -708,7 +708,7 @@ index 0000000..8a6693f
 +mypy --strict src/agent_sdk
 +Success: no issues found in 92 source files
 +
-+git diff --check f34d2fc..9fbcd16
++git diff --check 8825897..774ae6c
 +clean
 +```
 +
@@ -721,7 +721,7 @@ index 0000000..43696fd
 @@ -0,0 +1,156 @@
 +# v0.1 R3 Task 3 Final Compatibility Review
 +
-+Review range: `fc72ae4..aa3fcac`
++Review range: `9c2abb8..37e4698`
 +
 +Verdict: **CHANGES_REQUIRED**
 +
@@ -775,7 +775,7 @@ index 0000000..43696fd
 +
 +### Previous M1 — CLOSED
 +
-+`git diff --check fc72ae4..aa3fcac` is clean.
++`git diff --check 9c2abb8..37e4698` is clean.
 +
 +## Finding
 +
@@ -865,7 +865,7 @@ index 0000000..43696fd
 +mypy --strict src/agent_sdk
 +Success: no issues found in 92 source files
 +
-+git diff --check fc72ae4..aa3fcac
++git diff --check 9c2abb8..37e4698
 +clean
 +```
 +
@@ -885,7 +885,7 @@ index 0000000..5822aa6
 +
 +## Status
 +
-+PASS. Independent review findings `C1 / I1` from `1a7af37` are fixed.
++PASS. Independent review findings `C1 / I1` from `8f85363` are fixed.
 +
 +## Scope
 +
@@ -970,7 +970,7 @@ index 0000000..5822aa6
 +
 +## Re-review fix
 +
-+Re-review `fc72ae4` found that the schema-v1 compatibility branch compared an
++Re-review `9c2abb8` found that the schema-v1 compatibility branch compared an
 +immutable raw R2 `run.created` payload with the upgraded current serialization.
 +It also exposed two SQLite recovery reads that treated a safely upgraded raw
 +R2 private Run snapshot as non-authoritative.
@@ -1010,7 +1010,7 @@ index 0000000..5822aa6
 +
 +## Final-review fix
 +
-+Final review `f34d2fc` found that the SQLite schema-v1 semantic precondition
++Final review `8825897` found that the SQLite schema-v1 semantic precondition
 +fallback checked only for one schema-v1 `run.created` event. A malformed event
 +could therefore authorize normalized equality against a legacy private Run
 +snapshot.
@@ -1044,7 +1044,7 @@ index 0000000..5822aa6
 +- Workflow recovery, child workflow, subprocess recovery, and release slices:
 +  `25 passed`.
 +- Ruff passed; strict mypy passed over all 92 source files.
-+- Both working-tree and `f34d2fc` range `git diff --check` passed.
++- Both working-tree and `8825897` range `git diff --check` passed.
 diff --git a/.superpowers/sdd/v01-r3-task3-report.md b/.superpowers/sdd/v01-r3-task3-report.md
 new file mode 100644
 index 0000000..6d7fa70
@@ -1170,7 +1170,7 @@ index 0000000..bc29311
 @@ -0,0 +1,159 @@
 +# v0.1 R3 Task 3 Fix Re-review
 +
-+Review range: `1a7af37..76c33ea`
++Review range: `8f85363..7f33d89`
 +
 +Verdict: **CHANGES_REQUIRED**
 +
@@ -1278,7 +1278,7 @@ index 0000000..bc29311
 +
 +### M1 — Diff-check is not clean
 +
-+Fresh `git diff --check 1a7af37..76c33ea` reports:
++Fresh `git diff --check 8f85363..7f33d89` reports:
 +
 +```text
 +.superpowers/sdd/v01-r3-task3-fix-report.md:87: new blank line at EOF.
@@ -1322,7 +1322,7 @@ index 0000000..bc29311
 +mypy --strict src/agent_sdk
 +Success: no issues found in 92 source files
 +
-+git diff --check 1a7af37..76c33ea
++git diff --check 8f85363..7f33d89
 +FAILED: extra blank line at EOF in the fix report
 +```
 +
@@ -1335,7 +1335,7 @@ index 0000000..af029c8
 @@ -0,0 +1,175 @@
 +# v0.1 R3 Task 3 Independent Review
 +
-+Review range: `c0c993f..adea2de`
++Review range: `794739f..f80a956`
 +
 +Verdict: **CHANGES_REQUIRED**
 +
@@ -1500,7 +1500,7 @@ index 0000000..af029c8
 +              src/agent_sdk/storage/sqlite.py
 +Success: no issues found in 22 source files
 +
-+git diff --check c0c993f..adea2de
++git diff --check 794739f..f80a956
 +clean
 +```
 +
@@ -1516,7 +1516,7 @@ index 0000000..7e820c0
 @@ -0,0 +1,48 @@
 +# v0.1 R3 Task 3 Transition Review
 +
-+Review range: `2bd48e3..e105dfe`
++Review range: `c94ea77..83a8b4d`
 +
 +Verdict: **APPROVED**
 +
@@ -1532,7 +1532,7 @@ index 0000000..7e820c0
 +  `.superpowers/sdd/progress.md`, `docs/plans/releases/v0.1.md`, and
 +  `tests/docs/test_v01_release_ledger.py`.
 +- Both operational records mark R3 Task 3 complete and identify final
-+  implementation/fix checkpoint `9fbcd16` and final approval `2bd48e3`.
++  implementation/fix checkpoint `774ae6c` and final approval `c94ea77`.
 +- The recorded Task 3 approval is Critical 0 / Important 0 / Minor 0, Spec
 +  PASS, and Quality PASS. The retained implementation evidence
 +  (`521 passed, 1 skipped`; the 25-test Workflow/recovery/release gate; Ruff;
@@ -1557,7 +1557,7 @@ index 0000000..7e820c0
 +ruff check tests/docs/test_v01_release_ledger.py
 +All checks passed!
 +
-+git diff --check 2bd48e3..e105dfe
++git diff --check c94ea77..83a8b4d
 +clean
 +```
 +
@@ -1573,7 +1573,7 @@ index 0000000..6442b20
 +## Scope
 +
 +This change fixes both Important findings from
-+`v01-r3-task4-review.md` (review commit `ca52ffb`) without changing release or
++`v01-r3-task4-review.md` (review commit `4d0bb5b`) without changing release or
 +progress documents:
 +
 +- I1: strictly validate every durable prepared provider message and Tool schema.
@@ -1998,7 +1998,7 @@ index 0000000..ca14073
 +
 +## Verdict
 +
-+- Reviewed range: `ca52ffb..3a4b65f`
++- Reviewed range: `4d0bb5b..79996db`
 +- Spec: PASS
 +- Quality: PASS
 +- Critical: 0
@@ -2143,7 +2143,7 @@ index 0000000..223298f
 +- Approval: BLOCKED until both Important findings are fixed and independently
 +  re-reviewed.
 +
-+Reviewed range: `224219b..2ea0464`.
++Reviewed range: `85f0e0e..2f2048c`.
 +
 +## Important findings
 +
@@ -2339,8 +2339,8 @@ index 0000000..dcaba98
 +  Quality PASS.
 +- Task 3 transition review: Critical 0 / Important 0 / Minor 0; Spec PASS;
 +  Quality PASS.
-+- Task 4 implementation: `2ea0464`; recovery-evidence fix: `3a4b65f`; final
-+  approval: `b98e93f`. The final re-review reports Critical 0 / Important 0 /
++- Task 4 implementation: `2f2048c`; recovery-evidence fix: `79996db`; final
++  approval: `ab1d082`. The final re-review reports Critical 0 / Important 0 /
 +  Minor 0; Spec PASS; Quality PASS.
 +
 +## Ledger facts
@@ -2400,8 +2400,8 @@ index 0000000..a6ec9bb
 +
 +## Verdict
 +
-+- Reviewed fix commit: `bc8e745`
-+- Reviewed range: `38a454b..bc8e745`
++- Reviewed fix commit: `1e44ee0`
++- Reviewed range: `66107cb..1e44ee0`
 +- Spec: **PASS**
 +- Quality: **PASS**
 +- Critical: **0**
@@ -2487,7 +2487,7 @@ index 0000000..a6ec9bb
 +Strict mypy:
 +Success: no issues found in 93 source files
 +
-+git diff --check 38a454b..bc8e745:
++git diff --check 66107cb..1e44ee0:
 +clean
 +```
 +
@@ -2505,8 +2505,8 @@ index 0000000..91fa3a3
 +
 +## Verdict
 +
-+- Reviewed commit: `a6a45aa`
-+- Reviewed range: `b98e93f..a6a45aa`
++- Reviewed commit: `fcc8829`
++- Reviewed range: `ab1d082..fcc8829`
 +- Spec: **FAIL**
 +- Quality: **FAIL**
 +- Critical: **0**
@@ -2571,14 +2571,14 @@ index 0000000..91fa3a3
 +  the installed release complete.
 +- The active next-plan path correctly names
 +  `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md`.
-+- Task 1's final chain (`2bda910`, `ba9d05d`, `ead396b`) and C0/I0/M0 approval
++- Task 1's final chain (`dd93fb2`, `38e7d2d`, `93505aa`) and C0/I0/M0 approval
 +  agree with its final transition review.
-+- Task 2's final implementation/review commits (`c3dc154`, `3d8458e`) and
++- Task 2's final implementation/review commits (`3f23363`, `e5c646f`) and
 +  C0/I0/M0 approval agree with its transition re-review.
-+- Task 3's implementation/approval commits (`9fbcd16`, `2bd48e3`) and
++- Task 3's implementation/approval commits (`774ae6c`, `c94ea77`) and
 +  C0/I0/M0 approval agree with its transition review.
 +- Task 4's implementation, recovery fix, and final approval commits
-+  (`2ea0464`, `3a4b65f`, `b98e93f`) agree with the final re-review, including
++  (`2f2048c`, `79996db`, `ab1d082`) agree with the final re-review, including
 +  C0/I0/M0, Spec PASS, and Quality PASS.
 +- The old R3 Task 4 recovery paths and command are absent from both durable
 +  records and are explicitly rejected by the docs contract.
@@ -2607,7 +2607,7 @@ index 0000000..91fa3a3
 +Strict mypy:
 +Success: no issues found in 93 source files
 +
-+git diff --check b98e93f..a6a45aa:
++git diff --check ab1d082..fcc8829:
 +clean
 +```
 +
@@ -2638,13 +2638,13 @@ index 2029ce3..300fe61 100644
 
  ## Current Resume Point
 
- - R0 is complete at checkpoint commit `74c1e3b`.
- - R1 is complete through final hardening commit `2f0e922`.
+ - R0 is complete at checkpoint commit `ef0e4da`.
+ - R1 is complete through final hardening commit `704db69`.
  - R1 final review approved.
  - R1 Tasks 1-3 are complete and independently approved.
  - R2 Tasks 1-4 are complete and independently approved through implementation
-   checkpoint `56d60a8`.
- - R2 final hardening commits `852692f` and `309d63c` are complete; the
+   checkpoint `f9beb63`.
+ - R2 final hardening commits `4bdd433` and `826a32b` are complete; the
    final independent review found Critical 0 / Important 0 / Minor 0, Spec
    compliance PASS, Code quality PASS, and Ready to proceed to R3: Yes.
 -- Active next plan: `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md`.
@@ -2653,7 +2653,7 @@ index 2029ce3..300fe61 100644
 +- Active next plan: `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md`.
 +- Resume command: `$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\runtime\test_capability_intersection.py -q`.
 +- R3 Task 1 deterministic L0-L2 is complete (commits
-+  `2bda910`, `ba9d05d`, and `ead396b`); it began with
++  `dd93fb2`, `38e7d2d`, and `93505aa`); it began with
    `tests/unit/context/test_deterministic_strategies.py`.
 -- After that file exists, the first RED command is
 -  `.\.venv\Scripts\python.exe -m pytest tests/unit/context/test_deterministic_strategies.py -q`.
@@ -2669,10 +2669,10 @@ index 2029ce3..300fe61 100644
 +- Invalid, timeout, schema, reference, input-bound, or output-budget L3/L4
 +  results fall back to the exact deterministic L2 renderer without failing the
 +  main Run.
-+- Task 2 safety fix commit `c3dc154`; final independent re-review commit
-+  `3d8458e`: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS.
++- Task 2 safety fix commit `3f23363`; final independent re-review commit
++  `e5c646f`: Critical 0 / Important 0 / Minor 0; Spec PASS; Quality PASS.
 +  Fresh Context gate: 102 passed; Ruff and strict mypy clean.
-+- R3 Task 3 is complete (implementation `9fbcd16`, final approval `2bd48e3`):
++- R3 Task 3 is complete (implementation `774ae6c`, final approval `c94ea77`):
 +  `AgentSpec`/`DurableAgentSpec` persist the prompt and Context runtime fields;
 +  `SkillRegistry` is exposed publicly and its shared preflight covers direct,
 +  Workflow-node, and subagent Run creation; default/application/Skill prompt
@@ -2686,7 +2686,7 @@ index 2029ce3..300fe61 100644
 +- R3 Task 4 is complete: context preparation runs before every new model call;
 +  the durable prepared request, Context View, and Prompt Manifest are
 +  authenticated for exact recovery. Implementation/fix/approval commits are
-+  `2ea0464`, `3a4b65f`, and `b98e93f`.
++  `2f2048c`, `79996db`, and `ab1d082`.
 +- Task 4 final approval: Critical 0 / Important 0 / Minor 0; Spec PASS;
 +  Quality PASS. Its independent re-review covered strict provider request
 +  shapes, View/Manifest ownership and linkage, no-side-effect corruption
@@ -2713,16 +2713,16 @@ index 2029ce3..300fe61 100644
    $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
    Success: no issues found in 10 source files
 
-   $ git diff --check 56d60a8..309d63c
+   $ git diff --check f9beb63..826a32b
    clean
    ```
 
 +- 2026-07-20 - R3 checkpoint completed. Tasks 1-4 are independently approved:
-+  Task 1 deterministic L0-L2 (`2bda910`, `ba9d05d`, `ead396b`); Task 2
-+  automatic L0-L4 and recovery-safe capsule evidence (`c3dc154`, `3d8458e`);
-+  Task 3 prompt/Skill manifests and descriptor compatibility (`9fbcd16`,
-+  `2bd48e3`); and Task 4 per-call Context preparation and exact recovery
-+  (`2ea0464`, `3a4b65f`, `b98e93f`). All final approvals report Critical 0 /
++  Task 1 deterministic L0-L2 (`dd93fb2`, `38e7d2d`, `93505aa`); Task 2
++  automatic L0-L4 and recovery-safe capsule evidence (`3f23363`, `e5c646f`);
++  Task 3 prompt/Skill manifests and descriptor compatibility (`774ae6c`,
++  `c94ea77`); and Task 4 per-call Context preparation and exact recovery
++  (`2f2048c`, `79996db`, `ab1d082`). All final approvals report Critical 0 /
 +  Important 0 / Minor 0, Spec PASS, and Quality PASS. Fresh checkpoint
 +  evidence:
 +
@@ -8176,7 +8176,7 @@ index 019ce32..2fb2ada 100644
  $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
  Success: no issues found in 10 source files
 
- $ git diff --check 56d60a8..309d63c
+ $ git diff --check f9beb63..826a32b
  clean"""
 -R3_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r3-auto-context.md"
 -R3_RESUME_COMMAND = (
@@ -8186,10 +8186,10 @@ index 019ce32..2fb2ada 100644
  R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
 -R3_FIRST_RED = (
 -    rf".\.venv\Scripts\python.exe -m pytest {R3_FIRST_TEST} -q"
-+R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
-+R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
-+R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
-+R3_TASK4_COMMITS = ("2ea0464", "3a4b65f", "b98e93f")
++R3_TASK1_COMMITS = ("dd93fb2", "38e7d2d", "93505aa")
++R3_TASK2_COMMITS = ("3f23363", "e5c646f")
++R3_TASK3_COMMITS = ("774ae6c", "c94ea77")
++R3_TASK4_COMMITS = ("2f2048c", "79996db", "ab1d082")
 +R4_PLAN = "docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md"
 +R4_TASK1_TEST = "tests/unit/runtime/test_capability_intersection.py"
 +R4_FIRST_COMMAND = (
@@ -8291,7 +8291,7 @@ index 019ce32..2fb2ada 100644
          "2026-07-17 final checkpoint: 97 passed, 3 skipped in 7.94s; "
          "Ruff/mypy clean |"
      ) in ledger
-     assert "R1 is complete through final hardening commit `2f0e922`" in ledger
+     assert "R1 is complete through final hardening commit `704db69`" in ledger
      assert "final review approved" in ledger
      assert (
          "| R2 | completed | condition and bounded loop | "
@@ -8303,7 +8303,7 @@ index 019ce32..2fb2ada 100644
 +    assert "| R3 | completed | automatic L0-L4 | " in ledger
      assert "4 passed in 4.74s" in ledger
      assert "5.05s" not in ledger
-     assert "74c1e3b" in ledger
+     assert "ef0e4da" in ledger
      assert "R1 Tasks 1-3 are complete" in ledger
      historical_marker = "Historical initial checkpoint evidence:"
      canonical_marker = "Current canonical checkpoint evidence:"

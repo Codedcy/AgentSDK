@@ -2,7 +2,7 @@
 
 ## Verdict
 
-- Reviewed range: `ca52ffb..3a4b65f`
+- Reviewed range: `4d0bb5b..79996db`
 - Spec: PASS
 - Quality: PASS
 - Critical: 0

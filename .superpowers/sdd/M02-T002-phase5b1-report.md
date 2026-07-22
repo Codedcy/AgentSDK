@@ -4,7 +4,7 @@
 
 DONE. Phase 5B1 implements strict `CONFIRM_COMPLETED` resolution for
 operation-linked Model reconciliation requests on Memory and SQLite. The
-implementation commit is `8d9d671` (`feat(recovery): confirm model
+implementation commit is `acd8bd2` (`feat(recovery): confirm model
 reconciliation outcomes`).
 
 The work is intentionally limited to confirmed Model outcomes. Confirmed Tool
@@ -208,7 +208,7 @@ performed.
 The independent Phase 5B1 review returned C0/I3/M0. All three Important
 findings were reproduced through public production paths before production
 changes, fixed without entering Phase 5B2, and verified on Memory and SQLite.
-The review-fix implementation commit is `3aeaddb` (`fix(recovery): certify
+The review-fix implementation commit is `11c335e` (`fix(recovery): certify
 confirmed model replay history`). This addendum supersedes the pre-review risk
 statement above.
 
@@ -389,7 +389,7 @@ or push was performed.
 
 The second independent Phase 5B1 review returned C0/I2/M0. Both Important
 findings were reproduced on Memory and SQLite before changing production code,
-then closed in commit `85856f4` (`fix(recovery): close confirmed replay
+then closed in commit `77a0578` (`fix(recovery): close confirmed replay
 history`). This addendum supersedes the preceding post-review risk statement.
 
 ### I1: terminal replay coupled historical Session evidence to current state
@@ -544,7 +544,7 @@ or push was performed.
 
 The third independent Phase 5B1 review returned C0/I1/M0. The remaining
 Important finding was reproduced on Memory and SQLite before production code
-changed, then closed in commit `f1b9ba0` (`fix(recovery): certify confirmed
+changed, then closed in commit `e679125` (`fix(recovery): certify confirmed
 terminal history`). This addendum supersedes the preceding post-review risk
 statement.
 
@@ -695,7 +695,7 @@ or push was performed.
 
 The fourth independent Phase 5B1 review returned C0/I1/M0. The remaining
 Important finding was reproduced on Memory and SQLite before production code
-changed, then closed in commit `54b31ba` (`fix(recovery): preserve confirmed
+changed, then closed in commit `aca8698` (`fix(recovery): preserve confirmed
 partial streams`). This addendum supersedes the preceding post-review risk
 statement.
 

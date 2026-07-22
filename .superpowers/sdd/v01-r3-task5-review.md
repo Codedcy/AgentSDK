@@ -2,8 +2,8 @@
 
 ## Verdict
 
-- Reviewed commit: `a6a45aa`
-- Reviewed range: `b98e93f..a6a45aa`
+- Reviewed commit: `fcc8829`
+- Reviewed range: `ab1d082..fcc8829`
 - Spec: **FAIL**
 - Quality: **FAIL**
 - Critical: **0**
@@ -68,14 +68,14 @@ source of the 13.65-second run.
   the installed release complete.
 - The active next-plan path correctly names
   `docs/superpowers/plans/2026-07-17-agent-sdk-v0.1-r4-child-mailbox.md`.
-- Task 1's final chain (`2bda910`, `ba9d05d`, `ead396b`) and C0/I0/M0 approval
+- Task 1's final chain (`dd93fb2`, `38e7d2d`, `93505aa`) and C0/I0/M0 approval
   agree with its final transition review.
-- Task 2's final implementation/review commits (`c3dc154`, `3d8458e`) and
+- Task 2's final implementation/review commits (`3f23363`, `e5c646f`) and
   C0/I0/M0 approval agree with its transition re-review.
-- Task 3's implementation/approval commits (`9fbcd16`, `2bd48e3`) and
+- Task 3's implementation/approval commits (`774ae6c`, `c94ea77`) and
   C0/I0/M0 approval agree with its transition review.
 - Task 4's implementation, recovery fix, and final approval commits
-  (`2ea0464`, `3a4b65f`, `b98e93f`) agree with the final re-review, including
+  (`2f2048c`, `79996db`, `ab1d082`) agree with the final re-review, including
   C0/I0/M0, Spec PASS, and Quality PASS.
 - The old R3 Task 4 recovery paths and command are absent from both durable
   records and are explicitly rejected by the docs contract.
@@ -104,7 +104,7 @@ All checks passed!
 Strict mypy:
 Success: no issues found in 93 source files
 
-git diff --check b98e93f..a6a45aa:
+git diff --check ab1d082..fcc8829:
 clean
 ```
 

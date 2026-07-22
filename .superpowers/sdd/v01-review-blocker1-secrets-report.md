@@ -1,6 +1,6 @@
 # v0.1 Whole Review Blocker 1: Durable Secret Rejection Report
 
-Baseline: `19e3982`
+Baseline: `00b00a7`
 
 ## Outcome
 

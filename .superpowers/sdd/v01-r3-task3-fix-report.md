@@ -2,7 +2,7 @@
 
 ## Status
 
-PASS. Independent review findings `C1 / I1` from `1a7af37` are fixed.
+PASS. Independent review findings `C1 / I1` from `8f85363` are fixed.
 
 ## Scope
 
@@ -87,7 +87,7 @@ After the fixes:
 
 ## Re-review fix
 
-Re-review `fc72ae4` found that the schema-v1 compatibility branch compared an
+Re-review `9c2abb8` found that the schema-v1 compatibility branch compared an
 immutable raw R2 `run.created` payload with the upgraded current serialization.
 It also exposed two SQLite recovery reads that treated a safely upgraded raw
 R2 private Run snapshot as non-authoritative.
@@ -127,7 +127,7 @@ Second-round TDD evidence:
 
 ## Final-review fix
 
-Final review `f34d2fc` found that the SQLite schema-v1 semantic precondition
+Final review `8825897` found that the SQLite schema-v1 semantic precondition
 fallback checked only for one schema-v1 `run.created` event. A malformed event
 could therefore authorize normalized equality against a legacy private Run
 snapshot.
@@ -161,4 +161,4 @@ Final-round TDD evidence:
 - Workflow recovery, child workflow, subprocess recovery, and release slices:
   `25 passed`.
 - Ruff passed; strict mypy passed over all 92 source files.
-- Both working-tree and `f34d2fc` range `git diff --check` passed.
+- Both working-tree and `8825897` range `git diff --check` passed.

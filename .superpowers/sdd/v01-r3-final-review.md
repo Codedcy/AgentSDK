@@ -2,7 +2,7 @@
 
 ## Verdict
 
-- Reviewed range: `2774a94..f50b96a`
+- Reviewed range: `aa2d410..72dd259`
 - Spec: **FAIL**
 - Quality: **FAIL**
 - Critical: **0**
@@ -125,7 +125,7 @@ None.
 
 ### M1 - Whole-R3 diff-check is not clean
 
-Fresh `git diff --check 2774a94..f50b96a` reports:
+Fresh `git diff --check aa2d410..72dd259` reports:
 
 ```text
 .superpowers/sdd/v01-r3-task4-rereview.md:131: new blank line at EOF.
@@ -169,7 +169,7 @@ contradicts the durable handoff.
 ## Fresh verification evidence
 
 All commands were run independently from
-`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` at `f50b96a`.
+`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` at `72dd259`.
 
 ```text
 R3 Context, Prompt, reconciliation, release E2E, and docs:
@@ -187,7 +187,7 @@ All checks passed!
 mypy --strict src/agent_sdk:
 Success: no issues found in 93 source files
 
-git diff --check 2774a94..f50b96a:
+git diff --check aa2d410..72dd259:
 FAILED with the two M1 EOF warnings
 ```
 

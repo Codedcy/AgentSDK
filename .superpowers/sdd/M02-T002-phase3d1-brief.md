@@ -1,6 +1,6 @@
 # M02-T002 Phase 3D1 Brief — Certified Provider Recovery
 
-Required base: approved Phase 3C2 plus its approval ledger commit `7a12bad`.
+Required base: approved Phase 3C2 plus its approval ledger commit `89b6b42`.
 Read `.superpowers/sdd/M02-T002-phase3d-plan.md` and the source task completely
 before editing.
 

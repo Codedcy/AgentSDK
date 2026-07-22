@@ -14,7 +14,7 @@ all match exactly. Every other case keeps the Phase 3C2 unknown-outcome path and
 admits one bounded reconciliation request.
 
 The pre-change baseline was `1272 passed in 107.24s` on Python 3.13.14 at
-`9cc8e5eb5ec77b42e351904b5f346006eb6bb4e8` with a clean worktree.
+`96eefbf7456ee3e8f6727fef52fa2747e2fd4cdd` with a clean worktree.
 
 ## Implemented contract
 

@@ -1,6 +1,6 @@
 # v0.1 R3 Task 3 Fix Re-review
 
-Review range: `1a7af37..76c33ea`
+Review range: `8f85363..7f33d89`
 
 Verdict: **CHANGES_REQUIRED**
 
@@ -108,7 +108,7 @@ Required fix:
 
 ### M1 — Diff-check is not clean
 
-Fresh `git diff --check 1a7af37..76c33ea` reports:
+Fresh `git diff --check 8f85363..7f33d89` reports:
 
 ```text
 .superpowers/sdd/v01-r3-task3-fix-report.md:87: new blank line at EOF.
@@ -152,7 +152,7 @@ All checks passed!
 mypy --strict src/agent_sdk
 Success: no issues found in 92 source files
 
-git diff --check 1a7af37..76c33ea
+git diff --check 8f85363..7f33d89
 FAILED: extra blank line at EOF in the fix report
 ```
 

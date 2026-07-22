@@ -23,5 +23,5 @@
 - The skipped test requires Windows symlink creation support and was not a logic failure.
 - Strict mypy: clean.
 - Ruff: clean.
-- `git diff --check fd6d728 f320642`: clean.
-- Reviewed HEAD: `f320642`.
+- `git diff --check 6a48bac 88193ad`: clean.
+- Reviewed HEAD: `88193ad`.

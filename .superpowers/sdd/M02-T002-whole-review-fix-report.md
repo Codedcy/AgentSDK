@@ -4,9 +4,9 @@ Date: 2026-07-17 (Asia/Shanghai)
 
 Source brief: `.superpowers/sdd/M02-T002-whole-review-fix-brief.md`
 
-Fix baseline: `9dfdaa7`
+Fix baseline: `c3dfe30`
 
-Implementation head before this report: `efd62b0`
+Implementation head before this report: `052b77f`
 
 ## Outcome
 
@@ -23,10 +23,10 @@ required fresh independent whole-task re-review.
 
 Implementation commits:
 
-- `f9971af` - `fix(recovery): bound follower polling interval`
-- `efd62b0` - `fix(recovery): scope evidence reads to session`
+- `82b8cb6` - `fix(recovery): bound follower polling interval`
+- `052b77f` - `fix(recovery): scope evidence reads to session`
 
-The approved repair brief is commit `9dfdaa7`.
+The approved repair brief is commit `c3dfe30`.
 
 ## I1 - bounded cross-SDK follower polling
 
@@ -188,7 +188,7 @@ All checks passed!
 uv.exe run --frozen --python 3.13 mypy src
 Success: no issues found in 75 source files
 
-git diff --check 9dfdaa7..HEAD
+git diff --check c3dfe30..HEAD
 exit 0
 ```
 
@@ -210,7 +210,7 @@ Migration hashes remain unchanged:
 - `0003_leases.sql`:
   `63eaef03dcd1c10aabb6ce654374b8ae4d4bcc40477742a992ab2e26f933b7ee`
 
-Before this report, the exact implementation diff from `9dfdaa7` contained
+Before this report, the exact implementation diff from `c3dfe30` contained
 only:
 
 - `src/agent_sdk/runtime/recovery.py`

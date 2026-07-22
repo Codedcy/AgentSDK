@@ -2,7 +2,7 @@
 
 ## Verdict
 
-- Reviewed range: `5a8a160..4a49532`
+- Reviewed range: `e0b34c3..2f9b142`
 - Spec: **PASS**
 - Quality: **PASS**
 - Critical: **0**
@@ -90,7 +90,7 @@ these public payload shapes should use an explicit schema-version transition.
 Status: **CLOSED**.
 
 The extra EOF blank lines were removed from both Task 4 review artifacts.
-Fresh `git diff --check 2774a94..HEAD` is clean.
+Fresh `git diff --check aa2d410..HEAD` is clean.
 
 ### M2 - Historical R3-to-R4 handoff
 
@@ -131,7 +131,7 @@ the authentication calls.
 ## Fresh independent verification
 
 All commands were run from
-`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` at `4a49532`.
+`D:\code\AgentSDK\.worktrees\agent-sdk-implementation` at `2f9b142`.
 
 ```text
 Focused I1/I2 positive, corruption, completed recovery, and legacy paths:
@@ -155,7 +155,7 @@ All checks passed!
 mypy --strict src/agent_sdk:
 Success: no issues found in 93 source files
 
-git diff --check 2774a94..HEAD:
+git diff --check aa2d410..HEAD:
 clean
 
 worktree before review artifacts:

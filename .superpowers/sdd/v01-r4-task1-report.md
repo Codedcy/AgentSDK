@@ -209,7 +209,7 @@ Result: `184 passed, 5 skipped in 10.21s`; strict mypy (93 source files),
 Ruff, and diff-check passed.
 
 Baseline check for the separate recovery API suite: the five checkpoint-message
-failures reproduce unchanged in a clean `5466757` worktree. Each expects a
+failures reproduce unchanged in a clean `68d79f6` worktree. Each expects a
 provider request without the existing ContextMiddleware system prompt; no
 prompt/recovery-composition change is included in this hardening.
 

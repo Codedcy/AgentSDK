@@ -340,7 +340,7 @@ git commit -m "feat: add run leases and reconciliation"
 
 ## Completion evidence
 
-Completed on 2026-07-17 at `5ff955b`. The final independent whole-task
+Completed on 2026-07-17 at `5da9e79`. The final independent whole-task
 re-review approved Spec C0/I0/M0 and Quality C0/I0/M2. Python 3.13 passed all
 2,159 tests with zero failures/skips; the Phase 5C release gate also passed the
 full supported Python 3.12 suite, external sdist/wheel builds, clean installs,

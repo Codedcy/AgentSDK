@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented from baseline `d501d16` without changing `pyproject.toml` version,
+Implemented from baseline `eece098` without changing `pyproject.toml` version,
 tagging, building release artifacts, or publishing. R5 Task 5 remains pending.
 
 ## RED / GREEN evidence
@@ -55,7 +55,7 @@ tests, their fixture, and this report; production code remains unchanged.
 - GREEN: the focused thirteen-step acceptance passed (`1 passed in 41.55s`). The
   final Task4 aggregate passed (`6 passed in 44.36s`); Ruff passed; strict mypy
   passed for the reference example and changed fixture (`2 source files`); and
-  `git diff --check 85d4ba2` was clean.
+  `git diff --check c0fc2db` was clean.
 
 ## Actual smoke JSON
 

@@ -1,6 +1,6 @@
 # M02-T002 Phase 3D2 Brief — Certified Tool Retry and Phase 3 Release
 
-Required base: approved Phase 3D1 ending at `72dbf9b`. Read
+Required base: approved Phase 3D1 ending at `28f2a6f`. Read
 `.superpowers/sdd/M02-T002-phase3d-plan.md`, the Phase 3 plan, progress ledger,
 and the source task completely before editing.
 
@@ -198,6 +198,6 @@ After 3D2 approval, write `.superpowers/sdd/M02-T002-phase3-report.md` and run:
 - all Phase 3 focused/fault/e2e suites;
 - full pytest on Python 3.12 and Python 3.13;
 - Ruff, mypy, package build/import smoke, diff/scope/schema audits; and
-- a fresh independent whole-Phase-3 review over `2309dfb..HEAD` at C0/I0.
+- a fresh independent whole-Phase-3 review over `69e0ec5..HEAD` at C0/I0.
 
 Only then mark Phase 3 complete and begin Phase 4 Workflow recovery.

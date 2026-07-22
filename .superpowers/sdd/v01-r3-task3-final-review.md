@@ -1,6 +1,6 @@
 # v0.1 R3 Task 3 Final Compatibility Review
 
-Review range: `fc72ae4..aa3fcac`
+Review range: `9c2abb8..37e4698`
 
 Verdict: **CHANGES_REQUIRED**
 
@@ -54,7 +54,7 @@ creation event is legal.
 
 ### Previous M1 — CLOSED
 
-`git diff --check fc72ae4..aa3fcac` is clean.
+`git diff --check 9c2abb8..37e4698` is clean.
 
 ## Finding
 
@@ -144,7 +144,7 @@ All checks passed!
 mypy --strict src/agent_sdk
 Success: no issues found in 92 source files
 
-git diff --check fc72ae4..aa3fcac
+git diff --check 9c2abb8..37e4698
 clean
 ```
 

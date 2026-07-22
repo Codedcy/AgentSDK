@@ -11,8 +11,8 @@ has its own independent C0/I0 approval, and the final tree passed the dual-
 Python release gates below.
 
 The reviewed release candidate was
-`9cd44b902d8360288ed6e6c6f4dff20d932da962`, with release-gate evidence recorded
-at `f0c6c5569dc37af1fa1bb66d89ad499db99db720`, against Phase 3 base `2309dfb`.
+`32be17c98e3689b0e44bd129914eb791e55ec4d9`, with release-gate evidence recorded
+at `c33e8915d8a406de9ba2b66e21e26cd3fcbd55a0`, against Phase 3 base `69e0ec5`.
 The whole-phase review returned Not Approved with Spec/Quality C0/I1/M1 and no
 other Critical, Important, or Minor findings. The Important finding was a final
 Provider registry TOCTOU after the audit/refence commit and lease assertion;
@@ -119,7 +119,7 @@ cache provider.
 - Live progress: 40 passed in 3.54s.
 - Store progress and recovery records: 206 passed in 10.08s.
 - Compatibility files changed by Phase 3: 149 passed in 8.53s.
-- All 17 test files changed by `2309dfb..HEAD`: 856 passed, zero failed,
+- All 17 test files changed by `69e0ec5..HEAD`: 856 passed, zero failed,
   zero skipped.
 - Existing `tests/e2e`: 3 passed in 4.60s. Fault cases are embedded in the
   recovery, live, and Store suites; the repository has no `tests/faults` folder.
@@ -144,7 +144,7 @@ cache provider.
 - `ToolRetryPolicy` values were exactly `never`, `idempotent`, and `safe_retry`.
   Default Tool canonical JSON omitted `retry_policy`, and its established hash
   remained `2a6f67bbdf395f62fe0d6ecd1770dc6a3f3fe79e16efc8cfc61783578d78fb14`.
-- `git diff --check 2309dfb..HEAD` passed.
+- `git diff --check 69e0ec5..HEAD` passed.
 - Release-fix diffs for Workflow production, roadmap/milestone/task-index,
   storage, migration, and SQLite DDL/schema-version are empty. SQLite schema
   remains version 3.

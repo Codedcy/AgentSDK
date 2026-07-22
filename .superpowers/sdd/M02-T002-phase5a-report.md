@@ -4,7 +4,7 @@
 
 DONE. Phase 5A implements strict reconciliation resolution admission and the
 explicit `CONFIRM_NOT_EXECUTED` and `RETRY` transitions. The work remains on
-`feature/agent-sdk-implementation`, based on `5d5600b`, for independent review.
+`feature/agent-sdk-implementation`, based on `876bb36`, for independent review.
 No Phase 5B, M02-T003, M02-T004, `CONFIRM_COMPLETED`, `TERMINATE`, or subprocess
 release-gate behavior was implemented.
 

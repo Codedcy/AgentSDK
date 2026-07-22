@@ -129,7 +129,7 @@ tests/integration/context/test_context_recovery.py::test_authoritative_recovery_
 
 It raises public `AgentSDKError: recovery required`. The exact node was rerun
 against a clean detached worktree at baseline commit
-`2eb252ee1e1ff1ae69cc15cf3297077aa403e166`, with that worktree's `src` forced
+`d4c7b5f356806557adcb97975b69a9752c345756`, with that worktree's `src` forced
 to the front of `sys.path`; it failed identically.
 
 Post-mortem comparison showed the current and baseline executions are
@@ -167,7 +167,7 @@ failure point. Recovery code was therefore not changed outside Task 2 scope.
 ## Independent review hardening (legacy exact data / empty-read race)
 
 The independent review identified two major correctness gaps in commit
-`ae6aa89432d7301f945c8dfa4655409ec50b9115`.
+`eb9f3b0cf8ec780116c65ca56c8d94eae6fd28c0`.
 
 ### Legacy raw Run authentication RED
 

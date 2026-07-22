@@ -2,13 +2,13 @@ from pathlib import Path
 
 
 R1_COMMITS = (
-    "8fc36ad",
-    "8c2982b",
-    "e6d9f3b",
-    "2b145a7",
-    "e8ce3db",
-    "8fb3836",
-    "cd82a6f",
+    "621d14e",
+    "15cd330",
+    "15e5d80",
+    "c6d77a7",
+    "0fd4e54",
+    "5ec1541",
+    "5d61e25",
 )
 R1_INITIAL_CHECKPOINT = r"""$ .\.venv\Scripts\python.exe -m pytest tests/unit/permissions/test_policy_rules.py tests/unit/tools/test_workspace_paths.py tests/integration/tools/test_builtin_tools.py tests/integration/tools/test_permissioned_tool_slice.py tests/e2e/test_v01_release.py -q
 ..............s......................................................... [ 83%]
@@ -30,15 +30,15 @@ All checks passed!
 
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk
 Success: no issues found in 84 source files"""
-R1_FINAL_COMMITS = ("d4cd336", "2f0e922")
+R1_FINAL_COMMITS = ("88a3808", "704db69")
 R2_TASK_COMMITS = (
-    "e3494ae",
-    "1fc9c72",
-    "9b23e5a",
-    "cfdf43a",
-    "e4624f7",
-    "36a7268",
-    "04d8ee2",
+    "e225ac6",
+    "7e0b431",
+    "68289d5",
+    "9b7fbb4",
+    "72f069a",
+    "81fb5b3",
+    "52fde43",
 )
 R2_HISTORICAL_CHECKPOINT = r"""$ .\.venv\Scripts\python.exe -m pytest tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
 ........................................................................ [ 18%]
@@ -54,7 +54,7 @@ All checks passed!
 
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
 Success: no issues found in 10 source files"""
-R2_FINAL_COMMITS = ("852692f", "309d63c")
+R2_FINAL_COMMITS = ("4bdd433", "826a32b")
 R2_FINAL_CHECKPOINT = r"""$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'
 $ .\.venv\Scripts\python.exe -m pytest -p pytest_asyncio.plugin tests\unit\workflow tests\integration\workflow tests\e2e\test_v01_release.py -q
 403 passed in 43.03s
@@ -68,13 +68,13 @@ All checks passed!
 $ .\.venv\Scripts\python.exe -m mypy --strict src\agent_sdk\workflow src\agent_sdk\runtime\execution.py
 Success: no issues found in 10 source files
 
-$ git diff --check 56d60a8..309d63c
+$ git diff --check f9beb63..826a32b
 clean"""
 R3_FIRST_TEST = "tests/unit/context/test_deterministic_strategies.py"
-R3_TASK1_COMMITS = ("2bda910", "ba9d05d", "ead396b")
-R3_TASK2_COMMITS = ("c3dc154", "3d8458e")
-R3_TASK3_COMMITS = ("9fbcd16", "2bd48e3")
-R3_TASK4_COMMITS = ("2ea0464", "3a4b65f", "b98e93f")
+R3_TASK1_COMMITS = ("dd93fb2", "38e7d2d", "93505aa")
+R3_TASK2_COMMITS = ("3f23363", "e5c646f")
+R3_TASK3_COMMITS = ("774ae6c", "c94ea77")
+R3_TASK4_COMMITS = ("2f2048c", "79996db", "ab1d082")
 R4_TASK1_TEST = "tests/unit/runtime/test_capability_intersection.py"
 R4_TASK2_MAILBOX_TEST = "tests/unit/subagents/test_mailbox.py"
 R3_TASK5_FRESH_RESULT = "221 passed, 1 skipped in 25.32s"
@@ -100,7 +100,7 @@ def _assert_release_checkpoint_and_resume(document: str) -> None:
         assert commit in document
     for commit in R2_TASK_COMMITS:
         assert commit in document
-    assert "R2 implementation checkpoint: `56d60a8`" in document
+    assert "R2 implementation checkpoint: `f9beb63`" in document
     for commit in R2_FINAL_COMMITS:
         assert commit in document
     historical_r2_marker = "Historical R2 pre-final-hardening checkpoint evidence:"
@@ -186,7 +186,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
         "2026-07-17 final checkpoint: 97 passed, 3 skipped in 7.94s; "
         "Ruff/mypy clean |"
     ) in ledger
-    assert "R1 is complete through final hardening commit `2f0e922`" in ledger
+    assert "R1 is complete through final hardening commit `704db69`" in ledger
     assert "final review approved" in ledger
     assert (
         "| R2 | completed | condition and bounded loop | "
@@ -197,7 +197,7 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "| R3 | completed | automatic L0-L4 | " in ledger
     assert "4 passed in 4.74s" in ledger
     assert "5.05s" not in ledger
-    assert "74c1e3b" in ledger
+    assert "ef0e4da" in ledger
     assert "R1 Tasks 1-3 are complete" in ledger
     historical_marker = "Historical initial checkpoint evidence:"
     canonical_marker = "Current canonical checkpoint evidence:"
@@ -217,8 +217,8 @@ def test_v01_release_ledger_names_every_required_slice() -> None:
     assert "v0.1 R5 Task 5: complete" in progress
     assert "v0.1 R5 Task 6: complete" in progress
     assert "v0.1 final checkpoint: complete" in progress
-    assert "1476554" in ledger
-    assert "1476554" in progress
+    assert "ad310c4" in ledger
+    assert "ad310c4" in progress
     assert "C0 / I0 / M1 APPROVE" in ledger
     assert "Minor resolved by Task 6 status cleanup" in ledger
     assert "2,953 passed, 6 skipped" in ledger

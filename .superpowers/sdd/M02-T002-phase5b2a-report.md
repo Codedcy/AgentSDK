@@ -4,7 +4,7 @@
 
 DONE. Phase 5B2A implements strict `CONFIRM_COMPLETED` resolution for
 operation-linked Tool reconciliation requests on Memory and SQLite. The
-implementation commit is `2178fab` (`feat(recovery): confirm tool
+implementation commit is `04a1577` (`feat(recovery): confirm tool
 reconciliation outcomes`).
 
 This slice is intentionally limited to confirmed Tool outcomes. Workflow
@@ -196,7 +196,7 @@ independent review. No merge or push was performed.
 
 The independent Phase 5B2A review returned C0/I1/M0. The Important finding
 was reproduced on Memory and SQLite before production code changed, then
-closed in commit `4f22203` (`fix(recovery): certify multiple tool
+closed in commit `aa3401e` (`fix(recovery): certify multiple tool
 resolutions`). This addendum supersedes the pre-review risk statement above.
 
 ### I1: Tool exact replay assumed a single resolved request
@@ -316,7 +316,7 @@ dependencies, and lockfiles remain untouched. No merge or push was performed.
 
 The second independent Phase 5B2A review returned C0/I1/M0. The remaining
 Important finding was reproduced on Memory and SQLite before production code
-changed, then closed in commit `a05ac6b` (`fix(recovery): replay later safe
+changed, then closed in commit `9de7c67` (`fix(recovery): replay later safe
 tool states`). This addendum supersedes the preceding post-review risk
 statement.
 

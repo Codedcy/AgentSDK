@@ -2,7 +2,7 @@
 
 Source of truth: `docs/plans/tasks/M02-T002-leases-reconciliation.md`,
 `.superpowers/sdd/M02-T002-phase3-plan.md`, and the approved Phase 3C2 range
-ending at `9ad98f0`.
+ending at `e7abe7c`.
 
 ## Outcome
 

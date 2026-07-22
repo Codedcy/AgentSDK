@@ -1,7 +1,7 @@
-# Review package: 5a8a160..HEAD
+# Review package: e0b34c3..HEAD
 
 ## Commits
-4a49532 fix: close R3 final review findings
+2f9b142 fix: close R3 final review findings
 
 ## Files changed
  .superpowers/sdd/v01-r3-final-fix-report.md        |  94 ++++++++++++
@@ -31,7 +31,7 @@ index 0000000..ae632fa
 +## Scope
 +
 +This change closes every finding in the independent R3 final review at
-+`5a8a160`: I1, I2, M1, and M2. It does not start R4.
++`e0b34c3`: I1, I2, M1, and M2. It does not start R4.
 +
 +## I1 - Safe first-use L4
 +
@@ -115,7 +115,7 @@ index 0000000..ae632fa
 +- The single skip is the existing optional tokenizer-backend case.
 +- Ruff over all changed source/tests: clean.
 +- Strict mypy over all 93 source files: clean.
-+- Whole-R3 `git diff --check 2774a94..HEAD`: clean after M1.
++- Whole-R3 `git diff --check aa2d410..HEAD`: clean after M1.
 +
 +The known non-R3 `tests/integration/runtime/test_recovery_api.py` fixture /
 +built-in-capability mismatch remains release-candidate debt and was not

@@ -2,11 +2,11 @@
 
 Date: 2026-07-22
 
-Baseline: `c8b4110`
+Baseline: `b376a8b`
 
-Pre-review verified HEAD: `b422985`
+Pre-review verified HEAD: `4ab02bd`
 
-Post-review tested code HEAD: `8a63e7b`
+Post-review tested code HEAD: `1d1cd7e`
 
 Package version: `0.1.0.dev0` (unchanged)
 
@@ -39,76 +39,76 @@ the original 139 failures passed before the final full run:
 
 ## Blockers and Dispositions
 
-1. `af8fe07 fix: preserve durable recovery evidence`
+1. `e56430d fix: preserve durable recovery evidence`
    - Root cause: v2 events were normalized for v1 validation and the normalized
      copies were incorrectly reused for exact durable precondition comparison.
    - Fix: keep raw durable events/cursors separate from the validation view.
    - Added regression:
      `test_recovery_precondition_keeps_raw_v2_events_separate_from_validation_view`.
 
-2. `e01fee5 fix: resume recovered providers from base request`
+2. `3e4fdda fix: resume recovered providers from base request`
    - Root cause: the prepared provider request, including default prompt layers,
      was passed into descriptor validation where the durable base request was
      required.
    - Fix: validate/recover from the base request while the adapter still receives
      the prepared provider request.
 
-3. `f6a436f fix: preserve legacy recovery stage events`
+3. `989b3d2 fix: preserve legacy recovery stage events`
    - Root cause: uncorrelated legacy recovery emitted incomplete v2 stage events.
    - Fix: emit legal v1 fallback stage events when no reliable step correlation
      exists; correlated paths retain v2.
 
-4. `9d8b582 test: expect default prompt during recovery`
+4. `08946c8 test: expect default prompt during recovery`
    - Updated stale recovery assertions to require the exact packaged general
      system prompt followed by the original checkpoint/tool messages.
 
-5. `c8574cf fix: keep failed run events recoverable`
+5. `068b1d9 fix: keep failed run events recoverable`
    - Root cause: model-only evidence fields polluted strict `step.failed` and
      `run.failed` payloads and prevented terminal certification.
    - Fix: retain evidence on the model event and keep step/run terminal schemas
      minimal and valid.
 
-6. `b9dfb13 test: preserve recovery corruption coverage`
+6. `7d21a12 test: preserve recovery corruption coverage`
    - Replaced invalid `model_copy` fingerprint injection with a legal prepared
      request mutation, recomputed fingerprint, strict model validation, and real
      memory/SQLite persistence. Recovery still rejects the resulting mismatch
      against historical evidence. No production invariant was weakened.
 
-7. `fcbef9c test: assert default prompt message boundaries`
+7. `bb40644 test: assert default prompt message boundaries`
    - Default prompt tests now compare the exact packaged `general/system.md`,
      then verify the original user/assistant/tool order and content.
    - The short reference history explicitly verifies the correct L3-to-L2
      lossless fallback when all sources are protected/recent and no summary is
      needed.
 
-8. `abeee4f test: preserve lifecycle idempotency coverage` and
-   `3d9b314 test: distinguish mailbox bootstrap idempotency`
+8. `7f896c8 test: preserve lifecycle idempotency coverage` and
+   `7be4e6c test: distinguish mailbox bootstrap idempotency`
    - The lifecycle scenario now seeds enough public history to exercise a real
      L3 capsule.
    - Idempotency assertions distinguish application keys from the two durable
      mailbox bootstrap keys per run; the retained deleting session contained
      exactly the expected records and final deletion removed all of them.
 
-9. `3528af1 fix: validate run idempotency before storage`
+9. `387e254 fix: validate run idempotency before storage`
    - Root cause: `RunAPI.start` loaded the session/tool/workspace state before the
      command layer validated the idempotency key.
    - Fix: a shared sanitizer-safe validation function now runs at the public API
      boundary and is reused by the command layer. Invalid keys are rejected
      before any Store access.
 
-10. `6fd4d14 test: align detached replay capabilities`
+10. `ebf3935 test: align detached replay capabilities`
     - The manual durable descriptor now matches the public API's empty workspace
       scope and disabled builtin-tool catalog. This preserves the intended
       detached recovery assertion instead of correctly triggering a capability
       fingerprint conflict.
 
-11. `c5a5a31 test: allow durable tool limit processing`
+11. `a4d912b test: allow durable tool limit processing`
     - The ninth tool-call test's call phase takes about 2.17 seconds through nine
       context/prompt/durable-event rounds. Its timeout changed from 1 to 5 seconds.
       All semantic assertions remain: 9 model calls, 8 handler calls, 8 tool-start
       events, and terminal `step.failed`/`run.failed` with `tool step limit exceeded`.
 
-12. `b422985 fix: mark package as typed`
+12. `4ab02bd fix: mark package as typed`
     - Exact `mypy --strict` initially failed because the package lacked a
       `py.typed` marker, while explicit-path strict mypy was otherwise clean.
     - Added `src/agent_sdk/py.typed`; exact strict package mypy now passes.
@@ -203,7 +203,7 @@ Installed-wheel reference smoke output:
 The four approved whole-v0.1 review blocker groups were closed before this
 rerun: immutable/frozen mapping trust, terminal recovery abort safety, complete
 trace fields and failed-run usage aggregation, and the installed v0.1 reference
-loop. Their implementation commits precede tested code HEAD `8a63e7b`.
+loop. Their implementation commits precede tested code HEAD `1d1cd7e`.
 
 The first post-review Python 3.13 full run exposed four stale storage-test
 fixture failures:
@@ -214,7 +214,7 @@ fixture failures:
 - root cause: the generic storage CAS fixture still represented `TERMINATE` as
   a resolution event plus run snapshot, while terminal abort now correctly
   requires the complete operation/checkpoint/session/run/failure projection;
-- disposition: `8a63e7b test: update reconciliation progress fixture` changed
+- disposition: `1d1cd7e test: update reconciliation progress fixture` changed
   only the generic test fixture to semantic `RETRY` evidence. Production abort
   validation was not relaxed. The four failed nodes then passed, followed by
   all 72 tests in the storage reconciliation progress file.
@@ -247,7 +247,7 @@ Exact skipped nodes and reasons from the final JUnit:
 ### Final dev artifacts
 
 Fresh output directory:
-`.superpowers/sdd/dist-post-review-8a63e7b/`.
+`.superpowers/sdd/dist-post-review-1d1cd7e/`.
 
 - `agent_sdk-0.1.0.dev0-py3-none-any.whl`
   - size: 305,668 bytes;
@@ -270,12 +270,12 @@ The exact five critical files listed above ran under official CPython 3.12.10:
 ### Final fresh installed-wheel gate
 
 A newly created CPython 3.12.10 venv
-`fresh-wheel-8a63e7b` installed only the freshly built wheel and its declared
+`fresh-wheel-1d1cd7e` installed only the freshly built wheel and its declared
 runtime dependencies. `PYTHONPATH` was cleared and the smoke ran outside the
 repository:
 
 - imported module:
-  `C:\Users\10176\AppData\Local\Temp\agent-sdk-python312-gate\fresh-wheel-8a63e7b\Lib\site-packages\agent_sdk\__init__.py`;
+  `C:\Users\10176\AppData\Local\Temp\agent-sdk-python312-gate\fresh-wheel-1d1cd7e\Lib\site-packages\agent_sdk\__init__.py`;
 - installed version: `0.1.0.dev0`;
 - source directory on `sys.path`: false;
 - module loaded from source: false;

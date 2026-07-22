@@ -3,7 +3,7 @@
 ## Scope
 
 This change closes every finding in the independent R3 final review at
-`5a8a160`: I1, I2, M1, and M2. It does not start R4.
+`e0b34c3`: I1, I2, M1, and M2. It does not start R4.
 
 ## I1 - Safe first-use L4
 
@@ -87,7 +87,7 @@ TDD evidence:
 - The single skip is the existing optional tokenizer-backend case.
 - Ruff over all changed source/tests: clean.
 - Strict mypy over all 93 source files: clean.
-- Whole-R3 `git diff --check 2774a94..HEAD`: clean after M1.
+- Whole-R3 `git diff --check aa2d410..HEAD`: clean after M1.
 
 The known non-R3 `tests/integration/runtime/test_recovery_api.py` fixture /
 built-in-capability mismatch remains release-candidate debt and was not

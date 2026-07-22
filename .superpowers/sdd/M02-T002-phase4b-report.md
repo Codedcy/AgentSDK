@@ -112,7 +112,7 @@ ambiguous commit boundaries, and brittle mixed one-second/unbounded test
 barriers. The bounded remediation is recorded in
 `M02-T002-phase4-review-fix-brief.md`; Phase 5 remains blocked.
 
-The first re-review after `2f9ff74` was also **Not Approved**: Spec Compliance
+The first re-review after `3513035` was also **Not Approved**: Spec Compliance
 C0/I1/M0 and Task Quality C0/I0/M0. The public-entry, ambiguous ownership, and
 bounded-barrier findings were confirmed closed. The remaining finding is test
 authenticity: the expired/interrupted case fabricated an unreachable Run
@@ -123,7 +123,7 @@ blocked.
 
 ## Final whole-Phase-4 review
 
-After the reachable scanner and public busy-delete corrections in `20cf09e`,
+After the reachable scanner and public busy-delete corrections in `9e080e6`,
 the fresh independent review **Approved** Phase 4: Spec Compliance C0/I0/M0
 and Task Quality C0/I0/M1. Fresh evidence passed the exact authenticity matrix
 7, complete Phase 4 file 99, adjacent recovery/ownership suites 673, full

@@ -3,7 +3,7 @@
 ## Objective
 
 Implement the cross-SDK concurrency and fault-hardening slice from
-`M02-T002-phase4-plan.md`. Phase 4A is independently approved at `e3d2965`.
+`M02-T002-phase4-plan.md`. Phase 4A is independently approved at `1f15260`.
 Preserve every Phase 4A public and persistence contract. This brief covers only
 M02-T002 Step 4 / Phase 4B; it does not complete M02-T002 by itself.
 

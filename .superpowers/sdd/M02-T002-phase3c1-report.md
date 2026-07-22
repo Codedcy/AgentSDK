@@ -10,7 +10,7 @@ one reconciliation request; and an explicitly invoked `RecoveryScanner.scan()`
 claims a fresh lease generation and writes one exact `run.interrupted` boundary.
 
 The implementation is based on
-`25db10a29545c427108d3a515b570a9c0274de83`. It does not expose or schedule a
+`c5c45cd47a195df1cba23564f331389a5560d09e`. It does not expose or schedule a
 public recovery command, resume a checkpoint, invoke or register a provider,
 Tool, MCP, Workflow, or application callback, or change RunEngine/Workflow/schema
 behavior.

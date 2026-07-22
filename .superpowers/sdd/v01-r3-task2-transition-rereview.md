@@ -10,15 +10,15 @@
 - Summary: **C0 / I0 / M0**
 - Approval: **APPROVED**
 
-Commit `ad32767` closes the sole Important finding from the transition review at
-`9e88cf7`.
+Commit `43b8c60` closes the sole Important finding from the transition review at
+`7058cf2`.
 
 ## I1 verification
 
 **Resolved.**
 
 - The documentation contract now requires Task 2 implementation/review commits
-  `c3dc154` and `3d8458e`, the 102-test evidence, and Task 2 completion.
+  `3f23363` and `e5c646f`, the 102-test evidence, and Task 2 completion.
 - It requires the Task 3 Step 1 resume point,
   `tests/integration/prompts/test_runtime_prompt.py`, and the exact Windows
   pytest command with disabled plugin autoload plus explicit
@@ -40,7 +40,7 @@ pytest -p pytest_asyncio.plugin tests/docs -q
 ruff check tests/docs/test_v01_release_ledger.py
 All checks passed!
 
-git diff --check 9e88cf7..ad32767
+git diff --check 7058cf2..43b8c60
 clean
 ```
 

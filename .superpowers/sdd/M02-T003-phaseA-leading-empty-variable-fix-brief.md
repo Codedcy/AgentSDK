@@ -2,7 +2,7 @@
 
 ## Context
 
-The independent final review of `7ed2465..03a3a20` returned REQUEST CHANGES:
+The independent final review of `3777256..dbba78a` returned REQUEST CHANGES:
 
 - Spec: C0 / I1 / M0
 - Quality: C0 / I1 / M0
@@ -14,7 +14,7 @@ remain blocked.
 
 ## Required RED/GREEN
 
-1. Against `03a3a20`, use real SQLite and direct normalizer comparison to prove:
+1. Against `dbba78a`, use real SQLite and direct normalizer comparison to prove:
    - `$::foo` and `$::foo(bar)` are valid single bind parameters;
    - valid repeated empty segments followed by an identifier, such as
      `$::::foo`, follow the real SQLite tokenizer result;
