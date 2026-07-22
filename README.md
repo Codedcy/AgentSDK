@@ -1,5 +1,7 @@
 # Agent SDK
 
+English | [简体中文](README.zh-CN.md)
+
 Agent SDK `0.1.0` is an async Python foundation for building recoverable and
 observable agents. It combines a LiteLLM-backed Agent Loop with Tools, MCP,
 Skills, validated Workflows, Child agents, automatic L0-L4 Context compaction,
