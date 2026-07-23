@@ -30,6 +30,7 @@ from examples.quickstart_agent import (
     build_parser,
     define_agent,
     execute_turn,
+    run_chat,
     select_session,
     summarize_run,
 )
@@ -153,6 +154,57 @@ class WriteThenAnswerProvider:
                 {"path": "note.txt", "content": "hello"},
             )
         return _text_stream("finished")
+
+
+class ConversationProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests: list[tuple[dict[str, Any], ...]] = []
+
+    async def __call__(self, **params: Any) -> object:
+        self.calls += 1
+        self.requests.append(tuple(dict(item) for item in params["messages"]))
+        return _text_stream(f"answer-{self.calls}")
+
+
+@pytest.mark.asyncio
+async def test_run_chat_keeps_multiple_turns_in_one_session(
+    tmp_path: Path,
+) -> None:
+    provider = ConversationProvider()
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        permission_default="ask",
+    )
+    inputs = iter(("first question", "second question", "exit"))
+    output: list[str] = []
+
+    async def read_line(_: str) -> str:
+        return next(inputs)
+
+    async def deny(_: PermissionRequest) -> PermissionDecision:
+        return PermissionDecision.deny("not needed")
+
+    try:
+        session = await sdk.sessions.create(workspaces=(tmp_path,))
+        agent = define_agent(sdk, "fake/general")
+        await run_chat(
+            sdk,
+            session.session_id,
+            agent,
+            read_line=read_line,
+            write_line=output.append,
+            resolve_permission=deny,
+        )
+
+        assert provider.calls == 2
+        assert any("answer-1" in str(message) for message in provider.requests[1])
+        assert any("answer-1" in line for line in output)
+        assert any("answer-2" in line for line in output)
+        assert sum(line.startswith("Run ") for line in output) == 2
+    finally:
+        await sdk.close()
 
 
 @pytest.mark.asyncio

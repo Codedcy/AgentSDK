@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Awaitable, Callable
+import json
+import sys
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,9 @@ from pathlib import Path
 from agent_sdk import (
     AgentSDK,
     AgentSDKConfig,
+    AgentSDKError,
     AgentSpec,
+    ErrorCode,
     PermissionDecision,
     PermissionRequest,
     RunResult,
@@ -24,6 +28,8 @@ PermissionResolver = Callable[
     [PermissionRequest],
     Awaitable[PermissionDecision],
 ]
+LineReader = Callable[[str], Awaitable[str]]
+LineWriter = Callable[[str], None]
 
 
 @dataclass(frozen=True)
@@ -226,3 +232,100 @@ async def summarize_run(
         total_tokens=result.usage.total_tokens,
         tools=tools,
     )
+
+
+async def _console_read(prompt: str) -> str:
+    return await asyncio.to_thread(input, prompt)
+
+
+def _console_write(text: str) -> None:
+    print(text, flush=True)
+
+
+async def prompt_for_permission(
+    request: PermissionRequest,
+) -> PermissionDecision:
+    arguments = json.dumps(
+        request.model_dump(mode="json")["arguments"],
+        ensure_ascii=False,
+    )
+    answer = await _console_read(
+        f"Allow {request.tool_name} once with {arguments}? [y/N] "
+    )
+    if answer.strip().lower() == "y":
+        return PermissionDecision.allow_once()
+    return PermissionDecision.deny("user denied")
+
+
+async def run_chat(
+    sdk: AgentSDK,
+    session_id: str,
+    agent: AgentSpec,
+    *,
+    read_line: LineReader = _console_read,
+    write_line: LineWriter = _console_write,
+    resolve_permission: PermissionResolver = prompt_for_permission,
+) -> None:
+    while True:
+        try:
+            user_input = (await read_line("You> ")).strip()
+        except EOFError:
+            return
+        if user_input.lower() in {"exit", "quit"}:
+            return
+        if not user_input:
+            continue
+        result = await execute_turn(
+            sdk,
+            session_id,
+            agent,
+            user_input,
+            resolve_permission=resolve_permission,
+        )
+        summary = await summarize_run(sdk, result)
+        write_line(f"Agent> {result.output_text}")
+        tool_text = ", ".join(summary.tools) if summary.tools else "none"
+        token_text = (
+            str(summary.total_tokens)
+            if summary.total_tokens is not None
+            else "unknown"
+        )
+        write_line(
+            f"Run {summary.run_id} | tokens={token_text} | tools={tool_text}"
+        )
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    workspace = args.workspace.resolve()
+    if not workspace.is_dir():
+        raise AgentSDKError(
+            ErrorCode.INVALID_STATE,
+            "workspace must be an existing directory",
+            retryable=False,
+        )
+    sdk = create_sdk(args)
+    try:
+        session = await select_session(sdk, workspace, args.session_id)
+        agent = define_agent(sdk, args.model)
+        _console_write(f"Session: {session.session_id}")
+        _console_write("Type exit to stop. The Session will be kept.")
+        await run_chat(sdk, session.session_id, agent)
+        return 0
+    finally:
+        await sdk.close()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        _console_write("\nStopped. The Session was kept.")
+        return 130
+    except AgentSDKError as error:
+        _console_write(f"Agent SDK error: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
