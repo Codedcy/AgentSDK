@@ -97,6 +97,19 @@ def test_bilingual_readmes_share_executable_examples() -> None:
     assert _fenced_blocks(chinese, "python") == _fenced_blocks(english, "python")
 
 
+def test_bilingual_readmes_recommend_the_general_agent_quickstart() -> None:
+    english = README.read_text(encoding="utf-8")
+    chinese = ZH_README.read_text(encoding="utf-8")
+    command = "python examples/quickstart_agent.py --model openai/gpt-4o-mini"
+
+    assert "## Build a General Agent" in english
+    assert "examples/quickstart_agent.py" in chinese
+    assert command in english
+    assert command in chinese
+    assert "--session-id" in english
+    assert "--session-id" in chinese
+
+
 def test_chinese_readme_python_examples_are_valid_modules() -> None:
     chinese = ZH_README.read_text(encoding="utf-8")
     blocks = _fenced_blocks(chinese, "python")

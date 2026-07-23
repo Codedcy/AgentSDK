@@ -26,6 +26,27 @@ python -m pip install .
 
 仓库是 v0.1 支持的分发路径；本 README 不假定已发布到包索引。
 
+## 构建一个通用 Agent
+
+设置 LiteLLM 提供方所需的凭据，然后启动交互式示例：
+
+```powershell
+python examples/quickstart_agent.py --model openai/gpt-4o-mini
+```
+
+该示例会创建由 SQLite 持久化的 Session，在选定的 workspace 内使用内置
+`read`、`write` 和 `bash` Tool，并在写入文件或执行命令前询问用户。每轮
+对话结束后，它会显示 Session ID、最终回复、token 用量和调用过的 Tool。
+
+进程重启后，可以通过打印出的标识继续同一段对话：
+
+```powershell
+python examples/quickstart_agent.py --model openai/gpt-4o-mini --session-id SESSION_ID
+```
+
+使用 `--workspace` 和 `--database` 可以选择其他路径。输入 `exit` 会关闭
+应用，但不会删除 Session。
+
 ## 五分钟确定性 smoke 运行
 
 ```powershell

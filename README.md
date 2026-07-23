@@ -38,6 +38,30 @@ python -m pip install .
 The repository is the supported distribution path for v0.1; no package-index
 release is assumed by this README.
 
+## Build a General Agent
+
+Set the credentials required by your LiteLLM provider, then start the
+interactive example:
+
+```powershell
+python examples/quickstart_agent.py --model openai/gpt-4o-mini
+```
+
+The example creates a SQLite-backed Session, uses the built-in `read`, `write`,
+and `bash` Tools inside the selected workspace, and asks before write or command
+execution. It prints the Session ID, final answer, token usage, and invoked
+Tools after each turn.
+
+To continue the same conversation after restarting the process, pass the
+printed identifier:
+
+```powershell
+python examples/quickstart_agent.py --model openai/gpt-4o-mini --session-id SESSION_ID
+```
+
+Use `--workspace` and `--database` to select different paths. Enter `exit` to
+close the application without deleting its Session.
+
 ## Five-minute deterministic smoke run
 
 ```powershell
