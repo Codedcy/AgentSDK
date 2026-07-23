@@ -419,3 +419,16 @@ v0.2 retained hardening backlog after the first task: workspace authorization TO
 2026-07-22 author rewrite cleanup: temporary `refs/original` and `refs/rewrites` removed after bundle and mapping verification.
 2026-07-22 author rewrite remote completion: after explicit user approval, the old remote head was verified unchanged and `origin/master` was updated with an exact `--force-with-lease` expectation to checkpoint `2438fb4`; local and remote heads matched immediately after fetch verification, with all 335 commits using the target Author/Committer identity.
 2026-07-22 bilingual README Task 1: complete (implementation `2d232fe`; review fix `5bfb2e4`; task review and final re-review approved, Critical 0 / Important 0 / Minor 0; controller gate 20 documentation tests passed, Ruff clean, strict mypy clean across 107 source files, diff-check clean, deterministic smoke passed).
+
+2026-07-23 quickstart general Agent example: in progress on `master` with explicit user approval.
+Plan: `docs/superpowers/plans/2026-07-23-quickstart-general-agent.md`
+Baseline: 25 passed across reference CLI, v0.1 reference example, and public README contracts.
+Next action: Task 1, CLI configuration, Session selection, and Agent definition.
+Quickstart Task 1: complete (commit `7c1f9a3`, review clean; Spec compliant, Task quality approved; focused 4 passed).
+Next action: Task 2, permission-aware turn execution and Trace summary.
+Quickstart Task 2: complete (commits `df21bde`, `79e2327`; initial review found two Important cleanup races and one Minor coverage gap; fix re-review clean; focused 10 passed, Ruff clean).
+Next action: Task 3, interactive multi-turn application.
+Quickstart Task 3: complete (commit `cfb7818`; review clean; focused 11 passed, Ruff clean, CLI help verified).
+Next action: Task 4, bilingual README entry point.
+Quickstart Task 4: complete (commit `613ff27`; review clean; README contracts 15 passed, Ruff clean).
+Next action: Task 5, completion verification and whole-branch review.
