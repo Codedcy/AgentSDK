@@ -108,6 +108,39 @@ async def _settle_permission_waiter(
     return None
 
 
+async def _resolve_permission_best_effort(
+    sdk: AgentSDK,
+    request: PermissionRequest,
+    decision: PermissionDecision,
+) -> None:
+    resolution = asyncio.create_task(
+        sdk.permissions.resolve(request.request_id, decision)
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not resolution.done():
+        try:
+            await asyncio.shield(resolution)
+        except asyncio.CancelledError as error:
+            if resolution.cancelled():
+                return
+            cancellation = error
+        except BaseException:
+            return
+    with suppress(BaseException):
+        resolution.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _cancel_and_await_result_waiter(
+    waiter: asyncio.Task[RunResult],
+) -> None:
+    if not waiter.done():
+        waiter.cancel()
+    with suppress(BaseException):
+        await waiter
+
+
 async def execute_turn(
     sdk: AgentSDK,
     session_id: str,
@@ -135,11 +168,13 @@ async def execute_turn(
                 )
                 permission_waiter = None
                 if pending_request is not None:
-                    await sdk.permissions.resolve(
-                        pending_request.request_id,
+                    request = pending_request
+                    pending_request = None
+                    await _resolve_permission_best_effort(
+                        sdk,
+                        request,
                         PermissionDecision.deny("Run already terminated"),
                     )
-                    pending_request = None
                 break
             pending_request = await permission_waiter
             permission_waiter = None
@@ -151,17 +186,22 @@ async def execute_turn(
             pending_request = None
         return await result_waiter
     finally:
-        if permission_waiter is not None:
-            with suppress(BaseException):
-                recovered = await _settle_permission_waiter(permission_waiter)
-                if pending_request is None:
-                    pending_request = recovered
-        if pending_request is not None:
-            with suppress(BaseException):
-                await sdk.permissions.resolve(
-                    pending_request.request_id,
+        try:
+            if permission_waiter is not None:
+                with suppress(BaseException):
+                    recovered = await _settle_permission_waiter(permission_waiter)
+                    if pending_request is None:
+                        pending_request = recovered
+            if pending_request is not None:
+                request = pending_request
+                pending_request = None
+                await _resolve_permission_best_effort(
+                    sdk,
+                    request,
                     PermissionDecision.deny("quickstart stopped"),
                 )
+        finally:
+            await _cancel_and_await_result_waiter(result_waiter)
 
 
 async def summarize_run(

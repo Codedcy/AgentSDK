@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -11,8 +12,17 @@ import pytest
 from agent_sdk import (
     AgentSDK,
     AgentSpec,
+    AgentSDKError,
+    ErrorCode,
     PermissionDecision,
     PermissionRequest,
+    RunResult,
+    TokenUsage,
+    ToolResult,
+    TraceStage,
+    TraceStageKind,
+    TraceStageStatus,
+    TraceTimeline,
 )
 from agent_sdk.permissions import PermissionRule
 from agent_sdk.storage.memory import InMemoryStore
@@ -225,3 +235,245 @@ async def test_execute_turn_can_deny_write(tmp_path: Path) -> None:
         assert result.tool_results[0].status.value == "denied"
     finally:
         await sdk.close()
+
+
+def _run_result() -> RunResult:
+    return RunResult(
+        run_id="quickstart-run",
+        output_text="finished",
+        usage=TokenUsage(total_tokens=3),
+    )
+
+
+class _ControlledRunHandle:
+    def __init__(self, result: RunResult | None = None) -> None:
+        loop = asyncio.get_running_loop()
+        self.run_id = "quickstart-run"
+        self._completion: asyncio.Future[RunResult] = loop.create_future()
+        if result is not None:
+            self._completion.set_result(result)
+        self.result_started = asyncio.Event()
+        self.result_cancelled = asyncio.Event()
+        self.result_finished = asyncio.Event()
+
+    def finish(self, result: RunResult) -> None:
+        if not self._completion.done():
+            self._completion.set_result(result)
+
+    async def result(self) -> RunResult:
+        self.result_started.set()
+        try:
+            return await self._completion
+        except asyncio.CancelledError:
+            self.result_cancelled.set()
+            raise
+        finally:
+            self.result_finished.set()
+
+
+class _ControlledRuns:
+    def __init__(self, handle: _ControlledRunHandle) -> None:
+        self._handle = handle
+
+    async def start(self, *_: object) -> _ControlledRunHandle:
+        return self._handle
+
+
+class _ControlledPermissions:
+    def __init__(
+        self,
+        request: PermissionRequest | None = None,
+        *,
+        resolve_error: Exception | None = None,
+    ) -> None:
+        self._request = request
+        self._resolve_error = resolve_error
+        self.next_started = asyncio.Event()
+        self.resolved = asyncio.Event()
+        self.resolutions: list[tuple[str, PermissionDecision]] = []
+        self._delivery = asyncio.Event()
+
+    async def next_request(self, _: str) -> PermissionRequest:
+        self.next_started.set()
+        await self._delivery.wait()
+        assert self._request is not None
+        return self._request
+
+    async def resolve(
+        self,
+        request_id: str,
+        decision: PermissionDecision,
+    ) -> None:
+        self.resolutions.append((request_id, decision))
+        self.resolved.set()
+        if self._resolve_error is not None:
+            raise self._resolve_error
+
+    def deliver(self) -> None:
+        self._delivery.set()
+
+
+class _ControlledSDK:
+    def __init__(
+        self,
+        handle: _ControlledRunHandle,
+        permissions: _ControlledPermissions,
+    ) -> None:
+        self.runs = _ControlledRuns(handle)
+        self.permissions = permissions
+
+
+def _permission_request() -> PermissionRequest:
+    return PermissionRequest(
+        request_id="quickstart-request",
+        run_id="quickstart-run",
+        session_id="quickstart-session",
+        tool_name="write",
+        arguments={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_cancellation_before_permission_delivery_cancels_run_waiter() -> None:
+    handle = _ControlledRunHandle()
+    permissions = _ControlledPermissions()
+    sdk = _ControlledSDK(handle, permissions)
+    agent = AgentSpec(name="quickstart", model="fake/general")
+    turn = asyncio.create_task(
+        execute_turn(
+            sdk,  # type: ignore[arg-type]
+            "quickstart-session",
+            agent,
+            "write a note",
+            resolve_permission=lambda _: asyncio.sleep(0),  # type: ignore[arg-type]
+        )
+    )
+
+    try:
+        await asyncio.wait_for(permissions.next_started.wait(), timeout=1)
+        turn.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        await asyncio.wait_for(handle.result_cancelled.wait(), timeout=1)
+    finally:
+        handle.finish(_run_result())
+        await asyncio.wait_for(handle.result_finished.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_cancellation_while_resolver_waits_denies_request_and_cancels_run_waiter() -> None:
+    handle = _ControlledRunHandle()
+    request = _permission_request()
+    permissions = _ControlledPermissions(request)
+    permissions.deliver()
+    sdk = _ControlledSDK(handle, permissions)
+    agent = AgentSpec(name="quickstart", model="fake/general")
+    resolver_started = asyncio.Event()
+    resolver_release = asyncio.Event()
+
+    async def wait_for_decision(_: PermissionRequest) -> PermissionDecision:
+        resolver_started.set()
+        await resolver_release.wait()
+        return PermissionDecision.allow_once()
+
+    turn = asyncio.create_task(
+        execute_turn(
+            sdk,  # type: ignore[arg-type]
+            "quickstart-session",
+            agent,
+            "write a note",
+            resolve_permission=wait_for_decision,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(resolver_started.wait(), timeout=1)
+        turn.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+        await asyncio.wait_for(permissions.resolved.wait(), timeout=1)
+        assert permissions.resolutions == [
+            (request.request_id, PermissionDecision.deny("quickstart stopped"))
+        ]
+        await asyncio.wait_for(handle.result_cancelled.wait(), timeout=1)
+    finally:
+        resolver_release.set()
+        handle.finish(_run_result())
+        await asyncio.wait_for(handle.result_finished.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_returns_result_when_recovered_request_is_already_resolved() -> None:
+    expected = _run_result()
+    handle = _ControlledRunHandle(expected)
+    permissions = _ControlledPermissions(
+        _permission_request(),
+        resolve_error=AgentSDKError(
+            ErrorCode.NOT_FOUND,
+            "permission request not found",
+            retryable=False,
+        ),
+    )
+    permissions.deliver()
+    sdk = _ControlledSDK(handle, permissions)
+    agent = AgentSpec(name="quickstart", model="fake/general")
+
+    result = await execute_turn(
+        sdk,  # type: ignore[arg-type]
+        "quickstart-session",
+        agent,
+        "write a note",
+        resolve_permission=lambda _: asyncio.sleep(0),  # type: ignore[arg-type]
+    )
+
+    assert result == expected
+    assert permissions.resolutions == [
+        ("quickstart-request", PermissionDecision.deny("Run already terminated"))
+    ]
+
+
+class _TraceSDK:
+    def __init__(self, timeline: TraceTimeline) -> None:
+        self.trace = self
+        self._timeline = timeline
+
+    async def timeline(self, _: str) -> TraceTimeline:
+        return self._timeline
+
+
+@pytest.mark.asyncio
+async def test_summarize_run_includes_only_tool_results_in_trace_timeline() -> None:
+    result = RunResult(
+        run_id="quickstart-run",
+        output_text="finished",
+        usage=TokenUsage(total_tokens=3),
+        tool_results=(
+            ToolResult.succeeded("included-call", "write", {"ok": True}),
+            ToolResult.succeeded("unrelated-call", "bash", {"ok": True}),
+        ),
+    )
+    timeline = TraceTimeline(
+        root_id=result.run_id,
+        root_kind="run",
+        stages=(
+            TraceStage(
+                stage_id="tool-stage",
+                kind=TraceStageKind.TOOL,
+                status=TraceStageStatus.COMPLETED,
+                entity_id="included-call",
+                run_id=result.run_id,
+                session_id="quickstart-session",
+                first_cursor=1,
+                last_cursor=1,
+            ),
+        ),
+        as_of_cursor=1,
+    )
+
+    summary = await summarize_run(_TraceSDK(timeline), result)  # type: ignore[arg-type]
+
+    assert summary.tools == ("write",)
