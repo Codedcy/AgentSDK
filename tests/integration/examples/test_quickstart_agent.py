@@ -201,13 +201,13 @@ async def test_bash_permission_prompt_redacts_secrets_and_warns_before_approval(
     (
         (
             "read",
-            {"path": "notes/\n\t\r\x1b\x07\x85\x7f\u202e\u200d.txt"},
+            {"path": ("notes/\n\t\r\x1b\x07\x85\x7f\u2028\u2029\u202e\u200d\ud800\udfff.txt")},
             0,
         ),
         (
             "write",
             {
-                "path": "notes/\n\t\r\x1b\x07\x85\x7f\u202e\u200d.txt",
+                "path": ("notes/\n\t\r\x1b\x07\x85\x7f\u2028\u2029\u202e\u200d\ud800\udfff.txt"),
                 "content": "content is never displayed",
             },
             0,
@@ -215,8 +215,11 @@ async def test_bash_permission_prompt_redacts_secrets_and_warns_before_approval(
         (
             "bash",
             {
-                "cwd": "workspace/\n\t\r\x1b\x07\x85\x7f\u202e\u200d",
-                "argv": ["printf", "value\n\t\r\x1b\x07\x85\x7f\u202e\u200d"],
+                "cwd": ("workspace/\n\t\r\x1b\x07\x85\x7f\u2028\u2029\u202e\u200d\ud800"),
+                "argv": [
+                    "printf",
+                    ("value\n\t\r\x1b\x07\x85\x7f\u2028\u2029\u202e\u200d\udfff"),
+                ],
             },
             1,
         ),
@@ -251,7 +254,20 @@ async def test_permission_prompt_escapes_terminal_controls_before_bounding(
 
     assert prompts == [f"Allow {tool_name} once with {summary}? [y/N] "]
     assert summary.count("\n") == expected_newlines
-    for raw_control in ("\t", "\r", "\x1b", "\x07", "\x85", "\x7f", "\u202e", "\u200d"):
+    for raw_control in (
+        "\t",
+        "\r",
+        "\x1b",
+        "\x07",
+        "\x85",
+        "\x7f",
+        "\u2028",
+        "\u2029",
+        "\u202e",
+        "\u200d",
+        "\ud800",
+        "\udfff",
+    ):
         assert raw_control not in summary
         assert raw_control not in prompts[0]
     for visible_escape in (
@@ -262,13 +278,36 @@ async def test_permission_prompt_escapes_terminal_controls_before_bounding(
         r"\x07",
         r"\x85",
         r"\x7f",
+        r"\u2028",
+        r"\u2029",
         r"\u202e",
         r"\u200d",
+        r"\ud800",
+        r"\udfff",
     ):
         assert visible_escape in summary
         assert visible_escape in prompts[0]
     assert len(summary) <= 512
     assert len(prompts[0]) <= 600
+
+
+def test_write_permission_summary_handles_invalid_unicode_content() -> None:
+    request = PermissionRequest(
+        request_id="write-invalid-unicode-request",
+        run_id="write-invalid-unicode-run",
+        session_id="write-invalid-unicode-session",
+        tool_name="write",
+        arguments={
+            "path": "notes/output.txt",
+            "content": "before\ud800after",
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    assert "path=notes/output.txt" in summary
+    assert "content_bytes=invalid_unicode" in summary
+    assert "\ud800" not in summary
 
 
 def test_bash_permission_summary_redacts_bare_names_and_attached_short_options() -> None:

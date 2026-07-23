@@ -488,7 +488,7 @@ def _visible_terminal_text(value: object) -> str:
             code_point = ord(character)
             if code_point <= 0x1F or 0x7F <= code_point <= 0x9F:
                 visible.append(f"\\x{code_point:02x}")
-            elif unicodedata.category(character) == "Cf":
+            elif unicodedata.category(character) in {"Cf", "Cs", "Zl", "Zp"}:
                 if code_point <= 0xFFFF:
                     visible.append(f"\\u{code_point:04x}")
                 else:
@@ -512,7 +512,13 @@ def summarize_permission_request(request: PermissionRequest) -> str:
         return f"path={_bounded_display(arguments.get('path'))}"
     if request.tool_name == "write":
         content = arguments.get("content")
-        content_bytes = len(content.encode("utf-8")) if isinstance(content, str) else 0
+        if isinstance(content, str):
+            try:
+                content_bytes: int | str = len(content.encode("utf-8"))
+            except UnicodeEncodeError:
+                content_bytes = "invalid_unicode"
+        else:
+            content_bytes = 0
         overwrite = "true" if arguments.get("overwrite") is True else "false"
         return (
             f"path={_bounded_display(arguments.get('path'))} "
