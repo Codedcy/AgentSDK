@@ -55,8 +55,9 @@ answer, Run ID, token usage, and invoked Tools.
 `read` and `write` stay within the Session workspace. For `bash`, the workspace
 rule binds the subprocess working directory, but an approved process is not
 sandboxed: it can use absolute paths outside the workspace and inherits the
-application environment, including provider credentials. The example shows
-this warning before approval.
+application environment, including provider credentials. Its stdout and stderr
+are sent to the model and stored in Session history, so approve only commands
+whose output is safe to retain. The example shows this warning before approval.
 
 To continue the same conversation after restarting the process, pass the
 printed identifier:
@@ -64,6 +65,9 @@ printed identifier:
 ```powershell
 python examples/quickstart_agent.py --model openai/gpt-4o-mini --session-id SESSION_ID
 ```
+
+To resume, reuse the same database and the exact original resolved workspace;
+the example rejects a different workspace.
 
 Use `--workspace` and `--database` to select different paths. Enter `exit` to
 close the application without deleting its Session.

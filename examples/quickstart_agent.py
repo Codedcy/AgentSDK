@@ -5,7 +5,8 @@ import asyncio
 import json
 import re
 import sys
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+import unicodedata
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,12 +37,11 @@ _PERMISSION_SUMMARY_LIMIT = 512
 _PERMISSION_FIELD_LIMIT = 192
 _PERMISSION_ARG_LIMIT = 80
 _PERMISSION_ARG_COUNT = 16
-_UNKNOWN_ITEM_COUNT = 8
-_UNKNOWN_DEPTH_LIMIT = 5
 _REDACTED = "[REDACTED]"
 _BASH_WARNING = (
     "WARNING: approved commands are not sandboxed; they can access paths "
-    "outside the workspace and inherit the application environment."
+    "outside the workspace and inherit the application environment. Their "
+    "stdout and stderr are sent to the model and stored in Session history."
 )
 _SENSITIVE_NAMES = frozenset(
     {
@@ -102,31 +102,33 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def create_sdk(args: argparse.Namespace) -> AgentSDK:
+def build_sdk_config(args: argparse.Namespace) -> AgentSDKConfig:
     workspace = args.workspace.resolve()
-    return AgentSDK(
-        AgentSDKConfig(
-            database_path=args.database,
-            permission_default="ask",
-            permission_rules=(
-                PermissionRule(
-                    outcome="allow",
-                    tool="read",
-                    path_prefix=workspace,
-                ),
-                PermissionRule(
-                    outcome="ask",
-                    tool="write",
-                    path_prefix=workspace,
-                ),
-                PermissionRule(
-                    outcome="ask",
-                    tool="bash",
-                    path_prefix=workspace,
-                ),
+    return AgentSDKConfig(
+        database_path=args.database,
+        permission_default="ask",
+        permission_rules=(
+            PermissionRule(
+                outcome="allow",
+                tool="read",
+                path_prefix=workspace,
             ),
-        )
+            PermissionRule(
+                outcome="ask",
+                tool="write",
+                path_prefix=workspace,
+            ),
+            PermissionRule(
+                outcome="ask",
+                tool="bash",
+                path_prefix=workspace,
+            ),
+        ),
     )
+
+
+def create_sdk(args: argparse.Namespace) -> AgentSDK:
+    return AgentSDK(build_sdk_config(args))
 
 
 async def select_session(
@@ -472,53 +474,36 @@ def _redact_bash_argv(value: object) -> list[str]:
     return redacted
 
 
-def _bounded_display(value: object, *, limit: int = _PERMISSION_FIELD_LIMIT) -> str:
+def _visible_terminal_text(value: object) -> str:
     text = value if isinstance(value, str) else type(value).__name__
+    visible: list[str] = []
+    for character in text:
+        if character == "\n":
+            visible.append(r"\n")
+        elif character == "\t":
+            visible.append(r"\t")
+        elif character == "\r":
+            visible.append(r"\r")
+        else:
+            code_point = ord(character)
+            if code_point <= 0x1F or 0x7F <= code_point <= 0x9F:
+                visible.append(f"\\x{code_point:02x}")
+            elif unicodedata.category(character) == "Cf":
+                if code_point <= 0xFFFF:
+                    visible.append(f"\\u{code_point:04x}")
+                else:
+                    visible.append(f"\\U{code_point:08x}")
+            else:
+                visible.append(character)
+    return "".join(visible)
+
+
+def _bounded_display(value: object, *, limit: int = _PERMISSION_FIELD_LIMIT) -> str:
+    text = _visible_terminal_text(value)
     if len(text) <= limit:
         return text
     tail_length = min(48, (limit - 3) // 2)
     return f"{text[: limit - tail_length - 3]}...{text[-tail_length:]}"
-
-
-def _redact_unknown_value(
-    value: object,
-    *,
-    field_name: str | None = None,
-    depth: int = 0,
-) -> object:
-    if field_name is not None and _is_sensitive_name(field_name):
-        return _REDACTED
-    if depth >= _UNKNOWN_DEPTH_LIMIT:
-        return "..."
-    if isinstance(value, Mapping):
-        items = list(value.items())
-        redacted = {
-            _bounded_display(key, limit=40): _redact_unknown_value(
-                nested,
-                field_name=key,
-                depth=depth + 1,
-            )
-            for key, nested in items[:_UNKNOWN_ITEM_COUNT]
-            if isinstance(key, str)
-        }
-        if len(items) > _UNKNOWN_ITEM_COUNT:
-            redacted["..."] = f"{len(items) - _UNKNOWN_ITEM_COUNT} more fields"
-        return redacted
-    if isinstance(value, (list, tuple)):
-        redacted_items = [
-            _redact_unknown_value(item, depth=depth + 1) for item in value[:_UNKNOWN_ITEM_COUNT]
-        ]
-        if len(value) > _UNKNOWN_ITEM_COUNT:
-            redacted_items.append(f"... {len(value) - _UNKNOWN_ITEM_COUNT} more items")
-        return redacted_items
-    if isinstance(value, str):
-        return _bounded_display(
-            _redact_bash_argument(value),
-            limit=_PERMISSION_ARG_LIMIT,
-        )
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return type(value).__name__
 
 
 def summarize_permission_request(request: PermissionRequest) -> str:
@@ -541,22 +526,15 @@ def summarize_permission_request(request: PermissionRequest) -> str:
         body = f"cwd={_bounded_display(arguments.get('cwd'))} argv={argv}"
         body_limit = _PERMISSION_SUMMARY_LIMIT - len(_BASH_WARNING) - 1
         return f"{_bounded_display(body, limit=body_limit)}\n{_BASH_WARNING}"
-    rendered = json.dumps(
-        _redact_unknown_value(arguments),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return _bounded_display(
-        f"arguments={rendered}",
-        limit=_PERMISSION_SUMMARY_LIMIT,
-    )
+    return "arguments omitted"
 
 
 async def prompt_for_permission(
     request: PermissionRequest,
 ) -> PermissionDecision:
     summary = summarize_permission_request(request)
-    answer = await _console_read(f"Allow {request.tool_name} once with {summary}? [y/N] ")
+    tool_name = _bounded_display(request.tool_name, limit=40)
+    answer = await _console_read(f"Allow {tool_name} once with {summary}? [y/N] ")
     if answer.strip().lower() == "y":
         return PermissionDecision.allow_once()
     return PermissionDecision.deny("user denied")

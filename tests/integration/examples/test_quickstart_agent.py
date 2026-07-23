@@ -29,6 +29,7 @@ from agent_sdk import (
 from agent_sdk.permissions import PermissionRule
 from agent_sdk.storage.memory import InMemoryStore
 from examples.quickstart_agent import (
+    build_sdk_config,
     build_parser,
     define_agent,
     execute_turn,
@@ -78,6 +79,32 @@ def test_parser_supplies_documented_defaults() -> None:
     assert args.database == Path(".agent-sdk/quickstart.db")
     assert args.workspace == Path(".")
     assert args.session_id is None
+
+
+def test_sdk_config_uses_exact_workspace_permission_policy(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    database = tmp_path / "quickstart.db"
+    args = build_parser().parse_args(
+        [
+            "--database",
+            str(database),
+            "--workspace",
+            str(workspace),
+        ]
+    )
+
+    config = build_sdk_config(args)
+
+    assert config.database_path == database
+    assert config.permission_default == "ask"
+    assert [
+        (rule.tool, rule.outcome, rule.path_prefix, rule.command_prefix)
+        for rule in config.permission_rules
+    ] == [
+        ("read", "allow", workspace.resolve(), ()),
+        ("write", "ask", workspace.resolve(), ()),
+        ("bash", "ask", workspace.resolve(), ()),
+    ]
 
 
 def test_permission_summary_for_large_write_hides_content_and_counts_utf8_bytes() -> None:
@@ -162,7 +189,86 @@ async def test_bash_permission_prompt_redacts_secrets_and_warns_before_approval(
     assert "not sandboxed" in summary
     assert "outside the workspace" in summary
     assert "inherit the application environment" in summary
+    assert "stdout and stderr" in summary
+    assert "sent to the model" in summary
+    assert "stored in Session history" in summary
     assert len(summary) <= 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "expected_newlines"),
+    (
+        (
+            "read",
+            {"path": "notes/\n\t\r\x1b\x07\x85\x7f\u202e\u200d.txt"},
+            0,
+        ),
+        (
+            "write",
+            {
+                "path": "notes/\n\t\r\x1b\x07\x85\x7f\u202e\u200d.txt",
+                "content": "content is never displayed",
+            },
+            0,
+        ),
+        (
+            "bash",
+            {
+                "cwd": "workspace/\n\t\r\x1b\x07\x85\x7f\u202e\u200d",
+                "argv": ["printf", "value\n\t\r\x1b\x07\x85\x7f\u202e\u200d"],
+            },
+            1,
+        ),
+    ),
+)
+async def test_permission_prompt_escapes_terminal_controls_before_bounding(
+    tool_name: str,
+    arguments: dict[str, object],
+    expected_newlines: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = PermissionRequest(
+        request_id=f"{tool_name}-controls-request",
+        run_id=f"{tool_name}-controls-run",
+        session_id=f"{tool_name}-controls-session",
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    prompts: list[str] = []
+
+    async def capture_prompt(prompt: str) -> str:
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr(
+        "examples.quickstart_agent._console_read",
+        capture_prompt,
+    )
+
+    await prompt_for_permission(request)
+    summary = summarize_permission_request(request)
+
+    assert prompts == [f"Allow {tool_name} once with {summary}? [y/N] "]
+    assert summary.count("\n") == expected_newlines
+    for raw_control in ("\t", "\r", "\x1b", "\x07", "\x85", "\x7f", "\u202e", "\u200d"):
+        assert raw_control not in summary
+        assert raw_control not in prompts[0]
+    for visible_escape in (
+        r"\n",
+        r"\t",
+        r"\r",
+        r"\x1b",
+        r"\x07",
+        r"\x85",
+        r"\x7f",
+        r"\u202e",
+        r"\u200d",
+    ):
+        assert visible_escape in summary
+        assert visible_escape in prompts[0]
+    assert len(summary) <= 512
+    assert len(prompts[0]) <= 600
 
 
 def test_bash_permission_summary_redacts_bare_names_and_attached_short_options() -> None:
@@ -279,7 +385,7 @@ def test_bash_permission_summary_caps_complete_display_and_keeps_warning() -> No
     assert "inherit the application environment" in summary
 
 
-def test_unknown_permission_summary_redacts_sensitive_fields_and_is_bounded() -> None:
+def test_unknown_permission_summary_omits_arguments() -> None:
     request = PermissionRequest(
         request_id="unknown-summary-request",
         run_id="unknown-summary-run",
@@ -300,18 +406,13 @@ def test_unknown_permission_summary_redacts_sensitive_fields_and_is_bounded() ->
 
     summary = summarize_permission_request(request)
 
-    assert "arguments=" in summary
-    assert "safe-action" in summary
-    assert "public-prefix" in summary
-    assert summary.count("[REDACTED]") >= 3
+    assert summary == "arguments omitted"
     for secret in (
         "unknown-api-secret",
         "unknown-password-secret",
         "unknown-token-secret",
     ):
         assert secret not in summary
-    assert "..." in summary
-    assert len(summary) <= 512
 
 
 @pytest.mark.asyncio

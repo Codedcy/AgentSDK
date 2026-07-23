@@ -36,13 +36,15 @@ python examples/quickstart_agent.py --model openai/gpt-4o-mini
 
 该示例会创建由 SQLite 持久化的 Session，并使用内置 `read`、`write` 和 `bash` Tool。它会在写入文件或执行命令前询问用户。Session ID 仅在启动时打印一次；每轮结束后会显示最终回复、Run ID、token 用量和调用过的 Tool。
 
-`read` 和 `write` 始终受 Session workspace 约束。对于 `bash`，workspace 规则只绑定子进程的工作目录，但获批进程并不在沙箱中：它可以通过绝对路径访问 workspace 之外的位置，并会继承应用环境（包括其中的提供方凭据）。示例会在审批前显示这项警告。
+`read` 和 `write` 始终受 Session workspace 约束。对于 `bash`，workspace 规则只绑定子进程的工作目录，但获批进程并不在沙箱中：它可以通过绝对路径访问 workspace 之外的位置，并会继承应用环境（包括其中的提供方凭据）。其 stdout 和 stderr 会发送给模型，并存储在 Session 历史中，因此只能批准输出内容适合留存的命令。示例会在审批前显示这项警告。
 
 进程重启后，可以通过打印出的标识继续同一段对话：
 
 ```powershell
 python examples/quickstart_agent.py --model openai/gpt-4o-mini --session-id SESSION_ID
 ```
+
+恢复时必须复用同一个数据库和原始 workspace 的解析后精确路径；示例会拒绝不同的 workspace。
 
 使用 `--workspace` 和 `--database` 可以选择其他路径。输入 `exit` 会关闭
 应用，但不会删除 Session。

@@ -9,6 +9,7 @@ QUICKSTART = ROOT / "docs" / "guides" / "v01-quickstart.md"
 QUICKSTART_DESIGN = (
     ROOT / "docs" / "superpowers" / "specs" / "2026-07-23-quickstart-general-agent-design.md"
 )
+QUICKSTART_PLAN = ROOT / "docs" / "superpowers" / "plans" / "2026-07-23-quickstart-general-agent.md"
 
 
 def _readme() -> str:
@@ -120,11 +121,17 @@ def test_quickstart_docs_disclose_bash_boundary_and_output_timing() -> None:
         assert "not sandboxed" in text
         assert "absolute paths outside the workspace" in text
         assert "inherits the application environment" in text
+        assert "stdout and stderr" in text
+        assert "sent to the model" in text
+        assert "stored in Session history" in text
         assert "before approval" in text
     for text in (chinese,):
         assert "不在沙箱中" in text
         assert "绝对路径访问 workspace 之外" in text
         assert "继承应用环境" in text
+        assert "stdout 和 stderr" in text
+        assert "发送给模型" in text
+        assert "存储在 Session 历史中" in text
         assert "审批前" in text
 
     assert "Session ID is printed once at startup" in english
@@ -133,6 +140,22 @@ def test_quickstart_docs_disclose_bash_boundary_and_output_timing() -> None:
     ) in english
     assert "Session ID 仅在启动时打印一次" in chinese
     assert "每轮结束后会显示最终回复、Run ID、token 用量和调用过的 Tool" in chinese
+    assert "reuse the same database and the exact original resolved workspace" in english
+    assert "复用同一个数据库和原始 workspace 的解析后精确路径" in chinese
+
+
+def test_quickstart_implementation_plan_readme_copy_matches_final_boundary() -> None:
+    plan = " ".join(QUICKSTART_PLAN.read_text(encoding="utf-8").split())
+
+    assert "and `bash` Tools inside the selected workspace" not in plan
+    assert (
+        "It prints the Session ID, final answer, token usage, and invoked Tools after each turn."
+        not in plan
+    )
+    assert "Session ID is printed once at startup" in plan
+    assert "approved process is not sandboxed" in plan
+    assert "stdout and stderr are sent to the model and stored in Session history" in plan
+    assert "reuse the same database and the exact original resolved workspace" in plan
 
 
 def test_chinese_readme_python_examples_are_valid_modules() -> None:

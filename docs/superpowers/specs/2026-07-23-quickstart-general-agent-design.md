@@ -27,7 +27,9 @@ once. Passing that identifier through `--session-id` reopens the same
 conversation after a process restart. The example uses
 `.agent-sdk/quickstart.db` by default and accepts explicit `--database` and
 `--workspace` values. Each completed turn prints the final answer, Run ID,
-provider token usage when available, and invoked Tool names.
+provider token usage when available, and invoked Tool names. Resuming requires
+the same database and the exact original resolved workspace; a workspace
+mismatch is rejected before a Run starts.
 
 ## Agent and Tool Policy
 
@@ -45,13 +47,16 @@ The SDK configuration uses explicit workspace-scoped permission rules:
 
 An approved `bash` process is not sandboxed. It can use absolute paths outside
 the workspace and inherits the application environment, including provider
-credentials. The example must show this warning before approval.
+credentials. Its stdout and stderr are sent to the model and stored in Session
+history. The example must show this warning before approval.
 
 When the SDK emits a permission request, the example displays the Tool name and
-a bounded, redacted representation of the requested arguments. Write content is
-represented only by its UTF-8 byte count. The user can allow that single
-invocation or deny it. The example does not implement permanent approvals,
-broad unrestricted mode, policy editing, or a process sandbox.
+a bounded, redacted representation of supported Tool arguments. Control and
+Unicode format characters are converted to visible escapes before bounding.
+Write content is represented only by its UTF-8 byte count, and unknown Tool
+arguments are omitted. The user can allow that single invocation or deny it.
+The example does not implement permanent approvals, broad unrestricted mode,
+policy editing, or a process sandbox.
 
 ## Runtime Flow
 
@@ -66,9 +71,12 @@ The compact summary is derived from public Trace APIs and includes the Run ID,
 total token usage when reported by the provider, and Tool names invoked during
 the Run. Raw events, full prompts, and Tool payloads are not printed by default.
 
-Provider credentials remain in the application environment and are never placed
-in `AgentSpec.model_params` or persisted by the example. LiteLLM remains the
-only model gateway.
+Provider credentials remain in the application environment and are never
+placed deliberately in `AgentSpec.model_params`. Approved `bash` commands
+inherit that environment, however, and their stdout and stderr become Tool
+output sent to the model and persisted in Session history. A command that
+prints a credential can therefore persist it. LiteLLM remains the only model
+gateway.
 
 ## Files
 
