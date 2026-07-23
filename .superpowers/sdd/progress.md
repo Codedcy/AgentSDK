@@ -434,3 +434,7 @@ Quickstart Task 4: complete (commit `613ff27`; review clean; README contracts 15
 Next action: Task 5, completion verification and whole-branch review.
 Quickstart Task 5: complete (focused 26 passed; neighboring examples 11 passed; full suite 2982 passed / 6 skipped; Ruff, supported mypy 1.20.2 across 103 files, and diff-check clean).
 Next action: whole-branch review for `a58062f..HEAD`.
+Quickstart whole-branch review: complete after fixes `406e73e`, `893f97b`, and `2304134`; final re-review approved for release with Critical 0 / Important 0 / Minor 0.
+Quickstart final safety boundary: approved `bash` commands are explicitly not sandboxed, may access paths outside the workspace, inherit the application environment, and send stdout/stderr to the model and durable Session history.
+Quickstart final controller gate on `2304134`: full suite 3001 passed / 6 skipped; focused quickstart and README 45 passed; Ruff check and format clean; supported mypy 1.20.2 clean across 103 source files; diff-check clean.
+2026-07-23 quickstart general Agent example: complete on `master`; next action is optional user validation with real LiteLLM provider credentials, not additional v0.1 scope.
