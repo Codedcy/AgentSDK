@@ -85,7 +85,8 @@ provider and do not open network sockets. They verify:
 - an `ask` permission can be allowed once or denied by the application;
 - the compact summary reports the Run ID, token usage, and invoked Tools;
 - the CLI parser supplies the documented defaults;
-- the example imports Agent SDK APIs only from the package root.
+- the example imports Agent SDK APIs only from the package root and documented
+  public modules such as `agent_sdk.permissions`.
 
 README contract tests verify that both languages contain equivalent installation
 and invocation commands.
