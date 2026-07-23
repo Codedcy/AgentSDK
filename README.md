@@ -47,10 +47,16 @@ interactive example:
 python examples/quickstart_agent.py --model openai/gpt-4o-mini
 ```
 
-The example creates a SQLite-backed Session, uses the built-in `read`, `write`,
-and `bash` Tools inside the selected workspace, and asks before write or command
-execution. It prints the Session ID, final answer, token usage, and invoked
-Tools after each turn.
+The example creates a SQLite-backed Session and uses the built-in `read`,
+`write`, and `bash` Tools. It asks before write or command execution. The
+Session ID is printed once at startup; after each turn it prints the final
+answer, Run ID, token usage, and invoked Tools.
+
+`read` and `write` stay within the Session workspace. For `bash`, the workspace
+rule binds the subprocess working directory, but an approved process is not
+sandboxed: it can use absolute paths outside the workspace and inherits the
+application environment, including provider credentials. The example shows
+this warning before approval.
 
 To continue the same conversation after restarting the process, pass the
 printed identifier:
@@ -225,10 +231,12 @@ async def resolve_next_request(sdk: AgentSDK, run_id: str) -> None:
     )
 ```
 
-Built-in `read`, `write`, and `bash` enforce both the Session workspace roots and
-the configured policy. The SDK suspends an `ask` decision; the host application
-decides when and how to show it, then calls `allow_once()` or
-`PermissionDecision.deny(...)`.
+Built-in `read` and `write` enforce Session workspace roots and the configured
+policy. For `bash`, `path_prefix` constrains the subprocess working directory
+used for policy matching; it does not sandbox an approved process, which can use
+absolute paths and inherits the application environment. The SDK suspends an
+`ask` decision; the host application decides when and how to show it, then calls
+`allow_once()` or `PermissionDecision.deny(...)`.
 
 Connect an MCP server to the same Tool registry and authorization path:
 

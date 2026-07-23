@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import socket
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from agent_sdk import (
     PermissionDecision,
     PermissionRequest,
     RunResult,
+    RunStatus,
     TokenUsage,
     ToolResult,
     TraceStage,
@@ -30,10 +32,26 @@ from examples.quickstart_agent import (
     build_parser,
     define_agent,
     execute_turn,
+    prompt_for_permission,
     run_chat,
     select_session,
+    summarize_permission_request,
     summarize_run,
 )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_network_connections(
+    event_loop: asyncio.AbstractEventLoop,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del event_loop
+
+    def forbid_network(*_: object, **__: object) -> object:
+        raise AssertionError("quickstart tests must not open a network socket")
+
+    monkeypatch.setattr(socket.socket, "connect", forbid_network)
+    monkeypatch.setattr(socket.socket, "connect_ex", forbid_network)
 
 
 async def _unexpected_provider(**_: Any) -> AsyncIterator[dict[str, object]]:
@@ -62,6 +80,240 @@ def test_parser_supplies_documented_defaults() -> None:
     assert args.session_id is None
 
 
+def test_permission_summary_for_large_write_hides_content_and_counts_utf8_bytes() -> None:
+    content = "private-write-marker-秘密" * 1000
+    request = PermissionRequest(
+        request_id="write-summary-request",
+        run_id="write-summary-run",
+        session_id="write-summary-session",
+        tool_name="write",
+        arguments={
+            "path": "notes/output.txt",
+            "content": content,
+            "overwrite": True,
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    assert "path=notes/output.txt" in summary
+    assert f"content_bytes={len(content.encode('utf-8'))}" in summary
+    assert "overwrite=true" in summary
+    assert "private-write-marker" not in summary
+    assert "秘密" not in summary
+    assert len(summary) <= 512
+
+
+@pytest.mark.asyncio
+async def test_bash_permission_prompt_redacts_secrets_and_warns_before_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = PermissionRequest(
+        request_id="bash-summary-request",
+        run_id="bash-summary-run",
+        session_id="bash-summary-session",
+        tool_name="bash",
+        arguments={
+            "cwd": "C:/workspace",
+            "argv": [
+                "env",
+                "OPENAI_API_KEY=sk-assignment-secret",
+                "deploy",
+                "--token",
+                "separate-token-secret",
+                "--password=inline-password-secret",
+                "AWS_SESSION_TOKEN=session-token-secret",
+                "-u",
+                "curl-user:curl-password-secret",
+                "--header",
+                "Authorization: Bearer header-secret",
+            ],
+        },
+    )
+    prompts: list[str] = []
+
+    async def capture_prompt(prompt: str) -> str:
+        prompts.append(prompt)
+        return "n"
+
+    monkeypatch.setattr(
+        "examples.quickstart_agent._console_read",
+        capture_prompt,
+    )
+
+    decision = await prompt_for_permission(request)
+    summary = summarize_permission_request(request)
+
+    assert decision == PermissionDecision.deny("user denied")
+    assert prompts and summary in prompts[0]
+    for secret in (
+        "sk-assignment-secret",
+        "separate-token-secret",
+        "inline-password-secret",
+        "session-token-secret",
+        "curl-password-secret",
+        "header-secret",
+    ):
+        assert secret not in summary
+        assert secret not in prompts[0]
+    assert summary.count("[REDACTED]") >= 6
+    assert "cwd=C:/workspace" in summary
+    assert "argv=" in summary
+    assert "not sandboxed" in summary
+    assert "outside the workspace" in summary
+    assert "inherit the application environment" in summary
+    assert len(summary) <= 512
+
+
+def test_bash_permission_summary_redacts_bare_names_and_attached_short_options() -> None:
+    request = PermissionRequest(
+        request_id="bash-common-secret-forms-request",
+        run_id="bash-common-secret-forms-run",
+        session_id="bash-common-secret-forms-session",
+        tool_name="bash",
+        arguments={
+            "cwd": "C:/workspace",
+            "argv": [
+                "env",
+                "API_TOKEN",
+                "bare-env-token-secret",
+                "aws",
+                "configure",
+                "set",
+                "aws_secret_access_key",
+                "bare-aws-secret",
+                "mysql",
+                "-pattached-password-secret",
+                "curl",
+                "-uattached-user:attached-password-secret",
+            ],
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    for secret in (
+        "bare-env-token-secret",
+        "bare-aws-secret",
+        "attached-password-secret",
+        "attached-user",
+    ):
+        assert secret not in summary
+    assert summary.count("[REDACTED]") >= 4
+    assert "API_TOKEN" in summary
+    assert "aws_secret_access_key" in summary
+    assert len(summary) <= 512
+
+
+def test_bash_permission_summary_redacts_attached_authorization_headers() -> None:
+    request = PermissionRequest(
+        request_id="bash-attached-header-request",
+        run_id="bash-attached-header-run",
+        session_id="bash-attached-header-session",
+        tool_name="bash",
+        arguments={
+            "cwd": "C:/workspace",
+            "argv": [
+                "curl",
+                "--header=Authorization: Bearer long-header-secret",
+                "-HAuthorization: Basic short-header-secret",
+                "--proxy-header=Proxy-Authorization: Basic proxy-header-secret",
+            ],
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    for secret in (
+        "long-header-secret",
+        "short-header-secret",
+        "proxy-header-secret",
+    ):
+        assert secret not in summary
+    assert summary.count("[REDACTED]") == 3
+    assert "--header=Authorization: [REDACTED]" in summary
+    assert "-HAuthorization: [REDACTED]" in summary
+    assert "--proxy-header=Proxy-Authorization: [REDACTED]" in summary
+    assert len(summary) <= 512
+
+
+def test_read_permission_summary_bounds_long_path() -> None:
+    path = "C:/workspace/" + ("nested/" * 200) + "target.txt"
+    request = PermissionRequest(
+        request_id="read-summary-request",
+        run_id="read-summary-run",
+        session_id="read-summary-session",
+        tool_name="read",
+        arguments={"path": path},
+    )
+
+    summary = summarize_permission_request(request)
+
+    assert summary.startswith("path=C:/workspace/")
+    assert summary.endswith("target.txt")
+    assert "..." in summary
+    assert path not in summary
+    assert len(summary) <= 512
+
+
+def test_bash_permission_summary_caps_complete_display_and_keeps_warning() -> None:
+    huge_argument = "benign-segment-" * 200
+    request = PermissionRequest(
+        request_id="bash-truncation-request",
+        run_id="bash-truncation-run",
+        session_id="bash-truncation-session",
+        tool_name="bash",
+        arguments={
+            "cwd": "C:/workspace/" + ("nested/" * 100),
+            "argv": ["python", huge_argument, *(f"argument-{index}" for index in range(50))],
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    assert len(summary) <= 512
+    assert huge_argument not in summary
+    assert "..." in summary
+    assert "not sandboxed" in summary
+    assert "outside the workspace" in summary
+    assert "inherit the application environment" in summary
+
+
+def test_unknown_permission_summary_redacts_sensitive_fields_and_is_bounded() -> None:
+    request = PermissionRequest(
+        request_id="unknown-summary-request",
+        run_id="unknown-summary-run",
+        session_id="unknown-summary-session",
+        tool_name="custom_tool",
+        arguments={
+            "action": "safe-action",
+            "api_key": "unknown-api-secret",
+            "nested": {
+                "password": "unknown-password-secret",
+                "items": [
+                    {"token": "unknown-token-secret"},
+                    {"note": "public-prefix-" + ("x" * 2000)},
+                ],
+            },
+        },
+    )
+
+    summary = summarize_permission_request(request)
+
+    assert "arguments=" in summary
+    assert "safe-action" in summary
+    assert "public-prefix" in summary
+    assert summary.count("[REDACTED]") >= 3
+    for secret in (
+        "unknown-api-secret",
+        "unknown-password-secret",
+        "unknown-token-secret",
+    ):
+        assert secret not in summary
+    assert "..." in summary
+    assert len(summary) <= 512
+
+
 @pytest.mark.asyncio
 async def test_select_session_creates_then_reopens_same_session(
     tmp_path: Path,
@@ -76,6 +328,34 @@ async def test_select_session_creates_then_reopens_same_session(
 
         assert reopened.session_id == created.session_id
         assert reopened.workspaces == (str(tmp_path.resolve()),)
+    finally:
+        await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_select_session_rejects_mismatched_workspace_before_run(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "original"
+    requested = tmp_path / "requested"
+    original.mkdir()
+    requested.mkdir()
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=_unexpected_provider,
+    )
+    try:
+        created = await select_session(sdk, original, None)
+
+        with pytest.raises(
+            AgentSDKError,
+            match="session workspace does not match --workspace",
+        ) as captured:
+            await select_session(sdk, requested, created.session_id)
+
+        assert captured.value.code is ErrorCode.INVALID_STATE
+        persisted = await sdk.sessions.get(created.session_id)
+        assert persisted.active_run_ids == ()
     finally:
         await sdk.close()
 
@@ -99,9 +379,7 @@ async def test_general_agent_exposes_only_workspace_tools(tmp_path: Path) -> Non
 
 def _text_stream(text: str) -> AsyncIterator[dict[str, object]]:
     async def chunks() -> AsyncIterator[dict[str, object]]:
-        yield {
-            "choices": [{"delta": {"content": text}, "finish_reason": "stop"}]
-        }
+        yield {"choices": [{"delta": {"content": text}, "finish_reason": "stop"}]}
         yield {
             "choices": [],
             "usage": {
@@ -117,6 +395,8 @@ def _text_stream(text: str) -> AsyncIterator[dict[str, object]]:
 def _tool_stream(
     name: str,
     arguments: dict[str, object],
+    *,
+    call_id: str = "quickstart-call",
 ) -> AsyncIterator[dict[str, object]]:
     async def chunks() -> AsyncIterator[dict[str, object]]:
         yield {
@@ -126,7 +406,7 @@ def _tool_stream(
                         "tool_calls": [
                             {
                                 "index": 0,
-                                "id": "quickstart-call",
+                                "id": call_id,
                                 "function": {
                                     "name": name,
                                     "arguments": json.dumps(arguments),
@@ -167,6 +447,41 @@ class ConversationProvider:
         return _text_stream(f"answer-{self.calls}")
 
 
+class FixedAnswerProvider:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.requests: list[tuple[dict[str, Any], ...]] = []
+
+    async def __call__(self, **params: Any) -> object:
+        self.requests.append(tuple(dict(item) for item in params["messages"]))
+        return _text_stream(self.answer)
+
+
+class DeferredTwoWritesProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.first_call_started = asyncio.Event()
+        self.release_first_call = asyncio.Event()
+
+    async def __call__(self, **_: Any) -> object:
+        self.calls += 1
+        if self.calls == 1:
+            self.first_call_started.set()
+            await self.release_first_call.wait()
+            return _tool_stream(
+                "write",
+                {"path": "first.txt", "content": "first"},
+                call_id="deferred-write-1",
+            )
+        if self.calls == 2:
+            return _tool_stream(
+                "write",
+                {"path": "second.txt", "content": "second"},
+                call_id="deferred-write-2",
+            )
+        return _text_stream("cleanup finished")
+
+
 @pytest.mark.asyncio
 async def test_run_chat_keeps_multiple_turns_in_one_session(
     tmp_path: Path,
@@ -205,6 +520,71 @@ async def test_run_chat_keeps_multiple_turns_in_one_session(
         assert sum(line.startswith("Run ") for line in output) == 2
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_restart_preserves_workspace_and_conversation_history(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "quickstart.db"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first_provider = FixedAnswerProvider("first answer")
+    first_sdk = AgentSDK.for_test(
+        database_path=database,
+        acompletion=first_provider,
+        permission_default="ask",
+    )
+    session_id: str
+    try:
+        session = await select_session(first_sdk, workspace, None)
+        session_id = session.session_id
+        first_result = await execute_turn(
+            first_sdk,
+            session_id,
+            define_agent(first_sdk, "fake/general"),
+            "first question",
+            resolve_permission=lambda _: asyncio.sleep(0),  # type: ignore[arg-type]
+        )
+
+        assert first_result.output_text == "first answer"
+    finally:
+        await asyncio.wait_for(first_sdk.close(), timeout=2)
+
+    second_provider = FixedAnswerProvider("second answer")
+    second_sdk = AgentSDK.for_test(
+        database_path=database,
+        acompletion=second_provider,
+        permission_default="ask",
+    )
+    try:
+        resumed = await select_session(second_sdk, workspace, session_id)
+        second_result = await execute_turn(
+            second_sdk,
+            resumed.session_id,
+            define_agent(second_sdk, "fake/general"),
+            "second question",
+            resolve_permission=lambda _: asyncio.sleep(0),  # type: ignore[arg-type]
+        )
+
+        assert resumed.workspaces == (str(workspace.resolve()),)
+        assert second_result.output_text == "second answer"
+        assert len(second_provider.requests) == 1
+        second_request = second_provider.requests[0]
+        assert any(
+            message.get("role") == "user" and message.get("content") == "first question"
+            for message in second_request
+        )
+        assert any(
+            message.get("role") == "assistant" and message.get("content") == "first answer"
+            for message in second_request
+        )
+        assert any(
+            message.get("role") == "user" and message.get("content") == "second question"
+            for message in second_request
+        )
+    finally:
+        await asyncio.wait_for(second_sdk.close(), timeout=2)
 
 
 @pytest.mark.asyncio
@@ -287,6 +667,236 @@ async def test_execute_turn_can_deny_write(tmp_path: Path) -> None:
         assert result.tool_results[0].status.value == "denied"
     finally:
         await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_run_chat_treats_permission_prompt_eof_as_normal_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WriteThenAnswerProvider()
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        permission_default="ask",
+    )
+    requests: list[PermissionRequest] = []
+    output: list[str] = []
+
+    async def read_user_input(_: str) -> str:
+        return "write a note"
+
+    async def permission_eof(_: str) -> str:
+        raise EOFError
+
+    async def prompt(request: PermissionRequest) -> PermissionDecision:
+        requests.append(request)
+        return await prompt_for_permission(request)
+
+    monkeypatch.setattr(
+        "examples.quickstart_agent._console_read",
+        permission_eof,
+    )
+    closed = False
+    try:
+        session = await sdk.sessions.create(workspaces=(tmp_path,))
+        agent = define_agent(sdk, "fake/general")
+
+        await run_chat(
+            sdk,
+            session.session_id,
+            agent,
+            read_line=read_user_input,
+            write_line=output.append,
+            resolve_permission=prompt,
+        )
+
+        assert len(requests) == 1
+        snapshot = await sdk.runs.get(requests[0].run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        assert [item.status.value for item in snapshot.tool_results] == ["denied"]
+        assert not (tmp_path / "note.txt").exists()
+        assert output == []
+        await asyncio.wait_for(sdk.close(), timeout=1)
+        closed = True
+    finally:
+        if not closed:
+            await asyncio.wait_for(sdk.close(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_cancellation_drains_real_run_permissions(
+    tmp_path: Path,
+) -> None:
+    provider = DeferredTwoWritesProvider()
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        permission_default="ask",
+    )
+    session = await sdk.sessions.create(workspaces=(tmp_path,))
+    agent = define_agent(sdk, "fake/general")
+    resolver_calls: list[PermissionRequest] = []
+
+    async def unexpected_resolver(
+        request: PermissionRequest,
+    ) -> PermissionDecision:
+        resolver_calls.append(request)
+        return PermissionDecision.allow_once()
+
+    turn = asyncio.create_task(
+        execute_turn(
+            sdk,
+            session.session_id,
+            agent,
+            "write two files",
+            resolve_permission=unexpected_resolver,
+        )
+    )
+    rescue: asyncio.Task[None] | None = None
+    closed = False
+
+    async def rescue_stalled_run(run_id: str) -> None:
+        for _ in range(2):
+            request = await sdk.permissions.next_request(run_id)
+            await sdk.permissions.resolve(
+                request.request_id,
+                PermissionDecision.deny("test rescue"),
+            )
+
+    try:
+        await asyncio.wait_for(provider.first_call_started.wait(), timeout=1)
+        active = await sdk.sessions.get(session.session_id)
+        assert len(active.active_run_ids) == 1
+        run_id = active.active_run_ids[0]
+
+        turn.cancel()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(turn), timeout=0.05)
+
+        provider.release_first_call.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=2)
+
+        snapshot = await sdk.runs.get(run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        assert [item.status.value for item in snapshot.tool_results] == [
+            "denied",
+            "denied",
+        ]
+        assert resolver_calls == []
+        assert provider.calls == 3
+        await asyncio.wait_for(sdk.close(), timeout=1)
+        closed = True
+    finally:
+        provider.release_first_call.set()
+        if not closed:
+            if turn.done():
+                active = await sdk.sessions.get(session.session_id)
+                if active.active_run_ids:
+                    rescue = asyncio.create_task(rescue_stalled_run(active.active_run_ids[0]))
+            else:
+                turn.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(turn, timeout=2)
+            if rescue is not None:
+                await asyncio.wait_for(rescue, timeout=2)
+            await asyncio.wait_for(sdk.close(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_execute_turn_cancellation_during_start_retains_real_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = DeferredTwoWritesProvider()
+    sdk = AgentSDK.for_test(
+        store=InMemoryStore(),
+        acompletion=provider,
+        permission_default="ask",
+    )
+    session = await sdk.sessions.create(workspaces=(tmp_path,))
+    agent = define_agent(sdk, "fake/general")
+    start_committed = asyncio.Event()
+    release_start = asyncio.Event()
+    committed_run_ids: list[str] = []
+    original_start_run = sdk.runs._commands.start_run  # type: ignore[attr-defined]
+
+    async def delay_committed_start(*args: Any, **kwargs: Any) -> Any:
+        outcome = await original_start_run(*args, **kwargs)
+        committed_run_ids.append(outcome.value.run_id)
+        start_committed.set()
+        await release_start.wait()
+        return outcome
+
+    monkeypatch.setattr(
+        sdk.runs._commands,  # type: ignore[attr-defined]
+        "start_run",
+        delay_committed_start,
+    )
+
+    async def unexpected_resolver(_: PermissionRequest) -> PermissionDecision:
+        raise AssertionError("cancelled turn must deny without prompting")
+
+    turn = asyncio.create_task(
+        execute_turn(
+            sdk,
+            session.session_id,
+            agent,
+            "write two files",
+            resolve_permission=unexpected_resolver,
+        )
+    )
+    rescue: asyncio.Task[None] | None = None
+    closed = False
+
+    async def rescue_stalled_run(run_id: str) -> None:
+        for _ in range(2):
+            request = await sdk.permissions.next_request(run_id)
+            await sdk.permissions.resolve(
+                request.request_id,
+                PermissionDecision.deny("test rescue"),
+            )
+
+    try:
+        await asyncio.wait_for(start_committed.wait(), timeout=1)
+        assert len(committed_run_ids) == 1
+        run_id = committed_run_ids[0]
+
+        turn.cancel()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(turn), timeout=0.05)
+
+        release_start.set()
+        await asyncio.wait_for(provider.first_call_started.wait(), timeout=1)
+        assert not turn.done(), "execute_turn returned before draining the started Run"
+
+        provider.release_first_call.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=2)
+
+        snapshot = await sdk.runs.get(run_id)
+        assert snapshot.status is RunStatus.COMPLETED
+        assert [item.status.value for item in snapshot.tool_results] == [
+            "denied",
+            "denied",
+        ]
+        assert provider.calls == 3
+        await asyncio.wait_for(sdk.close(), timeout=1)
+        closed = True
+    finally:
+        release_start.set()
+        provider.release_first_call.set()
+        if not closed:
+            if turn.done() and committed_run_ids:
+                rescue = asyncio.create_task(rescue_stalled_run(committed_run_ids[0]))
+            else:
+                turn.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(turn, timeout=2)
+            if rescue is not None:
+                await asyncio.wait_for(rescue, timeout=2)
+            await asyncio.wait_for(sdk.close(), timeout=2)
 
 
 def _run_result() -> RunResult:
@@ -415,7 +1025,9 @@ async def test_execute_turn_cancellation_before_permission_delivery_cancels_run_
 
 
 @pytest.mark.asyncio
-async def test_execute_turn_cancellation_while_resolver_waits_denies_request_and_cancels_run_waiter() -> None:
+async def test_execute_turn_cancellation_while_resolver_waits_denies_request_and_cancels_run_waiter() -> (
+    None
+):
     handle = _ControlledRunHandle()
     request = _permission_request()
     permissions = _ControlledPermissions(request)

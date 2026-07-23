@@ -34,9 +34,9 @@ python -m pip install .
 python examples/quickstart_agent.py --model openai/gpt-4o-mini
 ```
 
-该示例会创建由 SQLite 持久化的 Session，在选定的 workspace 内使用内置
-`read`、`write` 和 `bash` Tool，并在写入文件或执行命令前询问用户。每轮
-对话结束后，它会显示 Session ID、最终回复、token 用量和调用过的 Tool。
+该示例会创建由 SQLite 持久化的 Session，并使用内置 `read`、`write` 和 `bash` Tool。它会在写入文件或执行命令前询问用户。Session ID 仅在启动时打印一次；每轮结束后会显示最终回复、Run ID、token 用量和调用过的 Tool。
+
+`read` 和 `write` 始终受 Session workspace 约束。对于 `bash`，workspace 规则只绑定子进程的工作目录，但获批进程并不在沙箱中：它可以通过绝对路径访问 workspace 之外的位置，并会继承应用环境（包括其中的提供方凭据）。示例会在审批前显示这项警告。
 
 进程重启后，可以通过打印出的标识继续同一段对话：
 
@@ -200,7 +200,7 @@ async def resolve_next_request(sdk: AgentSDK, run_id: str) -> None:
     )
 ```
 
-内置 `read`、`write` 和 `bash` 会同时强制执行 Session 的 workspace 根目录约束和已配置策略。SDK 会暂停 `ask` 决策；宿主应用决定何时以及如何展示该请求，然后调用 `allow_once()` 或 `PermissionDecision.deny(...)`。
+内置 `read` 和 `write` 会强制执行 Session 的 workspace 根目录约束和已配置策略。对于 `bash`，`path_prefix` 约束用于策略匹配的子进程工作目录；它不会隔离获批进程，进程仍可使用绝对路径并会继承应用环境。SDK 会暂停 `ask` 决策；宿主应用决定何时以及如何展示该请求，然后调用 `allow_once()` 或 `PermissionDecision.deny(...)`。
 
 将 MCP 服务器接入相同的 Tool 注册表和授权路径：
 

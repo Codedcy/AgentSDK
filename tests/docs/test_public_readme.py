@@ -6,6 +6,9 @@ ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 ZH_README = ROOT / "README.zh-CN.md"
 QUICKSTART = ROOT / "docs" / "guides" / "v01-quickstart.md"
+QUICKSTART_DESIGN = (
+    ROOT / "docs" / "superpowers" / "specs" / "2026-07-23-quickstart-general-agent-design.md"
+)
 
 
 def _readme() -> str:
@@ -91,9 +94,7 @@ def test_bilingual_readmes_share_executable_examples() -> None:
     english = README.read_text(encoding="utf-8")
     chinese = ZH_README.read_text(encoding="utf-8")
 
-    assert _fenced_blocks(chinese, "powershell") == _fenced_blocks(
-        english, "powershell"
-    )
+    assert _fenced_blocks(chinese, "powershell") == _fenced_blocks(english, "powershell")
     assert _fenced_blocks(chinese, "python") == _fenced_blocks(english, "python")
 
 
@@ -108,6 +109,30 @@ def test_bilingual_readmes_recommend_the_general_agent_quickstart() -> None:
     assert command in chinese
     assert "--session-id" in english
     assert "--session-id" in chinese
+
+
+def test_quickstart_docs_disclose_bash_boundary_and_output_timing() -> None:
+    english = " ".join(README.read_text(encoding="utf-8").split())
+    chinese = " ".join(ZH_README.read_text(encoding="utf-8").split())
+    design = " ".join(QUICKSTART_DESIGN.read_text(encoding="utf-8").split())
+
+    for text in (english, design):
+        assert "not sandboxed" in text
+        assert "absolute paths outside the workspace" in text
+        assert "inherits the application environment" in text
+        assert "before approval" in text
+    for text in (chinese,):
+        assert "不在沙箱中" in text
+        assert "绝对路径访问 workspace 之外" in text
+        assert "继承应用环境" in text
+        assert "审批前" in text
+
+    assert "Session ID is printed once at startup" in english
+    assert (
+        "after each turn it prints the final answer, Run ID, token usage, and invoked Tools"
+    ) in english
+    assert "Session ID 仅在启动时打印一次" in chinese
+    assert "每轮结束后会显示最终回复、Run ID、token 用量和调用过的 Tool" in chinese
 
 
 def test_chinese_readme_python_examples_are_valid_modules() -> None:
@@ -165,10 +190,14 @@ def test_bilingual_readmes_preserve_non_fenced_technical_content() -> None:
 
     for source, translation in (
         (
-            "Built-in `read`, `write`, and `bash` enforce both the Session "
-            "workspace roots and the configured policy.",
-            "内置 `read`、`write` 和 `bash` 会同时强制执行 Session 的 workspace "
-            "根目录约束和已配置策略。",
+            "Built-in `read` and `write` enforce Session workspace roots and "
+            "the configured policy. For `bash`, `path_prefix` constrains the "
+            "subprocess working directory used for policy matching; it does "
+            "not sandbox an approved process, which can use absolute paths "
+            "and inherits the application environment.",
+            "内置 `read` 和 `write` 会强制执行 Session 的 workspace 根目录约束和"
+            "已配置策略。对于 `bash`，`path_prefix` 约束用于策略匹配的子进程工作"
+            "目录；它不会隔离获批进程，进程仍可使用绝对路径并会继承应用环境。",
         ),
         (
             "Deleting a Session removes SDK-owned persisted history, events, "

@@ -22,10 +22,12 @@ message starts one Run in the same Session, so later turns can use the durable
 conversation history. Entering `exit` or pressing `Ctrl+C` closes the SDK
 cleanly without deleting the Session.
 
-On first start, the example creates a Session and prints its identifier. Passing
-that identifier through `--session-id` reopens the same conversation after a
-process restart. The example uses `.agent-sdk/quickstart.db` by default and
-accepts explicit `--database` and `--workspace` values.
+At startup, the example creates or loads a Session and prints its identifier
+once. Passing that identifier through `--session-id` reopens the same
+conversation after a process restart. The example uses
+`.agent-sdk/quickstart.db` by default and accepts explicit `--database` and
+`--workspace` values. Each completed turn prints the final answer, Run ID,
+provider token usage when available, and invoked Tool names.
 
 ## Agent and Tool Policy
 
@@ -36,14 +38,20 @@ tools.
 The SDK configuration uses explicit workspace-scoped permission rules:
 
 - `read` is allowed within the configured workspace;
-- `write` and `bash` require an application decision;
-- access outside the Session workspace remains unavailable regardless of the
-  decision.
+- `write` requires an application decision and remains constrained to that
+  workspace;
+- `bash` requires an application decision, and its workspace rule binds the
+  subprocess working directory used for policy matching.
+
+An approved `bash` process is not sandboxed. It can use absolute paths outside
+the workspace and inherits the application environment, including provider
+credentials. The example must show this warning before approval.
 
 When the SDK emits a permission request, the example displays the Tool name and
-a concise representation of the requested arguments. The user can allow that
-single invocation or deny it. The example does not implement permanent
-approvals, broad unrestricted mode, or policy editing.
+a bounded, redacted representation of the requested arguments. Write content is
+represented only by its UTF-8 byte count. The user can allow that single
+invocation or deny it. The example does not implement permanent approvals,
+broad unrestricted mode, policy editing, or a process sandbox.
 
 ## Runtime Flow
 
@@ -80,9 +88,15 @@ provider and do not open network sockets. They verify:
 
 - a new Session is created in the configured workspace;
 - multiple inputs run in the same Session;
-- an existing Session can be selected explicitly;
+- an existing Session can be selected explicitly only when its durable
+  workspace exactly matches the resolved requested workspace;
 - the Agent exposes only `read`, `write`, and `bash`;
 - an `ask` permission can be allowed once or denied by the application;
+- cancellation keeps denying later permissions until the real Run terminates;
+- end-of-input at a permission prompt drains the Run and shuts down normally;
+- permission summaries are bounded and redact write content and common secrets;
+- two sequential SQLite-backed SDK instances preserve the Session workspace and
+  prior conversation;
 - the compact summary reports the Run ID, token usage, and invoked Tools;
 - the CLI parser supplies the documented defaults;
 - the example imports Agent SDK APIs only from the package root and documented
@@ -95,9 +109,11 @@ and invocation commands.
 
 Configuration and SDK errors are rendered as short user-facing messages and
 produce a non-zero process exit. End-of-input, `exit`, and `Ctrl+C` are normal
-shutdown paths. A denied Tool call returns through the Agent loop so the model
-can explain or choose another action. Closing the process never deletes the
-Session database or application workspace files.
+shutdown paths. Exceptional or cancelled turns keep consuming and denying
+permission requests until their real Run terminates, then preserve the caller's
+original error or cancellation. A denied Tool call returns through the Agent
+loop so the model can explain or choose another action. Closing the process
+never deletes the Session database or application workspace files.
 
 ## Non-goals
 
@@ -106,4 +122,5 @@ Session database or application workspace files.
 - custom Tool registration;
 - automatic provider credential discovery beyond LiteLLM conventions;
 - permanent permission decisions or unrestricted execution;
+- a process or filesystem sandbox for approved commands;
 - replacing either existing comprehensive reference example.
