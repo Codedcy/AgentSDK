@@ -432,3 +432,5 @@ Quickstart Task 3: complete (commit `cfb7818`; review clean; focused 11 passed, 
 Next action: Task 4, bilingual README entry point.
 Quickstart Task 4: complete (commit `613ff27`; review clean; README contracts 15 passed, Ruff clean).
 Next action: Task 5, completion verification and whole-branch review.
+Quickstart Task 5: complete (focused 26 passed; neighboring examples 11 passed; full suite 2982 passed / 6 skipped; Ruff, supported mypy 1.20.2 across 103 files, and diff-check clean).
+Next action: whole-branch review for `a58062f..HEAD`.
